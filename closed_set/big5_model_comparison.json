@@ -1,0 +1,1182 @@
+{
+  "1738274201897771303_0.jpg": {
+    "language": "es",
+    "gt_nature": 1,
+    "gt_biotic": 1,
+    "gt_material": 0,
+    "predictions": {
+      "places_resnet50": {
+        "raw_prediction": "booth/indoor (id=61)",
+        "pred_nature": null,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": true
+      },
+      "convnext_base": {
+        "raw_prediction": "web site (n06359193)",
+        "pred_nature": 0,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": false
+      },
+      "vit_b_16": {
+        "raw_prediction": "web site (n06359193)",
+        "pred_nature": 0,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": false
+      },
+      "swin_v2_b": {
+        "raw_prediction": "web site (n06359193)",
+        "pred_nature": 0,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": false
+      },
+      "q2l_query2labels": {
+        "raw_prediction": "person, cat, television receiver, laptop, cellular telephone",
+        "pred_nature": 0,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": false
+      },
+      "multitask_DenseNet121": {
+        "raw_prediction": "nature=Yes, materiality=immaterial, biological=biotic",
+        "pred_nature": 1,
+        "pred_biotic": 1,
+        "pred_material": 0,
+        "no_taxonomy_match": false
+      },
+      "Qwen_Qwen3.5-0.8B": {
+        "responses": {
+          "Summarise the background elements in a concise manner.": "In the background of the image, there are several elements:\n\n- A large white sign with \u201cSPORTLINE\u201d written on it, which appears to be a store or event backdrop.\n- People walking or standing in what looks like a shopping mall or public space.\n- An escalator with signage, including \u201cAMAZONIC\u201d visible on it.\n- A red cross symbol on the escalator.\n- A colorful, abstract background with gradients of pink, purple, green, and blue.\n\nThese elements suggest the photo was taken in a public or commercial setting, possibly at a sports-related event or shopping mall.",
+          "Summarise the foreground elements in a concise manner.": "The foreground elements in the image are:\n\n- A man in a white t-shirt smiling at the camera.\n- A man in a blue shirt with a cat face filter applied to his face.\n- A selfie-style photo taken indoors, likely in a shopping mall or public space, with people in the background.\n- The photo is overlaid with a digital clock reading \u201c15:54\u201d at the bottom right.\n- The overall composition suggests a casual, possibly staged or edited moment captured by someone using a phone.",
+          "Identify the primary subject or subjects of this image. State what they are, and if there are multiple, briefly note how they interact. Justify your conclusion based on visual prominence (size, focus, or placement) in 1 to 2 sentences.": "The primary subjects are two men in a selfie-style photo, with one wearing a cat face filter. They are the main focus of the image, as they are centrally placed and clearly visible. The interaction between them is casual and friendly, as they are posing together in a public setting.",
+          "Ignoring any foreground subjects or specific objects, what specific place, background environment, or spatial layout does this image depict? State the setting, then justify your conclusion based on background details in 1 to 2 sentences.": "The image depicts a public indoor space, likely a shopping mall or entertainment center, characterized by its bright lighting, modern architecture, and visible elements such as escalators, signage, and people moving through the area.",
+          "Does this image contain any nature-related elements or concepts? Answer 'Yes' or 'No', and justify your decision in 1 to 2 sentences.": "No, the image contains no nature-related elements or concepts."
+        }
+      }
+    }
+  },
+  "1685441070979534849_0.jpg": {
+    "language": "en",
+    "gt_nature": 1,
+    "gt_biotic": 0,
+    "gt_material": 0,
+    "predictions": {
+      "places_resnet50": {
+        "raw_prediction": "art_gallery (id=19)",
+        "pred_nature": 0,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": false
+      },
+      "convnext_base": {
+        "raw_prediction": "coral fungus (n12985857)",
+        "pred_nature": 1,
+        "pred_biotic": 1,
+        "pred_material": 1,
+        "no_taxonomy_match": false
+      },
+      "vit_b_16": {
+        "raw_prediction": "jigsaw puzzle (n03598930)",
+        "pred_nature": 0,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": false
+      },
+      "swin_v2_b": {
+        "raw_prediction": "barn (n02793495)",
+        "pred_nature": 0,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": false
+      },
+      "q2l_query2labels": {
+        "raw_prediction": "(nothing detected above threshold)",
+        "pred_nature": 0,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": true
+      },
+      "multitask_DenseNet121": {
+        "raw_prediction": "nature=Yes, materiality=immaterial, biological=abiotic",
+        "pred_nature": 1,
+        "pred_biotic": 0,
+        "pred_material": 0,
+        "no_taxonomy_match": false
+      },
+      "Qwen_Qwen3.5-0.8B": {
+        "responses": {
+          "Summarise the background elements in a concise manner.": "This is a radar map from **RadarScope Pro**, showing precipitation over **Boston, Massachusetts**, on **8:01 PM** (updated at 8:02 PM). The image displays **super-resolution reflectivity** in **VCP 212: Precipitation Mode**, with a color scale ranging from green (low reflectivity) to red/orange (high reflectivity), indicating strong precipitation.\n\nKey background elements include:\n\n- **Weather system**: A large area of intense precipitation (red/orange) dominates the central and eastern portions of the map, with lightning symbols indicating active storms.\n- **Urban area**: The map shows Boston\u2019s urban landscape, including roads, buildings, and water bodies (like the harbor or bay) on the right side.\n- **Geographic features**: Yellow outlines highlight specific regions of interest or storm tracks; blue lines may represent wind or other atmospheric features.\n- **Satellite imagery**: The black background represents clear or low-reflectivity areas, while the colorful overlay indicates active precipitation.\n\nOverall, the image captures a severe weather event in Boston during the evening, with significant rainfall and storm activity concentrated in the central-eastern region.",
+          "Summarise the foreground elements in a concise manner.": "The foreground elements in the image are:\n\n- A weather radar map showing precipitation patterns in the Boston area, with high reflectivity (red/orange) indicating active storms.\n- Yellow outlines highlighting specific areas of interest or potential hazards.\n- White lightning bolt symbols indicating active thunderstorms.\n- Blue lines representing precipitation or radar signals.\n- A black background representing land and water features (likely Boston\u2019s coastline and surrounding areas).\n- Text overlays at the top and bottom: \u201cKBOX Boston\u201d, \u201cRadarScope Pro\u201d, \u201cSuper-Res Reflectivity 1\u201d, elevation, and timestamp \u201c8:01 PM\u201d.\n\nThese elements collectively depict a severe weather event in Boston, with radar data emphasizing active precipitation and storm activity.",
+          "Identify the primary subject or subjects of this image. State what they are, and if there are multiple, briefly note how they interact. Justify your conclusion based on visual prominence (size, focus, or placement) in 1 to 2 sentences.": "The primary subject of this image is a weather radar map from KBOX Boston, specifically displaying precipitation patterns using the VCP 212 mode. The map is overlaid with radarScope Pro data, indicating high-resolution reflectivity imagery. The map's focus is on the northeastern United States, with distinct areas of intense precipitation (red/orange) and scattered lightning (white lightning bolts) visible. The radarScope Pro overlay provides additional context, likely indicating the location of active storms or radar coverage. The map's placement and the prominence of the precipitation patterns suggest it is designed to monitor and analyze weather conditions in the specified region.",
+          "Ignoring any foreground subjects or specific objects, what specific place, background environment, or spatial layout does this image depict? State the setting, then justify your conclusion based on background details in 1 to 2 sentences.": "This image depicts a weather radar map of Boston, Massachusetts, USA, showing precipitation patterns over a metropolitan area. The setting is a city with a dense urban environment, characterized by a mix of green and yellow areas indicating lower and moderate precipitation, respectively, and red areas indicating higher precipitation. The spatial layout includes a coastline on the right side, likely representing the Atlantic Ocean, and a dense network of roads and buildings, typical of a major city. The presence of a radar system and the specific location of Boston confirm this is a weather map of a city.",
+          "Does this image contain any nature-related elements or concepts? Answer 'Yes' or 'No', and justify your decision in 1 to 2 sentences.": "Yes, the image contains nature-related elements as it displays a weather radar map of precipitation, which is a natural phenomenon."
+        }
+      }
+    }
+  },
+  "1515722753923592197_2.jpg": {
+    "language": "en",
+    "gt_nature": 0,
+    "gt_biotic": null,
+    "gt_material": null,
+    "predictions": {
+      "places_resnet50": {
+        "raw_prediction": "drugstore (id=128)",
+        "pred_nature": 0,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": false
+      },
+      "convnext_base": {
+        "raw_prediction": "water bottle (n04557648)",
+        "pred_nature": 0,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": false
+      },
+      "vit_b_16": {
+        "raw_prediction": "water bottle (n04557648)",
+        "pred_nature": 0,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": false
+      },
+      "swin_v2_b": {
+        "raw_prediction": "water bottle (n04557648)",
+        "pred_nature": 0,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": false
+      },
+      "q2l_query2labels": {
+        "raw_prediction": "bottle, cup, dining table, toothbrush",
+        "pred_nature": 0,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": false
+      },
+      "multitask_DenseNet121": {
+        "raw_prediction": "nature=No, materiality=N/A, biological=N/A",
+        "pred_nature": 0,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": false
+      },
+      "Qwen_Qwen3.5-0.8B": {
+        "responses": {
+          "Summarise the background elements in a concise manner.": "The background consists of a plain, light brown surface, likely cardboard or paper, which provides a neutral backdrop for the two water bottles.",
+          "Summarise the foreground elements in a concise manner.": "Two personalized water bottles, one labeled \u201cShanny\u201d and the other \u201cMichael,\u201d are displayed side by side. Both feature gold lettering on a teal-blue background, with matching teal ribbons and clear lids. A small tag hangs from each bottle, and they rest on a brown cardboard surface.",
+          "Identify the primary subject or subjects of this image. State what they are, and if there are multiple, briefly note how they interact. Justify your conclusion based on visual prominence (size, focus, or placement) in 1 to 2 sentences.": "The primary subjects are two personalized water bottles \u2014 one labeled \u201cShanny\u201d and the other \u201cMichael\u201d \u2014 both in teal with gold lettering. They are positioned side by side, with the \u201cShanny\u201d bottle slightly to the left and the \u201cMichael\u201d bottle to the right, creating a balanced composition. Their interaction is minimal; they stand independently but together form a cohesive set of branded accessories.",
+          "Ignoring any foreground subjects or specific objects, what specific place, background environment, or spatial layout does this image depict? State the setting, then justify your conclusion based on background details in 1 to 2 sentences.": "The setting is a cardboard box, likely used for shipping or storage. Justification: The background consists of crumpled brown cardboard, which is a common packaging material for retail items like water bottles.",
+          "Does this image contain any nature-related elements or concepts? Answer 'Yes' or 'No', and justify your decision in 1 to 2 sentences.": "No, the image contains no nature-related elements or concepts."
+        }
+      }
+    }
+  },
+  "1685290076203290624_1.jpg": {
+    "language": "en",
+    "gt_nature": 0,
+    "gt_biotic": null,
+    "gt_material": null,
+    "predictions": {
+      "places_resnet50": {
+        "raw_prediction": "barndoor (id=41)",
+        "pred_nature": 0,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": false
+      },
+      "convnext_base": {
+        "raw_prediction": "baseball (n02799071)",
+        "pred_nature": 0,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": false
+      },
+      "vit_b_16": {
+        "raw_prediction": "sandal (n04133789)",
+        "pred_nature": 0,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": false
+      },
+      "swin_v2_b": {
+        "raw_prediction": "sandal (n04133789)",
+        "pred_nature": 0,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": false
+      },
+      "q2l_query2labels": {
+        "raw_prediction": "scissors",
+        "pred_nature": 0,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": false
+      },
+      "multitask_DenseNet121": {
+        "raw_prediction": "nature=Yes, materiality=material, biological=biotic",
+        "pred_nature": 1,
+        "pred_biotic": 1,
+        "pred_material": 1,
+        "no_taxonomy_match": false
+      },
+      "Qwen_Qwen3.5-0.8B": {
+        "responses": {
+          "Summarise the background elements in a concise manner.": "The background consists of weathered, vertical wooden planks, likely part of a fence or deck, with visible grain and texture. The wood is grayish-brown and shows signs of age and exposure to the elements.",
+          "Summarise the foreground elements in a concise manner.": "A pair of worn, tan leather gloves with brown laces and stitching, resting on a weathered wooden surface. The gloves feature the brand name \u201cRawlings\u201d and the slogan \u201cTHE FINEST IN THE FIELD\u201d on the back of one glove.",
+          "Identify the primary subject or subjects of this image. State what they are, and if there are multiple, briefly note how they interact. Justify your conclusion based on visual prominence (size, focus, or placement) in 1 to 2 sentences.": "The primary subject is a worn, tan leather baseball glove resting on weathered wooden planks. It is the dominant visual element, with its detailed texture, stitching, and branding clearly visible. The glove is positioned centrally in the frame, angled slightly to the right, drawing the viewer's attention to its craftsmanship and vintage condition.",
+          "Ignoring any foreground subjects or specific objects, what specific place, background environment, or spatial layout does this image depict? State the setting, then justify your conclusion based on background details in 1 to 2 sentences.": "The setting is a rustic outdoor environment, likely a wooden fence or boardwalk, with the glove resting on weathered, vertical planks of wood. The background details suggest a natural, possibly rural or western setting, as indicated by the aged, textured wood and the glove\u2019s historical association with outdoor work.",
+          "Does this image contain any nature-related elements or concepts? Answer 'Yes' or 'No', and justify your decision in 1 to 2 sentences.": "Yes, the image contains nature-related elements as it features a wooden fence background."
+        }
+      }
+    }
+  },
+  "1652977158124449793_1.jpg": {
+    "language": "en",
+    "gt_nature": 1,
+    "gt_biotic": 0,
+    "gt_material": 1,
+    "predictions": {
+      "places_resnet50": {
+        "raw_prediction": "sky (id=306)",
+        "pred_nature": 1,
+        "pred_biotic": 0,
+        "pred_material": 1,
+        "no_taxonomy_match": false
+      },
+      "convnext_base": {
+        "raw_prediction": "flute (n03372029)",
+        "pred_nature": 0,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": false
+      },
+      "vit_b_16": {
+        "raw_prediction": "ocarina (n03840681)",
+        "pred_nature": 0,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": false
+      },
+      "swin_v2_b": {
+        "raw_prediction": "flute (n03372029)",
+        "pred_nature": 0,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": false
+      },
+      "q2l_query2labels": {
+        "raw_prediction": "person, toothbrush",
+        "pred_nature": 0,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": false
+      },
+      "multitask_DenseNet121": {
+        "raw_prediction": "nature=Yes, materiality=material, biological=biotic",
+        "pred_nature": 1,
+        "pred_biotic": 1,
+        "pred_material": 1,
+        "no_taxonomy_match": false
+      },
+      "Qwen_Qwen3.5-0.8B": {
+        "responses": {
+          "Summarise the background elements in a concise manner.": "The background is overcast with a cloudy sky, suggesting an overcast day. Bare tree branches are visible on the left side, indicating a possibly cold or winter setting.",
+          "Summarise the foreground elements in a concise manner.": "A person wearing a beanie and hoodie, holding a cigar in their mouth, with a cloudy sky in the background.",
+          "Identify the primary subject or subjects of this image. State what they are, and if there are multiple, briefly note how they interact. Justify your conclusion based on visual prominence (size, focus, or placement) in 1 to 2 sentences.": "The primary subject is a young man with a beard, wearing a dark beanie and a grey hoodie, holding a cigar to his lips. He is the central focus of the image, with his face clearly visible and his hand positioned in the foreground. The background consists of an overcast sky and some bare tree branches, which are less prominent and serve as a backdrop. The man is the main subject, and the cigar is a key accessory he is holding, which is also a significant visual element.",
+          "Ignoring any foreground subjects or specific objects, what specific place, background environment, or spatial layout does this image depict? State the setting, then justify your conclusion based on background details in 1 to 2 sentences.": "The setting is an overcast outdoor scene, likely in a park or public space. The sky is filled with heavy, gray clouds, and bare tree branches are visible in the background, suggesting a cold, possibly winter day. The person is positioned in the foreground, with the sky and trees forming the backdrop, indicating a natural, open environment.",
+          "Does this image contain any nature-related elements or concepts? Answer 'Yes' or 'No', and justify your decision in 1 to 2 sentences.": "Yes, the image contains nature-related elements as it depicts a person outdoors against a cloudy sky, with bare tree branches visible in the background."
+        }
+      }
+    }
+  },
+  "1524480460780457985_0.jpg": {
+    "language": "en",
+    "gt_nature": 0,
+    "gt_biotic": null,
+    "gt_material": null,
+    "predictions": {
+      "places_resnet50": {
+        "raw_prediction": "arena/performance (id=16)",
+        "pred_nature": null,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": true
+      },
+      "convnext_base": {
+        "raw_prediction": "stage (n04296562)",
+        "pred_nature": 0,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": false
+      },
+      "vit_b_16": {
+        "raw_prediction": "stage (n04296562)",
+        "pred_nature": 0,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": false
+      },
+      "swin_v2_b": {
+        "raw_prediction": "stage (n04296562)",
+        "pred_nature": 0,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": false
+      },
+      "q2l_query2labels": {
+        "raw_prediction": "person, car, traffic light, umbrella, surfboard",
+        "pred_nature": 0,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": false
+      },
+      "multitask_DenseNet121": {
+        "raw_prediction": "nature=Yes, materiality=immaterial, biological=biotic",
+        "pred_nature": 1,
+        "pred_biotic": 1,
+        "pred_material": 0,
+        "no_taxonomy_match": false
+      },
+      "Qwen_Qwen3.5-0.8B": {
+        "responses": {
+          "Summarise the background elements in a concise manner.": "The background features a dark, atmospheric stage setting with glowing red and blue floral or abstract patterns illuminated by spotlights. The floor is reflective, mirroring the stage lights and the performer\u2019s attire.",
+          "Summarise the foreground elements in a concise manner.": "A woman in a yellow dress stands on a reflective stage, holding a microphone, with a backdrop of glowing red and blue floral patterns and floating embers.",
+          "Identify the primary subject or subjects of this image. State what they are, and if there are multiple, briefly note how they interact. Justify your conclusion based on visual prominence (size, focus, or placement) in 1 to 2 sentences.": "The primary subject is a woman in a yellow gown performing on stage, illuminated by spotlights and surrounded by glowing red and blue floral projections. She is the central focus, with her attire and posture drawing attention, while the background elements like the projections and stage lighting serve as decorative and atmospheric context that enhances the performance setting.",
+          "Ignoring any foreground subjects or specific objects, what specific place, background environment, or spatial layout does this image depict? State the setting, then justify your conclusion based on background details in 1 to 2 sentences.": "The setting is a stage with a dark, atmospheric backdrop featuring glowing red and blue floral or abstract patterns illuminated by spotlights. The reflective floor suggests a performance venue, likely a concert hall or theater, where the performer is on stage.",
+          "Does this image contain any nature-related elements or concepts? Answer 'Yes' or 'No', and justify your decision in 1 to 2 sentences.": "No, the image does not contain any nature-related elements or concepts."
+        }
+      }
+    }
+  },
+  "1529765283514224641_0.jpg": {
+    "language": "es",
+    "gt_nature": 0,
+    "gt_biotic": null,
+    "gt_material": null,
+    "predictions": {
+      "places_resnet50": {
+        "raw_prediction": "church/indoor (id=90)",
+        "pred_nature": null,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": true
+      },
+      "convnext_base": {
+        "raw_prediction": "altar (n02699494)",
+        "pred_nature": 0,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": false
+      },
+      "vit_b_16": {
+        "raw_prediction": "vestment (n04532106)",
+        "pred_nature": 0,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": false
+      },
+      "swin_v2_b": {
+        "raw_prediction": "vestment (n04532106)",
+        "pred_nature": 0,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": false
+      },
+      "q2l_query2labels": {
+        "raw_prediction": "person, clock",
+        "pred_nature": 0,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": false
+      },
+      "multitask_DenseNet121": {
+        "raw_prediction": "nature=No, materiality=N/A, biological=N/A",
+        "pred_nature": 0,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": false
+      },
+      "Qwen_Qwen3.5-0.8B": {
+        "responses": {
+          "Summarise the background elements in a concise manner.": "The background is a richly decorated, ornate golden altar or throne, likely in a religious or cultural setting. It features intricate gold carvings, statues of saints and angels, and a large, radiant halo-like structure behind the central figure. The overall atmosphere suggests a sacred or ceremonial space, possibly within a church or cathedral.",
+          "Summarise the foreground elements in a concise manner.": "The foreground features a detailed, ornate statue of a religious figure, likely the Virgin Mary, adorned with a radiant golden halo and intricate gold and red garments. The statue is surrounded by elaborate religious iconography, including smaller figures and decorative elements, set against a richly decorated backdrop.",
+          "Identify the primary subject or subjects of this image. State what they are, and if there are multiple, briefly note how they interact. Justify your conclusion based on visual prominence (size, focus, or placement) in 1 to 2 sentences.": "The primary subjects are a large, ornate golden halo and a detailed religious statue of the Virgin Mary. The halo is the most prominent feature, radiating outward with intricate gold detailing and appearing to emanate light, drawing immediate attention. The statue of the Virgin Mary is the central focus, positioned in the foreground and clearly visible, with its elaborate gold and red attire, including a jeweled cross on her chest, making her the main subject of the image. The halo and statue interact by being part of the same religious icon, with the halo serving as a symbolic and decorative element that frames and enhances the depiction of the Virgin Mary.",
+          "Ignoring any foreground subjects or specific objects, what specific place, background environment, or spatial layout does this image depict? State the setting, then justify your conclusion based on background details in 1 to 2 sentences.": "This image depicts a religious shrine or altar, likely within a church or cathedral. The setting is characterized by its ornate, gilded architectural details and the presence of statues, including one of the Virgin Mary in the foreground and a saint-like figure to the left. The background environment is richly decorated with intricate gold carvings and sculptures, suggesting a space dedicated to religious devotion and worship.",
+          "Does this image contain any nature-related elements or concepts? Answer 'Yes' or 'No', and justify your decision in 1 to 2 sentences.": "No, this image contains no nature-related elements or concepts."
+        }
+      }
+    }
+  },
+  "1486278739801481218_0.jpg": {
+    "language": "en",
+    "gt_nature": 1,
+    "gt_biotic": 0,
+    "gt_material": 1,
+    "predictions": {
+      "places_resnet50": {
+        "raw_prediction": "runway (id=293)",
+        "pred_nature": 0,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": false
+      },
+      "convnext_base": {
+        "raw_prediction": "airliner (n02690373)",
+        "pred_nature": 0,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": false
+      },
+      "vit_b_16": {
+        "raw_prediction": "airliner (n02690373)",
+        "pred_nature": 0,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": false
+      },
+      "swin_v2_b": {
+        "raw_prediction": "airliner (n02690373)",
+        "pred_nature": 0,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": false
+      },
+      "q2l_query2labels": {
+        "raw_prediction": "car, airplane, truck",
+        "pred_nature": 0,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": false
+      },
+      "multitask_DenseNet121": {
+        "raw_prediction": "nature=No, materiality=N/A, biological=N/A",
+        "pred_nature": 0,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": false
+      },
+      "Qwen_Qwen3.5-0.8B": {
+        "responses": {
+          "Summarise the background elements in a concise manner.": "The background is a snowy, overcast landscape with a flat, white expanse stretching to the horizon. Several tall, red-and-white striped airport lighting poles stand in the distance, and faint silhouettes of other aircraft or structures are visible. The sky is uniformly gray, suggesting a cold, possibly stormy day.",
+          "Summarise the foreground elements in a concise manner.": "A snowy airport tarmac with three Turkish Airlines aircraft parked in line.",
+          "Identify the primary subject or subjects of this image. State what they are, and if there are multiple, briefly note how they interact. Justify your conclusion based on visual prominence (size, focus, or placement) in 1 to 2 sentences.": "The primary subjects are three Turkish Airlines aircraft parked on a snowy airport tarmac. They interact by being positioned side-by-side, with the one in the foreground partially obscuring the others behind it, suggesting they are either parked or taxiing together. Their size and placement dominate the frame, making them the clear focal point against the snowy background.",
+          "Ignoring any foreground subjects or specific objects, what specific place, background environment, or spatial layout does this image depict? State the setting, then justify your conclusion based on background details in 1 to 2 sentences.": "The setting is a snowy airport tarmac, with multiple Turkish Airlines aircraft parked in a row. The background environment includes airport infrastructure like runway lights and control towers, all situated in a vast, snow-covered landscape under an overcast sky.",
+          "Does this image contain any nature-related elements or concepts? Answer 'Yes' or 'No', and justify your decision in 1 to 2 sentences.": "Yes, the image contains nature-related elements as it depicts a snowy airport scene."
+        }
+      }
+    }
+  },
+  "1601487882191269889_0.jpg": {
+    "language": "en",
+    "gt_nature": 1,
+    "gt_biotic": 1,
+    "gt_material": 1,
+    "predictions": {
+      "places_resnet50": {
+        "raw_prediction": "stadium/soccer (id=314)",
+        "pred_nature": null,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": true
+      },
+      "convnext_base": {
+        "raw_prediction": "soccer ball (n04254680)",
+        "pred_nature": 0,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": false
+      },
+      "vit_b_16": {
+        "raw_prediction": "soccer ball (n04254680)",
+        "pred_nature": 0,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": false
+      },
+      "swin_v2_b": {
+        "raw_prediction": "soccer ball (n04254680)",
+        "pred_nature": 0,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": false
+      },
+      "q2l_query2labels": {
+        "raw_prediction": "person, frisbee, ball, baseball glove",
+        "pred_nature": 0,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": false
+      },
+      "multitask_DenseNet121": {
+        "raw_prediction": "nature=No, materiality=N/A, biological=N/A",
+        "pred_nature": 0,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": false
+      },
+      "Qwen_Qwen3.5-0.8B": {
+        "responses": {
+          "Summarise the background elements in a concise manner.": "The background is filled with a blurred crowd of spectators in stadium seating, suggesting a live match atmosphere. The focus remains on the players on the field, with the vibrant colors of their jerseys and the green pitch clearly visible.",
+          "Summarise the foreground elements in a concise manner.": "A man in a white and blue striped jersey with the number 10 on it, celebrating on a soccer field.",
+          "Identify the primary subject or subjects of this image. State what they are, and if there are multiple, briefly note how they interact. Justify your conclusion based on visual prominence (size, focus, or placement) in 1 to 2 sentences.": "The primary subjects are Lionel Messi and his teammates celebrating a goal. Messi is the central figure, with his arms outstretched and mouth open in a triumphant expression, drawing immediate attention. His teammates, including one in a white Argentina jersey with the number 10, are positioned around him, some standing and others lying on the ground, all engaged in the same celebratory moment. Their interaction is one of shared joy and collective victory, with Messi leading the celebration while his teammates support him.",
+          "Ignoring any foreground subjects or specific objects, what specific place, background environment, or spatial layout does this image depict? State the setting, then justify your conclusion based on background details in 1 to 2 sentences.": "The image depicts a professional soccer stadium during a match. The setting is justified by the presence of players in Argentina's blue and white striped jerseys celebrating, along with teammates in orange kits, and the blurred stadium seating filled with spectators in the background.",
+          "Does this image contain any nature-related elements or concepts? Answer 'Yes' or 'No', and justify your decision in 1 to 2 sentences.": "No, the image contains no nature-related elements or concepts."
+        }
+      }
+    }
+  },
+  "1540334929958936576_0.jpg": {
+    "language": "en",
+    "gt_nature": 1,
+    "gt_biotic": 1,
+    "gt_material": 0,
+    "predictions": {
+      "places_resnet50": {
+        "raw_prediction": "jewelry_shop (id=198)",
+        "pred_nature": null,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": true
+      },
+      "convnext_base": {
+        "raw_prediction": "comic book (n06596364)",
+        "pred_nature": 0,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": false
+      },
+      "vit_b_16": {
+        "raw_prediction": "toyshop (n04462240)",
+        "pred_nature": 0,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": false
+      },
+      "swin_v2_b": {
+        "raw_prediction": "comic book (n06596364)",
+        "pred_nature": 0,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": false
+      },
+      "q2l_query2labels": {
+        "raw_prediction": "person, bag, necktie, book, scissors, teddy",
+        "pred_nature": 1,
+        "pred_biotic": 1,
+        "pred_material": 0,
+        "no_taxonomy_match": false
+      },
+      "multitask_DenseNet121": {
+        "raw_prediction": "nature=Yes, materiality=immaterial, biological=biotic",
+        "pred_nature": 1,
+        "pred_biotic": 1,
+        "pred_material": 0,
+        "no_taxonomy_match": false
+      },
+      "Qwen_Qwen3.5-0.8B": {
+        "responses": {
+          "Summarise the background elements in a concise manner.": "The background is out of focus but appears to be an indoor setting, possibly a store or display area. There are blurred shapes that could suggest furniture or other items, but no clear details are discernible. The lighting is artificial and somewhat dim, typical of retail environments.",
+          "Summarise the foreground elements in a concise manner.": "The foreground elements are two anime-style characters in a red and white outfit, each holding a teddy bear. One character is holding a gift box, while the other is holding a small bouquet of flowers. Both characters are wearing long coats with floral patterns and are standing in front of a clear plastic packaging that includes a printed card with text.",
+          "Identify the primary subject or subjects of this image. State what they are, and if there are multiple, briefly note how they interact. Justify your conclusion based on visual prominence (size, focus, or placement) in 1 to 2 sentences.": "The primary subjects are two anime-style characters in a red and white outfit, each holding a gift box. They are positioned side-by-side within a clear plastic packaging that includes a printed background image of the characters. The larger character on the left is more prominent due to its size and placement in the frame, while the smaller character on the right is partially obscured by the packaging. Their interaction is minimal, as they are separate figures within the same package.",
+          "Ignoring any foreground subjects or specific objects, what specific place, background environment, or spatial layout does this image depict? State the setting, then justify your conclusion based on background details in 1 to 2 sentences.": "The setting is a casual indoor environment, likely a home or small office, characterized by soft, warm lighting and a blurred background that suggests a relaxed atmosphere. The presence of a hand holding the merchandise indicates an intimate, personal interaction, possibly with a friend or family member. The overall composition evokes a cozy, everyday scene rather than a formal or commercial one.",
+          "Does this image contain any nature-related elements or concepts? Answer 'Yes' or 'No', and justify your decision in 1 to 2 sentences.": "Yes, the image contains nature-related elements or concepts. The artwork features floral motifs, such as flowers and leaves, which are natural elements."
+        }
+      }
+    }
+  },
+  "1607150192473546753_0.jpg": {
+    "language": "en",
+    "gt_nature": 1,
+    "gt_biotic": null,
+    "gt_material": 0,
+    "predictions": {
+      "places_resnet50": {
+        "raw_prediction": "valley (id=344)",
+        "pred_nature": null,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": true
+      },
+      "convnext_base": {
+        "raw_prediction": "alp (n09193705)",
+        "pred_nature": 1,
+        "pred_biotic": 0,
+        "pred_material": 1,
+        "no_taxonomy_match": false
+      },
+      "vit_b_16": {
+        "raw_prediction": "alp (n09193705)",
+        "pred_nature": 1,
+        "pred_biotic": 0,
+        "pred_material": 1,
+        "no_taxonomy_match": false
+      },
+      "swin_v2_b": {
+        "raw_prediction": "alp (n09193705)",
+        "pred_nature": 1,
+        "pred_biotic": 0,
+        "pred_material": 1,
+        "no_taxonomy_match": false
+      },
+      "q2l_query2labels": {
+        "raw_prediction": "book",
+        "pred_nature": 0,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": false
+      },
+      "multitask_DenseNet121": {
+        "raw_prediction": "nature=Yes, materiality=material, biological=biotic",
+        "pred_nature": 1,
+        "pred_biotic": 1,
+        "pred_material": 1,
+        "no_taxonomy_match": false
+      },
+      "Qwen_Qwen3.5-0.8B": {
+        "responses": {
+          "Summarise the background elements in a concise manner.": "The background elements in the image are:\n\n- A mountainous landscape with rugged, rocky peaks and snow-capped summits under a clear blue sky.\n- Dense evergreen forests scattered across the slopes, with some areas showing autumnal colors (browns and reds).\n- Rocky terrain and exposed rock formations in the foreground.\n- A grassy hillside with patches of brown and green vegetation.\n- The overall scene conveys a sense of adventure, wilderness, and natural beauty typical of the North Cascades region.",
+          "Summarise the foreground elements in a concise manner.": "In the foreground, there are evergreen trees with some showing autumnal colors, and a grassy hillside with scattered rocks.",
+          "Identify the primary subject or subjects of this image. State what they are, and if there are multiple, briefly note how they interact. Justify your conclusion based on visual prominence (size, focus, or placement) in 1 to 2 sentences.": "The primary subjects are the book cover and its scenic mountain landscape. The book cover, with its bold title and author name, dominates the top portion of the image, while the mountainous terrain fills the lower half, creating a balanced composition that highlights both the textual information and the natural beauty.",
+          "Ignoring any foreground subjects or specific objects, what specific place, background environment, or spatial layout does this image depict? State the setting, then justify your conclusion based on background details in 1 to 2 sentences.": "The setting is a mountainous region, likely in the North, characterized by rugged peaks, rocky terrain, and sparse vegetation. The background environment features a clear blue sky and a mix of evergreen trees and grassy slopes, suggesting a high-altitude or alpine landscape. The spatial layout includes a prominent mountain range in the background with a foreground of forested slopes, creating a layered and expansive view typical of such regions.",
+          "Does this image contain any nature-related elements or concepts? Answer 'Yes' or 'No', and justify your decision in 1 to 2 sentences.": "Yes, the image contains nature-related elements and concepts, as it features a mountainous landscape with trees, rocks, and a clear sky, which are key components of nature."
+        }
+      }
+    }
+  },
+  "1478351505153536013_0.jpg": {
+    "language": "en",
+    "gt_nature": 1,
+    "gt_biotic": 0,
+    "gt_material": 1,
+    "predictions": {
+      "places_resnet50": {
+        "raw_prediction": "snowfield (id=309)",
+        "pred_nature": 1,
+        "pred_biotic": 0,
+        "pred_material": 1,
+        "no_taxonomy_match": false
+      },
+      "convnext_base": {
+        "raw_prediction": "alp (n09193705)",
+        "pred_nature": 1,
+        "pred_biotic": 0,
+        "pred_material": 1,
+        "no_taxonomy_match": false
+      },
+      "vit_b_16": {
+        "raw_prediction": "ski (n04228054)",
+        "pred_nature": 0,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": false
+      },
+      "swin_v2_b": {
+        "raw_prediction": "alp (n09193705)",
+        "pred_nature": 1,
+        "pred_biotic": 0,
+        "pred_material": 1,
+        "no_taxonomy_match": false
+      },
+      "q2l_query2labels": {
+        "raw_prediction": "person, snowboard",
+        "pred_nature": 0,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": false
+      },
+      "multitask_DenseNet121": {
+        "raw_prediction": "nature=No, materiality=N/A, biological=N/A",
+        "pred_nature": 0,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": false
+      },
+      "Qwen_Qwen3.5-0.8B": {
+        "responses": {
+          "Summarise the background elements in a concise manner.": "The background is a clear, deep blue sky with a few wispy clouds drifting across it.",
+          "Summarise the foreground elements in a concise manner.": "A snow-covered roof with two chimneys emitting steam against a clear blue sky.",
+          "Identify the primary subject or subjects of this image. State what they are, and if there are multiple, briefly note how they interact. Justify your conclusion based on visual prominence (size, focus, or placement) in 1 to 2 sentences.": "The primary subjects are two snow-covered chimneys on a roof, with a large, snow-laden roof dominating the frame. They interact by being positioned side-by-side on the same roof surface, with one chimney slightly to the left and the other to the right, both facing forward and emitting steam. The chimneys are the most prominent features due to their size relative to the roof and their clear visibility against the blue sky.",
+          "Ignoring any foreground subjects or specific objects, what specific place, background environment, or spatial layout does this image depict? State the setting, then justify your conclusion based on background details in 1 to 2 sentences.": "The setting is a snowy roof of a building, likely a warehouse or industrial structure, with two prominent chimneys emitting steam against a clear blue sky. The background environment is a bright, clear winter day with no visible clouds or other structures, suggesting a remote or isolated location. The spatial layout shows the roof's ridges and the chimneys as the primary subjects, with the building's green siding visible in the lower right corner.",
+          "Does this image contain any nature-related elements or concepts? Answer 'Yes' or 'No', and justify your decision in 1 to 2 sentences.": "Yes, the image contains nature-related elements as it depicts a snowy roof with natural snow and ice formations, which are part of the natural environment."
+        }
+      }
+    }
+  },
+  "1528330831819046913_0.jpg": {
+    "language": "en",
+    "gt_nature": 1,
+    "gt_biotic": 1,
+    "gt_material": 1,
+    "predictions": {
+      "places_resnet50": {
+        "raw_prediction": "inn/outdoor (id=193)",
+        "pred_nature": null,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": true
+      },
+      "convnext_base": {
+        "raw_prediction": "scoreboard (n04149813)",
+        "pred_nature": 0,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": false
+      },
+      "vit_b_16": {
+        "raw_prediction": "lakeside (n09332890)",
+        "pred_nature": 1,
+        "pred_biotic": 0,
+        "pred_material": 1,
+        "no_taxonomy_match": false
+      },
+      "swin_v2_b": {
+        "raw_prediction": "alp (n09193705)",
+        "pred_nature": 1,
+        "pred_biotic": 0,
+        "pred_material": 1,
+        "no_taxonomy_match": false
+      },
+      "q2l_query2labels": {
+        "raw_prediction": "person, car, bus, train, truck",
+        "pred_nature": 0,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": false
+      },
+      "multitask_DenseNet121": {
+        "raw_prediction": "nature=Yes, materiality=material, biological=biotic",
+        "pred_nature": 1,
+        "pred_biotic": 1,
+        "pred_material": 1,
+        "no_taxonomy_match": false
+      },
+      "Qwen_Qwen3.5-0.8B": {
+        "responses": {
+          "Summarise the background elements in a concise manner.": "The background features a large, traditional Korean-style building with green tiled roofs and white pillars, situated in front of a lush, mountainous landscape. The scene is set during twilight, with the building illuminated by warm lights, while the surrounding area is filled with dense greenery and trees.",
+          "Summarise the foreground elements in a concise manner.": "A large crowd of people is seated in rows on the grassy area in front of a stage, which is set up for an event. The stage features multiple platforms and is illuminated by bright lights. In the background, there is a large building with traditional Korean architecture, surrounded by lush green hills.",
+          "Identify the primary subject or subjects of this image. State what they are, and if there are multiple, briefly note how they interact. Justify your conclusion based on visual prominence (size, focus, or placement) in 1 to 2 sentences.": "The primary subjects are a large Korean temple complex with traditional architecture, a stage setup for a live performance, and a vast audience seated in rows. The temple complex is the central focal point, with its grand structure and surrounding lush greenery. The stage is positioned in front of the temple, serving as the backdrop for the performance. The audience fills the foreground, creating a sense of scale and activity. The temple and stage are clearly the main subjects, with the audience being a secondary element that contributes to the overall atmosphere of the event.",
+          "Ignoring any foreground subjects or specific objects, what specific place, background environment, or spatial layout does this image depict? State the setting, then justify your conclusion based on background details in 1 to 2 sentences.": "The image depicts a large-scale outdoor concert or performance held in front of a traditional Korean-style temple complex, set against a backdrop of lush green hills. The spatial layout features a grand, multi-tiered temple structure with distinctive rooflines, flanked by smaller pavilions, with a vast audience seated in rows on a grassy area, all under a clear sky.",
+          "Does this image contain any nature-related elements or concepts? Answer 'Yes' or 'No', and justify your decision in 1 to 2 sentences.": "Yes, the image features a mountainous landscape with lush greenery and trees surrounding the venue, which are key natural elements."
+        }
+      }
+    }
+  },
+  "1699226909417304351_0.jpg": {
+    "language": "es",
+    "gt_nature": 1,
+    "gt_biotic": 1,
+    "gt_material": 1,
+    "predictions": {
+      "places_resnet50": {
+        "raw_prediction": "raceway (id=276)",
+        "pred_nature": 0,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": false
+      },
+      "convnext_base": {
+        "raw_prediction": "police van (n03977966)",
+        "pred_nature": 1,
+        "pred_biotic": 1,
+        "pred_material": 1,
+        "no_taxonomy_match": false
+      },
+      "vit_b_16": {
+        "raw_prediction": "police van (n03977966)",
+        "pred_nature": 1,
+        "pred_biotic": 1,
+        "pred_material": 1,
+        "no_taxonomy_match": false
+      },
+      "swin_v2_b": {
+        "raw_prediction": "police van (n03977966)",
+        "pred_nature": 1,
+        "pred_biotic": 1,
+        "pred_material": 1,
+        "no_taxonomy_match": false
+      },
+      "q2l_query2labels": {
+        "raw_prediction": "person, car, bus, truck, traffic light",
+        "pred_nature": 0,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": false
+      },
+      "multitask_DenseNet121": {
+        "raw_prediction": "nature=Yes, materiality=material, biological=biotic",
+        "pred_nature": 1,
+        "pred_biotic": 1,
+        "pred_material": 1,
+        "no_taxonomy_match": false
+      },
+      "Qwen_Qwen3.5-0.8B": {
+        "responses": {
+          "Summarise the background elements in a concise manner.": "In the background, there are lush green trees and foliage, suggesting a rural or semi-rural setting. A building with a light-colored facade is visible behind the truck, partially obscured by the trees. The scene appears to be outdoors during daylight, with natural lighting illuminating the area.",
+          "Summarise the foreground elements in a concise manner.": "A white pickup truck with \u201cPOLICIA MUNICIPAL\u201d written on its side is parked on a street. The truck has a metal rack on its bed and is positioned in front of a white car and greenery.",
+          "Identify the primary subject or subjects of this image. State what they are, and if there are multiple, briefly note how they interact. Justify your conclusion based on visual prominence (size, focus, or placement) in 1 to 2 sentences.": "The primary subjects are a white pickup truck and a police vehicle. The police vehicle is more prominent due to its larger size, clearer focus, and central placement in the frame, while the white pickup truck is partially visible in the background, indicating it is secondary.",
+          "Ignoring any foreground subjects or specific objects, what specific place, background environment, or spatial layout does this image depict? State the setting, then justify your conclusion based on background details in 1 to 2 sentences.": "This image depicts a street scene in a residential or suburban neighborhood, likely in Latin America given the \"P\u00d3LCIA MUNICIPAL\" (Police Municipal) markings on the truck. The setting is characterized by a paved road, greenery, and buildings in the background, suggesting a quiet, everyday urban environment. The presence of a police vehicle parked along the side of the road reinforces the idea of a public safety presence in a community area.",
+          "Does this image contain any nature-related elements or concepts? Answer 'Yes' or 'No', and justify your decision in 1 to 2 sentences.": "Yes, the image contains nature-related elements as it features lush green trees and foliage in the background."
+        }
+      }
+    }
+  },
+  "1700389569915748363_0.jpg": {
+    "language": "en",
+    "gt_nature": 1,
+    "gt_biotic": 1,
+    "gt_material": 0,
+    "predictions": {
+      "places_resnet50": {
+        "raw_prediction": "ice_cream_parlor (id=185)",
+        "pred_nature": null,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": true
+      },
+      "convnext_base": {
+        "raw_prediction": "soap dispenser (n04254120)",
+        "pred_nature": 0,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": false
+      },
+      "vit_b_16": {
+        "raw_prediction": "soap dispenser (n04254120)",
+        "pred_nature": 0,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": false
+      },
+      "swin_v2_b": {
+        "raw_prediction": "soap dispenser (n04254120)",
+        "pred_nature": 0,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": false
+      },
+      "q2l_query2labels": {
+        "raw_prediction": "bottle, teddy",
+        "pred_nature": 1,
+        "pred_biotic": 1,
+        "pred_material": 0,
+        "no_taxonomy_match": false
+      },
+      "multitask_DenseNet121": {
+        "raw_prediction": "nature=Yes, materiality=immaterial, biological=biotic",
+        "pred_nature": 1,
+        "pred_biotic": 1,
+        "pred_material": 0,
+        "no_taxonomy_match": false
+      },
+      "Qwen_Qwen3.5-0.8B": {
+        "responses": {
+          "Summarise the background elements in a concise manner.": "The background consists of a speckled countertop with a dark brown, speckled, and brownish surface. Behind the plush rabbit, there is a dark, possibly wooden, horizontal surface, and above that, a plain white wall.",
+          "Summarise the foreground elements in a concise manner.": "A plush rabbit wearing a pink crocheted outfit with a large embroidered flower, standing next to a small glass bottle filled with colorful beads and a cork stopper.",
+          "Identify the primary subject or subjects of this image. State what they are, and if there are multiple, briefly note how they interact. Justify your conclusion based on visual prominence (size, focus, or placement) in 1 to 2 sentences.": "The primary subjects are a plush rabbit doll and a small glass bottle with colorful candies. The rabbit doll is the main focus, positioned centrally and in sharp focus, while the bottle sits to its right, slightly out of focus. The rabbit doll is larger and more detailed, making it the dominant subject. The bottle is smaller and less detailed, acting as a secondary element that adds context to the scene.",
+          "Ignoring any foreground subjects or specific objects, what specific place, background environment, or spatial layout does this image depict? State the setting, then justify your conclusion based on background details in 1 to 2 sentences.": "The setting is a kitchen countertop, with a speckled brown and black granite-like surface visible beneath the plush rabbit and the small glass bottle. The background includes a dark countertop edge and a light-colored wall, suggesting a domestic kitchen environment.",
+          "Does this image contain any nature-related elements or concepts? Answer 'Yes' or 'No', and justify your decision in 1 to 2 sentences.": "No, the image does not contain any nature-related elements or concepts."
+        }
+      }
+    }
+  },
+  "1480238941815009280_0.jpg": {
+    "language": "es",
+    "gt_nature": 1,
+    "gt_biotic": 0,
+    "gt_material": 0,
+    "predictions": {
+      "places_resnet50": {
+        "raw_prediction": "stage/indoor (id=315)",
+        "pred_nature": null,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": true
+      },
+      "convnext_base": {
+        "raw_prediction": "volcano (n09472597)",
+        "pred_nature": 1,
+        "pred_biotic": 0,
+        "pred_material": 1,
+        "no_taxonomy_match": false
+      },
+      "vit_b_16": {
+        "raw_prediction": "volcano (n09472597)",
+        "pred_nature": 1,
+        "pred_biotic": 0,
+        "pred_material": 1,
+        "no_taxonomy_match": false
+      },
+      "swin_v2_b": {
+        "raw_prediction": "volcano (n09472597)",
+        "pred_nature": 1,
+        "pred_biotic": 0,
+        "pred_material": 1,
+        "no_taxonomy_match": false
+      },
+      "q2l_query2labels": {
+        "raw_prediction": "bear, pizza",
+        "pred_nature": 1,
+        "pred_biotic": 1,
+        "pred_material": 1,
+        "no_taxonomy_match": false
+      },
+      "multitask_DenseNet121": {
+        "raw_prediction": "nature=Yes, materiality=immaterial, biological=abiotic",
+        "pred_nature": 1,
+        "pred_biotic": 0,
+        "pred_material": 0,
+        "no_taxonomy_match": false
+      },
+      "Qwen_Qwen3.5-0.8B": {
+        "responses": {
+          "Summarise the background elements in a concise manner.": "The background is dominated by intense, swirling flames that engulf the central figure, creating a fiery, chaotic atmosphere. The flames appear to be emanating from behind and around the character, suggesting a powerful, perhaps supernatural or elemental source. The overall scene conveys a sense of danger, heat, and intensity, with the dark, smoky backdrop enhancing the dramatic effect.",
+          "Summarise the foreground elements in a concise manner.": "The foreground elements are a fiery, humanoid figure engulfed in flames, with text overlay reading \u201cac\u00e1 hace 60 grados en invierno\u201d (here it is 60 degrees in winter).",
+          "Identify the primary subject or subjects of this image. State what they are, and if there are multiple, briefly note how they interact. Justify your conclusion based on visual prominence (size, focus, or placement) in 1 to 2 sentences.": "The primary subject is a humanoid figure engulfed in flames, with the text overlay stating it has been in the winter for 60 degrees. The figure is the central focus, with the flames surrounding it and the text positioned at the bottom to emphasize the duration of the cold weather. The figure's presence and the text's placement suggest a narrative about the passage of time or the passage of time in the winter.",
+          "Ignoring any foreground subjects or specific objects, what specific place, background environment, or spatial layout does this image depict? State the setting, then justify your conclusion based on background details in 1 to 2 sentences.": "The image depicts a fiery, apocalyptic landscape, likely from a video game or digital art piece. The setting is characterized by intense orange and red flames engulfing a humanoid figure, with debris and ash scattered around. The background features a dark, smoky environment with hints of a ruined or destroyed structure, suggesting a post-apocalyptic or battle-worn world. The overall atmosphere is one of destruction and chaos, with the flames dominating the visual composition.",
+          "Does this image contain any nature-related elements or concepts? Answer 'Yes' or 'No', and justify your decision in 1 to 2 sentences.": "Yes, the image contains nature-related elements or concepts. The fiery, intense background suggests a natural, possibly volcanic or desert-like environment, while the text about \"60 degrees in winter\" implies cold weather, which is a natural condition."
+        }
+      }
+    }
+  },
+  "1597939500956938240_2.jpg": {
+    "language": "en",
+    "gt_nature": 1,
+    "gt_biotic": 1,
+    "gt_material": 1,
+    "predictions": {
+      "places_resnet50": {
+        "raw_prediction": "mausoleum (id=226)",
+        "pred_nature": 0,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": false
+      },
+      "convnext_base": {
+        "raw_prediction": "suit (n04350905)",
+        "pred_nature": 0,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": false
+      },
+      "vit_b_16": {
+        "raw_prediction": "fire screen (n03347037)",
+        "pred_nature": 0,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": false
+      },
+      "swin_v2_b": {
+        "raw_prediction": "fire screen (n03347037)",
+        "pred_nature": 0,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": false
+      },
+      "q2l_query2labels": {
+        "raw_prediction": "person, necktie, chair, sofa, pot plant, book",
+        "pred_nature": 1,
+        "pred_biotic": 1,
+        "pred_material": 1,
+        "no_taxonomy_match": false
+      },
+      "multitask_DenseNet121": {
+        "raw_prediction": "nature=Yes, materiality=material, biological=biotic",
+        "pred_nature": 1,
+        "pred_biotic": 1,
+        "pred_material": 1,
+        "no_taxonomy_match": false
+      },
+      "Qwen_Qwen3.5-0.8B": {
+        "responses": {
+          "Summarise the background elements in a concise manner.": "In the background, there is a large white fireplace with a dark metal grate and a mantelpiece adorned with greenery. The room features ornate molding and a patterned rug beneath the chairs, suggesting a formal or ceremonial setting.",
+          "Summarise the foreground elements in a concise manner.": "In the foreground, there are two men in suits seated in armchairs facing each other. The man on the left is wearing a blue suit and tie, while the man on the right is also in a blue suit with a white pocket square. They appear to be engaged in a formal conversation or meeting.",
+          "Identify the primary subject or subjects of this image. State what they are, and if there are multiple, briefly note how they interact. Justify your conclusion based on visual prominence (size, focus, or placement) in 1 to 2 sentences.": "The primary subjects are two men in suits, likely political figures, seated in armchairs facing each other. They are the main focus due to their prominent placement in the frame, clear visibility, and central positioning between the fireplace and decorative elements. Their interaction appears formal and diplomatic, as they are engaged in a direct conversation or meeting.",
+          "Ignoring any foreground subjects or specific objects, what specific place, background environment, or spatial layout does this image depict? State the setting, then justify your conclusion based on background details in 1 to 2 sentences.": "This image depicts a formal, diplomatic setting, likely within the White House. The background environment is characterized by a classic, elegant interior design featuring a large, ornate fireplace with a marble mantel and decorative greenery above it. The room's layout includes two prominent armchairs, a patterned rug, and a polished wooden floor, all contributing to a sense of official and ceremonial atmosphere.",
+          "Does this image contain any nature-related elements or concepts? Answer 'Yes' or 'No', and justify your decision in 1 to 2 sentences.": "No, the image contains no nature-related elements or concepts."
+        }
+      }
+    }
+  },
+  "1707833621040509050_0.jpg": {
+    "language": "es",
+    "gt_nature": 1,
+    "gt_biotic": 0,
+    "gt_material": 0,
+    "predictions": {
+      "places_resnet50": {
+        "raw_prediction": "lake/natural (id=205)",
+        "pred_nature": null,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": true
+      },
+      "convnext_base": {
+        "raw_prediction": "seashore (n09428293)",
+        "pred_nature": 1,
+        "pred_biotic": 0,
+        "pred_material": 1,
+        "no_taxonomy_match": false
+      },
+      "vit_b_16": {
+        "raw_prediction": "seashore (n09428293)",
+        "pred_nature": 1,
+        "pred_biotic": 0,
+        "pred_material": 1,
+        "no_taxonomy_match": false
+      },
+      "swin_v2_b": {
+        "raw_prediction": "seashore (n09428293)",
+        "pred_nature": 1,
+        "pred_biotic": 0,
+        "pred_material": 1,
+        "no_taxonomy_match": false
+      },
+      "q2l_query2labels": {
+        "raw_prediction": "person, surfboard",
+        "pred_nature": 0,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": false
+      },
+      "multitask_DenseNet121": {
+        "raw_prediction": "nature=Yes, materiality=material, biological=biotic",
+        "pred_nature": 1,
+        "pred_biotic": 1,
+        "pred_material": 1,
+        "no_taxonomy_match": false
+      },
+      "Qwen_Qwen3.5-0.8B": {
+        "responses": {
+          "Summarise the background elements in a concise manner.": "The background elements include:\n\n- A large, stylized face (likely a man\u2019s) dominating the upper portion of the image, with one eye clearly visible.\n- A silhouette of a person standing on a beach, facing away from the viewer.\n- The beach scene is mirrored in the water below, creating a reflective effect.\n- In the distance, there are small boats or structures on the water, and a hilly coastline with buildings visible.\n- The overall color palette is warm, with golden hues from the sunset or sunrise, contrasting with cooler tones in the sky and water.\n- There\u2019s a faint signature or watermark in the lower right corner.\n\nThis surreal composition blends human emotion (the face) with a peaceful, reflective natural setting (the beach).",
+          "Summarise the foreground elements in a concise manner.": "A shirtless man with a ponytail stands on a wet beach, his reflection visible in the water. Behind him, a large, stylized face dominates the upper portion of the image, with one eye clearly visible. The background features a calm sea, distant hills, and small boats, all bathed in warm, golden light.",
+          "Identify the primary subject or subjects of this image. State what they are, and if there are multiple, briefly note how they interact. Justify your conclusion based on visual prominence (size, focus, or placement) in 1 to 2 sentences.": "The primary subjects are a shirtless man standing on a beach and a large, close-up portrait of a man\u2019s face. The man is the main focus due to his central placement and clear visibility, while the face serves as a surreal, dreamlike overlay that frames him and adds emotional depth. Their interaction is symbolic \u2014 the man appears to be gazing into the face, suggesting introspection, longing, or perhaps a moment of solitude in a vast, reflective landscape.",
+          "Ignoring any foreground subjects or specific objects, what specific place, background environment, or spatial layout does this image depict? State the setting, then justify your conclusion based on background details in 1 to 2 sentences.": "The setting is a serene beach at sunset, with a large, stylized portrait of a man\u2019s face superimposed over the scene. The background environment includes calm water reflecting the warm hues of the setting sun, a distant shoreline with hills and scattered buildings, and a few small boats on the water. The spatial layout places the man standing on the wet sand, with the beach stretching out toward the horizon, creating a tranquil and contemplative atmosphere.",
+          "Does this image contain any nature-related elements or concepts? Answer 'Yes' or 'No', and justify your decision in 1 to 2 sentences.": "Yes, the image contains nature-related elements, such as the beach, ocean, and hills in the background."
+        }
+      }
+    }
+  },
+  "1505606092725833730_0.jpg": {
+    "language": "en",
+    "gt_nature": 1,
+    "gt_biotic": null,
+    "gt_material": 1,
+    "predictions": {
+      "places_resnet50": {
+        "raw_prediction": "playground (id=268)",
+        "pred_nature": 0,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": false
+      },
+      "convnext_base": {
+        "raw_prediction": "web site (n06359193)",
+        "pred_nature": 0,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": false
+      },
+      "vit_b_16": {
+        "raw_prediction": "bow (n02879718)",
+        "pred_nature": 0,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": false
+      },
+      "swin_v2_b": {
+        "raw_prediction": "maillot (n03710637)",
+        "pred_nature": 0,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": false
+      },
+      "q2l_query2labels": {
+        "raw_prediction": "person, bicycle, television receiver, cellular telephone",
+        "pred_nature": 0,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": false
+      },
+      "multitask_DenseNet121": {
+        "raw_prediction": "nature=No, materiality=N/A, biological=N/A",
+        "pred_nature": 0,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": false
+      },
+      "Qwen_Qwen3.5-0.8B": {
+        "responses": {
+          "Summarise the background elements in a concise manner.": "The background elements in the image are:\n\n- A clear blue sky.\n- Trees and possibly a road or highway in the distance.\n- A portion of a car\u2019s interior, including a steering wheel and dashboard.\n- A woman in a black bikini posing on the hood of the car, with one leg extended upward.\n- A hand holding a black object (possibly a glove or shoe) near her hand.\n\nThese elements suggest an outdoor, possibly urban or suburban, setting with a focus on the car and the woman\u2019s pose.",
+          "Summarise the foreground elements in a concise manner.": "A woman in a black bikini is posing on the hood of a car, with a shattered glass effect overlaying the image.",
+          "Identify the primary subject or subjects of this image. State what they are, and if there are multiple, briefly note how they interact. Justify your conclusion based on visual prominence (size, focus, or placement) in 1 to 2 sentences.": "The primary subjects are a woman in a black bikini and a car, both prominently featured in the album cover. The woman is the main focus, with her face and upper body clearly visible, while the car is partially visible beneath her. They interact by being part of the same visual composition, suggesting they are the central elements of the album artwork.",
+          "Ignoring any foreground subjects or specific objects, what specific place, background environment, or spatial layout does this image depict? State the setting, then justify your conclusion based on background details in 1 to 2 sentences.": "The setting is a suburban street scene, likely during the day, with a clear blue sky and green trees in the background. The foreground features a woman in a black bikini, and the background includes a car, a road, and some trees.",
+          "Does this image contain any nature-related elements or concepts? Answer 'Yes' or 'No', and justify your decision in 1 to 2 sentences.": "Yes, the image contains nature-related elements or concepts, as it features a woman in a car with a clear blue sky and trees in the background."
+        }
+      }
+    }
+  },
+  "1735571392282628503_0.jpg": {
+    "language": "en",
+    "gt_nature": 1,
+    "gt_biotic": null,
+    "gt_material": 0,
+    "predictions": {
+      "places_resnet50": {
+        "raw_prediction": "clean_room (id=93)",
+        "pred_nature": 0,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": false
+      },
+      "convnext_base": {
+        "raw_prediction": "comic book (n06596364)",
+        "pred_nature": 0,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": false
+      },
+      "vit_b_16": {
+        "raw_prediction": "comic book (n06596364)",
+        "pred_nature": 0,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": false
+      },
+      "swin_v2_b": {
+        "raw_prediction": "comic book (n06596364)",
+        "pred_nature": 0,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": false
+      },
+      "q2l_query2labels": {
+        "raw_prediction": "person, horse, backpack",
+        "pred_nature": 0,
+        "pred_biotic": null,
+        "pred_material": null,
+        "no_taxonomy_match": false
+      },
+      "multitask_DenseNet121": {
+        "raw_prediction": "nature=Yes, materiality=immaterial, biological=biotic",
+        "pred_nature": 1,
+        "pred_biotic": 1,
+        "pred_material": 0,
+        "no_taxonomy_match": false
+      },
+      "Qwen_Qwen3.5-0.8B": {
+        "responses": {
+          "Summarise the background elements in a concise manner.": "The background is a vibrant, stylized fantasy scene featuring:\n\n- A large, ethereal wolf-like creature with glowing blue eyes and white fur, positioned on the right side.\n- Another similar wolf or beast figure partially visible on the left, also with glowing blue accents.\n- Abstract, colorful shapes and glowing particles in shades of pink, orange, and purple, suggesting magical energy or elemental forces.\n- The overall composition evokes a sense of epic fantasy, battle, and high-stakes combat, typical of games like *Honkai: Star Rail*.",
+          "Summarise the foreground elements in a concise manner.": "The foreground features a female character with blue hair and a futuristic, armored outfit, holding a large mechanical weapon. She is surrounded by large, ethereal wolf-like creatures in a vibrant, colorful background.",
+          "Identify the primary subject or subjects of this image. State what they are, and if there are multiple, briefly note how they interact. Justify your conclusion based on visual prominence (size, focus, or placement) in 1 to 2 sentences.": "The primary subjects are the female character and the two large, stylized wolf-like creatures in the background. The character is the central focus, with her large, detailed wings and weaponry dominating the foreground. The wolves are positioned behind her, partially obscured by her and the text overlay, but their presence provides context and thematic elements for the scene.",
+          "Ignoring any foreground subjects or specific objects, what specific place, background environment, or spatial layout does this image depict? State the setting, then justify your conclusion based on background details in 1 to 2 sentences.": "The setting is a fantastical, surreal battlefield or arena, likely from a video game. The background depicts a chaotic, abstract environment filled with swirling, ethereal energy and floating, monstrous creatures, suggesting a high-stakes combat scenario.",
+          "Does this image contain any nature-related elements or concepts? Answer 'Yes' or 'No', and justify your decision in 1 to 2 sentences.": "No, the image contains no nature-related elements or concepts."
+        }
+      }
+    }
+  }
+}
