@@ -16,52 +16,14 @@ import time
 from pathlib import Path
 
 import wandb
-from pydantic import BaseModel, Field
-from typing import Literal
 
 from lib.excel_loader import TaxonomyGraph
 from lib.vlm import MODEL_REGISTRY, create_vlm
 from lib.dataset_loader import load_dataset
-
-
-class TaxonomyResponse(BaseModel):
-    """
-    Pydantic schema driving `outlines` structured output.
-    By defining `reasoning` first, we force the model into a chain-of-thought 
-    generation process before it commits to the final taxonomic labels.
-    """
-    reasoning: str = Field(description="One concise sentence justifying your classification based on the visual evidence.")
-    nature: Literal["yes", "no"]
-    biotic: Literal["biotic", "abiotic", "n/a"]
-    material: Literal["material", "immaterial", "n/a"]
-
-
-_AXIS_INSTRUCTIONS = {
-    "nature": '"nature": either "yes" or "no" — whether this instance counts as nature under the definition above',
-    "biotic": '"biotic": either "biotic", "abiotic", or "n/a" — only answer "biotic"/"abiotic" if "nature" is "yes"; use "n/a" if "nature" is "no"',
-    "material": '"material": either "material", "immaterial", or "n/a" — only answer "material"/"immaterial" if "nature" is "yes"; use "n/a" if "nature" is "no"'
-}
-
-
-def build_classification_prompt(class_name, axes):
-    """
-    Constructs the contextualized prompt. The model is forced to evaluate the 
-    taxonomic labels based on the specific visual instance depicted in the image.
-    """
-    unknown_axes = set(axes) - set(_AXIS_INSTRUCTIONS)
-    if unknown_axes:
-        raise ValueError(f"Unknown axis/axes requested: {unknown_axes}")
-
-    field_lines = "\n".join(f"  - {_AXIS_INSTRUCTIONS[axis]}" for axis in axes)
-
-    return f"""You are analyzing a specific object identified in the provided image. 
-The object is classified as: {class_name}
-
-Based on the visual evidence in the image and the definitions provided, classify this specific instance of the object. 
-
-Provide your reasoning first, followed by the specific labels according to these rules:
-{field_lines}
-"""
+# TaxonomyResponse + build_classification_prompt live in lib/prompts.py so this
+# calibration eval and the VLM pipeline's fallback path share the EXACT same
+# prompt and schema (they cannot drift — same imported objects).
+from lib.prompts import TaxonomyResponse, build_classification_prompt
 
 
 def parse_args():

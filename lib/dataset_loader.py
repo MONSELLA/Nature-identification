@@ -62,9 +62,9 @@ def get_gt_from_graph(synset_str, taxonomy_graph):
     resolved_node = labels["resolved_from_node"]
     node_attrs = taxonomy_graph.graph.nodes.get(resolved_node, {})
     mat_val = node_attrs.get("material_immaterial")
-    
+
     is_nature = labels["is_nature"]
-    
+
     # Critical Fix: If nature is False, downstream labels MUST be None (N/A)
     # to match the prompt rules we are enforcing on the VLM.
     if is_nature:
@@ -74,7 +74,11 @@ def get_gt_from_graph(synset_str, taxonomy_graph):
         gt_biotic = None
         gt_material = None
 
+    # `synset_id` is the ORIGINAL target synset (e.g. "leopard.n.01"), not the
+    # nearest labeled ancestor it resolved from — ClipMatch / hierarchical
+    # metrics need the leaf GT synset, so we thread it through here.
     return {
+        "synset_id": synset_str,
         "gt_nature": is_nature,
         "gt_biotic": gt_biotic,
         "gt_material": gt_material
@@ -83,11 +87,21 @@ def get_gt_from_graph(synset_str, taxonomy_graph):
 # ============================================================================
 # LOADERS
 # ============================================================================
+def _wnid_to_synset(wnid):
+    """Convert an ImageNet folder id (e.g. "n02124278") to a WordNet synset
+    string ("leopard.n.01"), or None if it can't be resolved."""
+    from nltk.corpus import wordnet as wn
+    try:
+        return wn.synset_from_pos_and_offset(wnid[0], int(wnid[1:])).name()
+    except Exception:
+        return None
+
+
 def load_imagenet(data_dir, taxonomy_graph):
     from torchvision.datasets import ImageFolder
     import nltk
     from nltk.corpus import wordnet as wn
-    
+
     try:
         wn.synsets('dog')
     except LookupError:
@@ -99,11 +113,8 @@ def load_imagenet(data_dir, taxonomy_graph):
     class_to_target = {}
 
     for idx, wnid in idx_to_wnid.items():
-        offset = int(wnid[1:])
-        pos = wnid[0]
-        try:
-            synset_name = wn.synset_from_pos_and_offset(pos, offset).name()
-        except Exception:
+        synset_name = _wnid_to_synset(wnid)
+        if synset_name is None:
             continue
 
         gt = get_gt_from_graph(synset_name, taxonomy_graph)
@@ -153,26 +164,32 @@ def load_coco(images_dir, instances_json, taxonomy_graph):
     return results
 
 
-def load_places365(data_dir, categories_txt, excel_path, taxonomy_graph):
-    from torchvision.datasets import ImageFolder
-    
-    def resolve_via_wordnet(cls, taxonomy_synsets):
-        from nltk.corpus import wordnet as wn
-        base = cls.replace('/', '_')
-        head = cls.split('/')[0]
-        candidates = [base, head]
-        if '/' in cls:
-            candidates.append(cls.split('/')[-1])
-        seen = set()
-        for c in candidates:
-            key = c.replace(' ', '_')
-            if key in seen: continue
-            seen.add(key)
-            for s in wn.synsets(key, pos='n'):
-                if s.name() in taxonomy_synsets: return s.name()
-        return None
+# ---------------------------------------------------------------------------
+# Places365 helpers (module-level so both load_places365 and get_candidate_vocab
+# resolve scene names to synsets identically).
+# ---------------------------------------------------------------------------
+def _resolve_places_name_to_synset(cls, taxonomy_synsets):
+    """Resolve a Places scene name (e.g. "forest/broadleaf") to a MIT-tagged
+    taxonomy synset string, or None if it doesn't resolve. Heuristic — see the
+    lossy-reconstruction caveat in baseline/evaluate_places.py."""
+    from nltk.corpus import wordnet as wn
+    base = cls.replace('/', '_')
+    head = cls.split('/')[0]
+    candidates = [base, head]
+    if '/' in cls:
+        candidates.append(cls.split('/')[-1])
+    seen = set()
+    for c in candidates:
+        key = c.replace(' ', '_')
+        if key in seen: continue
+        seen.add(key)
+        for s in wn.synsets(key, pos='n'):
+            if s.name() in taxonomy_synsets: return s.name()
+    return None
 
-    # Load categories and exclusion set
+
+def _load_places_categories(categories_txt):
+    """Parse categories_places365.txt into {places_id: scene_name}."""
     id_to_name = {}
     with open(categories_txt, "r") as f:
         for line in f:
@@ -181,21 +198,34 @@ def load_places365(data_dir, categories_txt, excel_path, taxonomy_graph):
             path, idx_str = line.rsplit(" ", 1)
             name = path[3:] if (path.startswith("/") and len(path) > 3 and path[2] == "/") else path.lstrip("/")
             id_to_name[int(idx_str)] = name
+    return id_to_name
 
+
+def _load_places_taxonomy_synsets(excel_path):
+    """Return (exclusion_set, taxonomy_synsets) from the BIG-5 Excel — the set
+    of scene names to skip and the set of MIT-tagged taxonomy synset strings."""
     exclusion_df = pd.read_excel(excel_path, sheet_name="still missing MIT Places", header=None)
     exclusion = {str(val).strip() for val in exclusion_df.iloc[:, 0] if pd.notna(val) and str(val).strip()}
 
     sourcekey_df = pd.read_excel(excel_path, sheet_name="sourcekey", header=0)
     taxonomy_synsets = {
-        str(row[0]).strip().split(' ')[0] 
-        for _, row in sourcekey_df.iterrows() 
+        str(row[0]).strip().split(' ')[0]
+        for _, row in sourcekey_df.iterrows()
         if pd.notna(row[0]) and pd.notna(row[1]) and 'MIT' in str(row[1])
     }
+    return exclusion, taxonomy_synsets
+
+
+def load_places365(data_dir, categories_txt, excel_path, taxonomy_graph):
+    from torchvision.datasets import ImageFolder
+
+    id_to_name = _load_places_categories(categories_txt)
+    exclusion, taxonomy_synsets = _load_places_taxonomy_synsets(excel_path)
 
     class_to_target = {}
     for cid, name in id_to_name.items():
         if name in exclusion: continue
-        synset = resolve_via_wordnet(name, taxonomy_synsets)
+        synset = _resolve_places_name_to_synset(name, taxonomy_synsets)
         if synset:
             gt = get_gt_from_graph(synset, taxonomy_graph)
             if gt:
@@ -257,6 +287,7 @@ def load_big5(en_gt, es_gt, en_media, es_media, cache_dir):
                     "image_path": local_path,
                     "targets": [{
                         "class_name": "scene", # BIG-5 annotations apply to the entire scene
+                        "synset_id": None,      # holistic scene label — no WordNet synset
                         "gt_nature": nat == 1,
                         "gt_biotic": bio == 1 if bio is not None else None,
                         "gt_material": mat == 1 if mat is not None else None
@@ -278,3 +309,91 @@ def load_dataset(dataset_name, taxonomy_graph, **kwargs):
         return load_big5(kwargs.get("en_gt"), kwargs.get("es_gt"), kwargs.get("en_media"), kwargs.get("es_media"), kwargs.get("cache_dir"))
     else:
         raise ValueError(f"Unknown dataset: {dataset_name}")
+
+
+# ============================================================================
+# CANDIDATE VOCABULARY (for ClipMatch + hierarchical metrics — ImageNet/Places)
+# ============================================================================
+def get_candidate_vocab(dataset_name, **kwargs):
+    """
+    Returns the FIXED closed-set candidate class list for the ClipMatch and
+    hierarchical (hP/hR) metrics, as a list of dicts:
+        [{"class_name": str, "synset_id": str}, ...]
+
+    Only ImageNet and Places365 define such a vocabulary (single-label, closed
+    class set). COCO (multi-label) and BIG-5 (no closed class vocabulary) return
+    None — ClipMatch/hP/hR are not run on them, per the project conventions.
+
+    Every returned candidate carries a resolvable WordNet synset, so the
+    ClipMatch-predicted class always has a synset for the hierarchical metrics:
+      - ImageNet: every folder WNID converts losslessly via wn.synset_from_pos_and_offset.
+      - Places365: scene names are resolved heuristically (MIT-tagged synsets);
+        names that do not resolve are dropped from the candidate set.
+    """
+    if dataset_name == "imagenet":
+        from torchvision.datasets import ImageFolder
+        classes = ImageFolder(kwargs.get("data_dir")).classes  # sorted WNIDs
+        vocab = []
+        seen = set()
+        for wnid in classes:
+            synset_name = _wnid_to_synset(wnid)
+            if synset_name is None or synset_name in seen:
+                continue
+            seen.add(synset_name)
+            class_name = synset_name.split('.')[0].replace('_', ' ')
+            vocab.append({"class_name": class_name, "synset_id": synset_name})
+        return vocab
+
+    if dataset_name == "places365":
+        id_to_name = _load_places_categories(kwargs.get("places_categories_txt"))
+        exclusion, taxonomy_synsets = _load_places_taxonomy_synsets(kwargs.get("excel_path"))
+        vocab = []
+        seen = set()
+        for _, name in sorted(id_to_name.items()):
+            if name in exclusion:
+                continue
+            synset = _resolve_places_name_to_synset(name, taxonomy_synsets)
+            if synset is None or synset in seen:
+                continue
+            seen.add(synset)
+            class_name = name.replace('/', ' ').replace('_', ' ')
+            vocab.append({"class_name": class_name, "synset_id": synset})
+        return vocab
+
+    # COCO (multi-label) and BIG-5 (open scene) have no closed candidate vocab.
+    return None
+
+
+# ============================================================================
+# MAPPING VOCABULARY (authoritative class_name -> synset, for the hybrid
+# object-labeling step — nature/biotic WordNet mapping vs VLM fallback)
+# ============================================================================
+def build_mapping_vocab(dataset_name, **kwargs):
+    """
+    Returns {normalized_class_name: synset_id} for the dataset — the authoritative
+    lookup used to map an EXTRACTED OBJECT phrase onto a WordNet synset WITHOUT
+    word-sense guessing. Synsets come from the dataset's own class tables
+    (ImageNet WNIDs, COCO_TO_WNSYNSET, Places MIT-resolved), so e.g. "tiger"
+    maps to tiger.n.02 (the animal), never tiger.n.01 ("a fierce person").
+
+    Objects whose (normalized) phrase is not a key here are UNMAPPED and go to
+    the image-supported VLM fallback. BIG-5 has no class vocabulary -> {}.
+
+    Names are lowercased/space-normalized. Cross-dataset union mapping (recap §9)
+    is a deliberate future enhancement, not done here.
+    """
+    vocab = {}
+
+    if dataset_name in ("imagenet", "places365"):
+        for entry in (get_candidate_vocab(dataset_name, **kwargs) or []):
+            vocab[entry["class_name"].strip().lower()] = entry["synset_id"]
+        return vocab
+
+    if dataset_name == "coco":
+        for synset in COCO_TO_WNSYNSET.values():
+            name = synset.split('.')[0].replace('_', ' ').strip().lower()
+            vocab.setdefault(name, synset)
+        return vocab
+
+    # big5 (holistic scene) — no closed class vocabulary.
+    return vocab
