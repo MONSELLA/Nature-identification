@@ -199,7 +199,8 @@ def load_places365(data_dir, categories_txt, excel_path, taxonomy_graph):
         if synset:
             gt = get_gt_from_graph(synset, taxonomy_graph)
             if gt:
-                class_to_target[cid] = {"class_name": name, **gt}
+                class_name = name.replace('/', ' ').replace('_', ' ')
+                class_to_target[cid] = {"class_name": class_name, **gt}
 
     dataset = ImageFolder(data_dir)
     idx_to_places_id = {dl_idx: int(name) for name, dl_idx in dataset.class_to_idx.items()}

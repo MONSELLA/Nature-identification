@@ -70,7 +70,7 @@ def parse_args():
     )
     
     parser.add_argument("--output_mode", type=str, choices=["structured", "free_form"], default="structured")
-    parser.add_argument("--excel_path", type=str, default="../flat_wordnet_tree_fixed.xlsx",
+    parser.add_argument("--excel_path", type=str, default="flat_wordnet_tree_fixed.xlsx",
                         help="Path to the BIG-5 WordNet taxonomy Excel file.")
     parser.add_argument("--sheet_name", type=str, default="data corrected")
 
@@ -104,7 +104,8 @@ def parse_args():
 
     # Context Files
     parser.add_argument("--nature_definition_path", type=str, default="docs/big5_nature_definition.txt")
-    parser.add_argument("--taxonomy_axes_path", type=str, default="docs/big5_taxonomy_axes.txt")
+    parser.add_argument("--biotic_definition_path", type=str, default="docs/big5_biotic_definition.txt")
+    parser.add_argument("--material_definition_path", type=str, default="docs/big5_material_definition.txt")
     
     parser.add_argument("--output_file", type=str, default="taxonomy_calibration_results.json")
     parser.add_argument("--max_samples", type=int, default=None, help="Limit number of evaluations.")
@@ -114,10 +115,11 @@ def parse_args():
     return parser.parse_args()
 
 
-def load_system_prompt(nature_def_path, taxonomy_axes_path):
+def load_system_prompt(nature_def_path, biotic_def_path, material_def_path):
     nature_def = Path(nature_def_path).read_text()
-    taxonomy_axes = Path(taxonomy_axes_path).read_text()
-    return f"{nature_def}\n\n{taxonomy_axes}"
+    biotic_def = Path(biotic_def_path).read_text()
+    material_def = Path(material_def_path).read_text()
+    return f"{nature_def}\n\n{biotic_def}\n\n{material_def}"
 
 
 def _label_to_bool(value, axis):
@@ -161,7 +163,7 @@ def main():
     if args.wandb:
         wandb.init(
             entity="paumonserrat03-universitat-aut-noma-de-barcelona",
-            project="TFM_Closed-set",
+            project="TFM_VLM",
             config=vars(args),
             name=f"taxonomy_image_calibration_{args.dataset}_{model_label}",
         )
@@ -209,7 +211,9 @@ def main():
         print("No mapped evaluation instances found — exiting.")
         sys.exit(1)
 
-    system_prompt = load_system_prompt(args.nature_definition_path, args.taxonomy_axes_path)
+    system_prompt = load_system_prompt(
+        args.nature_definition_path, args.biotic_definition_path, args.material_definition_path
+    )
 
     if args.verbose:
         print(f"[INFO] Creating VLM: family='{args.model_family}', model='{args.model_name}'...")
@@ -221,7 +225,7 @@ def main():
         }
         if args.max_model_len is not None: vlm_kwargs["max_model_len"] = args.max_model_len
     else:
-        vlm_kwargs = {"device": args.device}
+        vlm_kwargs = {"device": args.device, "dtype": args.dtype}
         
     vlm = create_vlm(args.model_family, args.model_name, **vlm_kwargs)
 
