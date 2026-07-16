@@ -1,0 +1,510 @@
+BIG-5 VLM PIPELINE — DESIGN RECAP (v3)
+(For review/correction — please edit directly and send back)
+
+===============================================================
+1. TWO SEPARATE PIPELINES (KEY TERMINOLOGY)
+===============================================================
+
+  A) VLM PIPELINE (language-based; in progress now):
+     1. Open-ended caption generation
+     2. Structured object extraction
+     3. Taxonomy labeling (nature/no-nature, biotic/abiotic,
+        material/immaterial) — done via mapping when possible,
+        VLM reasoning otherwise (see Section 6)
+     Produces a full per-image prediction scoreable with standard
+     accuracy/precision/recall/F1, same framework as the closed-set
+     baselines already built.
+
+  B) GROUNDING PIPELINE (geometric/embedding-based; designed, not
+     yet implemented):
+     1. Thing/stuff geometric routing — Grounding DINO 1.5 + SAM
+        for discrete objects ("things"); CLIPSeg-style dense
+        segmentation for amorphous regions ("stuff"). Routing is
+        geometric (boundable vs amorphous), NOT taxonomic —
+        material/immaterial does not align with thing/stuff (e.g.
+        a stuffed rabbit is immaterial but geometrically a "thing")
+     2. Dual-branch verification — detector/segmenter confidence +
+        hierarchy-based margin check via FG-CLIP2 (cosine similarity
+        across target/hypernym/sibling hyponyms on localized crops)
+     3. Taxonomy-attribute spatial aggregation — per-object
+        localization maps combined into biotic/abiotic and
+        material/immaterial heatmaps.
+        OPEN QUESTION (raised by Pau): worth reassessing whether
+        this is actually valuable to implement, vs. lower priority
+        than the other Grounding pipeline components — not yet
+        decided either way.
+     4. Nature importance score (NEW): once nature-related elements
+        are segmented via CLIPSeg/SAM, compute the fraction of
+        total image pixels belonging to nature-related segments —
+        a 0-to-1 score reflecting how much of the image nature
+        occupies. Proposed refinement (not yet designed): weight
+        central pixels more heavily than peripheral ones, on the
+        reasoning that centrally-placed content is more likely to
+        be the compositional focus of the image. Exact weighting
+        scheme (e.g. distance-from-center falloff function) still
+        to be defined.
+
+The rest of this document is organized around the VLM pipeline
+(Sections 2-8), since that's what's actively being built. The
+Grounding pipeline's role in FINAL cross-VLM metrics is in
+Section 9.
+
+===============================================================
+2. CONTEXT FILES (SYSTEM PROMPT REFERENCE MATERIAL)
+===============================================================
+
+Two .txt files created, derived from Protocol_v6, stripped of
+everything not relevant to the nature/biotic-abiotic/material-
+immaterial axes (dropped: Relational Values table, coding-flow /
+text-vs-visual contradiction procedure, harmful content handling,
+thematic code boxes).
+
+Both are PURE reference/definitional content — no task
+instructions, no "you are..." framing. Task instructions are
+added separately at call-time depending on stage.
+
+  a) big5_nature_definition.txt (NOW v2 — GAP RESOLVED) — nature
+     vs. non-nature criteria only. Used during open captioning.
+     Does NOT mention biotic/abiotic or material/immaterial by
+     name (avoids premature axis-bias in the free-form caption),
+     but now BROADENED so its categories implicitly cover the full
+     scope that biotic/abiotic and material/immaterial will later
+     need:
+       - Added geological/mineral elements (rock, salt, oil)
+       - Added astrophysical elements/processes (sunset, stars,
+         eclipse, day/night)
+       - Added explicit coverage of symbolic/fictional/artistic
+         representations (paintings, cartoons, video games, poems,
+         VR, metaphors) as nature-relevant even when non-literal —
+         with the alteration-based inclusion criterion now scoped
+         explicitly to apply ONLY to real/unaltered instances, not
+         to representations (previously this criterion implicitly
+         penalized stylized depictions by omission).
+     This closes the gap flagged in v1/v2 of this recap.
+
+  b) big5_taxonomy_axes.txt (UPDATED) — material/immaterial and
+     biotic/abiotic definitions. Used during structured extraction
+     / labeling.
+       - CHANGE: the five immaterial "format subcategories"
+         (videogame, infographic, AI-generated, plain text,
+         illustration) are NO LONGER presented as a classification
+         target/output the pipeline needs to produce. Per Pau: a
+         priori these format subcategories won't need to be
+         classified. They're now folded in purely as illustrative
+         examples under the two immaterial subtypes (fictional
+         representation / art-cultural-scientific representation),
+         to aid recognition without implying a required output
+         field.
+
+===============================================================
+3. SERVING / FRAMEWORK DECISIONS
+===============================================================
+
+- Context files go in the "system" role (fixed, cacheable,
+  behavioral), not "user" (variable, per-call, read as a request).
+- vLLM prefix caching (--enable-prefix-caching) to be confirmed ON
+  with Ramin — makes the always-present protocol cheap at 2M-image
+  scale rather than reprocessed every call.
+- Different system prompts per stage = different cache prefixes
+  (fine; confirm Ramin's serving config allows this).
+- Files read from disk once at startup, not per-call, so the token
+  sequence stays stable (identical string = cache hit).
+- DSPy: protocol text maps to a Signature's "instructions" field;
+  underlying calls still hit vLLM, caching still applies.
+- Need to empirically verify smaller models (e.g. Qwen3.5-0.8B)
+  actually follow system-prompt instructions reliably — not
+  assumed, to be tested.
+
+--- HANDOFF TO CLAUDE CODE (NEW) ---
+Pau is considering using Claude Code to generate pipeline scripts,
+which won't have this conversation's context by default. Claude
+Code automatically reads a file named CLAUDE.md at the start of
+every session if present in the project directory — this is the
+standard mechanism for giving it persistent project context.
+Recommended setup:
+  - Put a (trimmed) version of this recap in a CLAUDE.md at the
+    repo root.
+  - Keep big5_nature_definition.txt and big5_taxonomy_axes.txt as
+    separate files in the repo (e.g. under docs/ or context/) and
+    reference them from CLAUDE.md rather than pasting their full
+    content in.
+  - CAVEAT: very long CLAUDE.md files can reduce how consistently
+    Claude Code follows every instruction in them. Full discussion/
+    rationale (the "why," e.g. everything in this recap) should
+    live in a linked doc; CLAUDE.md itself should stay focused on
+    the "what" — schema formats, metric formulas, file paths,
+    naming conventions, concrete decisions — trimmed over time.
+
+===============================================================
+4. VLM PIPELINE — CAPTIONING STRATEGY (BASELINE)
+===============================================================
+
+- BASELINE = two-pass: fully open-ended caption generation (no
+  schema at all) → separate call for structured extraction.
+  Chosen over single-pass-with-schema-from-the-start because
+  forcing structure immediately risks collapsing the caption into
+  a checklist-style output, which would make the faithful
+  F-CLIPScore and Object-CLIPScore metrics converge and stop being
+  meaningfully different.
+
+- Caption prompt (baseline, NEUTRAL — no nature-priming):
+  "Describe this image in detail, including the main subject,
+  the background, the setting, and any secondary elements
+  present."
+  Reasoning: plain "describe the scene" suffers from (a) salience
+  bias (only prominent subject described) and (b) brevity bias
+  (short captions leave no room for secondary elements). Rewritten
+  prompt addresses both without leading toward nature specifically.
+
+- Explicit decision: do NOT add "pay special attention to nature-
+  related elements" to the baseline. Reasoning: leading question →
+  risk of hallucinated compliance (model invents nature-adjacent
+  content because it was asked to look for it) — directly relevant
+  since this is the exact failure mode F-CLIPScore/OHD-Caps
+  research targets. Nature bias already present via the system-
+  level definition file.
+  → Proposed as an ABLATION axis instead (Section 7), to be
+  settled empirically via F-CLIPScore/Object-CLIPScore rather than
+  assumed.
+
+===============================================================
+5. VLM PIPELINE — EXTRACTION STRATEGY
+===============================================================
+
+Two ways to do extraction — both planned as part of the ablation
+study, undecided which is default:
+  a) same VLM does both caption + extraction (multi-turn) —
+     simpler, faster to ship, but conflates visual understanding
+     quality with instruction-following/schema-adherence quality.
+     ADDED BENEFIT (Pau): re-sending the image to the VLM during
+     the extraction call gives the model a second look, which may
+     surface objects omitted from the free-form caption the first
+     time around.
+  b) caption by VLM, extraction by a separate fixed agnostic LLM
+     (constant across all VLMs benchmarked) — decouples visual
+     perception from extraction compliance, cleaner for the Goal-1
+     cross-VLM comparison.
+Plan: build (a) first for week-1 speed, formally compare vs (b)
+once the pipeline exists.
+
+CONSTRAINT ON THIS ABLATION: material/immaterial labeling
+(Section 6) cannot be handed to a text-only agnostic LLM regardless
+of what wins here — it requires image access (see Section 6). So
+even if (b) wins for extraction/object-naming, material/immaterial
+classification specifically must stay VLM-based. Not a fully open
+50/50 comparison for that one axis.
+
+===============================================================
+6. VLM PIPELINE — TAXONOMY LABELING STRATEGY
+===============================================================
+
+Hybrid approach, applying the pre-existing project principle that
+biotic/abiotic (and nature/no-nature) is inheritable via WordNet
+hop distance, while material/immaterial is NOT (depends on
+real-instance-vs-representation — requires per-instance reasoning,
+not just concept lookup):
+
+  - NATURE/NO-NATURE and BIOTIC/ABIOTIC: use WordNet mapping when
+    the object falls in the mapped vocabulary (ImageNet/COCO/
+    Places); fall back to VLM reasoning when unmapped. Applies to
+    BOTH axes equally — both are hop-derivable from a mapped GT
+    node.
+
+  - MATERIAL/IMMATERIAL: ALWAYS use VLM reasoning, never mapping —
+    a "tree" node has no way of encoding whether THIS image shows
+    a real tree, a painting, or a video-game tree. No mapping-based
+    alternative exists for this axis.
+
+  - IMPORTANT: VLM labeling is IMAGE-SUPPORTED, not text-only — the
+    model has the image available when doing the labeling
+    reasoning, not just the extracted object string. Specifically
+    crucial for material/immaterial (a bare word "tree" cannot
+    disambiguate real/painted/video-game; the pixels can). Drives
+    the constraint in Section 5 — material/immaterial can't be
+    delegated to a text-only agnostic LLM.
+
+VALIDATION / CALIBRATION:
+  Rather than an ablation comparing "mapping-first" vs "always use
+  VLM," directly measure classification calibration: have the
+  model classify GT-mapped CLASS NAMES ONLY (no image, no
+  extraction involved) against the WordNet-derived labels for
+  nature/no-nature and biotic/abiotic. This isolates pure
+  taxonomic-reasoning reliability from object-recognition ability,
+  and gives a clean number for "how much can we trust VLM fallback
+  when mapping is unavailable."
+  ASSUMPTION TO STATE EXPLICITLY: this assumes reliability on
+  canonical dataset class names transfers to messier real-world
+  BIG-5 objects — a transfer assumption, not proven by the check
+  itself.
+
+THREE DISTINCT ACCURACY LAYERS (do not collapse into one number):
+  1. Extraction accuracy — did the GT object get mentioned at all
+     (Section 8a-c)
+  2. Classification calibration — class name → taxonomy label vs
+     WordNet GT, no image, no extraction (this section, above)
+  3. End-to-end mapped-subset accuracy — full image pipeline,
+     filtered to GT-mapped classes (compounds extraction quality +
+     classification quality; reflects real-world pipeline behavior,
+     NOT a clean reasoning-only number — the mapped subset's
+     accuracy still depends entirely on whether the model correctly
+     identified the element in the image first)
+  Report all three separately, clearly labeled — they answer
+  different questions and conflating them hides which part of the
+  pipeline (recognition vs reasoning) is responsible for errors.
+
+===============================================================
+7. ABLATION STUDIES PLANNED (VLM PIPELINE)
+===============================================================
+
+Run as SEQUENTIAL one-at-a-time ablations off the baseline (not
+full combinatorial grid) given the Sept 10 deadline. Assumes
+limited interaction effects between axes — a stated simplification,
+not hidden.
+
+Axes:
+  1. Same-VLM extraction vs. agnostic-LLM extraction (see Section 5
+     constraint re: material/immaterial)
+  2. Single-pass (schema from the start) vs. two-pass (baseline)
+  3. Foreground/background/scene-location decomposition vs. single
+     unified caption
+       - Motivation: counters salience bias; conceptually bridges
+         toward the Grounding pipeline's thing/stuff routing
+         (foreground≈things, background≈stuff)
+       - Known failure mode: breaks down for screenshots, plain-
+         text images, infographics (present in BIG-5). Proposed
+         handling: detect format first, route "photographic" images
+         through the 3-way split, route text/graphic-heavy images
+         to a single fallback caption.
+  4. Neutral prompt vs. explicit nature-priming prompt (Section 4)
+     — settled empirically via own metrics, not assumed
+
+Dev-loop model: Qwen3.5-0.8B, for iteration speed. Explicitly an
+ARCHITECTURE-SEARCH PROXY, not a performance benchmark — structural
+decisions assumed to transfer across models; actual per-model
+performance is Goal 1's separate main cross-model benchmark. Plan:
+spot-check final configuration against 1-2 larger models once
+Ramin's BSC infra is available, before locking in for full-scale run.
+
+===============================================================
+8. METRICS FOR VLM PIPELINE SELECTION
+===============================================================
+
+--- Reference-free (fast iteration, any image, no GT needed) ---
+
+a) F-CLIPScore (faithful replication, Oh & Hwang — "Vision-
+   Encoders (Already) Know What They See" / F-CLIPScore paper):
+     F-CLIPScore(S) = [CLIPScore(S) + sum_i CLIPScore(n_i)] / (N+1)
+   S = full caption sentence, n_i = individual extracted objects
+   (N of them). Requires the caption (sentence term). NOT novel to
+   us — cite exactly as their method when implemented per Eq. 1.
+
+b) Object-CLIPScore (OUR variant, F-CLIPScore-INSPIRED, NOT
+   identical — must be described precisely, never called
+   "F-CLIPScore"): average CLIPScore over extracted objects ONLY,
+   template "a photo of a {object}", NO sentence-level term. Their
+   ablations never test dropping the sentence term — must be
+   attributed as an adaptation. Underlying object-level insight is
+   theirs (cited); the specific simplified formula is ours.
+
+KNOWN LIMITATION (inherited, not introduced by us): CLIPScore-family
+metrics compare against the WHOLE image embedding, not a localized
+crop — a plausible-but-absent object can score deceptively well.
+Even the original paper's best untrained noun-level variant trails
+trained methods by 17.6-37.4 points on OHD-Caps. Explicitly
+first-pass proxies, not substitutes for the Grounding pipeline's
+localized verification.
+
+CRITICAL PRACTICAL ISSUE — CLIP 77-TOKEN LIMIT:
+Standard CLIP text encoders truncate at 77 tokens; only ~20 tokens
+reliably well-trained per Long-CLIP's analysis. Conflicts with the
+detailed-caption strategy (Section 4) for the sentence-level term.
+Object-level terms unaffected (short templated phrases).
+Mitigation options (not yet decided):
+  - Long-context CLIP variant for the sentence-level term (FG-CLIP2
+    explicitly trains on long-caption modeling, unlike vanilla CLIP
+    — verify its exact max sequence length before relying on it;
+    alternatively Long-CLIP)
+  - Accept + document truncation as a stated limitation
+  - Deliberately truncate/cap captions at a controlled length
+
+F-CLIPScore/Object-CLIPScore reward PLAUSIBILITY, not
+EXHAUSTIVENESS — insufficient alone to pick the final config (a
+pipeline extracting only a few "safe" objects can score well while
+missing most real content). ADDED (Pau): for this reason, track and
+report the TOTAL NUMBER of objects detected/extracted per model as
+a companion diagnostic — a model scoring well on F-CLIPScore/
+Object-CLIPScore while extracting very few objects overall is a
+red flag for under-extraction, not a sign of a well-calibrated
+pipeline. Must be paired with GT-based checks below (two-tier
+validation: cheap proxy for broad iteration, GT checks to confirm
+the winning configuration).
+
+--- GT-based (confirm final configuration) ---
+
+c) BIG-5 nature Yes/No accuracy: map extracted objects through
+   WordNet; nature=1 if ANY object maps to a nature node, else
+   nature=0. Compare against the BIG-5 GT annotations (image-level,
+   usable even without a full object dictionary mapped). Report
+   OBJECT-MAPPING HIT RATE (% of extracted objects that map to
+   WordNet at all) alongside it as a diagnostic — low hit rate
+   means "no nature" errors may reflect vocabulary-mapping gaps,
+   not genuine model failure to notice nature.
+
+   EXTENDED (Pau): since the VLM pipeline includes a VLM fallback
+   for unmapped objects by design (Section 6), this fallback can be
+   used from the start, not just as an unmapped-case patch — every
+   extracted object gets a nature/no-nature, biotic/abiotic, and
+   material/immaterial label regardless of mapping status (mapped →
+   WordNet-derived label; unmapped → VLM-derived label). This means
+   full accuracy — not just nature Yes/No, but also biotic/abiotic
+   and material/immaterial — can be computed across ALL datasets
+   (BIG-5, COCO, ImageNet, Places), not only where mapping succeeds.
+   Track WordNet-mapping-rate vs. VLM-fallback-rate throughout, so
+   it's always clear how much of any reported accuracy number rests
+   on deterministic mapping vs. VLM judgment.
+
+d) COCO/ImageNet/Places — GT-mention accuracy (EM/Contains, per
+   Ging et al.'s O-VQA framework, applied to extracted-object-lists
+   instead of free text — cite as such): check whether the GT class
+   or any WordNet-synset synonym (not just the literal label
+   string) appears among extracted objects.
+
+e) ClipMatch (Ging et al.), ImageNet + Places ONLY — COCO/BIG-5
+   excluded (COCO multi-label, BIG-5 has no closed class vocabulary
+   — ClipMatch needs a fixed candidate list, so this scoping is a
+   correctness requirement, not a compromise):
+     - Run against the EXTRACTED OBJECT LIST, not the raw caption
+       and NOT a concatenated sentence template ("a photo of a X,
+       a Y, and a Z" was considered and rejected — see below).
+     - Score each extracted object independently via its own short
+       phrase ("a photo of a {object}"), take the MAX similarity
+       across all objects as the model's implicit best guess for
+       each GT candidate class.
+     - REJECTED APPROACH — raw caption: risks CLIP 77-token
+       truncation on long captions, and ClipMatch was designed/
+       validated on short single-answer VQA responses, not
+       multi-sentence scene descriptions — using the full caption
+       deviates from how the metric was built and tested.
+     - REJECTED APPROACH — concatenated object-list sentence ("a
+       photo of a X, a Y ... and a Z"): (1) still risks the 77-token
+       limit with busy scenes (8-10+ objects), worse than the
+       caption case since triggered by object count not verbosity;
+       (2) semantic dilution — one joint embedding for many objects
+       is a smeared average, diluting the signal for any single
+       target GT class, hurting matching precisely in richer scenes.
+     - Independent per-object scoring avoids both problems, stays
+       truest to ClipMatch's original single-concept design, and
+       reuses the same object-list input as Object-CLIPScore (no
+       new extraction format needed).
+
+f) Hierarchical Precision / Recall (hP/hR) + Wu-Palmer, per
+   Snæbjarnarson et al.'s taxonomy-aware evaluation — ImageNet +
+   Places ONLY (same scoping rationale as ClipMatch, e above):
+     - Captures GRANULARITY CREDIT that EM/Contains cannot: e.g.
+       predicting "canine" when GT is "golden retriever" scores
+       flatly wrong under Contains, but hP/hR gives partial credit
+       for the correct branch of the tree.
+     - Directly demonstrates (rather than just cites) the
+       granularity-mismatch failure mode already discussed in the
+       SOTA review (Yu et al.'s fine-grained-task finding).
+     - Method: take the predicted GT class from ClipMatch (e,
+       above), then use a BGE cross-encoder to find the maximum
+       similarity between that predicted class and the extracted
+       object list, mapping the result directly onto WordNet to
+       compute hP/hR.
+
+Report BOTH EM/Contains (strict) and hP/hR (graded closeness) per
+dataset — they answer different questions; together they give a
+richer results table (exact-match rate + how far off misses were)
+than either alone.
+
+===============================================================
+9. GROUNDING PIPELINE — ROLE IN FINAL CROSS-VLM METRICS (GOAL 1)
+===============================================================
+
+Purpose: NOT for validating the VLM pipeline internally — for
+producing the final metrics comparing different VLMs' nature-
+identification performance across all available datasets, once
+both pipelines exist.
+
+Plan: combine (i) existing GTs (COCO/ImageNet/Places mapped vocab +
+BIG-5 annotations) with (ii) reference-free verification of
+VLM-claimed objects falling OUTSIDE the GT/mapped vocabulary, using
+Grounding DINO (open-vocabulary detection) + the CLIP margin-check
+idea, to check plausibility of e.g. a claimed "tree" not in GT.
+
+Framing decisions:
+  - DINO+CLIP check = agreement with an INDEPENDENT open-vocabulary
+    detector, NOT ground truth — must be described this way
+    explicitly (the detector has its own biases/error modes).
+  - Report GT-recovery and verified-extra-content as TWO SEPARATE
+    numbers, not merged — merging risks unfairly rewarding/
+    penalizing verbose vs conservative models depending on
+    weighting.
+  - Since this check feeds the headline cross-VLM comparison, a
+    SMALL MANUAL AUDIT (~50-100 images, human-checked) is planned
+    to validate the DINO+CLIP verifier's own agreement/error rate.
+
+Separately (VLM pipeline selection context, Section 8): extending
+WordNet mapping beyond the three fixed dataset vocabularies (map
+only the NOVEL object names the VLM actually extracts, not the
+whole dictionary upfront) proposed as a way to shrink the
+unmapped-object gap directly, cost permitting.
+
+===============================================================
+10. TIMELINE (8 WEEKS, JUL 16 → SEP 10)
+===============================================================
+
+Week 1 (Jul 16-22): VLM pipeline baseline (caption → extraction →
+  labeling) + F-CLIPScore + Object-CLIPScore implemented on
+  Qwen3.5-0.8B. Send code + first metric to Ramin early for fast
+  feedback loop on BSC infra.
+
+Week 2 (Jul 23-29): Iterate on Ramin's feedback; begin Grounding
+  pipeline setup (Grounding DINO 1.5 + SAM / CLIPSeg).
+
+Weeks 3-4 (Jul 30-Aug 12): Grounding pipeline — dual-branch
+  verification (highest-risk, most novel chunk). Checkpoint
+  ~Aug 10: if not working, cut ablation studies first, not the
+  core verification mechanism.
+
+Week 5 (Aug 13-19): Spatial aggregation (if kept — see Section 1
+  open question) + nature importance score + full pipeline handoff
+  to Ramin for full-scale BSC runs. Barcelona move fits here —
+  lighter cognitive-load week.
+
+Week 6 (Aug 20-26): Writing — update literature review, draft
+  Methodology (doesn't depend on final results). Slack built in
+  for summer/family time.
+
+Week 7 (Aug 27-Sep 2): Analyze BSC outputs, write Results + start
+  Discussion.
+
+Week 8 (Sep 3-10): Finish Discussion/Conclusion/Abstract,
+  formatting, proofreading, buffer.
+
+===============================================================
+11. OPEN ITEMS / NOT YET DECIDED
+===============================================================
+
+- Whether taxonomy-attribute spatial aggregation heatmaps
+  (Section 1, B.3) are worth implementing vs. deprioritizing in
+  favor of other Grounding pipeline components
+- Exact weighting scheme for the nature importance score's
+  central-pixel emphasis (Section 1, B.4) — not yet designed
+- Which CLIP variant for F-CLIPScore's sentence-level term (vanilla
+  + accept truncation, vs Long-CLIP, vs FG-CLIP2)
+- Exact max sequence length of FG-CLIP2's text encoder — verify
+  before relying on it for long captions
+- Format-detection method to route foreground/background/scene
+  decomposition vs. fallback single caption
+- Whether to extend WordNet mapping to novel VLM-extracted object
+  names (proposed, not committed)
+- Final choice between same-VLM vs agnostic-LLM extraction —
+  pending ablation results (material/immaterial stays VLM-based
+  regardless, per Section 5)
+- Whether to also test ClipMatch/hP/hR against the raw caption for
+  comparison, despite the concerns raised, or go straight to
+  object-list-only
+- CLAUDE.md trimming — decide what stays vs. gets moved to a linked
+  doc once Claude Code work actually starts (Section 3)
