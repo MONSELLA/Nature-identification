@@ -1,0 +1,23 @@
+BIG-5 PROJECT — NATURE TAXONOMY (REFERENCE)
+
+AXIS: BIOTIC vs. ABIOTIC
+
+BIOTIC — living organisms, or the material/immaterial result of biotic processes,
+present in an ecosystem, interacting, adapting, and evolving. Includes:
+- Natural or semi-natural flora and derivatives (plants, wild or potted; food like
+  sugar, honey, coffee, liqueur)
+- Natural or semi-natural fauna and derivatives (wild, domesticated, or bred
+  vertebrates, molluscs, insects; derivatives like butter)
+- Natural or semi-natural fungi and other organisms (moulds, yeasts, mushrooms,
+  bacteria)
+- Natural or semi-natural ecosystems (natural reserve, urban park, vegetable garden)
+
+ABIOTIC — non-living elements or processes, material or immaterial, that
+characterize or occur in an ecosystem and affect the behavior/survival of organisms.
+Includes:
+- Hydrological components (river, pond, lake)
+- Atmospheric/weather/seasonal components (rain, cloud, snow, wind, temperature,
+  winter, summer) — excluding non-natural uses like "summer school"
+- Geological components (salt, petrol, oil)
+- Astrophysical components/processes (sunset, sunrise, day, night, stars, moon) —
+  excluding purely conversational uses like "good morning/night"

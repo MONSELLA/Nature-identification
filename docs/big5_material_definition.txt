@@ -1,0 +1,38 @@
+BIG-5 PROJECT — NATURE TAXONOMY (REFERENCE)
+
+AXIS: MATERIAL vs. IMMATERIAL
+
+MATERIAL — the element has physical presence and can be perceived through the senses
+(it occupies space and has mass). Includes:
+- Biophysical processes (e.g., photosynthesis, evapotranspiration)
+- Meteorological elements/processes (e.g., rain, fog, wind)
+- Astrophysical elements/processes (e.g., sunset, sunrise, eclipse, meteor)
+- Natural or semi-natural flora (plants, wild or potted, and derivatives like honey,
+  coffee)
+- Natural or semi-natural fauna (wild, domesticated, or bred vertebrates, molluscs,
+  insects, and derivatives like butter)
+- Natural or semi-natural fungi (wild or cultivated mushrooms, moulds, yeasts)
+- Natural or semi-natural ecosystems (e.g., a natural reserve, urban park) —
+  excluding administrative units (country, county, district)
+- Edible solid/liquid elements at any processing level (unless only a package with the
+  element's name printed on it)
+- Nature-based artefacts where the natural material of origin is clearly identifiable
+  (e.g., a surface with visible wood grain or stone texture) — excluding artefacts
+  with homogenous, unidentifiable texture (e.g., a smooth statue)
+
+IMMATERIAL — concepts, ideas, or fictional/artistic representations of nature that are
+depicted or referenced, but are not a realistic, unfiltered depiction (a plain
+descriptive photo or text does not count as immaterial — it is material or excluded).
+Two subtypes, with illustrative examples of the range of formats this can take
+(video games, cartoons, humanized/fake animals or plants, costumes, songs, poems,
+drawings, paintings, prints, artistic photos, metaphors, proverbs, virtual reality,
+photos of photos, physical geography maps, infographics, AI-generated imagery, plain
+illustrations, etc.) — these formats are examples to aid recognition, not a required
+output classification:
+- Fictional representation: a depiction that reimagines or fabricates a nature
+  element in non-literal form (e.g., video games, cartoons, humanized animals, fake
+  plants or animals, costumes).
+- Art/cultural/scientific representation: a depiction that presents a nature element
+  through an artistic, cultural, or informational lens (e.g., songs, poems, drawings,
+  paintings, prints, artistic photos, metaphors, proverbs, virtual reality, photos of
+  photos, physical geography maps — political/administrative maps excluded).
