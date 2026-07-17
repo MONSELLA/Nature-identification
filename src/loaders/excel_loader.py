@@ -9,9 +9,8 @@ synsets the same way and never silently drift apart.
 
 What this module ADDS on top of evaluation.py's graph builder:
   - `resolve_labels()`: nearest-labeled-ancestor lookup. The Excel only
-    labels certain "anchor" nodes (broad parent concepts); most target
-    classes (e.g. a specific ImageNet leaf synset) are NOT themselves
-    labeled and need to inherit their nature/biotic/abiotic label from the
+    labels certain nodes; therefore, some other classes are NOT themselves
+    labeled and can inherit their nature/biotic/abiotic label from the
     nearest labeled ancestor above them. This is the automatic-propagation
     step described in the project's SOTA writeup.
   - `get_mapped_classes()`: filters a dataset's (class_name, synset_id)
@@ -23,7 +22,7 @@ USAGE:
     from src.loaders.excel_loader import TaxonomyGraph
 
     graph = TaxonomyGraph()
-    graph.load_excel("/home/pmonserrat/code/flat_wordnet_tree_fixed.xlsx")
+    graph.load_excel("/home/pmonserrat/code/data/big5_taxonomy/flat_wordnet_tree_fixed.xlsx")
     mapped = graph.get_mapped_classes(class_synset_pairs)
     # mapped = [{"class_name": ..., "synset_id": ..., "is_nature": ...,
     #            "biotic_abiotic": ..., "resolved_from_node": ..., "hops": ...}, ...]
@@ -36,10 +35,10 @@ copy of the file differs.
 
 BACKGROUND — WHAT ARE WE ACTUALLY BUILDING HERE?
 The BIG-5 researchers hand-annotated an Excel file that says, for certain
-broad WordNet concepts (e.g. "canine.n.02"), whether that concept counts as
+WordNet concepts (e.g. "canine.n.02"), whether that concept counts as
 "nature" and whether it's biotic/abiotic. But they obviously couldn't
 hand-label every single one of WordNet's ~80,000+ noun synsets one by one —
-only a manageable number of "anchor" concepts got a direct label.
+only almost all target classes of COCO, ImageNet and Places365 datasets.
 
 This module's job is two-fold:
   1. Build a directed graph (a tree-like structure, technically a DAG —

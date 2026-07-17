@@ -193,10 +193,10 @@ def build_classification_prompt(class_name, axes):
     # the visual evidence (not just the word "oak tree" in isolation), and
     # lists exactly which fields/labels it must produce and how.
     return f"""You are analyzing a specific object identified in the provided image.
-The object is classified as: {class_name}
+        The object is classified as: {class_name}
 
-Based on the visual evidence in the image and the definitions provided, classify this specific instance of the object.
+        Based on the visual evidence in the image and the definitions provided, classify this specific instance of the object.
 
-Provide your reasoning first, followed by the specific labels according to these rules:
-{field_lines}
-"""
+        Provide your reasoning first, followed by the specific labels according to these rules:
+        {field_lines}
+        """
