@@ -403,6 +403,17 @@ def phase_score(args):
     clipmatch_support = 0
     flat_rows = []  # per-object rows for the output CSV
 
+    # Which images get their per-object predictions written to the CSV.
+    # Fixed at --num_preds_to_store images, chosen deterministically by
+    # sorting on image_path (not on inference order, which can vary run to
+    # run) so the SAME set of images is stored for every model/dataset run,
+    # keeping the CSVs directly comparable across models.
+    if args.num_preds_to_store is not None:
+        chosen_paths = sorted({r["image_path"] for r in records})[: args.num_preds_to_store]
+        preds_to_store = set(chosen_paths)
+    else:
+        preds_to_store = {r["image_path"] for r in records}
+
     for idx, rec in enumerate(records):
         objs = rec["objects"]
         finals = rec["object_finals"]
@@ -496,16 +507,17 @@ def phase_score(args):
         # Build one output row per extracted object, capturing both the raw
         # VLM answer and the final resolved label — handy for manually
         # spot-checking individual predictions later.
-        for obj, lab, fin in zip(objs, rec["object_labels"], finals):
-            flat_rows.append({
-                "image_path": rec["image_path"], "caption": rec["caption"], "object": obj,
-                "mapped": fin["mapped"], "mapped_synset": fin["mapped_synset"],
-                "final_nature": fin["final_nature"], "final_biotic": fin["final_biotic"],
-                "final_material": fin["final_material"],
-                "nature_source": fin["nature_source"], "biotic_source": fin["biotic_source"],
-                "vlm_nature": lab.get("nature"), "vlm_biotic": lab.get("biotic"),
-                "vlm_material": lab.get("material"), "parse_failed": lab.get("parse_failed"),
-            })
+        if rec["image_path"] in preds_to_store:
+            for obj, lab, fin in zip(objs, rec["object_labels"], finals):
+                flat_rows.append({
+                    "image_path": rec["image_path"], "caption": rec["caption"], "object": obj,
+                    "mapped": fin["mapped"], "mapped_synset": fin["mapped_synset"],
+                    "final_nature": fin["final_nature"], "final_biotic": fin["final_biotic"],
+                    "final_material": fin["final_material"],
+                    "nature_source": fin["nature_source"], "biotic_source": fin["biotic_source"],
+                    "vlm_nature": lab.get("nature"), "vlm_biotic": lab.get("biotic"),
+                    "vlm_material": lab.get("material"), "parse_failed": lab.get("parse_failed"),
+                })
 
     # ---- Assemble summary ----
     n_images = len(records)
@@ -539,14 +551,28 @@ def phase_score(args):
 
     _print_summary(summary, run_clipmatch)
 
-    out_path = Path(args.output_file)
+    # Everything lands under --results_dir ("results/" by default); --run_name
+    # further nests it into a per-ablation-configuration subfolder, so results
+    # from different pipeline configurations never land in the same place and
+    # stay easy to tell apart later.
+    out_dir = Path(args.results_dir)
+    if args.run_name:
+        out_dir = out_dir / args.run_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / Path(args.output_file).name
     update_results_store(out_path, dataset=dataset, model=header.get("model"), metrics=summary)
     if flat_rows:
-        csv_path = out_path.with_name(out_path.stem + "_predictions.csv")
+        # Include dataset + model in the filename — otherwise every model run
+        # writes to the same "<stem>_predictions.csv" and each rerun (e.g. a
+        # different VLM on the same dataset) silently overwrites the previous
+        # model's predictions.
+        model_slug = header.get("model", "unknown_model").replace("/", "_")
+        csv_path = out_path.with_name(f"{out_path.stem}_{dataset}_{model_slug}_predictions.csv")
         with open(csv_path, "w", newline="") as f:
             w = csv.DictWriter(f, fieldnames=list(flat_rows[0].keys()))
             w.writeheader(); w.writerows(flat_rows)
-        print(f"💾 [score] wrote {out_path} and {csv_path}")
+        print(f"💾 [score] wrote {out_path} and {csv_path} "
+              f"({len(preds_to_store)} images stored)")
 
     if args.wandb:
         _log_wandb(args, summary, run_clipmatch)
@@ -654,7 +680,23 @@ def parse_args():
     p.add_argument("--output_file", type=str, default="vlm_pipeline_results.json",
                    help="Results store JSON, keyed by dataset then model name (updated in place — "
                         "a rerun of the same model overwrites its entry).")
+    p.add_argument("--results_dir", type=str, default="results",
+                   help="Base directory all results (JSON store + predictions CSV) are written "
+                        "under. Created if it doesn't exist.")
+    p.add_argument("--run_name", type=str, default=None,
+                   help="Optional subfolder of --results_dir to write --output_file (and its "
+                        "_predictions.csv) into, e.g. --run_name ablation_single_pass -> "
+                        "results/ablation_single_pass/. Useful for keeping results from "
+                        "different pipeline configurations (ablations) in separate, clearly "
+                        "labeled folders. Created if it doesn't exist. Default: write directly "
+                        "into --results_dir.")
     p.add_argument("--max_samples", type=int, default=None)
+    p.add_argument("--num_preds_to_store", type=int, default=None,
+                   help="Number of images whose per-object predictions get written to the "
+                        "_predictions.csv file. The images are chosen deterministically (sorted "
+                        "by image_path), so the SAME fixed set of images is stored across "
+                        "different models/runs on the same dataset, keeping CSVs comparable. "
+                        "Default: store all scored images.")
     p.add_argument("--verbose", action="store_true")
     p.add_argument("--wandb", action="store_true")
 
