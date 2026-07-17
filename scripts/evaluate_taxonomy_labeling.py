@@ -51,7 +51,7 @@ def parse_args():
     )
 
     parser.add_argument("--output_mode", type=str, choices=["structured", "free_form"], default="structured")
-    parser.add_argument("--excel_path", type=str, default="../data/big5_taxonomy/flat_wordnet_tree_fixed.xlsx",
+    parser.add_argument("--excel_path", type=str, default="/home/pmonserrat/code/data/big5_taxonomy/flat_wordnet_tree_fixed.xlsx",
                         help="Path to the BIG-5 WordNet taxonomy Excel file.")
     parser.add_argument("--sheet_name", type=str, default="data corrected")
 
@@ -59,7 +59,7 @@ def parse_args():
     parser.add_argument("--dataset", type=str, required=True, choices=["coco", "imagenet", "places365", "big5"],
                         help="Dataset to load and evaluate.")
     parser.add_argument("--data_dir", type=str, help="Path to images directory (for COCO/ImageNet/Places).")
-    parser.add_argument("--instances_json", type=str, help="Path to instances json (for COCO).")
+    parser.add_argument("--instances_json", type=str, default="/home/pmonserrat/datasets/coco/annotations/instances_val2017.json", help="Path to instances json (for COCO).")
     parser.add_argument("--places_categories_txt", type=str, help="Path to categories_places365.txt (for Places).")
 
     # BIG-5 Dataset Arguments
@@ -80,13 +80,13 @@ def parse_args():
 
     # Generation Arguments
     parser.add_argument("--batch_size", type=int, default=16)
-    parser.add_argument("--max_new_tokens", type=int, default=300)
+    parser.add_argument("--max_new_tokens", type=int, default=256)
     parser.add_argument("--temperature", type=float, default=0.0)
 
     # Context Files
-    parser.add_argument("--nature_definition_path", type=str, default="../data/big5_taxonomy/big5_nature_definition.txt")
-    parser.add_argument("--biotic_definition_path", type=str, default="../data/big5_taxonomy/big5_biotic_definition.txt")
-    parser.add_argument("--material_definition_path", type=str, default="../data/big5_taxonomy/big5_material_definition.txt")
+    parser.add_argument("--nature_definition_path", type=str, default="/home/pmonserrat/code/data/big5_taxonomy/big5_nature_definition.txt")
+    parser.add_argument("--biotic_definition_path", type=str, default="/home/pmonserrat/code/data/big5_taxonomy/big5_biotic_definition.txt")
+    parser.add_argument("--material_definition_path", type=str, default="/home/pmonserrat/code/data/big5_taxonomy/big5_material_definition.txt")
 
     parser.add_argument("--output_file", type=str, default="taxonomy_calibration_results.json")
     parser.add_argument("--max_samples", type=int, default=None, help="Limit number of evaluations.")

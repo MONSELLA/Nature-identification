@@ -53,10 +53,10 @@ from pydantic import BaseModel, Field
 # (called "salience bias"), and tends to be too short to mention secondary
 # details ("brevity bias"). This neutral caption becomes the input to Stage 2.
 CAPTION_PROMPT = (
-    "Describe this image in detail, including the main subject, the "
-    "background, the setting, and any secondary elements present."
+    "Describe this image in 3-4 sentences, covering the main subject, the "
+    "background, the setting, and any secondary elements present. Be "
+    "specific but concise."
 )
-
 
 # =============================================================================
 # Stage 2 — Object extraction (structured)
@@ -193,10 +193,10 @@ def build_classification_prompt(class_name, axes):
     # the visual evidence (not just the word "oak tree" in isolation), and
     # lists exactly which fields/labels it must produce and how.
     return f"""You are analyzing a specific object identified in the provided image.
-        The object is classified as: {class_name}
+The object is classified as: {class_name}
 
-        Based on the visual evidence in the image and the definitions provided, classify this specific instance of the object.
+Based on the visual evidence in the image and the definitions provided, classify this specific instance of the object.
 
-        Provide your reasoning first, followed by the specific labels according to these rules:
-        {field_lines}
-        """
+Provide your reasoning first, followed by the specific labels according to these rules:
+{field_lines}
+"""
