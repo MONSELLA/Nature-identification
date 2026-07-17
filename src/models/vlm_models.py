@@ -592,3 +592,61 @@ def create_vlm(family: str, model_name: str, **kwargs: Any) -> BaseVLM:
     if family not in MODEL_REGISTRY:
         raise ValueError(f"Unknown model family '{family}'. Available: {sorted(MODEL_REGISTRY)}")
     return MODEL_REGISTRY[family](model_name, **kwargs)
+
+
+# =============================================================================
+# Memory release — needed for a single-process end-to-end run (VLM inference
+# followed by CLIP scoring in the SAME process). Neither vLLM nor plain
+# torch/transformers release CUDA memory back to the driver on Python garbage
+# collection alone: vLLM keeps a distributed process group + KV-cache
+# allocator alive, and HF model tensors stay pinned until their CUDA blocks are
+# explicitly freed. Skipping this step is why the pipeline used to require two
+# separate process invocations (--stage infer, then --stage score).
+# =============================================================================
+def unload_vlm(vlm: BaseVLM) -> None:
+    """Tear down a VLM's GPU-resident state so a CLIP/metric model can be
+    loaded afterward in the SAME process without contending for VRAM. Safe to
+    call on any BaseVLM subclass; each backend's own GPU-holding attributes
+    (`.llm` for vLLM, `.model`/`.processor`/`.tokenizer`/`.image_processor` for
+    the HuggingFace families) are cleared before the general GC/cache pass."""
+    import gc
+
+    llm = getattr(vlm, "llm", None)  # VLLMBackedVLM
+    if llm is not None:
+        try:
+            from vllm.distributed.parallel_state import (
+                destroy_distributed_environment,
+                destroy_model_parallel,
+            )
+            destroy_model_parallel()
+            destroy_distributed_environment()
+        except Exception:
+            pass  # older/newer vLLM versions relocate these; best-effort only
+        try:
+            del llm.llm_engine.model_executor
+        except Exception:
+            pass
+
+    for attr in ("llm", "model", "processor", "tokenizer", "image_processor"):
+        if hasattr(vlm, attr):
+            try:
+                delattr(vlm, attr)
+            except Exception:
+                setattr(vlm, attr, None)
+
+    gc.collect()
+
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+    except Exception:
+        pass
+
+    try:
+        import torch.distributed as dist
+        if dist.is_available() and dist.is_initialized():
+            dist.destroy_process_group()
+    except Exception:
+        pass

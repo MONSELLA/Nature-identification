@@ -1,5 +1,5 @@
 """
-lib/excel_loader.py
+src/loaders/excel_loader.py
 
 Loads the BIG-5 WordNet-based taxonomy Excel file and builds a queryable
 taxonomy graph. The graph-construction logic (add_synset_and_ancestors /
@@ -20,7 +20,7 @@ What this module ADDS on top of evaluation.py's graph builder:
     entirely for this kind of evaluation, not treated as negatives.
 
 USAGE:
-    from lib.excel_loader import TaxonomyGraph
+    from src.loaders.excel_loader import TaxonomyGraph
 
     graph = TaxonomyGraph()
     graph.load_excel("/home/pmonserrat/code/flat_wordnet_tree_fixed.xlsx")

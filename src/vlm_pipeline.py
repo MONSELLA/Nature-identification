@@ -1,5 +1,5 @@
 """
-lib/vlm_pipeline.py
+src/vlm_pipeline.py
 
 Baseline BIG-5 VLM pipeline (language-based), Phase-1 inference + the hybrid
 taxonomy-label resolver used in Phase-2 scoring.
@@ -26,15 +26,16 @@ Hybrid labeling (resolved in Phase 2, needs the TaxonomyGraph):
 Diagnostics tracked: WordNet-mapping-rate vs VLM-fallback-rate, and total
 objects extracted per image.
 
-NO metric computation lives here (see lib/clip_metrics.py,
-lib/taxonomy_metrics.py). NO prompts live here (see lib/prompts.py).
+NO metric computation lives here (see src/evaluation/clip_metrics.py,
+src/evaluation/taxonomy_metrics.py). NO prompts live here (see
+src/models/prompts.py).
 """
 
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from lib.prompts import (
+from src.models.prompts import (
     CAPTION_PROMPT,
     EXTRACTION_PROMPT,
     ObjectExtractionResponse,

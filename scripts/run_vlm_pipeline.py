@@ -2,20 +2,27 @@
 """
 run_vlm_pipeline.py
 
-Two-phase driver for the baseline BIG-5 VLM pipeline.
+End-to-end driver for the baseline BIG-5 VLM pipeline, in three stages:
 
-  --stage infer : load ONLY the VLM (vLLM gets full GPU), run caption ->
-                  extraction -> per-object labeling over every image, and write
-                  a JSON-lines artifact of raw responses (+ a header line with
-                  the dataset's mapping vocab and ClipMatch candidate vocab).
-                  No CLIP / no metric math here.
+  --stage all   : THE STANDARD WAY TO RUN THIS PIPELINE. Loads the VLM, runs
+                  caption -> extraction -> per-object labeling over every image,
+                  and writes a JSON-lines artifact of raw responses to
+                  --responses_file. The VLM is then explicitly unloaded
+                  (src.models.vlm_models.unload_vlm — tears down vLLM's
+                  distributed process group / KV-cache, or the HF model's
+                  tensors, then empties the CUDA cache) BEFORE open_clip + the
+                  TaxonomyGraph are loaded to score the stored artifact. One
+                  command, one process, the VLM and CLIP never hold GPU memory
+                  at the same time.
 
-  --stage score : the VLM is gone; load open_clip + the TaxonomyGraph, read the
-                  artifact, resolve hybrid labels, compute all metrics, and write
-                  a summary JSON + per-object CSV.
+  --stage infer : run ONLY the inference half (VLM -> --responses_file) and
+                  exit. Useful to run inference on one machine/job and defer
+                  scoring to another, or to inspect the raw artifact first.
 
-  --stage all   : run both back-to-back (tiny smoke tests only — this loads both
-                  model sets in one process, which the two-phase split avoids).
+  --stage score : run ONLY the scoring half, reading a --responses_file written
+                  by a previous --stage infer (or --stage all) run. Useful to
+                  re-score an existing artifact (e.g. after a metrics-code
+                  change) without re-running inference.
 
 Metrics (per CLAUDE.md scoping):
   - accuracy / precision / recall / F1   : ALL datasets. Nature is image-level
@@ -39,7 +46,7 @@ from pathlib import Path
 from src.evaluation import taxonomy_metrics
 from src.loaders.excel_loader import TaxonomyGraph
 from src.loaders.dataset_loader import load_dataset, get_candidate_vocab, build_mapping_vocab
-from src.models.vlm_models import MODEL_REGISTRY, VLLM_FAMILIES, create_vlm
+from src.models.vlm_models import MODEL_REGISTRY, VLLM_FAMILIES, create_vlm, unload_vlm
 from src.vlm_pipeline import run_inference, resolve_hybrid_label, normalize_objects, _normalize_object
 from src.evaluation import clip_metrics
 
@@ -208,6 +215,7 @@ def phase_infer(args):
             f.write(json.dumps(rec) + "\n")
             n += 1
     print(f"💾 [infer] wrote {n} image records to {out_path} in {time.time()-t0:.1f}s")
+    return vlm
 
 
 # =============================================================================
@@ -467,7 +475,10 @@ def _log_wandb(args, summary, run_clipmatch):
 # =============================================================================
 def parse_args():
     p = argparse.ArgumentParser(description="Two-phase baseline VLM pipeline (infer -> score).")
-    p.add_argument("--stage", choices=["infer", "score", "all"], required=True)
+    p.add_argument("--stage", choices=["all", "infer", "score"], default="all",
+                   help="'all' (default) runs the full end-to-end pipeline in one process, "
+                        "releasing the VLM's GPU memory before loading CLIP for scoring. "
+                        "'infer'/'score' split the two halves across separate invocations.")
     p.add_argument("--dataset", choices=["coco", "imagenet", "places365", "big5"], required=True)
     p.add_argument("--responses_file", type=str, default="vlm_responses.jsonl",
                    help="Intermediate artifact: written by infer, read by score.")
@@ -522,8 +533,20 @@ def parse_args():
 
 def main():
     args = parse_args()
+
+    vlm = None
     if args.stage in ("infer", "all"):
-        phase_infer(args)
+        vlm = phase_infer(args)
+
+    if args.stage == "all":
+        # Free the VLM's GPU memory BEFORE loading CLIP for scoring — neither
+        # vLLM nor plain torch/transformers release CUDA memory on Python GC
+        # alone, so without this explicit step the CLIP load below would
+        # contend with (or OOM against) the still-resident VLM.
+        print("🧹 [all] releasing VLM GPU memory before loading CLIP for scoring...")
+        unload_vlm(vlm)
+        del vlm
+
     if args.stage in ("score", "all"):
         phase_score(args)
 

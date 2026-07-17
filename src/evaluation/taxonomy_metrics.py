@@ -1,5 +1,5 @@
 """
-lib/taxonomy_metrics.py
+src/evaluation/taxonomy_metrics.py
 
 Taxonomy-aware evaluation metrics for the BIG-5 VLM pipeline — hierarchical
 precision/recall/F1 (hP/hR/hF1), Wu-Palmer similarity, and free-text →
@@ -9,7 +9,7 @@ Ported/adapted from the reference `evaluation.py`
 (`TaxonomyEvaluationPipeline._compute_hierarchical_metrics`,
 `_get_ancestral_closure`, `_compute_wup_similarity`, `_resolve_to_wordnet`),
 but rewritten as free functions that operate on the maintained
-`lib.excel_loader.TaxonomyGraph` (its `.graph` DiGraph and
+`src.loaders.excel_loader.TaxonomyGraph` (its `.graph` DiGraph and
 `add_synset_and_ancestors`), so there is a single graph in the project rather
 than a second copy.
 
