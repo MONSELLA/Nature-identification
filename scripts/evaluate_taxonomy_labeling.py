@@ -17,13 +17,13 @@ from pathlib import Path
 
 import wandb
 
-from lib.excel_loader import TaxonomyGraph
-from lib.vlm import MODEL_REGISTRY, create_vlm
-from lib.dataset_loader import load_dataset
+from src.loaders.excel_loader import TaxonomyGraph
+from src.models.vlm_models import MODEL_REGISTRY, create_vlm
+from src.loaders.dataset_loader import load_dataset
 # TaxonomyResponse + build_classification_prompt live in lib/prompts.py so this
 # calibration eval and the VLM pipeline's fallback path share the EXACT same
 # prompt and schema (they cannot drift — same imported objects).
-from lib.prompts import TaxonomyResponse, build_classification_prompt
+from src.models.prompts import TaxonomyResponse, build_classification_prompt
 
 
 def parse_args():
@@ -32,7 +32,7 @@ def parse_args():
     )
     
     parser.add_argument("--output_mode", type=str, choices=["structured", "free_form"], default="structured")
-    parser.add_argument("--excel_path", type=str, default="flat_wordnet_tree_fixed.xlsx",
+    parser.add_argument("--excel_path", type=str, default="../data/big5_taxonomy/flat_wordnet_tree_fixed.xlsx",
                         help="Path to the BIG-5 WordNet taxonomy Excel file.")
     parser.add_argument("--sheet_name", type=str, default="data corrected")
 
@@ -65,9 +65,9 @@ def parse_args():
     parser.add_argument("--temperature", type=float, default=0.0)
 
     # Context Files
-    parser.add_argument("--nature_definition_path", type=str, default="docs/big5_nature_definition.txt")
-    parser.add_argument("--biotic_definition_path", type=str, default="docs/big5_biotic_definition.txt")
-    parser.add_argument("--material_definition_path", type=str, default="docs/big5_material_definition.txt")
+    parser.add_argument("--nature_definition_path", type=str, default="../data/big5_taxonomy/big5_nature_definition.txt")
+    parser.add_argument("--biotic_definition_path", type=str, default="../data/big5_taxonomy/big5_biotic_definition.txt")
+    parser.add_argument("--material_definition_path", type=str, default="../data/big5_taxonomy/big5_material_definition.txt")
     
     parser.add_argument("--output_file", type=str, default="taxonomy_calibration_results.json")
     parser.add_argument("--max_samples", type=int, default=None, help="Limit number of evaluations.")

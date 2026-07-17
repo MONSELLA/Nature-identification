@@ -586,6 +586,8 @@ MODEL_REGISTRY: Dict[str, type] = {
     "blip3": Blip3VLM,
 }
 
+VLLM_FAMILIES = ("qwen", "mistral", "llava")
+
 def create_vlm(family: str, model_name: str, **kwargs: Any) -> BaseVLM:
     if family not in MODEL_REGISTRY:
         raise ValueError(f"Unknown model family '{family}'. Available: {sorted(MODEL_REGISTRY)}")

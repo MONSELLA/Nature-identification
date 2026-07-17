@@ -50,7 +50,7 @@ EXTRACTION_PROMPT = (
     "Using BOTH the image and the description, list every distinct physical "
     "object, element, or entity that appears in the image. Follow these rules:\n"
     "  - Return each object as a short noun phrase (e.g. \"wooden bench\", "
-    "\"golden retriever\", \"snow-capped mountain\").\n"
+    "\"golden retriever\", \"mountain\").\n"
     "  - Include secondary and background elements, not just the main subject.\n"
     "  - Include an element even when it is only PART of a larger object or is "
     "depicted on its surface (e.g. a flower printed on a dress -> list "

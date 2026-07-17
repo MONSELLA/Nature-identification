@@ -38,6 +38,7 @@ import numpy as np
 
 OBJECT_TEMPLATE = "a photo of a {}"
 DEFAULT_CLIPSCORE_SCALE = 2.5
+CLIPMATCH_DATASETS = ("imagenet", "places365")
 
 
 # =============================================================================

@@ -36,18 +36,16 @@ import sys
 import time
 from pathlib import Path
 
-from lib.excel_loader import TaxonomyGraph
-from lib.dataset_loader import load_dataset, get_candidate_vocab, build_mapping_vocab
-from lib.vlm import MODEL_REGISTRY, create_vlm
-from lib.vlm_pipeline import run_inference, resolve_hybrid_label, normalize_objects, _normalize_object
-from lib import clip_metrics, taxonomy_metrics
-
-CLIPMATCH_DATASETS = ("imagenet", "places365")
-VLLM_FAMILIES = ("qwen", "mistral", "llava")
+from src.evaluation import taxonomy_metrics
+from src.loaders.excel_loader import TaxonomyGraph
+from src.loaders.dataset_loader import load_dataset, get_candidate_vocab, build_mapping_vocab
+from src.models.vlm_models import MODEL_REGISTRY, VLLM_FAMILIES, create_vlm
+from src.vlm_pipeline import run_inference, resolve_hybrid_label, normalize_objects, _normalize_object
+from src.evaluation import clip_metrics
 
 
 # =============================================================================
-# System prompts (built from the docs/ definition files)
+# System prompts (built from the ../data/big5_taxonomy/ definition files)
 # =============================================================================
 def build_system_prompts(nature_path, biotic_path, material_path):
     """Caption stage sees the NATURE definition only (no axis-priming, per the
@@ -239,7 +237,7 @@ def phase_score(args):
     dataset = header["dataset"]
     mapping_vocab = header.get("mapping_vocab") or {}
     candidate_vocab = header.get("candidate_vocab")
-    run_clipmatch = dataset in CLIPMATCH_DATASETS and candidate_vocab
+    run_clipmatch = dataset in clip_metrics.CLIPMATCH_DATASETS and candidate_vocab
     if args.max_samples is not None:
         records = records[: args.max_samples]
 
@@ -475,11 +473,11 @@ def parse_args():
                    help="Intermediate artifact: written by infer, read by score.")
 
     # taxonomy / context
-    p.add_argument("--excel_path", type=str, default="flat_wordnet_tree_fixed.xlsx")
+    p.add_argument("--excel_path", type=str, default="../data/big5_taxonomy/flat_wordnet_tree_fixed.xlsx")
     p.add_argument("--sheet_name", type=str, default="data corrected")
-    p.add_argument("--nature_definition_path", type=str, default="docs/big5_nature_definition.txt")
-    p.add_argument("--biotic_definition_path", type=str, default="docs/big5_biotic_definition.txt")
-    p.add_argument("--material_definition_path", type=str, default="docs/big5_material_definition.txt")
+    p.add_argument("--nature_definition_path", type=str, default="../data/big5_taxonomy/big5_nature_definition.txt")
+    p.add_argument("--biotic_definition_path", type=str, default="../data/big5_taxonomy/big5_biotic_definition.txt")
+    p.add_argument("--material_definition_path", type=str, default="../data/big5_taxonomy/big5_material_definition.txt")
 
     # dataset paths
     p.add_argument("--data_dir", type=str)
