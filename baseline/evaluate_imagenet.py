@@ -261,16 +261,15 @@ def main():
         if not node_attrs:
             stats["unmapped"] += 1
             missing_classes.append(synset_str)
-            # NOTE: unlike lib/dataset_loader.py's get_gt_from_graph (which
-            # explicitly returns None/skips a class entirely when unmapped),
-            # there is no `continue` here — execution falls through to the
-            # lines below with `node_attrs` = {} (empty dict). `{}.get(...)`
-            # returns None for every key, so `map_nature[idx]` ends up set to
-            # 0 (i.e. this unmapped class gets silently counted as
-            # "not nature") rather than being excluded from map_nature
-            # entirely. Worth double-checking against the project's stated
-            # convention of EXCLUDING (not defaulting) unmapped GT classes
-            # before trusting this script's exact numbers.
+            # Unmapped classes are EXCLUDED from map_nature/map_biotic/
+            # map_material entirely (matching lib/dataset_loader.py's
+            # get_gt_from_graph and count_classes.py's identical loop) —
+            # without this `continue`, execution would fall through with
+            # node_attrs = {} (empty dict), and `{}.get(...)` returning None
+            # for every key would silently set map_nature[idx] = 0, counting
+            # an unmapped class as "not nature" instead of excluding it as
+            # ground truth (contradicting this project's stated convention).
+            continue
 
         # 1. Nature (Boolean mapped to 1/0)
         is_nature = node_attrs.get('is_nature')
