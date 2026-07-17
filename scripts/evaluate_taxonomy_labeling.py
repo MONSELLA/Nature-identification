@@ -35,7 +35,7 @@ import wandb
 from src.loaders.excel_loader import TaxonomyGraph
 from src.models.vlm_models import MODEL_REGISTRY, create_vlm
 from src.loaders.dataset_loader import load_dataset
-from src.results_store import update_results_store
+from src.utils import update_results_store
 # TaxonomyResponse + build_classification_prompt live in prompts.py so this
 # calibration eval and the VLM pipeline's fallback path share the EXACT same
 # prompt and schema (they cannot drift — same imported objects).

@@ -59,7 +59,7 @@ from src.loaders.dataset_loader import load_dataset, get_candidate_vocab, build_
 from src.models.vlm_models import MODEL_REGISTRY, VLLM_FAMILIES, create_vlm, unload_vlm
 from src.vlm_pipeline import run_inference, resolve_hybrid_label, normalize_objects, _normalize_object
 from src.evaluation import clip_metrics
-from src.results_store import update_results_store
+from src.utils import update_results_store
 
 
 # =============================================================================
