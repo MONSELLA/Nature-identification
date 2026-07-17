@@ -9,9 +9,10 @@ from ImageNet, COCO and Places365. Therefore, these datasets can be used as well
 evaluating the models. 
 
 ## Reference files (load these, don't ask me to re-explain)
-@docs/big5_nature_definition.txt
-@docs/big5_material_definition.txt
-@docs/big5_biotic_definition.txt
+@data/big5_taxonomy/big5_nature_definition.txt
+@data/big5_taxonomy/big5_material_definition.txt
+@data/big5_taxonomy/big5_biotic_definition.txt
+@data/llm_reference/vlm_pipeline_recap.txt
 
 ## Two pipelines — do not conflate
 - **VLM pipeline** (language-based, in progress): caption → object extraction →
@@ -26,8 +27,8 @@ evaluating the models.
   extraction call. Never collapse into single-pass-with-schema without it being
   an explicit, labeled ablation.
 - Caption prompt (baseline, neutral, no nature-priming):
-  "Describe this image in detail, including the main subject, the background,
-  the setting, and any secondary elements present."
+    "Describe this image in 3-4 sentences, covering the main subject, the 
+    background, the setting, and any secondary elements present. Be specific but concise."
   Do NOT add "pay attention to nature" to this prompt unless running the
   nature-priming ablation explicitly.
 - Context files go in the `system` role, never `user`. Read once at startup,
@@ -55,9 +56,9 @@ evaluating the models.
   extracted object independently (`"a photo of a {object}"`), take the MAX
   similarity across objects per GT candidate class. Do NOT run against the raw
   caption or a concatenated object-list sentence — both were tried and
-  rejected (token limit + semantic dilution — see docs/vlm_pipeline_recap.txt
-  §8e for why).
-- **hP/hR** (hierarchical precision/recall): ImageNet + Places only, via BGE
+  rejected (token limit + semantic dilution — see data/llm_reference/vlm_pipeline_recap.txt
+  for why).
+- **hP/hR/hF1** (hierarchical precision/recall/F1): ImageNet + Places only, via BGE
   cross-encoder mapping the ClipMatch-predicted class onto WordNet.
 
 ## Inherited conventions (from the closed-set baseline work)

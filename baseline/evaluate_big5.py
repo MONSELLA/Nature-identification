@@ -6,6 +6,15 @@ classifier, or Paula Feliu's direct multitask model) against the BIG-5
 Twitter dataset, projecting/comparing predictions against BIG-5's OWN
 direct nature/biotic/material annotations.
 
+WHAT IS THIS SCRIPT FOR? All the other baseline/evaluate_*.py scripts test a
+model against a STANDARD benchmark dataset (ImageNet/COCO/Places365), each
+with its own native ground truth. This script instead evaluates against the
+BIG-5 project's OWN target domain: real social-media (Twitter) photos, with
+human annotators directly labeling nature/biotic/material for each one. This
+is the real "does this actually work on the images this whole project cares
+about" test — the other scripts mostly probe "how good is this off-the-shelf
+model on its home turf, once its predictions are projected onto our taxonomy."
+
 ------------------------------------------------------------------------------
 HOW THIS DIFFERS FROM evaluate_imagenet.py / evaluate_places.py / evaluate_coco.py
 ------------------------------------------------------------------------------
@@ -101,6 +110,8 @@ import torchvision.transforms as transforms
 from torch.utils.data import Dataset, DataLoader
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 
+# Make both the repo root (for the missing `first_tests` module) and this
+# script's own directory importable — see count_classes.py's comment.
 parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if parent_dir not in sys.path:
     sys.path.insert(0, parent_dir)
@@ -110,6 +121,8 @@ if this_dir not in sys.path:
 
 from first_tests.evaluation import TaxonomyEvaluationPipeline
 
+# Where BIG-5's Twitter images are hosted; downloaded and cached locally on
+# first use (see download_image_if_missing below).
 IMG_BASE_URL = "https://big5.cssh.bsc.es/STATIC/phase1-media/twitter_1_all/scaled/"
 
 
@@ -124,6 +137,10 @@ IMG_BASE_URL = "https://big5.cssh.bsc.es/STATIC/phase1-media/twitter_1_all/scale
 def imagenet_idx_to_wnid(idx):
     """Return the WNID for a given ImageNet-1k class index (0..999), via
     timm.data.ImageNetInfo. Lazily imported and cached on first call."""
+    # `hasattr(fn, "_info")` is a "memoize on the function object itself"
+    # trick: the first call builds and stores `_info` as an attribute
+    # ATTACHED TO THE FUNCTION, so subsequent calls skip straight to using it
+    # instead of re-importing/re-validating timm every single call.
     if not hasattr(imagenet_idx_to_wnid, "_info"):
         try:
             from timm.data import ImageNetInfo
@@ -177,6 +194,9 @@ COCO_TO_WNSYNSET = {
 # -- needed to interpret --model_family places' predictions)
 # ============================================================================
 def load_places365_categories(categories_txt):
+    """Parse categories_places365.txt into an id-ordered list of 365 scene
+    names — same logic as evaluate_places.py's identically-named function
+    (see there for a fully-commented line-by-line walkthrough)."""
     if not os.path.isfile(categories_txt):
         raise FileNotFoundError(
             f"Could not find categories_places365.txt at '{categories_txt}'. "
@@ -204,6 +224,8 @@ def load_places365_categories(categories_txt):
 
 
 def _raise_sheet_not_found(excel_path, sheet_name, original_error):
+    """Re-raise a pandas sheet-not-found error with the list of ACTUALLY
+    available sheet names attached, so a typo'd sheet-name flag is easy to spot."""
     try:
         available = pd.ExcelFile(excel_path).sheet_names
     except Exception:
@@ -215,6 +237,9 @@ def _raise_sheet_not_found(excel_path, sheet_name, original_error):
 
 
 def load_places_taxonomy_synsets(excel_path, sheet_name, mit_only=True):
+    """Read the taxonomy's 'sourcekey' sheet and return the set of synsets
+    tagged as coming from Places365 ('MIT') — see evaluate_places.py's
+    identically-named function for the full rationale."""
     try:
         df = pd.read_excel(excel_path, sheet_name=sheet_name, header=0)
     except ValueError as e:
@@ -234,6 +259,9 @@ def load_places_taxonomy_synsets(excel_path, sheet_name, mit_only=True):
 
 
 def load_places_exclusion_set(excel_path, sheet_name):
+    """Read the 'still missing MIT Places' sheet: Places365 classes with no
+    usable taxonomy synset at all — see evaluate_places.py's identically-
+    named function."""
     try:
         df = pd.read_excel(excel_path, sheet_name=sheet_name, header=None)
     except ValueError as e:
@@ -249,6 +277,9 @@ def load_places_exclusion_set(excel_path, sheet_name):
 
 
 def resolve_places_via_wordnet(cls, taxonomy_synsets):
+    """Try a few readings of a Places scene name against WordNet, accepting
+    the first noun sense that's in the restricted MIT-tagged synset set —
+    same heuristic as evaluate_places.py's resolve_via_wordnet."""
     from nltk.corpus import wordnet as wn
     base = cls.replace('/', '_')
     head = cls.split('/')[0]
@@ -268,6 +299,8 @@ def resolve_places_via_wordnet(cls, taxonomy_synsets):
 
 
 def load_places_explicit_mapping(mapping_csv):
+    """Load an authoritative places_name|places_id -> synset override CSV, if
+    the user supplied one, bypassing WordNet heuristics entirely."""
     df = pd.read_csv(mapping_csv)
     cols = [c.lower() for c in df.columns]
     df.columns = cols
@@ -287,6 +320,12 @@ def load_places_explicit_mapping(mapping_csv):
 
 def build_places_id_to_synset(places_categories, excel_path=None, sourcekey_sheet="sourcekey",
                                missing_sheet="still missing MIT Places", mapping_csv=None):
+    """Build {places_category_id: synset_string} either from an explicit
+    --places_mapping_csv (authoritative) or by WordNet reconstruction
+    restricted to MIT-tagged synsets — same logic/priority order as
+    evaluate_places.py's build_places_id_to_synset (see there for the fully
+    commented walkthrough); this copy skips the argparse-object indirection
+    since it's called with plain keyword arguments here instead."""
     explicit = load_places_explicit_mapping(mapping_csv) if mapping_csv else None
     try:
         exclusion = load_places_exclusion_set(excel_path, missing_sheet)
@@ -324,6 +363,9 @@ def build_places_id_to_synset(places_categories, excel_path=None, sourcekey_shee
 
 
 def _replace_head_365(model, model_name):
+    """Swap a torchvision classifier head to 365 outputs — see
+    evaluate_places.py's identically-named function for the full explanation
+    of why each architecture family needs a different attribute path."""
     name = model_name.lower()
     if name.startswith("convnext"):
         in_f = model.classifier[2].in_features
@@ -346,6 +388,9 @@ def _replace_head_365(model, model_name):
 # the model for --model_family coco_q2l)
 # ============================================================================
 def build_q2l_args(config_path, img_size_override=None, num_class_override=None):
+    """Build the Q2L model-construction args (defaults + config.json overlay)
+    — see evaluate_coco.py's identically-named function for the full
+    explanation of why this exact override sequence matters."""
     args = SimpleNamespace(
         dataname='coco14', dataset_dir='/comp_robot/liushilong/data/COCO14/', img_size=448,
         arch='Q2L-TResL_22k-448', output=None, loss='asl', num_class=80, workers=8, batch_size=16,
@@ -367,11 +412,17 @@ def build_q2l_args(config_path, img_size_override=None, num_class_override=None)
 
 
 def clean_state_dict_fallback(state_dict):
+    """Strip a leading 'module.' DataParallel/DDP prefix from checkpoint keys
+    — see evaluate_coco.py's identically-named function."""
     return {k.replace('module.', '', 1) if k.startswith('module.') else k: v
             for k, v in state_dict.items()}
 
 
 def install_inplace_abn_shim_if_missing(verbose=False):
+    """Register a numerically-identical eval-only substitute for the
+    inplace_abn package's InPlaceABNSync (which needs a CUDA build toolchain
+    to install) if the real package isn't available — see evaluate_coco.py's
+    identically-named function for the full rationale."""
     try:
         import inplace_abn  # noqa: F401
         if verbose:
@@ -383,6 +434,10 @@ def install_inplace_abn_shim_if_missing(verbose=False):
     import torch.nn.functional as F
 
     class InPlaceABNSyncShim(nn.BatchNorm2d):
+        """Drop-in stand-in matching InPlaceABNSync's constructor signature
+        and state_dict key names, implemented as plain BatchNorm2d + a
+        manually-applied activation (mathematically identical for
+        inference)."""
         def __init__(self, num_features, eps=1e-5, momentum=0.1, affine=True,
                      activation="leaky_relu", activation_param=0.01, group=None):
             super().__init__(num_features, eps=eps, momentum=momentum, affine=affine)
@@ -416,6 +471,7 @@ def install_inplace_abn_shim_if_missing(verbose=False):
 # other three scripts.
 # ============================================================================
 class CustomBackbone(nn.Module):
+    """Swappable CNN feature-extractor — see evaluate_imagenet.py for full comments."""
     def __init__(self, model_choice='ResNet18'):
         super(CustomBackbone, self).__init__()
         self.model_choice = model_choice
@@ -443,6 +499,8 @@ class CustomBackbone(nn.Module):
 
 
 class MultiTaskModel(nn.Module):
+    """Wraps a CustomBackbone with four independent linear prediction heads
+    sharing the same features — see evaluate_imagenet.py for full comments."""
     def __init__(self, backbone, feature_dim):
         super(MultiTaskModel, self).__init__()
         self.backbone = backbone
@@ -457,6 +515,8 @@ class MultiTaskModel(nn.Module):
                 self.fc_biological(features), self.fc_landscape(features))
 
 
+# Translate the multitask model's own 0/1 class indices into this project's
+# convention — see evaluate_imagenet.py for the full source citation.
 MULTITASK_MATERIALITY_TO_OURS = {0: 1, 1: 0}
 MULTITASK_BIOLOGICAL_TO_OURS = {0: 1, 1: 0}
 
@@ -518,9 +578,19 @@ def build_big5_image_records(gt_csv, media_csv, language):
     Applies the verified correction rule: if nature_visual_N == 'No' but
     materiality/biological are still populated, the stray detail is dropped
     (nature_visual_N is authoritative) -- per user decision.
+
+    WHY "EXPLODE"? Each ROW in the GT csv describes one Twitter POST, which
+    can have UP TO 4 attached images (indices 0-3, each with its own
+    nature/materiality/biological annotation column suffixed _0.._3). This
+    function turns "N posts, each with up to 4 image-slots" into a flat list
+    of "one dict per actual image" — the natural unit for evaluation, since
+    each image gets its own model prediction.
     """
     gt = pd.read_csv(gt_csv)
     media = pd.read_csv(media_csv)
+    # Inner join on platform_id: only posts present in BOTH the GT annotation
+    # table AND the media-file listing survive — a post with no matching
+    # media_files entry has nothing to download/evaluate anyway.
     joined = gt.merge(media, on='platform_id', how='inner')
 
     records = []
@@ -530,6 +600,10 @@ def build_big5_image_records(gt_csv, media_csv, language):
         if pd.isna(media_files_raw):
             continue
         try:
+            # media_files is stored as a STRING that looks like a Python list
+            # literal (e.g. "['123_0.jpg', '123_1.jpg']") — ast.literal_eval
+            # safely parses it back into an actual Python list without using
+            # eval() (which would allow arbitrary code execution).
             filenames = ast.literal_eval(media_files_raw)
         except (ValueError, SyntaxError):
             continue
@@ -580,6 +654,13 @@ def select_diagnostic_sample(all_records, size=20, seed=42):
       nature=1, biotic=0, material=0                      (depicted/illustrated abiotic content)
       nature=1, (biotic is None or material is None)      (annotation gap -- coder said "yes,
                                                              nature" but left a sub-label blank)
+
+    WHY "STRATIFIED" INSTEAD OF PLAIN RANDOM? A purely random 20-image sample
+    from real data (which skews heavily toward one or two common
+    combinations) could easily end up with zero examples of some rarer
+    category, making it useless for eyeballing how a model handles that case.
+    This function instead guarantees a MINIMUM presence from each
+    meaningfully-different ground-truth combination.
     """
     import random
     rnd = random.Random(seed)
@@ -608,6 +689,10 @@ def select_diagnostic_sample(all_records, size=20, seed=42):
         selected.extend(buckets[name][:target])
 
     if len(selected) < size:
+        # Rounding the per-bucket targets can leave the total slightly short
+        # of `size` — top up from whatever's left over across ALL buckets
+        # (beyond each bucket's own target count), shuffled together so the
+        # top-up isn't biased toward any one bucket.
         leftovers = []
         for name, target in targets.items():
             leftovers.extend(buckets[name][target:])
@@ -726,7 +811,16 @@ class Big5ImageDataset(Dataset):
 
 def big5_collate_fn(batch):
     """Drops failed downloads/opens (None entries), stacks images into a
-    tensor, keeps GT/metadata as plain Python lists so None values survive."""
+    tensor, keeps GT/metadata as plain Python lists so None values survive.
+
+    WHY A CUSTOM COLLATE FUNCTION? PyTorch's DEFAULT collate function tries
+    to stack every field of a batch into a tensor — which fails outright on
+    a list containing `None` (a missing biotic/material label) mixed with
+    integers, since there's no tensor dtype that represents "some values are
+    just absent." This custom function only stacks the IMAGE tensors (which
+    are always present and same-shaped) and leaves the GT/metadata fields as
+    plain Python lists, so a None passes through completely unchanged.
+    """
     batch = [b for b in batch if b is not None]
     if not batch:
         return None
@@ -742,6 +836,9 @@ def big5_collate_fn(batch):
 
 
 def parse_args():
+    """Command-line flags: BIG-5 data/cache paths, diagnostic-sample /
+    cross-model comparison bookkeeping, taxonomy path, which model family to
+    run and its family-specific arguments, and generation/testing/logging options."""
     parser = argparse.ArgumentParser(description="Evaluate a model family against the BIG-5 Twitter dataset")
     parser.add_argument("--twitter_en_gt_csv", type=str, default=None, help="table_for_pau_twitter-en-6.csv")
     parser.add_argument("--twitter_es_gt_csv", type=str, default=None, help="table_for_pau_twitter-es-6.csv")
@@ -814,6 +911,9 @@ def parse_args():
     parser.add_argument("--wandb", action="store_true")
     args = parser.parse_args()
 
+    # Each model family has its own conditionally-required arguments (argparse
+    # itself can't express "required only when --model_family is X" directly),
+    # so these are validated manually right after parsing.
     if args.model_family == "imagenet" and not args.model_name:
         parser.error("--model_family imagenet requires --model_name")
     if args.model_family == "places" and not args.places_weights:
@@ -848,6 +948,8 @@ def parse_args():
 
 
 def safe_binary_map(val, positive_str, negative_str):
+    """Safely converts string annotations to binary labels (identical to the
+    other baseline scripts' identically-named function)."""
     if not isinstance(val, str):
         return None
     val = val.strip().lower()
@@ -865,8 +967,13 @@ def compute_binary_metrics(gts, preds):
     valid_gt, valid_pred = [], []
     for gt, pred in zip(gts, preds):
         if gt is None:
+            # No usable ground truth for this instance at all — can't score
+            # it either way, so it's excluded entirely (not penalized).
             continue
         valid_gt.append(gt)
+        # A missing PREDICTION (None — e.g. "no taxonomy match") is instead
+        # scored as the OPPOSITE of ground truth, guaranteeing it counts as
+        # an error rather than being silently dropped from the metric.
         valid_pred.append((1 - gt) if pred is None else pred)
     if not valid_gt:
         return {"accuracy": 0, "precision": 0, "recall": 0, "f1": 0, "support": 0}
@@ -892,6 +999,10 @@ def stratified_eyeball_examples(results, n_per_bucket=3, seed=42):
     def sample_bucket(pool):
         return rng.sample(pool, min(n_per_bucket, len(pool)))
 
+    # Each bucket below corresponds to one cell of the standard binary
+    # confusion matrix (True/False Positive/Negative) for the nature axis,
+    # plus two extra diagnostic categories (no-taxonomy-match, and
+    # biotic/material errors) that the plain confusion matrix doesn't surface.
     buckets = {}
     buckets["Nature: True Positive (gt=Yes, pred=Yes)"] = sample_bucket(
         [r for r in results if r["gt_nature"] == 1 and r["pred_nature"] == 1])
@@ -913,6 +1024,8 @@ def stratified_eyeball_examples(results, n_per_bucket=3, seed=42):
 
 
 def print_eyeball_examples(buckets, images_cache_dir):
+    """Pretty-print each category's sampled examples: local file path, the
+    model's raw output, ground truth, and the mapped/final prediction."""
     for bucket_name, examples in buckets.items():
         print(f"\n--- {bucket_name} ({len(examples)} shown) ---")
         if not examples:
@@ -984,6 +1097,11 @@ def main():
         missing_diag = [d for d in diagnostic_sample if d["filename"] not in already_in]
         if missing_diag:
             # Find the actual full records (with all fields) for the missing diagnostic filenames.
+            # We have to rebuild ALL records again here (rather than reuse the
+            # already-subsetted `all_records`) because the diagnostic sample's
+            # own JSON only stored a SUMMARY (filename/GT), not the full record
+            # dict `Big5ImageDataset` needs — so we look the missing ones back
+            # up by filename from a fresh full build.
             by_filename = {}
             for lang, gt_csv, media_csv in [
                 ("en", args.twitter_en_gt_csv, args.twitter_en_media_csv),
@@ -1143,6 +1261,7 @@ def main():
     with torch.no_grad():
         for batch in tqdm(dataloader, disable=not args.verbose):
             if batch is None:
+                # every single image in this batch failed to download/open
                 continue
             images, gt_nature, gt_biotic, gt_material, languages, platform_ids, image_indices, filenames = batch
             images = images.to(device)
@@ -1191,6 +1310,8 @@ def main():
             elif args.model_family == "coco_q2l":
                 scores = torch.sigmoid(model(images)).cpu().numpy()
                 preds_bin = (scores >= args.threshold).astype(int)
+                # Which of the 80 COCO class COLUMNS are tagged nature/biotic/
+                # material — computed once outside this loop's per-image work.
                 nat_pos_cols = [c for c, lab in enumerate(q2l_col_nature) if lab == 1]
                 bio_pos_cols = [c for c, lab in enumerate(q2l_col_biotic) if lab == 1]
                 mat_pos_cols = [c for c, lab in enumerate(q2l_col_material) if lab == 1]
@@ -1201,7 +1322,13 @@ def main():
                     # "no taxonomy match" for a multi-label detector = it detected
                     # NOTHING at all above threshold across all 80 COCO classes.
                     no_match = bool(row.sum() == 0)
+                    # This image counts as "predicted nature" if ANY of its
+                    # detected (above-threshold) classes is nature-tagged.
                     pred_nat = 1 if (nat_pos_cols and row[nat_pos_cols].sum() > 0) else 0
+                    # Biotic/material only get a real 0/1 answer when the image
+                    # was predicted nature at all; otherwise (pred_nat == 0)
+                    # they correctly stay None ("not applicable"), matching the
+                    # same rule enforced everywhere else in this project.
                     pred_bio = 1 if (bio_pos_cols and row[bio_pos_cols].sum() > 0) else (0 if pred_nat else None)
                     pred_mat = 1 if (mat_pos_cols and row[mat_pos_cols].sum() > 0) else (0 if pred_nat else None)
                     results.append({"language": languages[i], "gt_nature": gt_nature[i], "gt_biotic": gt_biotic[i],
@@ -1237,6 +1364,8 @@ def main():
     # 6. METRICS -- combined + per-language
     # ==========================================
     def metrics_for(subset):
+        """Compute all three axis metrics for one subset of results (either
+        the full combined set, or just one language's results)."""
         return {
             "nature": compute_binary_metrics([r["gt_nature"] for r in subset], [r["pred_nature"] for r in subset]),
             "biotic": compute_binary_metrics([r["gt_biotic"] for r in subset], [r["pred_biotic"] for r in subset]),

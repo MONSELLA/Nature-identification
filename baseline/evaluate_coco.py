@@ -9,6 +9,20 @@ design (multi-label, pycocotools ground truth, per-class + per-image taxonomy
 metrics at threshold 0.5), but Q2L's loading/construction is different enough
 from ML-Decoder's to be worth documenting separately.
 
+WHAT IS "MULTI-LABEL" AND WHY DOES THAT MATTER HERE? Unlike ImageNet/Places
+(where each image belongs to exactly ONE class), a COCO image can contain
+MANY different labeled objects at once (a photo with both a "dog" and a
+"person" and a "bicycle"). So instead of a single predicted class, the model
+outputs an independent yes/no SCORE for EVERY one of the 80 COCO categories —
+this script thresholds each of those 80 scores separately (see step 7/8
+below) rather than picking one "best" class like the ImageNet/Places scripts do.
+
+WHAT IS "Q2L" (Query2Label)? A specific published multi-label image
+classifier architecture built on a transformer: it uses one "query" per class
+(80 learned query vectors) that each attend over the image's visual features
+to decide "is THIS class present in the image?" — hence the extra transformer
+config fields (dim_feedforward, hidden_dim, nheads, etc.) seen below.
+
 ------------------------------------------------------------------------------
 EVERYTHING BELOW WAS VERIFIED AGAINST YOUR ACTUAL FILES, NOT GUESSED
 ------------------------------------------------------------------------------
@@ -94,6 +108,9 @@ import torchvision.transforms as transforms
 from torchvision import models as tv_models
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support, average_precision_score
 
+# Make both the repo root (for the missing `first_tests` module) and this
+# script's own directory importable, the same pattern used throughout
+# baseline/ — see count_classes.py's comment on why this is needed.
 parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if parent_dir not in sys.path:
     sys.path.insert(0, parent_dir)
@@ -111,6 +128,8 @@ from first_tests.evaluation import TaxonomyEvaluationPipeline
 # for the verified label-encoding source citation.
 # ============================================================================
 class CustomBackbone(nn.Module):
+    """Swappable CNN feature-extractor — see the identical class in
+    evaluate_imagenet.py for full comments on its structure."""
     def __init__(self, model_choice='ResNet18'):
         super(CustomBackbone, self).__init__()
         self.model_choice = model_choice
@@ -138,6 +157,8 @@ class CustomBackbone(nn.Module):
 
 
 class MultiTaskModel(nn.Module):
+    """Wraps a CustomBackbone with four independent linear prediction heads
+    sharing the same features — see evaluate_imagenet.py for full comments."""
     def __init__(self, backbone, feature_dim):
         super(MultiTaskModel, self).__init__()
         self.backbone = backbone
@@ -155,6 +176,9 @@ class MultiTaskModel(nn.Module):
         return out_nature, out_materiality, out_biological, out_landscape
 
 
+# Translate the multitask model's own 0/1 class indices into this project's
+# convention (1 = positive: nature/biotic/material) — see evaluate_imagenet.py
+# for the full citation of where these encodings come from.
 MULTITASK_MATERIALITY_TO_OURS = {0: 1, 1: 0}  # their material(0)->our 1, their immaterial(1)->our 0
 MULTITASK_BIOLOGICAL_TO_OURS = {0: 1, 1: 0}   # their biotic(0)->our 1, their abiotic(1)->our 0
 
@@ -162,6 +186,9 @@ MULTITASK_BIOLOGICAL_TO_OURS = {0: 1, 1: 0}   # their biotic(0)->our 1, their ab
 # ============================================================================
 # COCO -> WORDNET SYNSET MAPPING (identical to evaluate_coco.py)
 # ============================================================================
+# Same hand-built COCO-category-id -> WordNet-synset table used throughout
+# this project (see lib/dataset_loader.py's identical COCO_TO_WNSYNSET for the
+# general explanation of why COCO needs this manual mapping at all).
 COCO_TO_WNSYNSET = {
     1: 'person.n.01', 2: 'bicycle.n.01', 3: 'car.n.01', 4: 'motorcycle.n.01', 5: 'airplane.n.01',
     6: 'bus.n.01', 7: 'train.n.01', 8: 'truck.n.01', 9: 'boat.n.01', 10: 'traffic_light.n.01',
@@ -195,6 +222,9 @@ def load_coco_categories(instances_json_path):
 
 
 def build_category_id_to_synset(id_to_name, mapping=None):
+    """Split COCO's category ids into (id -> synset) for those we have a
+    mapping for, and a list of (id, name) pairs we DON'T (so the caller can
+    warn about coverage gaps rather than silently dropping them)."""
     mapping = mapping or COCO_TO_WNSYNSET
     id_to_synset, unmapped_ids = {}, []
     for cid, name in id_to_name.items():
@@ -211,7 +241,15 @@ def build_category_id_to_synset(id_to_name, mapping=None):
 # `for k,v in cfg_dict.items(): setattr(args, k, v)` sequence.
 # ============================================================================
 def build_q2l_args(config_path, img_size_override=None, num_class_override=None):
+    """Build the `args`-like object build_q2l() expects, replicating the
+    ORIGINAL Q2L repo's own "argparse defaults, then overridden by whatever
+    is in the checkpoint's own config JSON" construction sequence — so the
+    model is built with EXACTLY the architecture the checkpoint was trained
+    with, not this script's own guesses."""
     # These are q2l_infer.py's own argparse defaults, transcribed verbatim.
+    # `SimpleNamespace` is just a plain object whose attributes we can freely
+    # get/set (`args.img_size`, etc.) — a lightweight stand-in for a real
+    # argparse Namespace without needing to construct an actual parser.
     args = SimpleNamespace(
         dataname='coco14',
         dataset_dir='/comp_robot/liushilong/data/COCO14/',
@@ -248,6 +286,10 @@ def build_q2l_args(config_path, img_size_override=None, num_class_override=None)
     )
     with open(config_path, 'r') as f:
         cfg_dict = json.load(f)
+    # Overwrite the defaults above with whatever this SPECIFIC checkpoint's
+    # own config.json actually specifies (e.g. dim_feedforward=2048 instead
+    # of the 256 default) — this is what makes the model architecture match
+    # the checkpoint's actual trained shape.
     for k, v in cfg_dict.items():
         setattr(args, k, v)
 
@@ -263,6 +305,11 @@ def clean_state_dict_fallback(state_dict):
     """Minimal local fallback for utils.misc.clean_state_dict, used only if
     importing the repo's own version fails for some reason. Strips a leading
     'module.' prefix, the standard DataParallel/DDP artifact."""
+    # When a model is trained wrapped in `nn.DataParallel` /
+    # `DistributedDataParallel`, PyTorch automatically prefixes every
+    # parameter name in the checkpoint with "module." — loading that
+    # checkpoint into a plain (non-wrapped) model fails unless this prefix is
+    # stripped back off first.
     return {k.replace('module.', '', 1) if k.startswith('module.') else k: v
             for k, v in state_dict.items()}
 
@@ -301,6 +348,12 @@ def install_inplace_abn_shim_if_missing(verbose=False):
     import torch.nn.functional as F
 
     class InPlaceABNSyncShim(nn.BatchNorm2d):
+        """Drop-in replacement matching InPlaceABNSync's constructor
+        signature and state_dict key names, but implemented as plain
+        (unfused) BatchNorm2d + a manually-applied activation function —
+        mathematically identical output for inference, just without the
+        memory-efficient fused CUDA kernel (irrelevant here since we never
+        run a backward pass)."""
         def __init__(self, num_features, eps=1e-5, momentum=0.1, affine=True,
                      activation="leaky_relu", activation_param=0.01, group=None):
             super().__init__(num_features, eps=eps, momentum=momentum, affine=affine)
@@ -308,7 +361,7 @@ def install_inplace_abn_shim_if_missing(verbose=False):
             self._shim_activation_param = activation_param
 
         def forward(self, x):
-            x = super().forward(x)
+            x = super().forward(x)  # plain BatchNorm2d
             act = self._shim_activation
             if act == "leaky_relu":
                 return F.leaky_relu(x, negative_slope=self._shim_activation_param, inplace=True)
@@ -321,6 +374,11 @@ def install_inplace_abn_shim_if_missing(verbose=False):
             else:
                 raise ValueError(f"Unsupported activation '{act}' in InPlaceABNSync shim")
 
+    # Register a completely FAKE "inplace_abn" module in Python's module
+    # cache (sys.modules) — so when the TResNet backbone code later does
+    # `import inplace_abn` / `from inplace_abn import InPlaceABNSync`, Python
+    # finds and uses OUR shim instead of ever needing the real package to be
+    # installed.
     shim_module = types.ModuleType("inplace_abn")
     shim_module.InPlaceABNSync = InPlaceABNSyncShim
     shim_module.InPlaceABN = InPlaceABNSyncShim  # some backbones import this name instead
@@ -334,11 +392,17 @@ def install_inplace_abn_shim_if_missing(verbose=False):
 # GROUND TRUTH DATASET (pycocotools-based, same as evaluate_coco.py)
 # ============================================================================
 class CocoMultiLabelDataset(Dataset):
+    """A PyTorch Dataset yielding (preprocessed_image, multi_hot_label_vector,
+    image_id) triples built directly from a COCO instances_*.json file via
+    pycocotools — the ground truth this whole evaluation is scored against."""
     def __init__(self, images_dir, instances_json, category_ids_sorted, transform):
         from pycocotools.coco import COCO
         self.images_dir = images_dir
         self.coco = COCO(instances_json)
         self.transform = transform
+        # Map each COCO category id to a fixed COLUMN INDEX (0..num_classes-1)
+        # in the multi-hot label vector below — `category_ids_sorted` fixes
+        # this ordering so it stays consistent across the whole run.
         self.cat_id_to_col = {cid: i for i, cid in enumerate(category_ids_sorted)}
         self.num_classes = len(category_ids_sorted)
         self.image_ids = sorted(self.coco.getImgIds())
@@ -353,6 +417,9 @@ class CocoMultiLabelDataset(Dataset):
         image = Image.open(path).convert("RGB")
         if self.transform is not None:
             image = self.transform(image)
+        # A "multi-hot" vector: one float per class, 1.0 if that class is
+        # annotated as present in this image, 0.0 otherwise — as opposed to a
+        # single class INDEX (which only works for single-label datasets).
         target = torch.zeros(self.num_classes, dtype=torch.float32)
         for ann in self.coco.loadAnns(self.coco.getAnnIds(imgIds=img_id)):
             col = self.cat_id_to_col.get(ann["category_id"])
@@ -362,6 +429,8 @@ class CocoMultiLabelDataset(Dataset):
 
 
 def parse_args():
+    """Command-line flags: dataset/taxonomy paths, which model to run (Q2L
+    checkpoint or the multitask direct model), and evaluation/logging options."""
     parser = argparse.ArgumentParser(description="Evaluate Query2Label on Nature Taxonomy (COCO)")
     parser.add_argument("--images_dir", type=str, required=True,
                         help="Path to COCO validation images (e.g. .../coco/images/val2017).")
@@ -405,6 +474,9 @@ def parse_args():
     parser.add_argument("--wandb", action="store_true")
     args = parser.parse_args()
 
+    # These two blocks emulate "conditionally required" arguments (argparse
+    # itself has no clean way to say "required only when --model_type is X"),
+    # checked manually after parsing.
     if args.model_type == "q2l":
         missing = [n for n in ("q2l_repo_path", "q2l_config", "checkpoint_path")
                   if getattr(args, n) is None]
@@ -529,6 +601,11 @@ def main():
         # 4. PREPROCESSING (from get_dataset.py's test_data_transform, verified)
         # ==========================================
         if q2l_args.orid_norm:
+            # "orid_norm" = "original/raw" normalization: mean 0 / std 1 means
+            # this is effectively a NO-OP normalization (pixel values pass
+            # through basically unchanged after ToTensor's [0,1] scaling) —
+            # this specific checkpoint was trained this way, so evaluation
+            # must match it exactly.
             normalize = transforms.Normalize(mean=[0, 0, 0], std=[1, 1, 1])
         else:
             normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
@@ -592,6 +669,10 @@ def main():
         if val == negative_str.lower(): return 0
         return None
 
+    # Build one taxonomy-label COLUMN per COCO category, aligned with the
+    # SAME `ordered_cat_ids` column ordering used by CocoMultiLabelDataset
+    # above (so column i in col_nature/col_biotic/col_material corresponds
+    # exactly to column i of the ground-truth multi-hot vectors).
     col_nature, col_biotic, col_material = [], [], []
     stats = {"nature": 0, "biotic": 0, "abiotic": 0, "material": 0, "immaterial": 0, "unmapped": 0}
     for cid in ordered_cat_ids:
@@ -646,6 +727,11 @@ def main():
     from tqdm import tqdm
     with torch.no_grad():
         if args.model_type == "q2l":
+            # The model outputs raw (unbounded) scores per class ("logits");
+            # sigmoid squashes each independently into a [0,1] probability —
+            # unlike softmax (used for single-label problems), sigmoid does
+            # NOT force the scores to sum to 1, since MULTIPLE classes can be
+            # simultaneously "yes" for one image.
             sigmoid = torch.nn.Sigmoid()
             for images, targets, _img_ids in tqdm(dataloader, disable=not args.verbose):
                 images = images.to(device)
@@ -669,6 +755,8 @@ def main():
 
     all_targets = np.concatenate(all_targets, axis=0)
     if args.model_type == "q2l":
+        # Apply the threshold to every class score independently — each
+        # class becomes an independent binary "present"/"absent" decision.
         all_preds = (all_scores >= args.threshold).astype(int)
 
     # ==========================================
@@ -698,6 +786,9 @@ def main():
         classes COCO happens to contain -- reported honestly as "not
         computable" rather than silently reporting a one-class metric.
         """
+        # Which taxonomy-label COLUMNS (COCO categories) are relevant for
+        # THIS specific axis — e.g. for nature, every column labeled 1;
+        # non-matching/unmapped columns (None/0) are excluded from `cols`.
         cols = [c for c, lab in enumerate(col_labels) if lab == 1]
         if not cols:
             return {"accuracy": 0, "precision": 0, "recall": 0, "f1": 0, "support": 0}
@@ -707,6 +798,9 @@ def main():
         if len(targets_pool) == 0:
             return {"accuracy": 0, "precision": 0, "recall": 0, "f1": 0, "support": 0}
 
+        # Reduce a per-CLASS multi-hot row down to a single per-IMAGE binary
+        # label: "does this image contain ANY of the relevant classes at
+        # all?" — done for both ground truth and predictions the same way.
         gt_any_pos = (targets_pool[:, cols].sum(axis=1) > 0).astype(int)
         pred_any_pos = (preds_pool[:, cols].sum(axis=1) > 0).astype(int)
         if len(set(gt_any_pos.tolist())) < 2:
@@ -733,6 +827,8 @@ def main():
         if not cols:
             return {"accuracy": 0, "precision": 0, "recall": 0, "f1": 0, "support": 0}
 
+        # dtype=object because this list can contain None values mixed with
+        # integers, which a plain numeric numpy array can't represent.
         direct_preds_arr = np.array(direct_preds, dtype=object)
         if restrict_pool is None:
             targets_pool = all_targets
@@ -747,6 +843,9 @@ def main():
         if len(set(gt_any_pos.tolist())) < 2:
             return {"accuracy": 0, "precision": 0, "recall": 0, "f1": 0, "support": 0}
 
+        # A None prediction (model said "not applicable") is scored as the
+        # OPPOSITE of ground truth (`1 - g`), guaranteeing it counts as wrong
+        # rather than being silently dropped or defaulted to a fixed class.
         pred_direct = np.array([1 - g if p is None else p for g, p in zip(gt_any_pos, preds_pool)])
         acc = accuracy_score(gt_any_pos, pred_direct)
         p, r, f1, _ = precision_recall_fscore_support(gt_any_pos, pred_direct, average='binary', zero_division=0)
@@ -760,14 +859,26 @@ def main():
         else np.zeros(all_targets.shape[0], dtype=bool)
 
     if args.model_type == "q2l":
+        # mAP (mean Average Precision) is COCO's own standard threshold-FREE
+        # multi-label metric — computed only over classes that actually have
+        # at least one positive example in this evaluation set (a class with
+        # zero positives has no meaningful precision-recall curve to average).
         valid_cols = [c for c in range(all_targets.shape[1]) if all_targets[:, c].sum() > 0]
         per_class_ap = [average_precision_score(all_targets[:, c], all_scores[:, c]) for c in valid_cols]
         coco_mAP = float(np.mean(per_class_ap)) if per_class_ap else 0.0
 
         def per_class_binary_metrics(col_labels):
+            """Flatten ALL relevant (image, class) pairs into one long list
+            and compute a single binary accuracy/precision/recall/F1 across
+            every one — i.e. "out of every (image, nature-class) pair,
+            how often did the model correctly say present/absent?" This is a
+            DIFFERENT question from per_image_binary_metrics above (which
+            collapses each image down to one yes/no first)."""
             cols = [c for c, lab in enumerate(col_labels) if lab is not None]
             if not cols:
                 return {"accuracy": 0, "precision": 0, "recall": 0, "f1": 0, "support": 0}
+            # `.ravel()` flattens the 2D (images x classes) array into one
+            # long 1D array of individual (image, class) decisions.
             y_true = all_targets[:, cols].astype(int).ravel()
             y_pred = all_preds[:, cols].astype(int).ravel()
             acc = accuracy_score(y_true, y_pred)
