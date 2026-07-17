@@ -33,6 +33,16 @@ Metrics (per CLAUDE.md scoping):
   - ClipMatch + hP/hR/hF1                : ImageNet + Places ONLY (fixed vocab).
   - Diagnostics: extraction-hit rate, WordNet-mapping vs VLM-fallback rate,
     objects/image, parse-failure rate.
+
+HOW TO READ THIS FILE
+This is the biggest, most "top-level" file in the pipeline — it's the actual
+script you run from the command line. It doesn't implement any of the deep
+logic itself (that all lives in src/vlm_pipeline.py, src/evaluation/*, etc.);
+instead it WIRES everything together: parses command-line flags, loads the
+right dataset, calls the VLM pipeline, calls the metric functions, and prints/
+saves the results. If you're trying to understand "what actually happens when
+I run this script", start reading at `main()` near the bottom and work
+backward through phase_infer/phase_score.
 """
 
 import argparse
@@ -62,6 +72,10 @@ def build_system_prompts(nature_path, biotic_path, material_path):
     nature = Path(nature_path).read_text()
     biotic = Path(biotic_path).read_text()
     material = Path(material_path).read_text()
+    # The caption call only needs to know what "nature" looks like in general
+    # (so it can describe the scene without being biased toward a specific
+    # axis); the per-object labeling call needs ALL THREE definitions since it
+    # has to answer nature/biotic/material questions directly.
     caption_system = nature
     label_system = f"{nature}\n\n{biotic}\n\n{material}"
     return caption_system, label_system
@@ -76,7 +90,22 @@ from functools import lru_cache
 @lru_cache(maxsize=None)
 def _synset_lemma_terms(synset_id):
     """Normalized WordNet lemma surface forms for a synset (cached — the same
-    class recurs across thousands of images, so recomputing per image is waste)."""
+    class recurs across thousands of images, so recomputing per image is waste).
+
+    A "lemma" here means a specific word/phrase that WordNet lists as a valid
+    name for a synset — e.g. the synset "dog.n.01" has lemmas like "dog" and
+    "domestic dog" and "Canis familiaris". We collect ALL of them (normalized:
+    lowercased, articles stripped) so that later, when checking whether a VLM
+    extracted "the GT object", any of these equivalent phrasings counts as a
+    match, not just the exact class_name string.
+
+    `@lru_cache` means: the first time this function is called with a
+    particular `synset_id`, it does the real work and REMEMBERS the result;
+    every subsequent call with that same synset_id just returns the
+    remembered answer instantly instead of recomputing it. This matters a lot
+    here because the SAME class (e.g. "dog.n.01") appears across potentially
+    thousands of different images in a dataset like ImageNet.
+    """
     from nltk.corpus import wordnet as wn
     try:
         return frozenset(_normalize_object(l.name().replace("_", " ")) for l in wn.synset(synset_id).lemmas())
@@ -94,7 +123,7 @@ def gt_match_terms(target):
         terms.add(_normalize_object(cn))
     syn = target.get("synset_id")
     if syn:
-        terms |= _synset_lemma_terms(syn)
+        terms |= _synset_lemma_terms(syn)  # `|=` merges the lemma set into `terms`
     return {t for t in terms if t}
 
 
@@ -109,6 +138,10 @@ def find_matching_object(objects, target):
         norm = _normalize_object(obj)
         if norm in terms:
             return i
+        # Also accept a match on just the LAST word of a multi-word extracted
+        # phrase, e.g. extracted "brown golden retriever" matching GT term
+        # "golden retriever"... actually the reverse: extracted "big dog"
+        # matching GT term "dog" via its trailing word.
         if " " in norm and norm.split()[-1] in terms:
             return i
     return None
@@ -119,6 +152,9 @@ def image_gt_nature(targets):
     are explicitly non-nature, None if no target carries a nature label."""
     vals = [t.get("gt_nature") for t in targets if t.get("gt_nature") is not None]
     if not vals:
+        # No target on this image has a usable nature label at all (shouldn't
+        # normally happen, since loaders only keep mapped targets, but this is
+        # a defensive fallback).
         return None
     return any(vals)
 
@@ -126,6 +162,9 @@ def image_gt_nature(targets):
 def image_pred_nature(object_final_labels):
     """Image-level predicted nature: True if ANY extracted object is labeled
     nature. An image with no objects predicts False (no nature found)."""
+    # `any(...)` on an empty list correctly returns False in Python, so an
+    # image with zero extracted objects naturally predicts "no nature found"
+    # without needing a special-case check here.
     return any(bool(o["final_nature"]) for o in object_final_labels)
 
 
@@ -133,6 +172,8 @@ def image_pred_nature(object_final_labels):
 # Metric aggregation
 # =============================================================================
 def _binary_metrics(y_true, y_pred):
+    """Standard accuracy/precision/recall/F1 for one taxonomy axis, given
+    matching lists of true and predicted booleans."""
     from sklearn.metrics import accuracy_score, precision_recall_fscore_support
     if not y_true:
         return {"accuracy": 0.0, "precision": 0.0, "recall": 0.0, "f1": 0.0, "support": 0}
@@ -142,6 +183,8 @@ def _binary_metrics(y_true, y_pred):
 
 
 def _mean(vals):
+    """Average of a list, treating None entries as "not applicable" (skipped
+    rather than counted as zero). Returns 0.0 for an empty/all-None list."""
     vals = [v for v in vals if v is not None]
     return float(sum(vals) / len(vals)) if vals else 0.0
 
@@ -150,9 +193,19 @@ def _mean(vals):
 # PHASE 1 — inference
 # =============================================================================
 def phase_infer(args):
+    """
+    Runs the ENTIRE inference half of the pipeline: load the dataset and the
+    taxonomy graph, create the VLM, run caption -> extraction -> labeling over
+    every image (src.vlm_pipeline.run_inference), and stream the results out to
+    --responses_file as they're produced (rather than holding them all in
+    memory). Returns the created `vlm` object so --stage all can explicitly
+    release its GPU memory afterward (see unload_vlm below / main()).
+    """
     print(f"🚀 [infer] dataset='{args.dataset}', model='{args.model_family}/{args.model_name}'")
 
     graph = TaxonomyGraph()
+    # --sheet_name may be a sheet NAME (string) or a numeric INDEX (still a
+    # string coming from argparse) — detect which and convert accordingly.
     sheet = args.sheet_name if not str(args.sheet_name).isdigit() else int(args.sheet_name)
     graph.load_excel(args.excel_path, sheet_name=sheet)
 
@@ -168,11 +221,18 @@ def phase_infer(args):
         print("No dataset instances loaded — exiting."); sys.exit(1)
 
     if args.max_samples is not None:
+        # Fixed seed so re-running with the same --max_samples always samples
+        # the SAME subset — keeps results comparable across runs/models.
         random.seed(42)
         dataset = random.sample(dataset, min(args.max_samples, len(dataset)))
 
     # Authoritative vocabularies (Phase 1 has the data access) — stored in the
     # artifact header so Phase 2 needs no dataset files.
+    # These two vocabularies need the SAME dataset-specific file paths (e.g.
+    # ImageNet's data_dir, Places' categories file) that we just used to load
+    # the dataset itself — we compute them here (while we still have those
+    # paths handy) and save them straight into the output artifact's header,
+    # so Phase 2 (scoring) never needs to re-open any dataset files at all.
     vocab_kwargs = dict(data_dir=args.data_dir, places_categories_txt=args.places_categories_txt,
                         excel_path=args.excel_path)
     mapping_vocab = build_mapping_vocab(args.dataset, **vocab_kwargs)
@@ -181,6 +241,8 @@ def phase_infer(args):
     caption_system, label_system = build_system_prompts(
         args.nature_definition_path, args.biotic_definition_path, args.material_definition_path)
 
+    # Different VLM backends need different constructor keyword arguments —
+    # see src/models/vlm_models.py for the classes behind each family name.
     if args.model_family in VLLM_FAMILIES:
         vlm_kwargs = {"dtype": args.dtype, "gpu_memory_utilization": args.gpu_memory_utilization,
                       "trust_remote_code": args.trust_remote_code}
@@ -190,6 +252,11 @@ def phase_infer(args):
         vlm_kwargs = {"device": args.device, "dtype": args.dtype}
     vlm = create_vlm(args.model_family, args.model_name, **vlm_kwargs)
 
+    # The very first line written to the output file is a special "header"
+    # record (distinguished by record_type="header") carrying metadata that
+    # applies to the WHOLE run, not any single image — Phase 2 reads this
+    # first to know which dataset/model produced the file and to get the
+    # vocabularies computed above.
     header = {
         "record_type": "header",
         "dataset": args.dataset,
@@ -201,6 +268,11 @@ def phase_infer(args):
     out_path = Path(args.responses_file)
     t0 = time.time()
     n = 0
+    # "JSON Lines" format: one complete, independent JSON object per line of
+    # the file (as opposed to one giant JSON array for the whole file). This
+    # lets us write results incrementally as they're produced (streaming,
+    # rather than building one huge in-memory list and writing it all at the
+    # end) and lets Phase 2 read them back one line at a time too.
     with open(out_path, "w") as f:
         f.write(json.dumps(header) + "\n")
         for rec in run_inference(
@@ -222,6 +294,9 @@ def phase_infer(args):
 # PHASE 2 — scoring
 # =============================================================================
 def _read_artifact(path):
+    """Read back a JSON-Lines artifact written by phase_infer: the first
+    header-tagged line, plus every per-image record line, as plain Python
+    dicts."""
     header = None
     records = []
     with open(path) as f:
@@ -240,11 +315,20 @@ def _read_artifact(path):
 
 
 def phase_score(args):
+    """
+    Runs the ENTIRE scoring half of the pipeline: read the artifact written by
+    phase_infer, resolve each object's final hybrid label (WordNet + VLM), run
+    every CLIP-based metric, aggregate per-axis accuracy/precision/recall/F1,
+    print a human-readable summary, and write the results to --output_file
+    (JSON summary) plus a per-object CSV.
+    """
     print(f"📊 [score] reading {args.responses_file}")
     header, records = _read_artifact(args.responses_file)
     dataset = header["dataset"]
     mapping_vocab = header.get("mapping_vocab") or {}
     candidate_vocab = header.get("candidate_vocab")
+    # ClipMatch/hP/hR only make sense for datasets with a fixed candidate
+    # class list (ImageNet/Places) — see clip_metrics.CLIPMATCH_DATASETS.
     run_clipmatch = dataset in clip_metrics.CLIPMATCH_DATASETS and candidate_vocab
     if args.max_samples is not None:
         records = records[: args.max_samples]
@@ -253,10 +337,18 @@ def phase_score(args):
     sheet = args.sheet_name if not str(args.sheet_name).isdigit() else int(args.sheet_name)
     graph.load_excel(args.excel_path, sheet_name=sheet)
 
+    # This is where CLIP actually gets loaded onto the GPU — by this point in
+    # `--stage all`, the VLM has already been unloaded (see main() below), so
+    # CLIP has the GPU memory to itself.
     scorer = clip_metrics.CLIPScorer(model_name=args.clip_model, pretrained=args.clip_pretrained,
                                      device=args.device, batch_size=args.clip_batch_size)
 
     # ---- Resolve hybrid labels for every object, up front (needs the graph) ----
+    # `resolve_hybrid_label` combines each object's raw VLM answer with a
+    # WordNet lookup (see src/vlm_pipeline.py) to get its FINAL nature/biotic/
+    # material labels. We do this once for every object across every image up
+    # front, storing the results as `rec["object_finals"]`, so the big scoring
+    # loop below can just read them off rather than recomputing per metric.
     for rec in records:
         finals = []
         for obj, lab in zip(rec["objects"], rec["object_labels"]):
@@ -264,25 +356,41 @@ def phase_score(args):
         rec["object_finals"] = finals
 
     # ---- CLIP encodings (batched across ALL images for efficiency) ----
+    # Rather than encoding one image/caption/object-list at a time inside the
+    # loop below, we batch ALL of them together right now — a small number of
+    # large batched GPU calls is much faster than thousands of tiny ones.
     image_paths = [r["image_path"] for r in records]
     captions = [r["caption"] for r in records]
     image_embs = scorer.encode_images(image_paths)
     caption_embs = scorer.encode_text(captions, warn_truncation=True)
 
     # Flatten object texts with per-image offsets, encode once.
+    # Every image has a DIFFERENT number of extracted objects, so we can't
+    # just make a fixed-size 2D array. Instead we lay every object phrase
+    # (across every image) end-to-end into one long flat list, and remember
+    # where each image's own objects START in that list (`offsets`) — so
+    # `flat_texts[offsets[i]:offsets[i+1]]` gives back exactly image i's
+    # object texts, while still letting us encode everything in ONE batched
+    # call to the CLIP text encoder.
     flat_texts, offsets = [], []
     for r in records:
         offsets.append(len(flat_texts))
         flat_texts.extend(clip_metrics.object_texts(r["objects"]))
-    offsets.append(len(flat_texts))
+    offsets.append(len(flat_texts))  # sentinel end-offset for the last image
     obj_embs_all = scorer.encode_text(flat_texts) if flat_texts else None
 
     candidate_embs = None
     if run_clipmatch:
+        # Also encode the FIXED candidate-class vocabulary just once (rather
+        # than per image) — every image's ClipMatch score is computed against
+        # this same set of candidate-class embeddings.
         candidate_embs = scorer.encode_text(
             [clip_metrics.OBJECT_TEMPLATE.format(c["class_name"]) for c in candidate_vocab])
 
     # ---- Per-image metric accumulation ----
+    # These lists/counters accumulate results across every image in the
+    # dataset; they get turned into final aggregate numbers (accuracy, mean
+    # scores, etc.) after the loop below finishes.
     nat_true, nat_pred = [], []
     bio_true, bio_pred, mat_true, mat_pred = [], [], [], []
     fclip_vals, objclip_vals = [], []
@@ -292,12 +400,14 @@ def phase_score(args):
     n_map_nature = n_vlm_nature = 0
     clipmatch_top1 = 0
     clipmatch_support = 0
-    flat_rows = []
+    flat_rows = []  # per-object rows for the output CSV
 
     for idx, rec in enumerate(records):
         objs = rec["objects"]
         finals = rec["object_finals"]
         targets = rec.get("targets", [])
+        # Slice this image's own chunk of object embeddings out of the big
+        # flat array we built above, using the offsets we remembered.
         obj_slice = slice(offsets[idx], offsets[idx + 1])
         rec_obj_embs = obj_embs_all[obj_slice] if obj_embs_all is not None else None
 
@@ -328,6 +438,9 @@ def phase_score(args):
             if t.get("gt_nature") is None:
                 continue
             n_gt_targets += 1
+            # Did the model actually EXTRACT (mention) an object matching this
+            # ground-truth target at all? If not, we can't score its
+            # biotic/material prediction (there IS no prediction to compare).
             mi = find_matching_object(objs, t)
             if mi is None:
                 continue
@@ -359,17 +472,29 @@ def phase_score(args):
         if gt_syn:
             clipmatch_support += 1
             if rec_obj_embs is not None and rec_obj_embs.shape[0] > 0:
+                # ClipMatch picks whichever candidate class has the strongest
+                # matching object among everything the model extracted (see
+                # clip_metrics.clipmatch for the full algorithm).
                 _, pred_idx, per_obj_sim = clip_metrics.clipmatch(rec_obj_embs, candidate_embs)
                 if pred_idx >= 0:
                     pred_class_synset = candidate_vocab[pred_idx]["synset_id"]
                     if pred_class_synset == gt_syn:
                         clipmatch_top1 += 1
+                    # Turn the predicted CLASS into a specific WordNet synset
+                    # NODE by picking whichever extracted object phrase best
+                    # represents that prediction (needed for hP/hR below).
                     pred_node = taxonomy_metrics.resolve_to_wordnet(
                         list(per_obj_sim), pred_class_synset, objs)
+            # hP/hR compare the GT synset's ancestor chain against the
+            # predicted node's ancestor chain — computed even when pred_node
+            # is None (a total miss), giving all-zero scores in that case.
             hier = taxonomy_metrics.compute_hierarchical_metrics(graph, gt_syn, pred_node)
             hp_vals.append(hier["hp"]); hr_vals.append(hier["hr"]); hf1_vals.append(hier["hf1"])
 
         # per-object CSV rows
+        # Build one output row per extracted object, capturing both the raw
+        # VLM answer and the final resolved label — handy for manually
+        # spot-checking individual predictions later.
         for obj, lab, fin in zip(objs, rec["object_labels"], finals):
             flat_rows.append({
                 "image_path": rec["image_path"], "caption": rec["caption"], "object": obj,
@@ -428,6 +553,7 @@ def phase_score(args):
 
 
 def _print_summary(s, run_clipmatch):
+    """Pretty-print the final metrics summary to the console."""
     d = s["diagnostics"]
     print("\n" + "=" * 60)
     print(f"📊 VLM PIPELINE: {s['model']} on {s['dataset'].upper()}  ({s['n_images']} images)")
@@ -451,6 +577,8 @@ def _print_summary(s, run_clipmatch):
 
 
 def _log_wandb(args, summary, run_clipmatch):
+    """Push the final summary metrics to Weights & Biases for tracking/
+    comparison across runs, if --wandb was passed."""
     import wandb
     wandb.init(entity="paumonserrat03-universitat-aut-noma-de-barcelona", project="TFM_VLM",
                config=vars(args), name=f"vlm_pipeline_{summary['dataset']}_{summary['model']}".replace("/", "_"))
@@ -474,6 +602,10 @@ def _log_wandb(args, summary, run_clipmatch):
 # CLI
 # =============================================================================
 def parse_args():
+    """Define every command-line flag this script accepts. Grouped into:
+    stage/dataset selection, taxonomy/context files, per-dataset paths, VLM
+    settings (only used by --stage infer/all), CLIP settings (only used by
+    --stage score/all), and shared output options."""
     p = argparse.ArgumentParser(description="Two-phase baseline VLM pipeline (infer -> score).")
     p.add_argument("--stage", choices=["all", "infer", "score"], default="all",
                    help="'all' (default) runs the full end-to-end pipeline in one process, "
@@ -526,6 +658,10 @@ def parse_args():
 
     args = p.parse_args()
     if args.stage in ("infer", "all"):
+        # These two flags are only conditionally required (argparse can't
+        # express "required unless --stage is score" declaratively), so we
+        # check manually here and raise the same kind of clean CLI error
+        # argparse itself would produce.
         if not args.model_family or not args.model_name:
             p.error("--model_family and --model_name are required for the infer stage.")
     return args

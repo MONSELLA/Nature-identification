@@ -8,6 +8,13 @@ and W&B logging are intentionally kept identical. The ONLY conceptually differen
 part is the class->taxonomy mapping, because Places365 gives us category ids and
 scene names instead of WordNet ids.
 
+WHAT IS PLACES365? A dataset of photos labeled by SCENE type (365 categories
+like "beach", "kitchen", "forest_path") rather than by object — so this
+script is about evaluating whether a scene classifier's predicted scene
+category, projected onto the BIG-5 taxonomy, agrees with the true scene's
+taxonomy label (e.g. is a "forest_path" photo's prediction also correctly
+"nature/biotic"?).
+
 ------------------------------------------------------------------------------
 IMPORTANT NOTES ON THE PLACES -> WORDNET MAPPING
 ------------------------------------------------------------------------------
@@ -98,6 +105,9 @@ from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 import wandb
 
 # Get the absolute path of the directory one level up and add it to sys.path
+# (so the `first_tests.evaluation` import below can be found — see
+# count_classes.py's comment; that module is not present in the current repo
+# tree, so this script cannot currently run as-is.)
 parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if parent_dir not in sys.path:
     sys.path.insert(0, parent_dir)
@@ -114,6 +124,8 @@ from first_tests.evaluation import TaxonomyEvaluationPipeline
 # models/multitask_model.py, with the same weights=None change (harmless,
 # since load_state_dict(strict=True) overwrites every weight anyway).
 class CustomBackbone(nn.Module):
+    """Swappable CNN feature-extractor — see the identical class in
+    evaluate_imagenet.py for full comments."""
     def __init__(self, model_choice='ResNet18'):
         super(CustomBackbone, self).__init__()
         self.model_choice = model_choice
@@ -141,6 +153,8 @@ class CustomBackbone(nn.Module):
 
 
 class MultiTaskModel(nn.Module):
+    """Wraps a CustomBackbone with four independent linear prediction heads
+    sharing the same features — see evaluate_imagenet.py for full comments."""
     def __init__(self, backbone, feature_dim):
         super(MultiTaskModel, self).__init__()
         self.backbone = backbone
@@ -196,6 +210,9 @@ def load_places365_categories(categories_txt):
             if not line:
                 continue
             try:
+                # rsplit(" ", 1) splits from the right, at most once, so the
+                # trailing numeric id is isolated even if the category name
+                # itself (unusually) contained a space.
                 path, idx_str = line.rsplit(" ", 1)
                 idx = int(idx_str)
             except ValueError:
@@ -210,6 +227,9 @@ def load_places365_categories(categories_txt):
                 name = path.lstrip("/")
             id_to_name[idx] = name
 
+    # Sanity check: Places365 should have EXACTLY ids 0 through 364, no more,
+    # no fewer — catches a truncated/corrupted/wrong file early with a clear
+    # error rather than silently proceeding with a partial category list.
     if set(id_to_name.keys()) != set(range(365)):
         missing_ids = sorted(set(range(365)) - set(id_to_name.keys()))
         extra_ids = sorted(set(id_to_name.keys()) - set(range(365)))
@@ -223,6 +243,8 @@ def load_places365_categories(categories_txt):
 
 
 def parse_args():
+    """Command-line flags: dataset/taxonomy/mapping paths, which model to run,
+    mapping-strictness behavior, and generation/testing/logging options."""
     parser = argparse.ArgumentParser(description="Evaluate Closed-Set Models on Nature Taxonomy (Places365)")
     parser.add_argument("--data_dir", type=str, required=True,
                         help="Path to Places365 validation split (val_formatted; subfolders named 0..364).")
@@ -359,6 +381,9 @@ def load_exclusion_set(excel_path, sheet_name):
 
 
 def _raise_sheet_not_found(excel_path, sheet_name, original_error):
+    """Turn a raw pandas "sheet not found" error into a more actionable
+    message that also LISTS the sheets that actually exist in the file, so a
+    typo'd --sourcekey_sheet/--missing_sheet flag is easy to fix."""
     try:
         available = pd.ExcelFile(excel_path).sheet_names
     except Exception:
@@ -377,7 +402,13 @@ def load_explicit_mapping(mapping_csv):
     cols = [c.lower() for c in df.columns]
     df.columns = cols
     # find the synset column
+    # Heuristically identify which column holds the synset string (by
+    # checking for common naming patterns), falling back to just assuming
+    # it's the LAST column if none of those keywords match.
     syn_col = next((c for c in cols if 'synset' in c or 'wordnet' in c or 'wnid' in c), cols[-1])
+    # Every OTHER column is treated as a possible "key" to look up by (e.g.
+    # both a places_name column and a places_id column, if both are present)
+    # so the caller can find a mapping entry using either.
     key_cols = [c for c in cols if c != syn_col]
     mapping = {}
     for _, row in df.iterrows():
@@ -396,6 +427,11 @@ def resolve_via_wordnet(cls, taxonomy_synsets):
     Returns (synset_str or None, candidate_used or None).
     Conservative: only accepts a synset the taxonomy actually contains."""
     from nltk.corpus import wordnet as wn
+    # Try a few different readings of the Places category name: the whole
+    # name with '/' turned into '_' (WordNet's multi-word convention), just
+    # its first segment, and (if applicable) just its LAST segment (e.g.
+    # "desert/sand" -> try "sand" too, since the qualifier after the slash is
+    # sometimes the more specific/relevant word).
     base = cls.replace('/', '_')
     head = cls.split('/')[0]
     candidates = [base, head]
@@ -459,6 +495,8 @@ def build_places_id_to_synset(args, places_categories):
 
     for cid, name in enumerate(places_categories):
         if explicit is not None:
+            # Try looking the class up by NAME first, then by its numeric id
+            # as a string — whichever key format the user's CSV actually used.
             syn = explicit.get(name) or explicit.get(str(cid))
             if syn:
                 id_to_synset[cid] = syn
@@ -510,6 +548,9 @@ def main():
     # ==========================================
     categories_txt = args.places_categories_txt
     if categories_txt is None:
+        # Default assumption: categories_places365.txt lives one directory
+        # ABOVE the val_formatted image folder (a common Places365 download
+        # layout) — only used if the user didn't explicitly pass a path.
         data_dir_parent = os.path.dirname(os.path.normpath(args.data_dir))
         categories_txt = os.path.join(data_dir_parent, "categories_places365.txt")
     if args.verbose:
@@ -647,6 +688,10 @@ def main():
             print("")
 
     if report["n_unresolved"] and not args.allow_unresolved:
+        # Refuse to silently proceed with unresolved classes by default — the
+        # whole point of the strict resolution logic above is to never GUESS
+        # a synset; if something couldn't be resolved, force the user to
+        # either fix the mapping data or explicitly opt into excluding them.
         print("❌ Refusing to produce a baseline with unresolved classes, because guessing their synset "
               "would silently corrupt the nature/biotic/material metrics.\n"
               "   Fix options:\n"
@@ -707,6 +752,9 @@ def main():
     full_dataset = datasets.ImageFolder(args.data_dir, transform=preprocess)
     # class_to_idx maps folder NAME (a string id "0".."364") -> dataloader index (lexicographic).
     # Build dataloader_idx -> true Places category id (int(name)).
+    # See the module docstring's "IMAGEFOLDER SORTING TRAP" section for why
+    # this conversion is essential: the dataloader's own numeric labels are
+    # NOT the real Places category ids, just an arbitrary string-sorted index.
     idx_to_places_id = {}
     for name, dl_idx in full_dataset.class_to_idx.items():
         try:
@@ -776,6 +824,9 @@ def main():
     # 5. METRIC CALCULATION
     # ==========================================
     def calculate_binary_metrics(gt_list, pred_list, map_dict, task_name):
+        """torchvision mode: both gt/pred are Places CATEGORY IDS, looked up
+        through map_dict to get their taxonomy label — same shape as
+        evaluate_imagenet.py's identically-named function."""
         valid_gts, valid_preds = [], []
         for gt_id, pred_id in zip(gt_list, pred_list):
             mapped_gt = map_dict.get(gt_id)
@@ -923,6 +974,13 @@ def main():
 def _replace_head_365(model, model_name):
     """Swap a torchvision classifier head to 365 outputs, for common architectures
     (convnext_*, swin_*, vit_b_16). Extend as needed for other backbones."""
+    # Every torchvision architecture family names its final classification
+    # layer differently (`.classifier[2]`, `.head`, `.heads.head`, `.fc`) —
+    # this function knows where each family keeps it and replaces just that
+    # final layer with a fresh, randomly-initialized 365-output one (the rest
+    # of the network's pretrained weights are left untouched), matching how
+    # you'd normally adapt an ImageNet-pretrained model to a new class count
+    # before loading Places365-specific trained weights into it.
     import torch.nn as nn
     name = model_name.lower()
     if name.startswith("convnext"):

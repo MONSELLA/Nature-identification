@@ -1,4 +1,13 @@
 #!/usr/bin/env python3
+# WHAT IS THIS SCRIPT? A "closed-set" baseline evaluation — unlike the VLM
+# pipeline (which asks a language model open-ended questions), this script
+# runs a STANDARD image classifier (e.g. a torchvision ConvNeXt or ResNet
+# already trained on the 1000-class ImageNet task) and checks how well its
+# predicted class, PROJECTED onto the BIG-5 taxonomy via WordNet, agrees with
+# the taxonomy label of the TRUE class. It supports two very different kinds
+# of models (see --model_type below): a plain off-the-shelf ImageNet
+# classifier, or a custom "multitask" model (from an external student
+# project) trained to predict nature/biotic/material labels directly.
 import os
 import sys
 import argparse
@@ -16,6 +25,9 @@ import json
 import wandb
 
 # Get the absolute path of the directory one level up and add it to sys.path
+# (so the `first_tests.evaluation` import below can be found — see the
+# matching note in baseline/count_classes.py; that module is not present in
+# the current repo tree, so this script cannot currently run as-is.)
 parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if parent_dir not in sys.path:
     sys.path.insert(0, parent_dir)
@@ -40,6 +52,11 @@ from first_tests.evaluation import TaxonomyEvaluationPipeline
 # strict=True, which overwrites every weight anyway -- so `weights=None` here
 # saves an unnecessary network download and gives an identical final result.
 class CustomBackbone(nn.Module):
+    """A swappable CNN feature-extractor (the "backbone") used inside
+    MultiTaskModel below — turns a raw image into a fixed-length feature
+    vector, with the ORIGINAL classification head replaced by `nn.Identity()`
+    (a no-op layer) since we only want the features, not that model's own
+    class predictions."""
     def __init__(self, model_choice='ResNet18'):
         super(CustomBackbone, self).__init__()
         self.model_choice = model_choice
@@ -63,20 +80,29 @@ class CustomBackbone(nn.Module):
 
     def forward(self, x):
         x = self.backbone(x)
+        # Flatten whatever shape the backbone produces down to a plain
+        # [batch_size, feature_dim] 2D tensor.
         return x.view(x.size(0), -1)
 
 
 class MultiTaskModel(nn.Module):
+    """Wraps a CustomBackbone with FOUR separate linear "heads" — one small
+    extra layer per task, all sharing the same underlying image features.
+    Only the first three heads (nature/materiality/biological) are actually
+    used by this script; `fc_landscape` exists because the original model was
+    trained on a 4th task this evaluation doesn't need."""
     def __init__(self, backbone, feature_dim):
         super(MultiTaskModel, self).__init__()
         self.backbone = backbone
-        self.fc_nature = nn.Linear(feature_dim, 2)
-        self.fc_materiality = nn.Linear(feature_dim, 3)
-        self.fc_biological = nn.Linear(feature_dim, 3)
-        self.fc_landscape = nn.Linear(feature_dim, 8)
+        self.fc_nature = nn.Linear(feature_dim, 2)       # 2 classes: nature yes/no
+        self.fc_materiality = nn.Linear(feature_dim, 3)  # 3 classes: material/immaterial/n-a
+        self.fc_biological = nn.Linear(feature_dim, 3)    # 3 classes: biotic/abiotic/n-a
+        self.fc_landscape = nn.Linear(feature_dim, 8)     # unused by this script
 
     def forward(self, x):
         features = self.backbone(x)
+        # Every head runs on the SAME shared features — this is what "multi-
+        # task" means here: one backbone, several independent prediction heads.
         out_nature = self.fc_nature(features)
         out_materiality = self.fc_materiality(features)
         out_biological = self.fc_biological(features)
@@ -91,11 +117,18 @@ class MultiTaskModel(nn.Module):
 # "nan" (class 2) means the model itself predicts "not applicable" (their
 # convention: undefined when nature=No). We remap 0/1 to our convention and
 # treat 2 as "no usable prediction", same as an ImageNet mapping failure.
+# These lookup dicts translate the multitask model's own class indices (0/1)
+# into THIS project's convention (nature=1/biotic=1/material=1 always means
+# "positive"); class index 2 ("n/a") is intentionally NOT a key here, so
+# `.get(2)` below correctly returns None (no usable prediction) rather than 0.
 MULTITASK_MATERIALITY_TO_OURS = {0: 1, 1: 0}  # their material(0)->our 1, their immaterial(1)->our 0
 MULTITASK_BIOLOGICAL_TO_OURS = {0: 1, 1: 0}   # their biotic(0)->our 1, their abiotic(1)->our 0
 
 
 def parse_args():
+    """Command-line flags: dataset/taxonomy paths, which model to run (and
+    how — torchvision off-the-shelf, or the multitask checkpoint), and
+    generation/testing/logging options."""
     parser = argparse.ArgumentParser(description="Evaluate Closed-Set Models on Nature Taxonomy")
     parser.add_argument("--data_dir", type=str, required=True, help="Path to ImageNet validation split.")
     parser.add_argument("--excel_path", type=str, default="../flat_wordnet_tree_fixed.xlsx", help="Path to taxonomy.")
@@ -123,7 +156,7 @@ def parse_args():
     parser.add_argument("--max_samples", type=int, default=None, help="Limit number of images for testing.")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose logging.")
     parser.add_argument("--wandb", action="store_true", help="Store the results on WandB.")
-    
+
     return parser.parse_args()
 
 def safe_binary_map(val, positive_str, negative_str):
@@ -154,6 +187,11 @@ def main():
     # ==========================================
     if args.model_type == "torchvision":
         if args.verbose: print(f"[INFO] Fetching weights and transforms for {args.model_name}...")
+        # `models.get_model_weights(name).DEFAULT` fetches torchvision's own
+        # recommended pretrained weights for this architecture, and
+        # `weights.transforms()` returns the EXACT image preprocessing
+        # (resize/crop/normalize) those specific weights were trained with —
+        # using any other preprocessing would silently hurt accuracy.
         weights = models.get_model_weights(args.model_name).DEFAULT
         model = models.get_model(args.model_name, weights=weights).to(device)
         model.eval()
@@ -197,37 +235,55 @@ def main():
 
     if args.verbose: print(f"[INFO] Mapping ImageNet directories from {args.data_dir}...")
     full_dataset = datasets.ImageFolder(args.data_dir, transform=preprocess)
-    
+
     # Extract mappings BEFORE applying any subsetting wrappers
+    # torchvision's ImageFolder assigns each class folder an integer index;
+    # this builds the reverse lookup (index -> WordNet id) needed below,
+    # BEFORE we potentially wrap the dataset in a Subset() further down
+    # (Subset only changes which SAMPLES are used, not the class indexing).
     idx_to_wnid = {v: k for k, v in full_dataset.class_to_idx.items()}
 
+    # These three dicts map an ImageNet class INDEX directly to its
+    # taxonomy label (1/0/None) — built once here, then reused for every
+    # image of that class during scoring, rather than re-resolving the
+    # taxonomy for every single image.
     map_nature = {}
     map_biotic = {}
     map_material = {}
     missing_classes = []
-    
+
     stats = {"nature": 0, "biotic": 0, "abiotic": 0, "material": 0, "immaterial": 0, "unmapped": 0}
 
     for idx, wnid in idx_to_wnid.items():
         synset_str = pipeline.get_synset_str_from_wnid(wnid)
         node_attrs = pipeline.get_node_attributes(synset_str)
-        
+
         if not node_attrs:
             stats["unmapped"] += 1
             missing_classes.append(synset_str)
-            
+            # NOTE: unlike lib/dataset_loader.py's get_gt_from_graph (which
+            # explicitly returns None/skips a class entirely when unmapped),
+            # there is no `continue` here — execution falls through to the
+            # lines below with `node_attrs` = {} (empty dict). `{}.get(...)`
+            # returns None for every key, so `map_nature[idx]` ends up set to
+            # 0 (i.e. this unmapped class gets silently counted as
+            # "not nature") rather than being excluded from map_nature
+            # entirely. Worth double-checking against the project's stated
+            # convention of EXCLUDING (not defaulting) unmapped GT classes
+            # before trusting this script's exact numbers.
+
         # 1. Nature (Boolean mapped to 1/0)
         is_nature = node_attrs.get('is_nature')
         map_nature[idx] = 1 if is_nature else 0
         if is_nature: stats["nature"] += 1
-        
+
         # 2. Biotic / Abiotic
         bio_val = node_attrs.get('biotic_abiotic')
         bio_bin = safe_binary_map(bio_val, "biotic", "abiotic")
         map_biotic[idx] = bio_bin
         if bio_bin == 1: stats["biotic"] += 1
         elif bio_bin == 0: stats["abiotic"] += 1
-        
+
         # 3. Material / Immaterial
         mat_val = node_attrs.get('material_immaterial')
         mat_bin = safe_binary_map(mat_val, "material", "immaterial")
@@ -242,7 +298,7 @@ def main():
         print(f"  Material/Immaterial:   {stats['material']} / {stats['immaterial']}")
         print(f"  Classes not in Excel:  {stats['unmapped']}")
         print("--------------------------------------------------------------\n")
-        
+
         if missing_classes:
             print("Missing classes:")
             for c in missing_classes:
@@ -255,6 +311,10 @@ def main():
     if args.max_samples is not None:
         if args.verbose: print(f"⚠️ Restricting execution to a deterministic random subset of {args.max_samples} samples.")
         random.seed(42) # Ensure the same subset across multiple model test runs
+        # `Subset` wraps the full dataset so the DataLoader below only ever
+        # touches these specific (randomly chosen but reproducible) indices,
+        # rather than iterating the entire validation set — much faster for
+        # quick smoke tests.
         subset_indices = random.sample(range(len(full_dataset)), min(args.max_samples, len(full_dataset)))
         dataset_to_use = Subset(full_dataset, subset_indices)
     else:
@@ -272,18 +332,24 @@ def main():
     all_pred_biotic_direct = []          # multitask_direct mode: already-final 1/0/None (biotic=1)
 
     print(f"Running Inference over {len(dataset_to_use)} images...")
-    with torch.no_grad():
+    with torch.no_grad():  # no gradients needed — pure inference, not training
         for images, labels in tqdm(dataloader, disable=not args.verbose):
             images, labels = images.to(device), labels.to(device)
             all_gt_imgnet.extend(labels.cpu().tolist())
 
             if args.model_type == "torchvision":
                 outputs = model(images)
+                # torch.max(outputs, 1) returns (max_value, max_index) along
+                # dimension 1 (the class dimension) — we only need the
+                # predicted class INDEX, hence `_, preds`.
                 _, preds = torch.max(outputs, 1)
                 all_pred_imgnet.extend(preds.cpu().tolist())
 
             else:  # multitask_direct
                 out_nature, out_materiality, out_biological, _out_landscape = model(images)
+                # `.argmax(dim=1)` picks, for each image, whichever of this
+                # head's output classes scored highest — the model's
+                # predicted class index for that specific task.
                 pred_nature = out_nature.argmax(dim=1).cpu().tolist()          # 0/1, matches our convention
                 pred_materiality = out_materiality.argmax(dim=1).cpu().tolist()  # 0/1/2 (their convention)
                 pred_biological = out_biological.argmax(dim=1).cpu().tolist()    # 0/1/2 (their convention)
@@ -300,13 +366,20 @@ def main():
     # 5. METRIC CALCULATION
     # ==========================================
     def calculate_binary_metrics(gt_list, pred_list, map_dict, task_name):
+        """For the 'torchvision' model type: both `gt_list` and `pred_list`
+        are ImageNet CLASS INDICES (not final taxonomy labels yet) — this
+        function looks BOTH up through `map_dict` to get their taxonomy
+        labels before comparing."""
         valid_gts, valid_preds = [], []
-        
+
         for gt_idx, pred_idx in zip(gt_list, pred_list):
             mapped_gt = map_dict.get(gt_idx)
             mapped_pred = map_dict.get(pred_idx)
-            
+
             if mapped_gt is not None:
+                # Only score images whose TRUE class has a usable taxonomy
+                # label — an unmapped GT is excluded entirely (see project
+                # convention), never defaulted.
                 valid_gts.append(mapped_gt)
                 if mapped_pred is None:
                     valid_preds.append(1 - mapped_gt) # Penalize mapping failure
@@ -318,11 +391,11 @@ def main():
 
         acc = accuracy_score(valid_gts, valid_preds)
         p, r, f1, _ = precision_recall_fscore_support(valid_gts, valid_preds, average='binary', zero_division=0)
-        
+
         return {
-            "accuracy": float(acc), 
-            "precision": float(p), 
-            "recall": float(r), 
+            "accuracy": float(acc),
+            "precision": float(p),
+            "recall": float(r),
             "f1": float(f1),
             "support": len(valid_gts)
         }
@@ -340,6 +413,10 @@ def main():
         """
         valid_gts, valid_preds = [], []
         for gt_idx, pred_direct in zip(gt_list, pred_direct_list):
+            # NOTE: unlike calculate_binary_metrics above, `pred_direct` is
+            # ALREADY a final taxonomy label (0/1/None) straight from the
+            # model's own output head — no `map_dict.get(pred_idx)` lookup
+            # needed for the prediction side, only for the ground truth.
             mapped_gt = map_dict.get(gt_idx)
             if mapped_gt is not None:
                 valid_gts.append(mapped_gt)
@@ -358,6 +435,9 @@ def main():
 
     if args.model_type == "torchvision":
         # Standard ImageNet Metrics
+        # These metrics measure raw 1000-way ImageNet classification accuracy
+        # (nothing taxonomy-related yet) — a sanity check that the loaded
+        # model performs as expected before trusting its taxonomy projection.
         imgnet_acc = accuracy_score(all_gt_imgnet, all_pred_imgnet)
         imgnet_p, imgnet_r, imgnet_f1, _ = precision_recall_fscore_support(
             all_gt_imgnet, all_pred_imgnet, average='macro', zero_division=0
@@ -391,19 +471,19 @@ def main():
     else:
         print("--- 1000-Class ImageNet ---")
         print("N/A -- this model predicts nature/materiality/biological directly, not ImageNet classes.")
-    
+
     print(f"\n--- Binary: Nature vs. No Nature (Support: {nature_metrics['support']}) ---")
     print(f"Accuracy:  {nature_metrics['accuracy']:.4f}")
     print(f"Precision: {nature_metrics['precision']:.4f}")
     print(f"Recall:    {nature_metrics['recall']:.4f}")
     print(f"F1 Score:  {nature_metrics['f1']:.4f}")
-    
+
     print(f"\n--- Binary: Biotic vs. Abiotic (Support: {biotic_metrics['support']}) ---")
     print(f"Accuracy:  {biotic_metrics['accuracy']:.4f}")
     print(f"Precision: {biotic_metrics['precision']:.4f}")
     print(f"Recall:    {biotic_metrics['recall']:.4f}")
     print(f"F1 Score:  {biotic_metrics['f1']:.4f}")
-    
+
     print(f"\n--- Binary: Material vs. Immaterial (Support: {material_metrics['support']}) ---")
     print(f"Accuracy:  {material_metrics['accuracy']:.4f}")
     print(f"Precision: {material_metrics['precision']:.4f}")
@@ -415,24 +495,24 @@ def main():
         print("\n🚀 Uploading baseline metrics to Weights & Biases...")
         wandb_log_dict = {
             "Number of missing classes:":stats["unmapped"],
-            
+
             "Imagenet/Accuracy": imgnet_acc,
             "Imagenet/Precision_Macro": imgnet_p,
             "Imagenet/Recall_Macro": imgnet_r,
             "Imagenet/F1_Macro": imgnet_f1,
-            
+
             "Nature/Accuracy": nature_metrics['accuracy'],
             "Nature/Precision": nature_metrics['precision'],
             "Nature/Recall": nature_metrics['recall'],
             "Nature/F1": nature_metrics['f1'],
             "Nature/Support": nature_metrics['support'],
-            
+
             "Biotic/Accuracy": biotic_metrics['accuracy'],
             "Biotic/Precision": biotic_metrics['precision'],
             "Biotic/Recall": biotic_metrics['recall'],
             "Biotic/F1": biotic_metrics['f1'],
             "Biotic/Support": biotic_metrics['support'],
-            
+
             "Material/Accuracy": material_metrics['accuracy'],
             "Material/Precision": material_metrics['precision'],
             "Material/Recall": material_metrics['recall'],
@@ -454,7 +534,7 @@ def main():
     with open(args.output_file, "w") as f:
         json.dump(summary_results, f, indent=4)
     print(f"💾 Results saved to {args.output_file}")
-    
+
     if args.wandb:
         wandb.save(args.output_file)
         wandb.finish()

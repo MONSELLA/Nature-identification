@@ -11,6 +11,13 @@ under this model's own --model_id -- so every model's output (closed-set
 predictions AND this VLM's free-text answers) lives in one file, indexed by
 image filename, exactly like update_comparison_file() in evaluate_big5.py.
 
+WHAT IS THIS SCRIPT FOR? Unlike the main run_vlm_pipeline.py (which produces
+scored metrics), this script is purely QUALITATIVE: it asks a VLM a handful of
+open-ended questions about a small fixed set of images and just SAVES the raw
+text answers for a human to read and compare against the closed-set models'
+predictions on the same images. There's no scoring/metric logic here at all —
+it's meant for eyeballing "does this model's reasoning actually make sense?"
+
 ------------------------------------------------------------------------------
 IMPORTANT: Qwen3.5-0.8B is a genuinely multimodal model -- verified, not
 guessed. Per the official Hugging Face transformers docs: "Qwen3.5 is Qwen's
@@ -74,6 +81,9 @@ import argparse
 import torch
 from transformers import AutoProcessor, AutoModelForImageTextToText
 
+# The fixed set of questions asked about EVERY image in the diagnostic sample
+# (unless the user overrides them with --prompts). Each is independent — see
+# the module docstring's note about no shared conversation history.
 DEFAULT_PROMPTS = [
     "Summarise the background elements in a concise manner.",
     "Summarise the foreground elements in a concise manner.",
@@ -84,6 +94,9 @@ DEFAULT_PROMPTS = [
 
 
 def parse_args():
+    """Parse command-line flags: which fixed sample/comparison files to use,
+    which model to run, which prompts to ask, and how many images to limit to
+    for cheap smoke-testing."""
     parser = argparse.ArgumentParser(
         description="Qualitative VLM evaluation on the fixed BIG-5 diagnostic sample")
     parser.add_argument("--diagnostic_sample_file", type=str, required=True,
@@ -113,6 +126,9 @@ def parse_args():
     args = parser.parse_args()
 
     if args.model_id is None:
+        # Model names often contain "/" (e.g. "Qwen/Qwen3.5-0.8B") which isn't
+        # safe to use as a dict key / filename component in some contexts —
+        # replace with underscore to get a clean default identifier.
         args.model_id = args.model_name_or_path.replace("/", "_")
 
     return args
@@ -120,25 +136,36 @@ def parse_args():
 
 def load_vlm(model_name_or_path):
     """Loading recipe kept EXACTLY as the user's own already-verified-working code."""
+    # AutoProcessor bundles together the image preprocessing AND the text
+    # tokenizer for this specific model family, auto-detected from the model's
+    # own config on the Hub.
     processor = AutoProcessor.from_pretrained(model_name_or_path, trust_remote_code=True)
     if hasattr(processor, "tokenizer") and processor.tokenizer is not None:
+        # Left-padding matters for DECODER-ONLY generation models: when
+        # batching prompts of different lengths, the actual "next token to
+        # generate" must be at the very end of every sequence — left-padding
+        # keeps that alignment (padding goes at the START, not the end).
         processor.tokenizer.padding_side = "left"
     model = AutoModelForImageTextToText.from_pretrained(
         model_name_or_path,
-        torch_dtype=torch.float16,
-        device_map="auto",
-        trust_remote_code=True,
+        torch_dtype=torch.float16,  # half-precision floats: faster, less GPU memory
+        device_map="auto",          # let transformers decide which device(s) to place the model on
+        trust_remote_code=True,     # this model ships custom code (not just standard weights)
     )
-    model.eval()
+    model.eval()  # disable training-only behavior (e.g. dropout)
     return processor, model
 
 
-@torch.no_grad()
+@torch.no_grad()  # no gradient tracking needed — we're only doing inference, not training
 def ask_vlm(processor, model, image_path, prompt, max_new_tokens=256):
     """
     One independent single-turn query: image + ONE question. See module
     docstring for the verified message/generation format.
     """
+    # The "chat message" format modern instruction-tuned VLMs expect: a list
+    # of turns, each with a role and content. Here content is a LIST of typed
+    # blocks (an image block plus a text block) rather than a plain string,
+    # since this is a multimodal message.
     messages = [
         {
             "role": "user",
@@ -148,6 +175,13 @@ def ask_vlm(processor, model, image_path, prompt, max_new_tokens=256):
             ],
         },
     ]
+    # `apply_chat_template` converts this structured message list into the
+    # actual token ids the model expects (inserting the model's own special
+    # formatting tokens around each turn/role), AND loads+preprocesses the
+    # referenced image, all in one call. `add_generation_prompt=True` appends
+    # the special tokens that signal "now it's the assistant's turn to speak"
+    # so the model knows to start generating a response rather than
+    # continuing the user's message.
     inputs = processor.apply_chat_template(
         messages,
         add_generation_prompt=True,
@@ -157,12 +191,17 @@ def ask_vlm(processor, model, image_path, prompt, max_new_tokens=256):
     ).to(model.device)
 
     generated_ids = model.generate(**inputs, max_new_tokens=max_new_tokens)
+    # `model.generate()` returns the FULL sequence (the original input prompt
+    # tokens PLUS the newly generated ones concatenated together) — we only
+    # want the NEW part. This slices off, for each sequence, however many
+    # tokens the corresponding input had (`len(in_ids)`), keeping just
+    # everything generated after that point.
     generated_ids_trimmed = [
         out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs["input_ids"], generated_ids)
     ]
     response = processor.batch_decode(
         generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
-    )[0]
+    )[0]  # [0] because there's only one sequence in this (batch-of-one) call
     return response.strip()
 
 
@@ -177,6 +216,9 @@ def update_comparison_file_with_vlm(comparison_file, diagnostic_sample, vlm_resp
     qualitative output: {"responses": {prompt: response, ...}}.
     """
     if os.path.isfile(comparison_file):
+        # This file may already contain results from OTHER models (closed-set
+        # or previous VLM runs) — load it so we can add to it rather than
+        # clobbering everyone else's data.
         with open(comparison_file, "r") as f:
             comparison = json.load(f)
     else:
@@ -184,6 +226,11 @@ def update_comparison_file_with_vlm(comparison_file, diagnostic_sample, vlm_resp
 
     for d in diagnostic_sample:
         filename = d["filename"]
+        # `.setdefault(filename, {...})` either returns the EXISTING entry
+        # for this filename (if some earlier model run already created it) or
+        # creates and returns a brand-new one with these base fields — either
+        # way, `entry` now safely points at this image's dict to add our
+        # model's results into below.
         entry = comparison.setdefault(filename, {
             "language": d["language"], "gt_nature": d["gt_nature"],
             "gt_biotic": d["gt_biotic"], "gt_material": d["gt_material"],
@@ -191,8 +238,16 @@ def update_comparison_file_with_vlm(comparison_file, diagnostic_sample, vlm_resp
         })
         responses = vlm_responses_by_filename.get(filename)
         if responses is None:
+            # This image was in the diagnostic sample but we never actually
+            # got a response for it this run (e.g. the cached file was
+            # missing) — record that explicitly rather than silently omitting
+            # this model's entry for the image.
             entry["predictions"][model_id] = {"missing_from_this_run": True}
         else:
+            # Overwrites any PREVIOUS entry for this exact model_id on this
+            # image (e.g. from an earlier partial run), while every OTHER
+            # model_id's entry in `entry["predictions"]` is left completely
+            # untouched.
             entry["predictions"][model_id] = {"responses": responses}
 
     with open(comparison_file, "w") as f:
@@ -228,6 +283,9 @@ def main():
         filename = d["filename"]
         local_path = os.path.join(args.images_cache_dir, filename)
         if not os.path.isfile(local_path):
+            # This image is listed in the diagnostic sample but hasn't been
+            # downloaded to the local cache yet — skip it rather than crashing
+            # the whole run over one missing file.
             print(f"⚠️  [{i+1}/{len(diagnostic_sample)}] {local_path} not found in cache -- skipping "
                   f"(was it downloaded by evaluate_big5.py yet?)")
             continue
@@ -238,6 +296,11 @@ def main():
             try:
                 response = ask_vlm(processor, model, local_path, prompt, max_new_tokens=args.max_new_tokens)
             except Exception as e:
+                # A single prompt failing (e.g. an OOM on one particularly
+                # large image) shouldn't abort the entire run — record the
+                # error as the "response" text itself so it's visible in the
+                # final output, and keep going with the remaining
+                # prompts/images.
                 response = f"[ERROR during generation: {e}]"
                 n_errors += 1
                 print(f"⚠️  Generation error for {filename} / '{prompt}': {e}")
@@ -253,6 +316,10 @@ def main():
 
     comparison = update_comparison_file_with_vlm(
         args.comparison_file, diagnostic_sample, vlm_responses_by_filename, args.model_id)
+    # Count how many DISTINCT model_ids appear across every image's
+    # predictions dict, as a quick sanity-check number to print (e.g. "3
+    # models so far" confirms this run's results were correctly merged
+    # alongside previous models' results rather than replacing them).
     n_models = len(set(m for e in comparison.values() for m in e["predictions"]))
     print(f"\n💾 Updated cross-model comparison file: {args.comparison_file} "
           f"(model_id='{args.model_id}', {len(comparison)} images tracked, {n_models} models so far)")

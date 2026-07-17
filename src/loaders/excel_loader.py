@@ -33,6 +33,25 @@ sheet_name="data corrected" — taken directly from evaluate_imagenet.py's
 existing call to load_custom_excel_annotations, so this stays consistent
 with the closed-set scripts. Override via load_excel()'s arguments if your
 copy of the file differs.
+
+BACKGROUND — WHAT ARE WE ACTUALLY BUILDING HERE?
+The BIG-5 researchers hand-annotated an Excel file that says, for certain
+broad WordNet concepts (e.g. "canine.n.02"), whether that concept counts as
+"nature" and whether it's biotic/abiotic. But they obviously couldn't
+hand-label every single one of WordNet's ~80,000+ noun synsets one by one —
+only a manageable number of "anchor" concepts got a direct label.
+
+This module's job is two-fold:
+  1. Build a directed graph (a tree-like structure, technically a DAG —
+     Directed Acyclic Graph) out of WordNet's built-in parent/child
+     relationships ("hypernyms": more general concepts above a given one),
+     so we can walk from any specific synset UP toward more general ones.
+  2. Given ANY WordNet synset (even one that was never directly labeled in
+     the Excel), walk upward through that graph until we hit the nearest
+     ancestor that DOES have a label, and "inherit" that label. E.g. if
+     "golden_retriever.n.01" itself isn't labeled but its ancestor
+     "canine.n.02" is labeled nature=True/biotic, then golden retrievers
+     automatically count as nature/biotic too.
 """
 
 from __future__ import annotations
@@ -46,13 +65,23 @@ import nltk
 import pandas as pd
 from nltk.corpus import wordnet as wn
 
+# Make sure NLTK's WordNet corpus data is actually downloaded on this machine
+# before we try to use it. `wn.synsets("dog")` is just a cheap "does this
+# work" probe; if it raises LookupError (data missing), download it now
+# rather than crashing later mid-pipeline.
 try:
     wn.synsets("dog")
 except LookupError:
     nltk.download("wordnet")
     nltk.download("omw-1.4")
 
+# The single topmost concept in WordNet's entire noun hierarchy — every noun
+# synset eventually has "entity.n.01" as an ancestor if you walk up far enough.
 ROOT_NODE = "entity.n.01"
+# Matches a WordNet synset id string like "golden_retriever.n.01" or
+# "hen-of-the-woods.n.01": word characters/hyphens/apostrophes, a dot, a
+# single part-of-speech letter (n=noun, v=verb, a=adjective, s=adjective
+# satellite, r=adverb), another dot, then a number (the WordNet "sense" index).
 _SYNSET_PATTERN = re.compile(r"([\w\-']+\.[nvasr]\.[0-9]+)")
 
 
@@ -73,6 +102,11 @@ class TaxonomyGraph:
     """
 
     def __init__(self) -> None:
+        # A DiGraph is a graph where edges have a DIRECTION (as opposed to a
+        # plain undirected Graph). We use directed edges pointing
+        # PARENT -> CHILD (see add_synset_and_ancestors below), so that later
+        # we can ask "what are ALL of this node's ancestors" by following
+        # edges backwards, or "what's the nearest labeled ancestor" the same way.
         self.graph = nx.DiGraph()
 
     # -------------------------------------------------------------------
@@ -88,24 +122,46 @@ class TaxonomyGraph:
         child, traversing upward until hitting the ultimate root entity.
         """
         try:
+            # Look up the actual WordNet Synset object from its id string.
             synset = wn.synset(synset_str)
         except Exception:
+            # Not a real/recognized WordNet synset — nothing we can add.
             return
 
         current_node = synset.name()
 
         if current_node == ROOT_NODE:
+            # Base case of the recursion: we've reached the very top of the
+            # hierarchy. Just make sure it exists as a node (it has no
+            # parent, so no edge to add), then stop recursing.
             self.graph.add_node(current_node)
             return
 
+        # "Hypernyms" are WordNet's term for more general parent concepts —
+        # e.g. the hypernym of "golden_retriever.n.01" is "retriever.n.01" (a
+        # broader dog category). Most synsets have exactly one hypernym, but
+        # some have more than one (a concept can belong to multiple broader
+        # categories at once).
         hypernyms = synset.hypernyms()
         if not hypernyms:
+            # Rare edge case: WordNet gave us no hypernym for this synset, but
+            # it's also not the official root. To keep our graph fully
+            # connected (so every node can eventually be traced back to
+            # ROOT_NODE), we force-link it directly to the root ourselves.
             self.graph.add_edge(ROOT_NODE, current_node)
             return
 
         for hypernym in hypernyms:
             parent_node = hypernym.name()
+            # Add a directed edge PARENT -> CHILD (this is what lets us later
+            # walk "upward" from a child by looking at its predecessors).
             self.graph.add_edge(parent_node, current_node)
+            # Recursively make sure the parent's OWN ancestors are in the
+            # graph too, all the way up to the root. Because networkx graphs
+            # silently ignore adding an edge/node that's already there, this
+            # recursion is safe to call repeatedly on synsets we've already
+            # processed — it just won't do any extra work for nodes already
+            # fully wired up.
             self.add_synset_and_ancestors(parent_node)
 
     def load_excel(
@@ -122,6 +178,8 @@ class TaxonomyGraph:
         "Material/immaterial")` call against sheet "data corrected" — override
         if your copy of the file differs.
         """
+        # pandas reads the whole named Excel sheet into a DataFrame (a table),
+        # using the first row as column headers by default.
         df_excel = pd.read_excel(excel_path, sheet_name=sheet_name)
         self._load_annotations(df_excel, bio_col, mat_col)
 
@@ -133,18 +191,36 @@ class TaxonomyGraph:
         as the synset the row annotates. `is_nature` is inferred True iff
         the material/immaterial column is non-empty for that row.
         """
+        # `.iterrows()` walks the spreadsheet one row at a time; `index` is
+        # the pandas row number (0-based) and `row` is that row's data as a
+        # pandas Series (dict-like, keyed by column name).
         for index, row in df_excel.iterrows():
             mat_val = row[mat_col]
             bio_val = row[bio_col]
 
+            # Normalize each annotation cell into either a clean lowercase
+            # string, or None if the cell was blank/NaN. `pd.notna(x)` is
+            # pandas' way of checking "is this NOT a missing value" (Excel
+            # blank cells show up as NaN in pandas).
             incoming_bio = (
                 str(bio_val).strip().lower() if pd.notna(bio_val) and str(bio_val).strip() != "" else None
             )
             incoming_mat = (
                 str(mat_val).strip().lower() if pd.notna(mat_val) and str(mat_val).strip() != "" else None
             )
+            # A row counts as describing a "nature" concept exactly when its
+            # material/immaterial cell was filled in at all — the presence of
+            # that annotation is itself the nature/no-nature signal.
             is_nature = incoming_mat is not None
 
+            # This spreadsheet stores a HIERARCHY PATH across several columns
+            # per row (shallow concept in an early column, progressively more
+            # specific concepts in later columns), with the material/biotic
+            # columns removed from consideration here (`.drop(...)`). We scan
+            # left-to-right and keep overwriting `raw_synset` with each
+            # non-empty cell we see — so by the time we hit the FIRST empty
+            # cell (and `break`), `raw_synset` holds the DEEPEST (most
+            # specific) synset string this row actually specifies.
             raw_synset = None
             hierarchy_data = row.drop(labels=[bio_col, mat_col])
             for val in hierarchy_data:
@@ -153,17 +229,29 @@ class TaxonomyGraph:
                 raw_synset = str(val).strip()
 
             if not raw_synset:
+                # This row had no hierarchy path at all (e.g. a fully blank
+                # row) — nothing to annotate.
                 continue
 
+            # The hierarchy cell might contain extra text around the actual
+            # synset id (e.g. a human-readable label plus the id in
+            # parentheses) — pull out just the part that matches WordNet's
+            # "word.pos.number" synset id pattern.
             match = _SYNSET_PATTERN.search(raw_synset)
             if not match:
                 continue
             synset_str = match.group(1)
 
+            # Was this exact synset already added to the graph by an earlier
+            # row? If so, we're about to potentially OVERWRITE its label —
+            # worth checking below whether the two rows actually agree.
             is_duplicate_entry = synset_str in self.graph
             self.add_synset_and_ancestors(synset_str)
 
             if synset_str not in self.graph:
+                # add_synset_and_ancestors silently does nothing if the
+                # string isn't a real WordNet synset — catch that here and
+                # warn instead of silently losing this row's annotation.
                 print(
                     f"WORDNET ERROR (Excel Row {index + 2}): could not load "
                     f"synset '{synset_str}' into the graph. Skipping annotation."
@@ -171,6 +259,14 @@ class TaxonomyGraph:
                 continue
 
             if is_duplicate_entry:
+                # This synset was already labeled by a PREVIOUS row in the
+                # spreadsheet. If the new row disagrees with what's already
+                # recorded, that's a data-quality problem worth flagging
+                # loudly (rather than silently picking one value) — print a
+                # warning so a human can go check the spreadsheet.
+                # (`index + 2` converts pandas' 0-based row index into the
+                # 1-based Excel row number a human would actually see, plus 1
+                # more for the header row.)
                 existing_bio = self.graph.nodes[synset_str].get("biotic_abiotic")
                 existing_mat = self.graph.nodes[synset_str].get("material_immaterial")
                 excel_row = index + 2
@@ -185,6 +281,12 @@ class TaxonomyGraph:
                         f"material mismatch. Graph has '{existing_mat}', row says '{incoming_mat}'."
                     )
 
+            # Actually record the annotation as attributes ON the graph node
+            # (networkx lets you attach arbitrary key/value data to any node —
+            # `self.graph.nodes[synset_str]` is a dict-like view of that
+            # node's attributes). `is_nature` is always (re)written; the
+            # biotic/material fields are only written when this row actually
+            # provided a value, so we never overwrite a real label with a blank.
             self.graph.nodes[synset_str]["is_nature"] = is_nature
             if incoming_bio:
                 self.graph.nodes[synset_str]["biotic_abiotic"] = incoming_bio
@@ -215,6 +317,10 @@ class TaxonomyGraph:
         it, per project convention.
         """
         if synset_str not in self.graph:
+            # We might be asked about a synset that was never mentioned in
+            # the Excel at all (e.g. a specific ImageNet leaf class). As long
+            # as it's a real WordNet synset, add it (and its ancestor chain)
+            # to the graph on the fly so we can still search upward from it.
             try:
                 wn.synset(synset_str)
                 self.add_synset_and_ancestors(synset_str)
@@ -223,22 +329,38 @@ class TaxonomyGraph:
         if synset_str not in self.graph:
             return None
 
+        # Breadth-first search (BFS) walking UPWARD through the hierarchy:
+        # start at `synset_str` itself (0 hops away from itself), then visit
+        # its parents (1 hop), then grandparents (2 hops), etc., stopping as
+        # soon as we find a node that carries an explicit "is_nature" label.
+        # BFS (rather than depth-first) guarantees we find the CLOSEST
+        # labeled ancestor first, since we always process all nodes at
+        # distance N before moving on to distance N+1.
         visited = {synset_str}
         queue = deque([(synset_str, 0)])
         while queue:
             node, hops = queue.popleft()
             attrs = self.graph.nodes[node]
             if "is_nature" in attrs:
+                # Found the nearest labeled ancestor (or the node itself, if
+                # it happened to be directly labeled) — return its label,
+                # tagged with which node it actually came from and how many
+                # hops away that was (useful for diagnostics/debugging).
                 return {
                     "resolved_from_node": node,
                     "hops": hops,
                     "is_nature": attrs["is_nature"],
                     "biotic_abiotic": attrs.get("biotic_abiotic"),
                 }
+            # `predecessors(node)` gives the nodes with an edge POINTING INTO
+            # `node` — since our edges run parent->child, a node's
+            # predecessors are exactly its parents (more general concepts).
             for parent in self.graph.predecessors(node):
                 if parent not in visited:
                     visited.add(parent)
                     queue.append((parent, hops + 1))
+        # Walked all the way up without ever finding a labeled node — this
+        # synset has no connection at all to anything the Excel annotated.
         return None
 
     def get_mapped_classes(
@@ -256,6 +378,8 @@ class TaxonomyGraph:
         for class_name, synset_id in class_synset_pairs:
             labels = self.resolve_labels(synset_id)
             if labels is None:
+                # This class couldn't be traced to any labeled ancestor at
+                # all — skip it entirely rather than guessing a label.
                 continue
             mapped.append(
                 {
