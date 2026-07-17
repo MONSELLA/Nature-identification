@@ -35,6 +35,7 @@ import wandb
 from src.loaders.excel_loader import TaxonomyGraph
 from src.models.vlm_models import MODEL_REGISTRY, create_vlm
 from src.loaders.dataset_loader import load_dataset
+from src.results_store import update_results_store
 # TaxonomyResponse + build_classification_prompt live in prompts.py so this
 # calibration eval and the VLM pipeline's fallback path share the EXACT same
 # prompt and schema (they cannot drift — same imported objects).
@@ -88,7 +89,9 @@ def parse_args():
     parser.add_argument("--biotic_definition_path", type=str, default="/home/pmonserrat/code/data/big5_taxonomy/big5_biotic_definition.txt")
     parser.add_argument("--material_definition_path", type=str, default="/home/pmonserrat/code/data/big5_taxonomy/big5_material_definition.txt")
 
-    parser.add_argument("--output_file", type=str, default="taxonomy_calibration_results.json")
+    parser.add_argument("--output_file", type=str, default="taxonomy_calibration_results.json",
+                        help="Results store JSON, keyed by dataset then model name (updated in "
+                             "place — a rerun of the same model overwrites its entry).")
     parser.add_argument("--max_samples", type=int, default=None, help="Limit number of evaluations.")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose logging.")
     parser.add_argument("--wandb", action="store_true", help="Store the results on WandB.")
@@ -386,7 +389,7 @@ def main():
     }
 
     output_path = Path(args.output_file)
-    with open(output_path, "w") as f: json.dump(summary_results, f, indent=4)
+    update_results_store(output_path, dataset=args.dataset, model=model_label, metrics=summary_results)
     with open(output_path.with_name(output_path.stem + "_predictions.csv"), "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=list(flat_rows[0].keys()))
         writer.writeheader()

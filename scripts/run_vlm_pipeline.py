@@ -59,6 +59,7 @@ from src.loaders.dataset_loader import load_dataset, get_candidate_vocab, build_
 from src.models.vlm_models import MODEL_REGISTRY, VLLM_FAMILIES, create_vlm, unload_vlm
 from src.vlm_pipeline import run_inference, resolve_hybrid_label, normalize_objects, _normalize_object
 from src.evaluation import clip_metrics
+from src.results_store import update_results_store
 
 
 # =============================================================================
@@ -539,8 +540,7 @@ def phase_score(args):
     _print_summary(summary, run_clipmatch)
 
     out_path = Path(args.output_file)
-    with open(out_path, "w") as f:
-        json.dump(summary, f, indent=4)
+    update_results_store(out_path, dataset=dataset, model=header.get("model"), metrics=summary)
     if flat_rows:
         csv_path = out_path.with_name(out_path.stem + "_predictions.csv")
         with open(csv_path, "w", newline="") as f:
@@ -651,7 +651,9 @@ def parse_args():
     p.add_argument("--clip_batch_size", type=int, default=64)
 
     # shared
-    p.add_argument("--output_file", type=str, default="vlm_pipeline_results.json")
+    p.add_argument("--output_file", type=str, default="vlm_pipeline_results.json",
+                   help="Results store JSON, keyed by dataset then model name (updated in place — "
+                        "a rerun of the same model overwrites its entry).")
     p.add_argument("--max_samples", type=int, default=None)
     p.add_argument("--verbose", action="store_true")
     p.add_argument("--wandb", action="store_true")
