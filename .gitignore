@@ -6,5 +6,8 @@ temporal.ipynb
 #IDE
 .vscode/
 
+#To avoid uploading Slurm launchers
+*.sh
+
 # Python chache
 __pycache__/
