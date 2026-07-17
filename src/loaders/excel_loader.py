@@ -8,11 +8,16 @@ loading annotations row-by-row) is ported directly from
 synsets the same way and never silently drift apart.
 
 What this module ADDS on top of evaluation.py's graph builder:
-  - `resolve_labels()`: nearest-labeled-ancestor lookup. The Excel only
-    labels certain nodes; therefore, some other classes are NOT themselves
-    labeled and can inherit their nature/biotic/abiotic label from the
-    nearest labeled ancestor above them. This is the automatic-propagation
-    step described in the project's SOTA writeup.
+  - `resolve_labels()`: nearest-labeled-node lookup, searching in BOTH
+    directions (ancestors AND descendants). Almost all COCO/ImageNet/
+    Places365 target classes ARE directly labeled in the Excel already —
+    this exists for the exceptions: a synset with no direct label (e.g. a
+    broad concept like "canine.n.02" that was never itself annotated) can
+    still resolve its taxonomy label by finding the nearest labeled node
+    anywhere nearby in the graph, whether that's an ancestor (more general)
+    or a descendant (more specific, e.g. "dog.n.01") — bounded by a
+    `max_hops` search radius so the lookup stays cheap and doesn't wander
+    arbitrarily far from the query synset.
   - `get_mapped_classes()`: filters a dataset's (class_name, synset_id)
     list down to only the classes that resolve to a definitive label — the
     "mapped" subset. Per project convention, unmapped classes are dropped
@@ -34,23 +39,29 @@ with the closed-set scripts. Override via load_excel()'s arguments if your
 copy of the file differs.
 
 BACKGROUND — WHAT ARE WE ACTUALLY BUILDING HERE?
-The BIG-5 researchers hand-annotated an Excel file that says, for certain
-WordNet concepts (e.g. "canine.n.02"), whether that concept counts as
-"nature" and whether it's biotic/abiotic. But they obviously couldn't
-hand-label every single one of WordNet's ~80,000+ noun synsets one by one —
-only almost all target classes of COCO, ImageNet and Places365 datasets.
+The BIG-5 researchers hand-annotated an Excel file that directly labels
+almost all of the actual target classes from COCO, ImageNet, and Places365
+— for each one, whether it counts as "nature" and whether it's
+biotic/abiotic. A smaller number of classes have no direct label of their
+own (e.g. a broad concept like "canine.n.02" might not be annotated even
+though a more specific descendant like "dog.n.01" is, because "dog.n.01"
+was annotated directly as one of the actual target classes).
 
 This module's job is two-fold:
   1. Build a directed graph (a tree-like structure, technically a DAG —
      Directed Acyclic Graph) out of WordNet's built-in parent/child
      relationships ("hypernyms": more general concepts above a given one),
-     so we can walk from any specific synset UP toward more general ones.
+     so we can walk from any specific synset both UP toward more general
+     ones and DOWN toward more specific ones.
   2. Given ANY WordNet synset (even one that was never directly labeled in
-     the Excel), walk upward through that graph until we hit the nearest
-     ancestor that DOES have a label, and "inherit" that label. E.g. if
-     "golden_retriever.n.01" itself isn't labeled but its ancestor
-     "canine.n.02" is labeled nature=True/biotic, then golden retrievers
-     automatically count as nature/biotic too.
+     the Excel), search outward through that graph — ancestors AND
+     descendants — until we hit the nearest node that DOES have a label,
+     and "inherit" that label. E.g. if "canine.n.02" itself isn't labeled
+     but its descendant "dog.n.01" is labeled nature=True/biotic, then
+     "canine.n.02" automatically resolves to nature/biotic too. The search
+     is bounded by a `max_hops` radius (default 3): if nothing labeled
+     turns up within that many hops in either direction, the synset is
+     treated as unmapped.
 """
 
 from __future__ import annotations
@@ -96,8 +107,8 @@ class TaxonomyGraph:
         by this evaluation — material/immaterial isn't well-defined at the
         class-name level; see resolve_labels() docstring)
 
-    Unlabeled descendant nodes inherit attributes from their nearest
-    labeled ancestor via `resolve_labels()`.
+    Unlabeled nodes inherit attributes from their nearest labeled node
+    (ancestor OR descendant) via `resolve_labels()`.
     """
 
     def __init__(self) -> None:
@@ -296,13 +307,24 @@ class TaxonomyGraph:
     # Querying / resolution (new in this module)
     # -------------------------------------------------------------------
 
-    def resolve_labels(self, synset_str: str) -> Optional[Dict[str, object]]:
+    def resolve_labels(
+        self, synset_str: str, max_hops: int = 3
+    ) -> Optional[Dict[str, object]]:
         """
-        Returns the resolved taxonomy labels for ANY synset by walking
-        upward (via predecessors, i.e. parent edges) to the NEAREST node
-        that has `is_nature` set — a labeled anchor. This is the automatic
-        propagation step: most target classes aren't directly labeled in
-        the Excel, only certain broad parent concepts are.
+        Returns the resolved taxonomy labels for ANY synset by searching
+        OUTWARD from it in both directions — ancestors (predecessors, i.e.
+        parent edges) AND descendants (successors, i.e. child edges) — for
+        the NEAREST node that has `is_nature` set. Almost all actual COCO/
+        ImageNet/Places365 target classes are directly labeled already (0
+        hops); this search only matters for the exceptions, e.g. a broader
+        concept like "canine.n.02" that wasn't itself annotated but has a
+        labeled descendant like "dog.n.01" nearby in the graph.
+
+        `max_hops` bounds how far the search is allowed to wander (in EITHER
+        direction) before giving up — without a bound, an upward search
+        could walk all the way to "entity.n.01" and a downward search could
+        fan out across huge, unrelated subtrees. If no labeled node turns up
+        within `max_hops` hops, the synset is treated as UNMAPPED.
 
         NOTE ON MATERIAL/IMMATERIAL: intentionally NOT returned here. That
         axis depends on whether a specific image instance is a real object
@@ -311,15 +333,15 @@ class TaxonomyGraph:
         no principled answer for this axis, so it's out of scope for a
         text-only, class-name-level evaluation.
 
-        Returns None if the synset can't be resolved to ANY labeled
-        ancestor (including itself) — treat this as UNMAPPED and exclude
-        it, per project convention.
+        Returns None if the synset can't be resolved to ANY labeled node
+        (including itself) within `max_hops` — treat this as UNMAPPED and
+        exclude it, per project convention.
         """
         if synset_str not in self.graph:
             # We might be asked about a synset that was never mentioned in
             # the Excel at all (e.g. a specific ImageNet leaf class). As long
             # as it's a real WordNet synset, add it (and its ancestor chain)
-            # to the graph on the fly so we can still search upward from it.
+            # to the graph on the fly so we can still search from it.
             try:
                 wn.synset(synset_str)
                 self.add_synset_and_ancestors(synset_str)
@@ -328,38 +350,47 @@ class TaxonomyGraph:
         if synset_str not in self.graph:
             return None
 
-        # Breadth-first search (BFS) walking UPWARD through the hierarchy:
-        # start at `synset_str` itself (0 hops away from itself), then visit
-        # its parents (1 hop), then grandparents (2 hops), etc., stopping as
-        # soon as we find a node that carries an explicit "is_nature" label.
-        # BFS (rather than depth-first) guarantees we find the CLOSEST
-        # labeled ancestor first, since we always process all nodes at
-        # distance N before moving on to distance N+1.
+        # Breadth-first search (BFS) radiating OUTWARD through the hierarchy
+        # in both directions: start at `synset_str` itself (0 hops away from
+        # itself), then visit its parents AND children (1 hop), then their
+        # parents/children (2 hops), etc., stopping as soon as we find a node
+        # that carries an explicit "is_nature" label. BFS (rather than
+        # depth-first) guarantees we find the CLOSEST labeled node first,
+        # since we always process all nodes at distance N before moving on
+        # to distance N+1. Expansion stops once a node's hop distance reaches
+        # `max_hops`, so the search radius stays bounded.
         visited = {synset_str}
         queue = deque([(synset_str, 0)])
         while queue:
             node, hops = queue.popleft()
             attrs = self.graph.nodes[node]
             if "is_nature" in attrs:
-                # Found the nearest labeled ancestor (or the node itself, if
-                # it happened to be directly labeled) — return its label,
-                # tagged with which node it actually came from and how many
-                # hops away that was (useful for diagnostics/debugging).
+                # Found the nearest labeled node (ancestor, descendant, or
+                # the node itself) — return its label, tagged with which
+                # node it actually came from and how many hops away that was
+                # (useful for diagnostics/debugging).
                 return {
                     "resolved_from_node": node,
                     "hops": hops,
                     "is_nature": attrs["is_nature"],
                     "biotic_abiotic": attrs.get("biotic_abiotic"),
                 }
+            if hops >= max_hops:
+                # We've hit the search radius limit — don't expand any
+                # further out from this node.
+                continue
             # `predecessors(node)` gives the nodes with an edge POINTING INTO
-            # `node` — since our edges run parent->child, a node's
-            # predecessors are exactly its parents (more general concepts).
-            for parent in self.graph.predecessors(node):
-                if parent not in visited:
-                    visited.add(parent)
-                    queue.append((parent, hops + 1))
-        # Walked all the way up without ever finding a labeled node — this
-        # synset has no connection at all to anything the Excel annotated.
+            # `node` (its parents, since edges run parent->child);
+            # `successors(node)` gives the nodes `node` points TO (its
+            # children). Searching both lets a broad, unlabeled concept find
+            # a labeled node in either direction.
+            neighbors = list(self.graph.predecessors(node)) + list(self.graph.successors(node))
+            for neighbor in neighbors:
+                if neighbor not in visited:
+                    visited.add(neighbor)
+                    queue.append((neighbor, hops + 1))
+        # Searched the full radius without ever finding a labeled node — this
+        # synset has no nearby connection to anything the Excel annotated.
         return None
 
     def get_mapped_classes(
