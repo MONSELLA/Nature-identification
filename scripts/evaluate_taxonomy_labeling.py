@@ -93,6 +93,12 @@ def parse_args():
                         help="Results store JSON, keyed by dataset then model name (updated in "
                              "place — a rerun of the same model overwrites its entry).")
     parser.add_argument("--max_samples", type=int, default=None, help="Limit number of evaluations.")
+    parser.add_argument("--num_preds_to_store", type=int, default=None,
+                        help="Number of images whose per-instance predictions get written to the "
+                             "_predictions.csv file. Images are chosen deterministically (sorted "
+                             "by image_path), so the SAME fixed set of images is stored across "
+                             "different models/runs on the same dataset, keeping CSVs comparable. "
+                             "Default: store all scored instances.")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose logging.")
     parser.add_argument("--wandb", action="store_true", help="Store the results on WandB.")
 
@@ -369,8 +375,20 @@ def main():
     # Build one flat, CSV-friendly row per evaluated instance, combining its
     # ground truth, its raw VLM prediction, and the model's reasoning text —
     # useful for manually spot-checking individual right/wrong answers later.
+    # Fixed at --num_preds_to_store images, chosen deterministically by
+    # sorting on image_path (not on eval order, which can vary run to run due
+    # to the random.sample above) so the SAME set of images is stored for
+    # every model/dataset run, keeping the CSVs directly comparable.
+    if args.num_preds_to_store is not None:
+        chosen_paths = sorted({r["image_path"] for r in scored_results})[: args.num_preds_to_store]
+        preds_to_store = set(chosen_paths)
+    else:
+        preds_to_store = {r["image_path"] for r in scored_results}
+
     flat_rows = []
     for r in scored_results:
+        if r["image_path"] not in preds_to_store:
+            continue
         flat_rows.append({
             "image_path": r["image_path"],
             "class_name": r["class_name"],
@@ -390,10 +408,17 @@ def main():
 
     output_path = Path(args.output_file)
     update_results_store(output_path, dataset=args.dataset, model=model_label, metrics=summary_results)
-    with open(output_path.with_name(output_path.stem + "_predictions.csv"), "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(flat_rows[0].keys()))
-        writer.writeheader()
-        writer.writerows(flat_rows)
+    # Include dataset + model in the filename — otherwise every model run
+    # writes to the same "<stem>_predictions.csv" and each rerun (e.g. a
+    # different VLM on the same dataset) silently overwrites the previous
+    # model's predictions.
+    if flat_rows:
+        csv_path = output_path.with_name(f"{output_path.stem}_{args.dataset}_{model_label}_predictions.csv")
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(flat_rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(flat_rows)
+        print(f"💾 wrote {csv_path} ({len(preds_to_store)} images stored)")
 
     if args.wandb:
         wandb.save(str(output_path))
