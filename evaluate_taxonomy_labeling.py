@@ -16,52 +16,14 @@ import time
 from pathlib import Path
 
 import wandb
-from pydantic import BaseModel, Field
-from typing import Literal
 
 from lib.excel_loader import TaxonomyGraph
 from lib.vlm import MODEL_REGISTRY, create_vlm
 from lib.dataset_loader import load_dataset
-
-
-class TaxonomyResponse(BaseModel):
-    """
-    Pydantic schema driving `outlines` structured output.
-    By defining `reasoning` first, we force the model into a chain-of-thought 
-    generation process before it commits to the final taxonomic labels.
-    """
-    reasoning: str = Field(description="One concise sentence justifying your classification based on the visual evidence.")
-    nature: Literal["yes", "no"]
-    biotic: Literal["biotic", "abiotic", "n/a"]
-    material: Literal["material", "immaterial", "n/a"]
-
-
-_AXIS_INSTRUCTIONS = {
-    "nature": '"nature": either "yes" or "no" — whether this instance counts as nature under the definition above',
-    "biotic": '"biotic": either "biotic", "abiotic", or "n/a" — only answer "biotic"/"abiotic" if "nature" is "yes"; use "n/a" if "nature" is "no"',
-    "material": '"material": either "material", "immaterial", or "n/a" — only answer "material"/"immaterial" if "nature" is "yes"; use "n/a" if "nature" is "no"'
-}
-
-
-def build_classification_prompt(class_name, axes):
-    """
-    Constructs the contextualized prompt. The model is forced to evaluate the 
-    taxonomic labels based on the specific visual instance depicted in the image.
-    """
-    unknown_axes = set(axes) - set(_AXIS_INSTRUCTIONS)
-    if unknown_axes:
-        raise ValueError(f"Unknown axis/axes requested: {unknown_axes}")
-
-    field_lines = "\n".join(f"  - {_AXIS_INSTRUCTIONS[axis]}" for axis in axes)
-
-    return f"""You are analyzing a specific object identified in the provided image. 
-The object is classified as: {class_name}
-
-Based on the visual evidence in the image and the definitions provided, classify this specific instance of the object. 
-
-Provide your reasoning first, followed by the specific labels according to these rules:
-{field_lines}
-"""
+# TaxonomyResponse + build_classification_prompt live in lib/prompts.py so this
+# calibration eval and the VLM pipeline's fallback path share the EXACT same
+# prompt and schema (they cannot drift — same imported objects).
+from lib.prompts import TaxonomyResponse, build_classification_prompt
 
 
 def parse_args():
@@ -70,7 +32,7 @@ def parse_args():
     )
     
     parser.add_argument("--output_mode", type=str, choices=["structured", "free_form"], default="structured")
-    parser.add_argument("--excel_path", type=str, default="../flat_wordnet_tree_fixed.xlsx",
+    parser.add_argument("--excel_path", type=str, default="flat_wordnet_tree_fixed.xlsx",
                         help="Path to the BIG-5 WordNet taxonomy Excel file.")
     parser.add_argument("--sheet_name", type=str, default="data corrected")
 
@@ -104,7 +66,8 @@ def parse_args():
 
     # Context Files
     parser.add_argument("--nature_definition_path", type=str, default="docs/big5_nature_definition.txt")
-    parser.add_argument("--taxonomy_axes_path", type=str, default="docs/big5_taxonomy_axes.txt")
+    parser.add_argument("--biotic_definition_path", type=str, default="docs/big5_biotic_definition.txt")
+    parser.add_argument("--material_definition_path", type=str, default="docs/big5_material_definition.txt")
     
     parser.add_argument("--output_file", type=str, default="taxonomy_calibration_results.json")
     parser.add_argument("--max_samples", type=int, default=None, help="Limit number of evaluations.")
@@ -114,10 +77,11 @@ def parse_args():
     return parser.parse_args()
 
 
-def load_system_prompt(nature_def_path, taxonomy_axes_path):
+def load_system_prompt(nature_def_path, biotic_def_path, material_def_path):
     nature_def = Path(nature_def_path).read_text()
-    taxonomy_axes = Path(taxonomy_axes_path).read_text()
-    return f"{nature_def}\n\n{taxonomy_axes}"
+    biotic_def = Path(biotic_def_path).read_text()
+    material_def = Path(material_def_path).read_text()
+    return f"{nature_def}\n\n{biotic_def}\n\n{material_def}"
 
 
 def _label_to_bool(value, axis):
@@ -161,7 +125,7 @@ def main():
     if args.wandb:
         wandb.init(
             entity="paumonserrat03-universitat-aut-noma-de-barcelona",
-            project="TFM_Closed-set",
+            project="TFM_VLM",
             config=vars(args),
             name=f"taxonomy_image_calibration_{args.dataset}_{model_label}",
         )
@@ -209,7 +173,9 @@ def main():
         print("No mapped evaluation instances found — exiting.")
         sys.exit(1)
 
-    system_prompt = load_system_prompt(args.nature_definition_path, args.taxonomy_axes_path)
+    system_prompt = load_system_prompt(
+        args.nature_definition_path, args.biotic_definition_path, args.material_definition_path
+    )
 
     if args.verbose:
         print(f"[INFO] Creating VLM: family='{args.model_family}', model='{args.model_name}'...")
@@ -221,7 +187,7 @@ def main():
         }
         if args.max_model_len is not None: vlm_kwargs["max_model_len"] = args.max_model_len
     else:
-        vlm_kwargs = {"device": args.device}
+        vlm_kwargs = {"device": args.device, "dtype": args.dtype}
         
     vlm = create_vlm(args.model_family, args.model_name, **vlm_kwargs)
 
