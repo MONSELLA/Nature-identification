@@ -552,6 +552,13 @@ def phase_score(args):
     _print_summary(summary, run_clipmatch)
 
     out_path = Path(args.output_file)
+    if args.run_name:
+        # Route both the results JSON and the predictions CSV into a
+        # user-named subfolder (e.g. one per ablation configuration), so
+        # results from different pipeline configurations never land in the
+        # same place and stay easy to tell apart later.
+        out_path = Path(args.run_name) / out_path.name
+        out_path.parent.mkdir(parents=True, exist_ok=True)
     update_results_store(out_path, dataset=dataset, model=header.get("model"), metrics=summary)
     if flat_rows:
         # Include dataset + model in the filename — otherwise every model run
@@ -672,6 +679,12 @@ def parse_args():
     p.add_argument("--output_file", type=str, default="vlm_pipeline_results.json",
                    help="Results store JSON, keyed by dataset then model name (updated in place — "
                         "a rerun of the same model overwrites its entry).")
+    p.add_argument("--run_name", type=str, default=None,
+                   help="Optional subfolder name to write --output_file (and its "
+                        "_predictions.csv) into, e.g. --run_name ablation_single_pass. Useful "
+                        "for keeping results from different pipeline configurations (ablations) "
+                        "in separate, clearly labeled folders. Created if it doesn't exist. "
+                        "Default: write into the current directory.")
     p.add_argument("--max_samples", type=int, default=None)
     p.add_argument("--num_preds_to_store", type=int, default=None,
                    help="Number of images whose per-object predictions get written to the "
