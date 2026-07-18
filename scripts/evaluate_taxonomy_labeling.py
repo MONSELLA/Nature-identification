@@ -124,7 +124,11 @@ def load_system_prompt(nature_def_path, biotic_def_path, material_def_path):
     nature_def = Path(nature_def_path).read_text()
     biotic_def = Path(biotic_def_path).read_text()
     material_def = Path(material_def_path).read_text()
-    return f"{nature_def}\n\n{biotic_def}\n\n{material_def}"
+    return (
+        "# 1. NATURE DEFINITION\n" f"{nature_def}\n\n"
+        "# 2. BIOTIC VS ABIOTIC AXIS\n" f"{biotic_def}\n\n"
+        "# 3. MATERIAL VS IMMATERIAL AXIS\n" f"{material_def}"
+    )
 
 
 def _label_to_bool(value, axis):

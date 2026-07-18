@@ -122,28 +122,41 @@ class ObjectExtractionResponse(BaseModel):
 
 class TaxonomyResponse(BaseModel):
     """
-    Pydantic schema driving `outlines` / guided-decoding structured output.
-    By defining `reasoning` first, we force the model into a chain-of-thought
-    generation process before it commits to the final taxonomic labels.
-
-    Field order matters here! Because the model generates tokens left-to-right,
-    putting `reasoning` BEFORE `nature`/`biotic`/`material` in the class means
-    the model has to "think out loud" and write its justification first, and
-    only afterward commit to yes/no-style answers. This tends to produce more
-    reliable classifications than asking for the labels with no explanation.
+    Pydantic schema with Interleaved Chain-of-Thought.
+    The model is forced to conclude the top-level nature gate BEFORE 
+    it is allowed to evaluate the downstream sub-axes.
     """
 
-    # A short free-text justification, generated FIRST (see docstring above).
-    reasoning: str = Field(
-        description="One concise sentence justifying your classification based on the visual evidence."
+    # 1. First, isolate the nature reasoning.
+    nature_reasoning: str = Field(
+        description=(
+            "Step 1: Concisely describe the specific target entity in the image. "
+            "Evaluate strictly whether it meets the criteria for 'nature'. "
+            "Do not discuss biotic or material properties yet."
+        )
     )
-    # `Literal[...]` restricts this field to EXACTLY these string values — the
-    # model is not allowed to answer anything else (e.g. "sort of", "maybe").
-    nature: Literal["yes", "no"]
-    # Only meaningful when nature == "yes"; the prompt below explains that the
-    # model must answer "n/a" whenever nature == "no" (see _AXIS_INSTRUCTIONS).
-    biotic: Literal["biotic", "abiotic", "n/a"]
-    material: Literal["material", "immaterial", "n/a"]
+    
+    # 2. Force the model to lock in the yes/no decision based ONLY on Step 1.
+    nature: Literal["yes", "no"] = Field(
+        description="The top-level classification. 'yes' if it is nature, 'no' otherwise."
+    )
+    
+    # 3. Now, initiate a second reasoning block conditioned on the decision just made.
+    sub_axes_reasoning: str = Field(
+        description=(
+            "Step 2: If nature is 'yes', apply the definitions to determine the 'biotic' and 'material' axes. "
+            "If nature is 'no', explicitly state 'Not applicable since the entity is not nature'."
+        )
+    )
+    
+    # 4. Apply the strict mutual exclusivity rule to the final labels.
+    biotic: Literal["biotic", "abiotic", "none"] = Field(
+        description="ALL nature entities MUST be classified as either 'biotic' or 'abiotic'. Non-nature entities MUST be 'none'."
+    )
+    
+    material: Literal["material", "immaterial", "none"] = Field(
+        description="ALL nature entities MUST be classified as either 'material' or 'immaterial'. Non-nature entities MUST be 'none'."
+    )
 
 
 # One line of plain-English instructions per taxonomy axis, injected into the
@@ -151,9 +164,9 @@ class TaxonomyResponse(BaseModel):
 # prompt string) so build_classification_prompt() can ask for a SUBSET of axes
 # if a caller only cares about e.g. nature+biotic and not material.
 _AXIS_INSTRUCTIONS = {
-    "nature": '"nature": either "yes" or "no" — whether this instance counts as nature under the definition above',
-    "biotic": '"biotic": either "biotic", "abiotic", or "n/a" — only answer "biotic"/"abiotic" if "nature" is "yes"; use "n/a" if "nature" is "no"',
-    "material": '"material": either "material", "immaterial", or "n/a" — only answer "material"/"immaterial" if "nature" is "yes"; use "n/a" if "nature" is "no"',
+    "nature": '"nature": either "yes" or "no" — whether this instance counts as nature under the provided definition.',
+    "biotic": '"biotic": either "biotic", "abiotic", or "none" — only answer "biotic"/"abiotic" if "nature" is "yes"; use "none" if "nature" is "no"',
+    "material": '"material": either "material", "immaterial", or "none" — only answer "material"/"immaterial" if "nature" is "yes"; use "none" if "nature" is "no"',
 }
 
 
@@ -186,17 +199,36 @@ def build_classification_prompt(class_name, axes):
     # Build one "- instruction" bullet line per requested axis and join them
     # with newlines, e.g.:
     #   - "nature": either "yes" or "no" - ...
-    #   - "biotic": either "biotic", "abiotic", or "n/a" - ...
+    #   - "biotic": either "biotic", "abiotic", or "none" - ...
     field_lines = "\n".join(f"  - {_AXIS_INSTRUCTIONS[axis]}" for axis in axes)
 
     # The final prompt: names the specific object, reminds the model to use
     # the visual evidence (not just the word "oak tree" in isolation), and
     # lists exactly which fields/labels it must produce and how.
-    return f"""You are analyzing a specific object identified in the provided image.
-The object is classified as: {class_name}
+    return f"""You are analyzing a specific target entity identified in the provided image.
+TARGET ENTITY TO CLASSIFY: "{class_name}"
 
-Based on the visual evidence in the image and the definitions provided, classify this specific instance of the object.
-
-Provide your reasoning first, followed by the specific labels according to these rules:
+You must evaluate ONLY the "{class_name}".
+Important to avoid logical stretches. If the object does not explicitly fit the definitions, do not invent justifications to force it into a category.
+Based on the visual evidence in the image and the strict definitions provided, classify this specific "{class_name}" instance.
+Follow the interleaved reasoning structure: evaluate nature first, lock in the decision, and only then evaluate the sub-axes according to these rules:
 {field_lines}
+
+FIRST EXAMPLE OUTPUT FOR TARGET "wooden chair":
+{{
+  "nature_reasoning": "The target is a chair made of wood with visible grain. Wood with an identifiable natural texture counts as a nature-based artefact, fulfilling the criteria for nature.",
+  "nature": "yes",
+  "sub_axes_reasoning": "Since nature is 'yes', I must evaluate the sub-axes. Wood is a derivative of flora, making it biotic. The chair has physical mass and is perceived through the senses, making it material.",
+  "biotic": "biotic",
+  "material": "material"
+}}
+
+SECOND EXAMPLE OUTPUT FOR TARGET "fan":
+{{
+  "nature_reasoning": "The target is a manufactured electric fan made of plastic and metal. It is a fully artificial object with no unaltered natural elements or identifiable natural textures, so it fails the criteria for nature.",
+  "nature": "no",
+  "sub_axes_reasoning": "Not applicable since the entity is not nature.",
+  "biotic": "none",
+  "material": "none"
+}}
 """

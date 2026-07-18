@@ -1,7 +1,3 @@
-BIG-5 PROJECT — NATURE TAXONOMY (REFERENCE)
-
-AXIS: BIOTIC vs. ABIOTIC
-
 BIOTIC — living organisms, or the material/immaterial result of biotic processes,
 present in an ecosystem, interacting, adapting, and evolving. Includes:
 - Natural or semi-natural flora and derivatives (plants, wild or potted; food like

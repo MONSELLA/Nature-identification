@@ -31,7 +31,7 @@ TWO KEY CONCEPTS USED THROUGHOUT THIS FILE:
     backend constrains generation so the model is FORCED to produce valid
     JSON matching that schema — it becomes literally impossible for the model
     to output something that doesn't parse. vLLM does this via
-    `GuidedDecodingParams`; the HuggingFace backend does it via the `outlines`
+    `StructuredOutputsParams`; the HuggingFace backend does it via the `outlines`
     library's `JSONPrefixAllowedTokens`.
   - "batch": processing many (prompt, image) pairs in a SINGLE model call
     instead of looping one at a time. This matters a lot for speed — GPUs are
@@ -212,16 +212,16 @@ class VLLMBackedVLM(BaseVLM):
         the model generates text (temperature, max length, and — crucially —
         the guided-decoding constraint if a schema was requested)."""
         from vllm import SamplingParams
-        from vllm.sampling_params import GuidedDecodingParams
+        from vllm.sampling_params import StructuredOutputsParams
         gd = None
         if output_mode == "structured" and schema is not None:
             # `schema.model_json_schema()` converts a pydantic BaseModel class
             # into the plain JSON Schema dict format vLLM's guided decoding
             # actually needs (if `schema` is already a plain dict, use it as-is).
             js = schema.model_json_schema() if hasattr(schema, "model_json_schema") else schema
-            gd = GuidedDecodingParams(json=js)
+            gd = StructuredOutputsParams(json=js)
         return SamplingParams(temperature=temperature, max_tokens=max_new_tokens,
-                            guided_decoding=gd, **kwargs)
+                            structured_outputs=gd, **kwargs)
 
     def generate(
         self,
@@ -315,7 +315,7 @@ class HuggingFaceBackedVLM(BaseVLM):
 
     def _get_prefix_allowed_tokens_fn(self, output_mode: str, schema: Optional[Any]) -> Optional[Any]:
         """Build the guided-decoding function for HuggingFace's `.generate()`
-        (the HF equivalent of vLLM's GuidedDecodingParams above) — this is
+        (the HF equivalent of vLLM's StructuredOutputsParams above) — this is
         what forces the model's token-by-token output to stay valid JSON
         matching `schema`, via the third-party `outlines` library. Returns
         None (no constraint) in free_form mode."""
