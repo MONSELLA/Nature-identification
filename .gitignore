@@ -3,6 +3,7 @@ first_ideas/
 notebooks/
 temporal.ipynb
 labeling_app/
+.claude
 
 #IDE
 .vscode/

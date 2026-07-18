@@ -1,59 +1,14 @@
-BIG-5 PROJECT — NATURE DEFINITION (REFERENCE) — v2
-
-DEFINITION
-
 Nature includes:
 
-- Non-human living entities: individual organisms, species, or groups of organisms
-  — flora, fauna, or fungi — whether wild, semi-natural, domesticated, cultivated,
-  or bred (e.g., a bird, a garden plant, a species of insect, cultivated mushrooms).
-- Natural or semi-natural environments and ecosystems where such entities interact
-  (e.g., a forest, a coral reef, a natural reserve, an urban park, a vegetable
-  garden) — excluding purely administrative or political units (e.g., a country,
-  county, or district), even when named after a natural feature.
+- Non-human living entities: individual organisms, species, or groups of organisms — flora, fauna, or fungi — whether wild, semi-natural, domesticated, cultivated, or bred (e.g., a bird, a garden plant, a species of insect, cultivated mushrooms).
+- Natural or semi-natural environments and ecosystems where such entities interact (e.g., a forest, a coral reef, a natural reserve, an urban park, a vegetable garden) — excluding purely administrative or political units (e.g., a country, county, or district), even when named after a natural feature.
 - Non-living natural elements and processes, including:
   - Hydrological components (e.g., a river, pond, lake)
-  - Atmospheric, meteorological, and seasonal components/processes (e.g., rain,
-    wind, snow, fog, temperature, a season)
+  - Atmospheric, meteorological, and seasonal components/processes (e.g., rain, wind, snow, fog, temperature, a season)
   - Geological and mineral components (e.g., rock, salt, oil)
-  - Astrophysical elements and processes (e.g., sunset, sunrise, stars, moon,
-    an eclipse, day/night)
+  - Astrophysical elements and processes (e.g., sunset, sunrise, stars, moon, an eclipse, day/night)
   - Biophysical processes (e.g., photosynthesis, evapotranspiration, erosion)
-- Activities that take place in or directly engage with any of the above (e.g.,
-  hiking, surfing, fishing, gardening, birdwatching).
-- Any representation of the above — whether a real, physically present instance,
-  or a concept, symbol, or fictional/artistic depiction — that explicitly refers
-  to or depicts one of the categories above. This includes stylized, imagined, or
-  clearly non-literal depictions (e.g., a painting of a landscape, a cartoon
-  animal, a video-game forest, a poem about the sea, a metaphor invoking nature,
-  a virtual-reality scene) — these count as nature-relevant even though they are
-  not a literal, unaltered depiction.
-
-INCLUSION CRITERION
-
-For real, physically present (unaltered) instances: an element counts as natural
-if its alteration has not changed its material, structural, or functional
-character from how it would appear in its natural habitat.
-- Example: a live plant in a pot = natural. A wooden table whose surface no
-  longer visibly resembles wood grain = not natural (too altered).
-- Food and drink count as natural at any level of processing, as long as
-  ingestion is the relevant framing (e.g., coffee, sugar, a meatball, pasta all
-  count).
-
-For symbolic, fictional, or artistic depictions: the alteration criterion above
-does not apply. A stylized, imagined, or non-literal depiction still counts as
-nature-relevant as long as it explicitly refers to or depicts one of the
-categories in the DEFINITION above (e.g., a cartoon bird still counts as nature
-even though it looks nothing like a real bird).
-
-EXCLUSION CRITERION
-
-An element only counts as nature if it explicitly and directly refers to or
-depicts one of the categories above — not when it is used incidentally,
-figuratively as an unrelated idiom, or purely as a unit of time/measurement with
-no natural content in focus.
-- Example: "summer school" = not nature (summer used only as a time reference).
-  "hot summer" = nature (the season's natural/climatic character is in focus).
-- Example: administrative or political units (e.g., a country, county, or
-  district) are not nature, even if named after a natural feature. A natural
-  reserve or urban park is nature.
+- Processed Food & Drink (The Ingestion Criterion): Edible solid or liquid elements at any processing level count as nature. This explicitly includes processed foods and derivatives (e.g., pasta, a meatball, a tuna can, sugar, coffee, butter).
+- Nature-Based Artefacts: Manufactured or crafted objects where the natural material of origin is clearly visually identifiable (e.g., a surface with visible wood grain, or distinct stone texture). This explicitly excludes artefacts with a homogenous, unidentifiable texture (e.g., smooth plastic, a painted statue).
+- Activities that take place in or directly engage with any of the above (e.g., hiking, surfing, fishing, gardening, birdwatching).
+- Any representation of the above — whether a real, physically present instance, or a concept, symbol, or fictional/artistic depiction — that explicitly refers to or depicts one of the categories above. This includes stylized, imagined, or clearly non-literal depictions (e.g., a painting of a landscape, a cartoon animal, a video-game forest, a poem about the sea, a metaphor invoking nature, a virtual-reality scene) — these count as nature-relevant even though they are not a literal, unaltered depiction.
