@@ -135,7 +135,8 @@ def _label_to_bool(value, axis):
     """Standardizes string answers into boolean logic depending on the axis.
     Mirrors src/vlm_pipeline.py's label_to_bool exactly (kept as a separate
     local copy here rather than importing it, since this script predates that
-    refactor — behavior is identical)."""
+    refactor — behavior is identical), including accepting BOTH "none" (the
+    current TaxonomyResponse sentinel) and "n/a" (older stored artifacts)."""
     if value is None:
         return None
     normalized = str(value).strip().lower()
@@ -146,29 +147,54 @@ def _label_to_bool(value, axis):
     elif axis == "biotic":
         if normalized == "biotic": return True
         if normalized == "abiotic": return False
-        if normalized == "n/a": return None
+        if normalized in ("none", "n/a"): return None
     elif axis == "material":
         if normalized == "material": return True
         if normalized == "immaterial": return False
-        if normalized == "n/a": return None
+        if normalized in ("none", "n/a"): return None
     return None
+
+
+def _combine_taxonomy_reasoning(pred):
+    """Mirrors src/vlm_pipeline.py's _combine_taxonomy_reasoning: TaxonomyResponse
+    splits the model's justification into `nature_reasoning` (Step 1) and
+    `sub_axes_reasoning` (Step 2) rather than one `reasoning` field — combine
+    them back into a single string for the predictions CSV."""
+    parts = [pred.get("nature_reasoning"), pred.get("sub_axes_reasoning")]
+    parts = [p for p in parts if p]
+    return " ".join(parts) if parts else None
 
 
 def calculate_binary_metrics(y_true, y_pred):
     """Standard binary classification metrics (accuracy/precision/recall/F1)
-    via scikit-learn, for one taxonomy axis at a time. Returns all-zero stats
-    if there's nothing to score (empty input) rather than letting sklearn
-    raise an error on empty arrays."""
+    via scikit-learn, for one taxonomy axis at a time — computed for BOTH the
+    positive class (nature/biotic/material, per CLAUDE.md's convention) and the
+    negative class (no-nature/abiotic/immaterial, suffixed `_neg` below), since
+    accuracy alone hides how the model does on the negative class specifically
+    (e.g. a model that over-predicts "nature" can still show high nature
+    recall while quietly missing most no-nature/abiotic/immaterial cases).
+    Returns all-zero stats if there's nothing to score (empty input) rather
+    than letting sklearn raise an error on empty arrays."""
     from sklearn.metrics import accuracy_score, precision_recall_fscore_support
     if not y_true:
-        return {"accuracy": 0, "precision": 0, "recall": 0, "f1": 0, "support": 0}
+        return {"accuracy": 0, "precision": 0, "recall": 0, "f1": 0,
+                "precision_neg": 0, "recall_neg": 0, "f1_neg": 0, "support": 0}
 
     acc = accuracy_score(y_true, y_pred)
     # average="binary" tells sklearn these are simple True/False labels (not
     # multi-class); zero_division=0 avoids a warning/crash if, say, the model
-    # never predicted the positive class at all in this batch.
-    p, r, f1, _ = precision_recall_fscore_support(y_true, y_pred, average="binary", zero_division=0)
-    return {"accuracy": float(acc), "precision": float(p), "recall": float(r), "f1": float(f1), "support": len(y_true)}
+    # never predicted the positive class at all in this batch. pos_label=True
+    # (sklearn's default) scores the positive class; pos_label=False re-runs
+    # the same computation scoring the NEGATIVE class instead.
+    p, r, f1, _ = precision_recall_fscore_support(y_true, y_pred, average="binary", pos_label=True, zero_division=0)
+    p_neg, r_neg, f1_neg, _ = precision_recall_fscore_support(
+        y_true, y_pred, average="binary", pos_label=False, zero_division=0)
+    return {
+        "accuracy": float(acc),
+        "precision": float(p), "recall": float(r), "f1": float(f1),
+        "precision_neg": float(p_neg), "recall_neg": float(r_neg), "f1_neg": float(f1_neg),
+        "support": len(y_true),
+    }
 
 
 def main():
@@ -308,7 +334,7 @@ def main():
                 # We do this by scoring it as the OPPOSITE of the ground
                 # truth, which guarantees it counts as an error in the metrics
                 # below rather than accidentally counting as correct.
-                r["prediction"] = {"reasoning": None, "parse_failed": True}
+                r["prediction"] = {"parse_failed": True}
                 r["scored_pred_nature"] = not r["gt_nature"]
                 r["scored_pred_biotic"] = not r["gt_biotic"] if r["gt_biotic"] is not None else None
                 r["scored_pred_material"] = not r["gt_material"] if r["gt_material"] is not None else None
@@ -363,17 +389,15 @@ def main():
     print(f"Evaluated Instances: {len(scored_results)}")
     print(f"Parse failure rate: {parse_failure_rate:.1%}")
 
-    print(f"\n--- Binary: Nature vs. No Nature (Support: {nature_metrics['support']}) ---")
-    print(f"Accuracy:  {nature_metrics['accuracy']:.4f}\nPrecision: {nature_metrics['precision']:.4f}")
-    print(f"Recall:    {nature_metrics['recall']:.4f}\nF1 Score:  {nature_metrics['f1']:.4f}")
+    def _print_axis(title, pos_label, neg_label, m):
+        print(f"\n--- Binary: {title} (Support: {m['support']}) ---")
+        print(f"Accuracy:  {m['accuracy']:.4f}")
+        print(f"{pos_label:<22} Precision: {m['precision']:.4f}  Recall: {m['recall']:.4f}  F1: {m['f1']:.4f}")
+        print(f"{neg_label:<22} Precision: {m['precision_neg']:.4f}  Recall: {m['recall_neg']:.4f}  F1: {m['f1_neg']:.4f}")
 
-    print(f"\n--- Binary: Biotic vs. Abiotic (Support: {biotic_metrics['support']}) ---")
-    print(f"Accuracy:  {biotic_metrics['accuracy']:.4f}\nPrecision: {biotic_metrics['precision']:.4f}")
-    print(f"Recall:    {biotic_metrics['recall']:.4f}\nF1 Score:  {biotic_metrics['f1']:.4f}")
-
-    print(f"\n--- Binary: Material vs. Immaterial (Support: {material_metrics['support']}) ---")
-    print(f"Accuracy:  {material_metrics['accuracy']:.4f}\nPrecision: {material_metrics['precision']:.4f}")
-    print(f"Recall:    {material_metrics['recall']:.4f}\nF1 Score:  {material_metrics['f1']:.4f}")
+    _print_axis("Nature vs. No Nature", "Nature (pos):", "No Nature (neg):", nature_metrics)
+    _print_axis("Biotic vs. Abiotic", "Biotic (pos):", "Abiotic (neg):", biotic_metrics)
+    _print_axis("Material vs. Immaterial", "Material (pos):", "Immaterial (neg):", material_metrics)
     print("=" * 55)
 
     if args.wandb:
@@ -381,8 +405,11 @@ def main():
         wandb.log({
             "ParseFailureRate": parse_failure_rate,
             "Nature/Accuracy": nature_metrics["accuracy"], "Nature/F1": nature_metrics["f1"],
+            "Nature/F1_NoNature": nature_metrics["f1_neg"],
             "Biotic/Accuracy": biotic_metrics["accuracy"], "Biotic/F1": biotic_metrics["f1"],
-            "Material/Accuracy": material_metrics["accuracy"], "Material/F1": material_metrics["f1"]
+            "Biotic/F1_Abiotic": biotic_metrics["f1_neg"],
+            "Material/Accuracy": material_metrics["accuracy"], "Material/F1": material_metrics["f1"],
+            "Material/F1_Immaterial": material_metrics["f1_neg"],
         })
 
     # Prepare outputs
@@ -410,7 +437,7 @@ def main():
             "pred_nature": r["prediction"].get("nature"),
             "pred_biotic": r["prediction"].get("biotic"),
             "pred_material": r["prediction"].get("material"),
-            "reasoning": r["prediction"].get("reasoning"),
+            "reasoning": _combine_taxonomy_reasoning(r["prediction"]),
             "parse_failed": r["prediction"]["parse_failed"]
         })
 

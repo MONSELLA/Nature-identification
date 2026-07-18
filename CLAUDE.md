@@ -15,12 +15,27 @@ evaluating the models.
 @data/llm_reference/vlm_pipeline_recap.txt
 
 ## Two pipelines — do not conflate
-- **VLM pipeline** (language-based, in progress): caption → object extraction →
-  taxonomy labeling. Produces per-image predictions scoreable with standard
+- **VLM pipeline** (language-based, IMPLEMENTED — `scripts/run_vlm_pipeline.py`,
+  `src/vlm_pipeline.py`): caption → object extraction → mapping → taxonomy
+  labeling. Produces per-image predictions scoreable with standard
   accuracy/precision/recall/F1.
 - **Grounding pipeline** (geometric/embedding-based, designed but not built):
   Grounding DINO + SAM (thing/stuff routing) → FG-CLIP2 hierarchy-margin
   verification → nature importance score.
+
+## VLM pipeline — code layout & how to run
+- Entrypoint: `scripts/run_vlm_pipeline.py` (`--stage all|infer|score`).
+- `--stage all` runs infer then score in SEPARATE spawned subprocesses so the
+  VLM's VRAM is fully released (OS reclaim on infer-process exit) before CLIP
+  loads for scoring — more reliable than in-process unload. A shared W&B run id
+  is threaded through so both subprocesses log into one run.
+- Core modules: `src/vlm_pipeline.py` (caption/extract/map/label + hybrid
+  resolution, all in Phase-1 inference), `src/models/prompts.py` (prompts +
+  schemas: `TaxonomyResponse`, `MaterialResponse`, `ObjectExtractionResponse`),
+  `src/models/vlm_models.py` (VLM backends), `src/loaders/dataset_loader.py`
+  (`COCO_LABELS`, `COCO_TO_WNSYNSET`, `build_mapping_vocab`),
+  `src/loaders/excel_loader.py` (`TaxonomyGraph.resolve_labels`, `max_hops`),
+  `src/evaluation/clip_metrics.py` + `taxonomy_metrics.py` (metrics).
 
 ## VLM pipeline — hard conventions
 - Baseline is TWO-PASS: open-ended caption (no schema) → separate structured
@@ -33,11 +48,24 @@ evaluating the models.
   nature-priming ablation explicitly.
 - Context files go in the `system` role, never `user`. Read once at startup,
   not per-call (keeps the string stable for vLLM prefix caching).
-- Taxonomy labeling is a HYBRID:
+- Taxonomy labeling is a HYBRID, resolved during PHASE-1 INFERENCE (mapping is
+  done BEFORE the VLM labeling calls, not deferred to scoring):
   - nature/no-nature AND biotic/abiotic → WordNet mapping first (when object is
     in ImageNet/COCO/Places mapped vocab), VLM fallback when unmapped.
   - material/immaterial → ALWAYS VLM, NEVER mapping. Always pass the image to
     the model for this judgment, not just the object string as text.
+- Labeling calls are ROUTED per object (map first, then ask the VLM only what
+  mapping could not answer — saves compute):
+  - unmapped object → ONE full VLM call (nature+biotic+material,
+    `TaxonomyResponse`; system prompt = all three definitions).
+  - mapped-nature object → material-only VLM call (`MaterialResponse`; system
+    prompt = material definition only); nature/biotic come from the mapping.
+  - mapped non-nature object → NO VLM call (nature=False, biotic/material n/a).
+- EVERY extracted object is labeled on all three axes regardless of GT matching.
+  "Best-matching" selection happens only at SCORING time (to reduce to one
+  prediction per image on single-label datasets); it never restricts labeling.
+- `--max_hops` controls how far an extracted object may resolve onto the taxonomy
+  (0 = only annotator-labeled nodes; default 3). Stored in the artifact header.
 - Always track and log: WordNet-mapping-rate vs. VLM-fallback-rate, and total
   objects extracted per image (diagnostic, not just the taxonomy scores).
 
@@ -58,8 +86,26 @@ evaluating the models.
   caption or a concatenated object-list sentence — both were tried and
   rejected (token limit + semantic dilution — see data/llm_reference/vlm_pipeline_recap.txt
   for why).
-- **hP/hR/hF1** (hierarchical precision/recall/F1): ImageNet + Places only, via BGE
-  cross-encoder mapping the ClipMatch-predicted class onto WordNet.
+- **hP/hR/hF1** (hierarchical precision/recall/F1): ImageNet + Places only. Map
+  the ClipMatch-predicted class onto a WordNet node via the extracted-object list
+  (`resolve_to_wordnet`: rank objects by CLIP sim to the predicted class,
+  Wu-Palmer disambiguation for polysemy), then score ancestral-closure overlap
+  of the GT node vs. the predicted node.
+
+## Axis scoring (nature/biotic/material accuracy) — per dataset
+- **ImageNet/Places (single-label)**: nature/biotic are read off the FORCED top-1
+  ClipMatch class's taxonomy position — no lexical extraction matching, no
+  similarity threshold (global argmax over the full candidate vocab always
+  returns a class). This means an incidental-but-correct object never counts
+  against the single GT label. material is the VLM's own label for the
+  best-matching extracted object (still VLM, never mapped). Prediction-unmapped
+  → penalized as wrong.
+- **COCO/BIG-5**: image-level nature = OR over extracted objects; biotic/material
+  scored on the matched GT object. COCO box-IoU matching (Hungarian, IoU≥0.5) is
+  FUTURE WORK gated on the Grounding pipeline — for now COCO uses the same
+  lexical GT matching as BIG-5.
+- **Extraction-hit rate** (exact-match: was the GT object mentioned) is a
+  REPORTING-ONLY diagnostic; it no longer gates or feeds the axis scores.
 
 ## Inherited conventions (from the closed-set baseline work)
 - Positive classes: nature=1, biotic=1, material=1.
@@ -81,5 +127,8 @@ evaluating the models.
   locking in)
 
 ## Current focus
-Week 1 of 8 (deadline Sept 10): VLM pipeline baseline + F-CLIPScore +
-Object-CLIPScore on Qwen3.5-0.8B, to hand off to Ramin for BSC infra check.
+Baseline VLM pipeline is IMPLEMENTED end-to-end (caption → extraction →
+mapping-routed labeling → hybrid resolution → metrics: F-CLIPScore,
+Object-CLIPScore, per-axis acc/P/R/F1, ClipMatch + hP/hR on ImageNet/Places).
+Next: spot-check on Qwen3.5-0.8B and hand off to Ramin for the BSC infra check;
+then the sequential ablations (recap §7) and the Grounding pipeline (weeks 2-5).

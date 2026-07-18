@@ -159,6 +159,25 @@ class TaxonomyResponse(BaseModel):
     )
 
 
+class MaterialResponse(BaseModel):
+    """
+    Material-only schema for the MAPPED-nature fast path (see
+    src/vlm_pipeline.py's label_objects_batch). When an extracted object already
+    resolves to a labeled nature node via WordNet, its nature/biotic axes are
+    fixed by the mapping and only material/immaterial still needs the VLM — so we
+    ask ONLY that axis, with a schema that omits nature/biotic entirely (rather
+    than reusing TaxonomyResponse and forcing the model to also emit two answers
+    we would throw away). `reasoning` stays first for the same think-first
+    reason as TaxonomyResponse. No "n/a" option: the object is known to be
+    nature, so material always applies.
+    """
+
+    reasoning: str = Field(
+        description="One concise sentence justifying the material/immaterial classification based on the visual evidence."
+    )
+    material: Literal["material", "immaterial"]
+
+
 # One line of plain-English instructions per taxonomy axis, injected into the
 # prompt text below. Kept as a dict (rather than hardcoded into one long
 # prompt string) so build_classification_prompt() can ask for a SUBSET of axes

@@ -1,22 +1,27 @@
 """
 src/vlm_pipeline.py
 
-Baseline BIG-5 VLM pipeline (language-based), Phase-1 inference + the hybrid
-taxonomy-label resolver used in Phase-2 scoring.
+Baseline BIG-5 VLM pipeline (language-based), Phase-1 inference including the
+hybrid taxonomy-label resolution (mapping now happens here, not in Phase-2).
 
 Two-pass baseline per image:
   1. caption_batch        — open-ended, neutral caption (no nature-priming).
   2. extract_objects_batch— structured object list, image re-sent (a "second
                             look"); captures part-objects (e.g. a flower on a
                             dress).
-  3. label_objects_batch  — ONE VLM call per extracted object, image ALWAYS
-                            attached, using the exact shared taxonomy prompt +
-                            TaxonomyResponse schema (identical to
-                            evaluate_taxonomy_labeling.py's calibration/fallback
-                            prompt). Fanned through vlm.generate_batch so vLLM
-                            prefix-caches the shared image + system tokens.
+  2b. map each object      — WordNet mapping FIRST (map_object_to_taxonomy), so
+                            the labeling call is routed to the minimum the VLM
+                            still has to answer.
+  3. label_objects_batch  — mapping-aware, image ALWAYS attached: UNMAPPED
+                            objects get a full nature/biotic/material call
+                            (TaxonomyResponse, three-definition system prompt);
+                            MAPPED-nature objects get a material-only call
+                            (MaterialResponse, material-definition system
+                            prompt); MAPPED non-nature objects get NO VLM call.
+                            Each group is fanned through vlm.generate_batch so
+                            vLLM prefix-caches the shared image + system tokens.
 
-Hybrid labeling (resolved in Phase 2, needs the TaxonomyGraph):
+Hybrid labeling (resolved in Phase 1 now, needs the TaxonomyGraph):
   - nature, biotic : WordNet mapping when the object resolves to a labeled node;
                      VLM fallback otherwise.
   - material       : ALWAYS the VLM (never mapping) — depends on whether THIS
@@ -52,16 +57,25 @@ from typing import Any, Dict, List, Optional
 from src.models.prompts import (
     CAPTION_PROMPT,
     EXTRACTION_PROMPT,
+    MaterialResponse,
     ObjectExtractionResponse,
     TaxonomyResponse,
     build_classification_prompt,
 )
 
-# Which taxonomy axes get asked about on every per-object labeling call. All
-# three axes are always requested together in one prompt/schema (see
-# label_objects_batch below) rather than issuing three separate VLM calls per
-# object — cheaper, and lets the model reason about all three at once.
-_TAXONOMY_AXES = ["nature", "biotic", "material"]
+# Axis sets for the two per-object labeling paths (see label_objects_batch):
+#   - FULL  : an UNMAPPED object — WordNet told us nothing, so the VLM must
+#             decide all three axes at once (one prompt/schema, cheaper than
+#             three separate calls, and lets the model reason jointly).
+#   - MATERIAL: a MAPPED-nature object — nature/biotic are already fixed by the
+#             WordNet mapping, so the VLM is only asked material/immaterial.
+_FULL_AXES = ["nature", "biotic", "material"]
+_MATERIAL_AXES = ["material"]
+
+# Sentinel distinguishing "mapping not provided, compute it" from "mapping is
+# genuinely None (unmapped)" in resolve_hybrid_label — a plain None default
+# could not tell those two apart.
+_UNSET = object()
 
 
 # =============================================================================
@@ -69,8 +83,14 @@ _TAXONOMY_AXES = ["nature", "biotic", "material"]
 # =============================================================================
 def label_to_bool(value: Optional[str], axis: str) -> Optional[bool]:
     """Standardize a TaxonomyResponse string answer into boolean logic.
-    nature: yes->True/no->False; biotic: biotic->True/abiotic->False/n_a->None;
-    material: material->True/immaterial->False/n_a->None. Unknown -> None.
+    nature: yes->True/no->False; biotic: biotic->True/abiotic->False/
+    n_a-or-none->None; material: material->True/immaterial->False/
+    n_a-or-none->None. Unknown -> None.
+
+    Both "n/a" and "none" are accepted as the not-applicable sentinel: the
+    current TaxonomyResponse schema (src/models/prompts.py) uses "none", but
+    "n/a" is accepted too so this still reads older stored artifacts written
+    before that schema change without silently misparsing them.
 
     Why convert to bool/None instead of just keeping the string? Because every
     downstream metric (accuracy/precision/recall/F1 in
@@ -91,17 +111,17 @@ def label_to_bool(value: Optional[str], axis: str) -> Optional[bool]:
             return True
         if v == "abiotic":
             return False
-        if v == "n/a":
-            # "n/a" is a valid/expected answer (nature was "no", so biotic
-            # doesn't apply) — distinguish it from an unrecognized value by
-            # returning None either way, but note it's not an ERROR case.
+        if v in ("none", "n/a"):
+            # A valid/expected answer (nature was "no", so biotic doesn't
+            # apply) — distinguish it from an unrecognized value by returning
+            # None either way, but note it's not an ERROR case.
             return None
     elif axis == "material":
         if v == "material":
             return True
         if v == "immaterial":
             return False
-        if v == "n/a":
+        if v in ("none", "n/a"):
             return None
     # Axis not recognized, or value didn't match any expected string for this
     # axis (e.g. a stray typo the model produced) — treat as "no answer".
@@ -208,71 +228,124 @@ def extract_objects_batch(
 
 
 # =============================================================================
-# Stage 3 — per-object taxonomy labeling (one call per object, batched)
+# Stage 3 — per-object taxonomy labeling (mapping-aware, batched)
 # =============================================================================
+def _combine_taxonomy_reasoning(out: Dict[str, Any]) -> Optional[str]:
+    """TaxonomyResponse (src/models/prompts.py) splits the model's
+    justification into TWO fields — `nature_reasoning` (Step 1, the nature
+    gate) then `sub_axes_reasoning` (Step 2, conditioned on that decision) —
+    rather than one `reasoning` field. Combine them back into a single string
+    here so the rest of the pipeline's object_labels shape (CSV output,
+    diagnostics, etc.) keeps working against one stable `reasoning` key
+    regardless of how many reasoning steps the schema asks for."""
+    parts = [out.get("nature_reasoning"), out.get("sub_axes_reasoning")]
+    parts = [p for p in parts if p]
+    return " ".join(parts) if parts else None
+
+
+def _empty_label(parse_failed: bool, vlm_called: bool) -> Dict[str, Any]:
+    """A raw-label dict with every axis absent — used for a parse failure
+    (vlm_called=True) or a mapped non-nature object the VLM was never asked
+    about (vlm_called=False)."""
+    return {"reasoning": None, "nature": None, "biotic": None, "material": None,
+            "parse_failed": parse_failed, "vlm_called": vlm_called}
+
+
 def label_objects_batch(
     vlm,
     image_paths: List[str],
     objects_per_image: List[List[str]],
-    system_prompt: Optional[str],
+    mappings_per_image: List[List[Optional[Dict[str, Any]]]],
+    label_system_full: Optional[str],
+    label_system_material: Optional[str],
     max_new_tokens: int = 300,
     temperature: float = 0.0,
 ) -> List[List[Dict[str, Any]]]:
     """
-    One structured VLM call per (image, object) pair, image always attached.
-    Returns, per image, a list of raw label dicts aligned with that image's
-    object list. A parse failure for an object yields {"parse_failed": True}.
+    Per-object taxonomy labeling, routed by the object's WordNet mapping so the
+    VLM is only asked what mapping could not already answer (recap §6; saves
+    compute vs. always asking all three axes):
+
+      - UNMAPPED object (mapping is None) -> FULL VLM call: nature/biotic/material
+        in one TaxonomyResponse, under the full three-definition system prompt.
+      - MAPPED-nature object              -> MATERIAL-only VLM call: nature/biotic
+        come from WordNet, so only material/immaterial is asked (MaterialResponse,
+        material-definition-only system prompt).
+      - MAPPED non-nature object          -> NO VLM call at all: nature=False from
+        WordNet, biotic/material are n/a. A synthetic empty label is recorded.
+
+    The image is always attached on every VLM call (material judgment needs the
+    pixels). Returns, per image, a list of raw label dicts aligned with that
+    image's object list; each carries `parse_failed` and `vlm_called` flags.
+    Two batched `generate_batch` calls are issued (one per system prompt) so
+    vLLM prefix-caches each stable system+image prefix across the batch.
     """
-    # We need to ask the VLM about MANY (image, object) pairs — e.g. if image
-    # 0 has 3 objects and image 1 has 2 objects, that's 5 separate questions
-    # total. Rather than looping with 5 individual model calls, we "flatten"
-    # everything into 3 parallel lists (one prompt/image/owner-index per
-    # question) so ALL 5 questions can be sent to `vlm.generate_batch` as ONE
-    # big batched call — much more efficient, especially with vLLM's ability
-    # to reuse cached prompt tokens across the batch.
-    flat_prompts: List[str] = []
-    flat_images: List[str] = []
-    owner_image_idx: List[int] = []  # which image each flat pair belongs to
+    # Pre-fill every slot; the two groups below overwrite their own entries and
+    # mapped-non-nature objects keep the synthetic label set here.
+    per_image: List[List[Dict[str, Any]]] = [
+        [_empty_label(parse_failed=False, vlm_called=False) for _ in objs]
+        for objs in objects_per_image
+    ]
 
-    for i, objs in enumerate(objects_per_image):
-        for obj in objs:
-            flat_prompts.append(build_classification_prompt(obj, axes=_TAXONOMY_AXES))
-            flat_images.append(image_paths[i])
-            owner_image_idx.append(i)  # remember "this question was about image i"
+    # Flatten each group into parallel prompt/image/owner lists so an entire
+    # group goes to the GPU in ONE batched call. `owner` is (image_idx, obj_idx)
+    # so results can be scattered straight back into `per_image`.
+    full_prompts: List[str] = []
+    full_images: List[str] = []
+    full_owner: List[tuple] = []
+    mat_prompts: List[str] = []
+    mat_images: List[str] = []
+    mat_owner: List[tuple] = []
 
-    flat_outs: List[Any]
-    if flat_prompts:
-        flat_outs = vlm.generate_batch(
-            prompts=flat_prompts,
-            images=flat_images,
-            system_prompt=system_prompt,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            output_mode="structured",
-            schema=TaxonomyResponse,
+    for i, (objs, maps) in enumerate(zip(objects_per_image, mappings_per_image)):
+        for j, (obj, mp) in enumerate(zip(objs, maps)):
+            if mp is None:
+                full_prompts.append(build_classification_prompt(obj, axes=_FULL_AXES))
+                full_images.append(image_paths[i])
+                full_owner.append((i, j))
+            elif mp["is_nature"]:
+                mat_prompts.append(build_classification_prompt(obj, axes=_MATERIAL_AXES))
+                mat_images.append(image_paths[i])
+                mat_owner.append((i, j))
+            # else: mapped & not nature -> keep the synthetic (vlm_called=False) label.
+
+    # --- FULL group (unmapped objects): all three axes ---
+    if full_prompts:
+        outs = vlm.generate_batch(
+            prompts=full_prompts, images=full_images,
+            system_prompt=label_system_full,
+            max_new_tokens=max_new_tokens, temperature=temperature,
+            output_mode="structured", schema=TaxonomyResponse,
         )
-    else:
-        # No objects were extracted for ANY image in this batch — nothing to
-        # ask, so skip the (otherwise pointless) model call entirely.
-        flat_outs = []
+        for (i, j), out in zip(full_owner, outs):
+            if isinstance(out, dict):
+                per_image[i][j] = {
+                    "reasoning": _combine_taxonomy_reasoning(out), "nature": out.get("nature"),
+                    "biotic": out.get("biotic"), "material": out.get("material"),
+                    "parse_failed": False, "vlm_called": True,
+                }
+            else:
+                per_image[i][j] = _empty_label(parse_failed=True, vlm_called=True)
 
-    # Regroup flat outputs back per image.
-    # Now we need to "unflatten" the results: `flat_outs[k]` is the answer for
-    # whichever object `owner_image_idx[k]` says it belongs to. We build one
-    # empty list per image up front, then append each answer into the correct
-    # image's slot as we walk through the flat results in order.
-    per_image: List[List[Dict[str, Any]]] = [[] for _ in image_paths]
-    for owner, out in zip(owner_image_idx, flat_outs):
-        if isinstance(out, dict):
-            rec = dict(out)  # copy, so we don't mutate the VLM's own dict
-            rec["parse_failed"] = False
-        else:
-            # This particular object's classification failed to parse as
-            # valid JSON — record it as an explicit failure (all fields None)
-            # rather than silently dropping it, so it's still counted in the
-            # object list and downstream failure-rate diagnostics.
-            rec = {"reasoning": None, "nature": None, "biotic": None, "material": None, "parse_failed": True}
-        per_image[owner].append(rec)
+    # --- MATERIAL group (mapped-nature objects): material axis only ---
+    if mat_prompts:
+        outs = vlm.generate_batch(
+            prompts=mat_prompts, images=mat_images,
+            system_prompt=label_system_material,
+            max_new_tokens=max_new_tokens, temperature=temperature,
+            output_mode="structured", schema=MaterialResponse,
+        )
+        for (i, j), out in zip(mat_owner, outs):
+            if isinstance(out, dict):
+                # nature/biotic intentionally left None here — they come from the
+                # WordNet mapping in resolve_hybrid_label, not from this call.
+                rec = _empty_label(parse_failed=False, vlm_called=True)
+                rec["reasoning"] = out.get("reasoning")
+                rec["material"] = out.get("material")
+                per_image[i][j] = rec
+            else:
+                per_image[i][j] = _empty_label(parse_failed=True, vlm_called=True)
+
     return per_image
 
 
@@ -283,8 +356,12 @@ def run_inference(
     vlm,
     dataset_instances: List[Dict[str, Any]],
     caption_system_prompt: Optional[str],
-    label_system_prompt: Optional[str],
+    label_system_full: Optional[str],
+    label_system_material: Optional[str],
+    tax_graph,
+    mapping_vocab: Dict[str, str],
     extraction_system_prompt: Optional[str] = None,
+    max_hops: int = 3,
     batch_size: int = 16,
     caption_max_new_tokens: int = 256,
     label_max_new_tokens: int = 300,
@@ -292,18 +369,28 @@ def run_inference(
     verbose: bool = False,
 ):
     """
-    Run caption -> extraction -> labeling over every image and yield one raw
-    record per image (no WordNet mapping, no metrics — that is Phase 2):
+    Run caption -> extraction -> (mapping + labeling) over every image and yield
+    one record per image. Mapping now happens HERE (Phase 1), not in Phase-2
+    scoring, so the VLM is only queried for what WordNet could not resolve
+    (recap §6) — mapped non-nature objects skip the VLM entirely and
+    mapped-nature objects are asked material only. Each record:
 
         {
           "image_path": str,
           "targets": [...],                 # GT carried through from the loader
           "caption": str,
           "objects": [str, ...],
-          "object_labels": [ {reasoning,nature,biotic,material,parse_failed}, ... ]
+          "object_labels": [ {reasoning,nature,biotic,material,parse_failed,vlm_called}, ... ],
+          "object_finals": [ resolve_hybrid_label(...) dicts, ... ],
         }
 
-    `object_labels[k]` aligns with `objects[k]`.
+    `object_labels[k]` and `object_finals[k]` both align with `objects[k]`.
+    `object_finals` are the fully resolved hybrid labels (WordNet + VLM), so
+    Phase-2 scoring can read them directly without re-mapping.
+
+    `max_hops` bounds how far the WordNet search may wander when mapping an
+    extracted object onto a labeled taxonomy node (0 = only directly-annotated
+    nodes count; see map_object_to_taxonomy).
 
     This is a GENERATOR function (it uses `yield`, not `return`) — it
     processes and produces results one BATCH at a time rather than holding
@@ -331,7 +418,7 @@ def run_inference(
         chunk = dataset_instances[b * batch_size : (b + 1) * batch_size]
         image_paths = [inst["image_path"] for inst in chunk]
 
-        # Run the three stages in order for this batch of images.
+        # Stages 1-2: caption, then structured object extraction.
         captions = caption_batch(
             vlm, image_paths, caption_system_prompt,
             max_new_tokens=caption_max_new_tokens, temperature=temperature,
@@ -340,23 +427,43 @@ def run_inference(
             vlm, image_paths, captions, extraction_system_prompt,
             max_new_tokens=caption_max_new_tokens, temperature=temperature,
         )
+
+        # Map every extracted object to the taxonomy FIRST (cheap dict/graph
+        # lookup) so Stage-3 labeling can route each object to the minimal VLM
+        # call it actually needs (or none). Computed once here and reused for
+        # both the routing and the final hybrid resolution below.
+        mappings_per_image = [
+            [map_object_to_taxonomy(obj, tax_graph, mapping_vocab, max_hops=max_hops) for obj in objs]
+            for objs in objects_per_image
+        ]
+
+        # Stage 3: mapping-aware labeling (full for unmapped, material-only for
+        # mapped-nature, skipped for mapped non-nature).
         labels_per_image = label_objects_batch(
-            vlm, image_paths, objects_per_image, label_system_prompt,
+            vlm, image_paths, objects_per_image, mappings_per_image,
+            label_system_full, label_system_material,
             max_new_tokens=label_max_new_tokens, temperature=temperature,
         )
 
-        # `zip(...)` walks all four lists together in lockstep — for each
-        # image in this batch, we have its original dataset entry (`inst`,
-        # which carries the ground truth `targets`), its caption, its
-        # extracted objects, and its per-object labels, all aligned by
-        # position. Yield one combined dict per image.
-        for inst, cap, objs, labels in zip(chunk, captions, objects_per_image, labels_per_image):
+        # `zip(...)` walks all lists together in lockstep — for each image in
+        # this batch we have its original dataset entry (`inst`, carrying the
+        # GT `targets`), caption, extracted objects, per-object mappings, and
+        # per-object raw labels, all aligned by position. Resolve the final
+        # hybrid label per object (reusing the precomputed mapping) and yield.
+        for inst, cap, objs, maps, labels in zip(
+            chunk, captions, objects_per_image, mappings_per_image, labels_per_image
+        ):
+            finals = [
+                resolve_hybrid_label(obj, lab, tax_graph, mapping_vocab, mapping=mp)
+                for obj, lab, mp in zip(objs, labels, maps)
+            ]
             yield {
                 "image_path": inst["image_path"],
                 "targets": inst.get("targets", []),
                 "caption": cap,
                 "objects": objs,
                 "object_labels": labels,
+                "object_finals": finals,
             }
 
         if verbose:
@@ -384,7 +491,7 @@ def _normalize_object(object_str: str) -> str:
     return s.strip()
 
 
-def map_object_to_taxonomy(object_str: str, tax_graph, mapping_vocab: Dict[str, str]) -> Optional[Dict[str, Any]]:
+def map_object_to_taxonomy(object_str: str, tax_graph, mapping_vocab: Dict[str, str], max_hops: int = 3) -> Optional[Dict[str, Any]]:
     """
     Map a free-text object phrase onto a WordNet synset using the AUTHORITATIVE
     dataset class->synset table (`mapping_vocab`, from
@@ -392,10 +499,16 @@ def map_object_to_taxonomy(object_str: str, tax_graph, mapping_vocab: Dict[str, 
     picking the wrong WordNet sense (e.g. "tiger" -> "a fierce person"): the
     synset comes from the dataset's own class mapping (tiger -> tiger.n.02).
 
+    `max_hops` bounds how far tax_graph.resolve_labels may search outward from
+    the matched synset for a labeled node: 0 accepts ONLY a directly-annotated
+    node (an annotator labeled that exact synset), 1 also accepts a node one
+    hop away (label inherited across a single hypernym/hyponym edge), etc.
+
     Returns {"synset", "is_nature", "biotic"} when the object's (normalized)
     phrase — or its trailing head noun — is a known class whose synset resolves
-    to a labeled node; else None (→ image-supported VLM fallback). `biotic` is
-    True/False/None (None when nature-True but the node carries no biotic label).
+    to a labeled node within `max_hops`; else None (→ image-supported VLM
+    fallback). `biotic` is True/False/None (None when nature-True but the node
+    carries no biotic label).
     """
     if not mapping_vocab:
         # This dataset has no closed class vocabulary at all (e.g. BIG-5) —
@@ -422,7 +535,7 @@ def map_object_to_taxonomy(object_str: str, tax_graph, mapping_vocab: Dict[str, 
         # whether that class's synset actually resolves to a LABELED taxonomy
         # node (see excel_loader.py's resolve_labels) — some classes in the
         # dataset's vocabulary might still be unmapped in the Excel.
-        labels = tax_graph.resolve_labels(synset)
+        labels = tax_graph.resolve_labels(synset, max_hops=max_hops)
         if labels is not None:
             is_nature = labels["is_nature"]
             biotic = None
@@ -433,7 +546,7 @@ def map_object_to_taxonomy(object_str: str, tax_graph, mapping_vocab: Dict[str, 
     return None
 
 
-def resolve_hybrid_label(object_str: str, vlm_label: Dict[str, Any], tax_graph, mapping_vocab: Dict[str, str]) -> Dict[str, Any]:
+def resolve_hybrid_label(object_str: str, vlm_label: Dict[str, Any], tax_graph, mapping_vocab: Dict[str, str], mapping: Any = _UNSET, max_hops: int = 3) -> Dict[str, Any]:
     """
     Combine WordNet mapping with the VLM's TaxonomyResponse into final per-object
     labels, recording the source of each axis (diagnostics):
@@ -445,6 +558,10 @@ def resolve_hybrid_label(object_str: str, vlm_label: Dict[str, Any], tax_graph, 
 
     Returns final booleans (nature/biotic/material, None = n/a) plus
     *_source ∈ {"wordnet","vlm"} and the mapped synset (if any).
+
+    `mapping` may be supplied precomputed (as run_inference does, having already
+    mapped every object to route the VLM calls) to avoid mapping twice; if left
+    unset it is computed here via map_object_to_taxonomy with `max_hops`.
 
     This is the function that actually implements the project's "hybrid"
     labeling strategy described in the module docstring: prefer the
@@ -458,7 +575,8 @@ def resolve_hybrid_label(object_str: str, vlm_label: Dict[str, Any], tax_graph, 
     vlm_biotic = label_to_bool(vlm_label.get("biotic"), "biotic")
     vlm_material = label_to_bool(vlm_label.get("material"), "material")
 
-    mapping = map_object_to_taxonomy(object_str, tax_graph, mapping_vocab)
+    if mapping is _UNSET:
+        mapping = map_object_to_taxonomy(object_str, tax_graph, mapping_vocab, max_hops=max_hops)
 
     if mapping is not None:
         # This object's phrase matched a known class AND that class resolves

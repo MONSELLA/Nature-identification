@@ -71,6 +71,36 @@ COCO_TO_WNSYNSET = {
     86: 'vase.n.01', 87: 'scissors.n.01', 88: 'teddy.n.01', 89: 'hand_blower.n.01', 90: 'toothbrush.n.01',
 }
 
+# The ACTUAL COCO category display name for each id — the human-readable label
+# COCO itself ships in its instances_*.json ("category" -> "name"), NOT the
+# WordNet synset lemma. These two disagree for many classes because the synset
+# chosen in COCO_TO_WNSYNSET is often a near-synonym rather than COCO's own
+# wording, e.g. COCO "couch" -> sofa.n.01, "tv" -> television_receiver.n.01,
+# "potted plant" -> pot_plant.n.01, "cell phone" -> cellular_telephone.n.01,
+# "hair drier" -> hand_blower.n.01, "donut" -> doughnut.n.02. Reconstructing a
+# name from the synset (synset.split('.')[0].replace('_', ' ')) therefore
+# produces the wrong surface form for those classes; this table gives the real
+# COCO label so class names / the mapping vocab stay faithful to the dataset.
+COCO_LABELS = {
+    1: 'person', 2: 'bicycle', 3: 'car', 4: 'motorcycle', 5: 'airplane',
+    6: 'bus', 7: 'train', 8: 'truck', 9: 'boat', 10: 'traffic light',
+    11: 'fire hydrant', 13: 'stop sign', 14: 'parking meter', 15: 'bench',
+    16: 'bird', 17: 'cat', 18: 'dog', 19: 'horse', 20: 'sheep',
+    21: 'cow', 22: 'elephant', 23: 'bear', 24: 'zebra', 25: 'giraffe',
+    27: 'backpack', 28: 'umbrella', 31: 'handbag', 32: 'tie', 33: 'suitcase',
+    34: 'frisbee', 35: 'skis', 36: 'snowboard', 37: 'sports ball', 38: 'kite',
+    39: 'baseball bat', 40: 'baseball glove', 41: 'skateboard', 42: 'surfboard',
+    43: 'tennis racket', 44: 'bottle', 46: 'wine glass', 47: 'cup', 48: 'fork',
+    49: 'knife', 50: 'spoon', 51: 'bowl', 52: 'banana', 53: 'apple',
+    54: 'sandwich', 55: 'orange', 56: 'broccoli', 57: 'carrot', 58: 'hot dog',
+    59: 'pizza', 60: 'donut', 61: 'cake', 62: 'chair', 63: 'couch',
+    64: 'potted plant', 65: 'bed', 67: 'dining table', 70: 'toilet',
+    72: 'tv', 73: 'laptop', 74: 'mouse', 75: 'remote',
+    76: 'keyboard', 77: 'cell phone', 78: 'microwave', 79: 'oven',
+    80: 'toaster', 81: 'sink', 82: 'refrigerator', 84: 'book', 85: 'clock',
+    86: 'vase', 87: 'scissors', 88: 'teddy bear', 89: 'hair drier', 90: 'toothbrush',
+}
+
 # ============================================================================
 # HELPER: GRAPH RESOLUTION
 # ============================================================================
@@ -213,7 +243,11 @@ def load_coco(images_dir, instances_json, taxonomy_graph):
     for cat_id, synset_str in COCO_TO_WNSYNSET.items():
         gt = get_gt_from_graph(synset_str, taxonomy_graph)
         if gt:
-            class_name = synset_str.split('.')[0].replace('_', ' ')
+            # Use COCO's OWN label (e.g. "potted plant", "couch") rather than
+            # a name reconstructed from the synset lemma (which would give
+            # "pot plant", "sofa") — keeps GT class names faithful to COCO so
+            # extraction-hit matching compares against the real dataset wording.
+            class_name = COCO_LABELS.get(cat_id, synset_str.split('.')[0].replace('_', ' '))
             cat_to_target[cat_id] = {"class_name": class_name, **gt}
 
     results = []
@@ -562,10 +596,15 @@ def build_mapping_vocab(dataset_name, **kwargs):
         return vocab
 
     if dataset_name == "coco":
-        for synset in COCO_TO_WNSYNSET.values():
-            name = synset.split('.')[0].replace('_', ' ').strip().lower()
+        # Key the lookup on COCO's OWN category names (COCO_LABELS), not on a
+        # name reconstructed from the synset lemma — the reconstruction is
+        # inaccurate for the many classes whose synset is a near-synonym rather
+        # than COCO's wording (e.g. "couch"/sofa.n.01, "tv"/television_receiver.n.01),
+        # which would make an extracted "couch" or "tv" fail to map.
+        for cat_id, synset in COCO_TO_WNSYNSET.items():
+            name = COCO_LABELS.get(cat_id, synset.split('.')[0].replace('_', ' ')).strip().lower()
             # `setdefault` only inserts if the key isn't already present —
-            # guards against two different COCO synsets accidentally
+            # guards against two different COCO labels accidentally
             # producing the same display name (unlikely here, but safe).
             vocab.setdefault(name, synset)
         return vocab
