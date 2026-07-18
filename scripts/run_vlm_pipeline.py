@@ -53,14 +53,37 @@ I run this script", start reading at `main()` near the bottom and work
 backward through phase_infer/phase_score.
 """
 
+import os
+
+# Quiet the very chatty third-party STARTUP logs by default — none of this comes
+# from the pipeline itself, it's vLLM's engine-config dump / torch.compile
+# timings, transformers deprecation notices, HF Hub download bars, and the HF
+# "unauthenticated requests" notice. Set here (before torch/vllm/transformers
+# are imported, and inherited by the spawned infer/score subprocesses) via
+# setdefault, so you can still override any of them from the shell to get the
+# verbose output back, e.g.:
+#     VLLM_LOGGING_LEVEL=INFO python scripts/run_vlm_pipeline.py ...
+# To silence the HF-token warning for good (and get faster downloads), export a
+# real token instead: `export HF_TOKEN=hf_...`.
+os.environ.setdefault("VLLM_LOGGING_LEVEL", "WARNING")   # drops the vLLM INFO firehose
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")  # silences the use_fast deprecation etc.
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")  # no safetensors download bars
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")   # avoids the fork/parallelism warning
+
 import argparse
 import csv
 import json
+import logging
 import multiprocessing as mp
 import random
 import sys
 import time
 from pathlib import Path
+
+# The HF "You are sending unauthenticated requests to the HF Hub" notice is
+# emitted by huggingface_hub at WARNING level; hide it unless a token is truly
+# needed. (Setting HF_TOKEN is the real fix and also lifts rate limits.)
+logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 
 from src.evaluation import taxonomy_metrics
 from src.loaders.excel_loader import TaxonomyGraph
