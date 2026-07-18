@@ -27,10 +27,12 @@ End-to-end driver for the baseline BIG-5 VLM pipeline, in three stages:
 Metrics (per CLAUDE.md scoping):
   - accuracy / precision / recall / F1   : ALL datasets, but scored differently
     by dataset type (recap §6):
-      * ImageNet/Places (single-label): nature/biotic/material are read off the
-        FORCED top-1 ClipMatch class's taxonomy position — one predicted class
-        per image, no lexical extraction matching, no similarity threshold.
-        Robust to species-level mismatch (GT "golden retriever" vs. pred "dog").
+      * ImageNet/Places (single-label): nature/biotic are read off the FORCED
+        top-1 ClipMatch class's taxonomy position — one predicted class per
+        image, no lexical extraction matching, no similarity threshold; robust
+        to species-level mismatch (GT "golden retriever" vs. pred "dog").
+        material is ALWAYS the VLM's own label (CLAUDE.md — never mapped), taken
+        from the best-matching extracted object.
       * COCO/BIG-5: image-level nature (nature=1 if ANY extracted object is
         nature) + matched-object biotic/material (COCO box-IoU matching is
         future work, gated on the Grounding pipeline — §6.4).
@@ -187,8 +189,8 @@ def image_pred_nature(object_final_labels):
 
 
 def _pred_axes_from_class(graph, pred_class_synset):
-    """Derive predicted (nature, biotic, material) for a single-label image from
-    the ClipMatch top-1 predicted CLASS's taxonomy position (recap §6.2).
+    """Derive predicted (nature, biotic) for a single-label image from the
+    ClipMatch top-1 predicted CLASS's taxonomy position (recap §6.2).
 
     Resolves the predicted class synset to its nearest labeled node via
     get_gt_from_graph — the SAME resolution used to build the GT labels — so the
@@ -198,19 +200,18 @@ def _pred_axes_from_class(graph, pred_class_synset):
     resolves to no labeled node (caller penalizes that as a wrong prediction,
     never drops it — CLAUDE.md convention).
 
-    NOTE (material): for ImageNet/Places this returns the class's taxonomy-level
-    material (get_gt_from_graph defaults it to True for real-photo datasets),
-    NOT a per-instance VLM material judgment. That is an intentional §6.2
-    simplification for these single-label benchmark datasets, whose material GT
-    is itself the heuristic real-photo default; genuine per-instance material
-    labeling (VLM) still governs BIG-5.
+    MATERIAL IS DELIBERATELY NOT RETURNED HERE. Per CLAUDE.md's hard convention,
+    material/immaterial is ALWAYS VLM-predicted, NEVER mapped — it depends on
+    whether THIS instance is a real object vs. a representation, which a class
+    name cannot encode. The caller sources predicted material from the VLM label
+    of the best-matching extracted object instead (see phase_score).
     """
     if not pred_class_synset:
         return None
     lbl = get_gt_from_graph(pred_class_synset, graph)
     if not lbl:
         return None
-    return {"nature": lbl["gt_nature"], "biotic": lbl["gt_biotic"], "material": lbl["gt_material"]}
+    return {"nature": lbl["gt_nature"], "biotic": lbl["gt_biotic"]}
 
 
 # =============================================================================
@@ -515,11 +516,16 @@ def phase_score(args):
             # nature across every extracted object penalized a correctly-detected
             # incidental object (e.g. a real cat in a GT-"couch" image).
             pred_class_synset = pred_node = None
+            best_obj_idx = None  # extracted object most representative of the pred class
             gt_syn = targets[0].get("synset_id") if targets else None
             if rec_obj_embs is not None and rec_obj_embs.shape[0] > 0:
                 _, pred_idx, per_obj_sim = clip_metrics.clipmatch(rec_obj_embs, candidate_embs)
                 if pred_idx >= 0:
                     pred_class_synset = candidate_vocab[pred_idx]["synset_id"]
+                    # The extracted object with the highest similarity to the
+                    # predicted class is the pipeline's representative of it —
+                    # used to source the VLM material label below.
+                    best_obj_idx = int(per_obj_sim.argmax())
                     # Turn the predicted CLASS into a specific WordNet synset
                     # NODE by picking whichever extracted object phrase best
                     # represents that prediction (needed for hP/hR below).
@@ -531,6 +537,7 @@ def phase_score(args):
             # A present GT with an unresolvable predicted class (pred_axes None,
             # or a None axis) is PENALIZED AS WRONG — encoded as the negation of
             # the GT — never dropped (CLAUDE.md: prediction-unmapped penalized).
+            # nature/biotic: from the predicted class's taxonomy position.
             if t0.get("gt_nature") is not None:
                 gt_n = bool(t0["gt_nature"])
                 pn = pred_axes["nature"] if pred_axes else None
@@ -541,9 +548,13 @@ def phase_score(args):
                 pb = pred_axes["biotic"] if pred_axes else None
                 bio_true.append(gt_b)
                 bio_pred.append(bool(pb) if pb is not None else (not gt_b))
+            # material: ALWAYS the VLM's own prediction (CLAUDE.md — never mapped),
+            # taken from the best-matching extracted object's final_material.
+            # None (object judged non-nature, parse failure, or no prediction)
+            # is penalized as wrong, never taxonomy-defaulted.
             if t0.get("gt_material") is not None:
                 gt_m = bool(t0["gt_material"])
-                pm = pred_axes["material"] if pred_axes else None
+                pm = finals[best_obj_idx]["final_material"] if best_obj_idx is not None else None
                 mat_true.append(gt_m)
                 mat_pred.append(bool(pm) if pm is not None else (not gt_m))
 
@@ -623,16 +634,18 @@ def phase_score(args):
         "nature": _binary_metrics(nat_true, nat_pred),
         "biotic_matched": _binary_metrics(bio_true, bio_pred),
         "material_matched": _binary_metrics(mat_true, mat_pred),
-        "axis_scoring_note": ("imagenet/places: nature/biotic/material are derived from the "
-                              "forced top-1 ClipMatch class's taxonomy position (recap §6.2), "
-                              "NOT from lexical extraction matching. coco/big5: image-level "
-                              "nature (OR) + matched-object biotic/material (coco box-IoU is "
-                              "future work, recap §6.4)."),
+        "axis_scoring_note": ("imagenet/places: nature/biotic come from the forced top-1 "
+                              "ClipMatch class's taxonomy position (recap §6.2), NOT lexical "
+                              "extraction matching; material is the VLM's own label for the "
+                              "best-matching extracted object (CLAUDE.md — material is ALWAYS "
+                              "VLM-predicted, never mapped). coco/big5: image-level nature (OR) "
+                              "+ matched-object biotic/material (coco box-IoU is future work, "
+                              "recap §6.4)."),
         "material_caveat": ("Material GT for imagenet/coco/places is the heuristic "
                             "gt_material=True default (real photos); only BIG-5 has genuine "
-                            "material GT. For imagenet/places the predicted material is likewise "
-                            "taxonomy-derived (§6.2), so this axis is near-trivially high there "
-                            "and is not a meaningful material benchmark — BIG-5 is."),
+                            "material GT. Predicted material is always the VLM's judgment "
+                            "(never mapped), so on imagenet/places it is scored against that "
+                            "heuristic GT default — BIG-5 is the only genuine material benchmark."),
     }
     if run_clipmatch:
         summary["clipmatch"] = {
