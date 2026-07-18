@@ -1,16 +1,54 @@
-BIG-5 VLM PIPELINE — DESIGN RECAP (v3)
-(For review/correction — please edit directly and send back)
+BIG-5 VLM PIPELINE — DESIGN RECAP (v4)
+(v4: the VLM pipeline is now IMPLEMENTED — this doc records both the original
+design rationale AND, in "IMPLEMENTED:" notes, how the shipped code actually
+does it where the two differ.)
+
+===============================================================
+0. IMPLEMENTATION STATUS (NEW in v4)
+===============================================================
+
+The VLM pipeline is coded end-to-end. Entry point:
+scripts/run_vlm_pipeline.py (--stage all|infer|score). Core logic:
+src/vlm_pipeline.py; prompts/schemas: src/models/prompts.py; VLM
+backends: src/models/vlm_models.py; dataset loaders + mapping vocab:
+src/loaders/dataset_loader.py; taxonomy graph: src/loaders/
+excel_loader.py; metrics: src/evaluation/{clip_metrics,taxonomy_metrics}.py.
+
+Key implemented shape (details in the sections below):
+  - Two-pass: open caption -> structured extraction (Sections 4-5).
+  - Mapping happens in PHASE-1 INFERENCE (not scoring): each extracted
+    object is mapped to the taxonomy FIRST, then the VLM labeling call
+    is ROUTED (Section 6):
+        unmapped        -> ONE full VLM call (nature+biotic+material)
+        mapped-nature   -> material-only VLM call (nature/biotic from map)
+        mapped non-nature -> NO VLM call
+    Every extracted object is labeled on all three axes.
+  - --max_hops CLI arg bounds how far an extracted object may resolve
+    onto the taxonomy (0 = only annotator-labeled nodes; default 3).
+  - --stage all runs infer and score in SEPARATE spawned subprocesses,
+    so the VLM's VRAM is released (OS reclaim on process exit) before
+    CLIP loads; a shared W&B run id keeps both in one run.
+  - Axis scoring differs by dataset type (Section 8): single-label
+    (ImageNet/Places) uses the forced top-1 ClipMatch class's taxonomy
+    for nature/biotic + VLM material of the best-matching object;
+    COCO/BIG-5 use image-level nature (OR) + matched-object axes.
+
+STILL DESIGN-ONLY (not built): the Grounding pipeline (Section 9, and
+the COCO box-IoU matching noted in Section 8), and the ablations
+(Section 7).
 
 ===============================================================
 1. TWO SEPARATE PIPELINES (KEY TERMINOLOGY)
 ===============================================================
 
-  A) VLM PIPELINE (language-based; in progress now):
+  A) VLM PIPELINE (language-based; IMPLEMENTED — see Section 0):
      1. Open-ended caption generation
      2. Structured object extraction
+     2b. Map each extracted object to the taxonomy (WordNet mapping
+        vocab) BEFORE labeling — routes the labeling call (Section 6)
      3. Taxonomy labeling (nature/no-nature, biotic/abiotic,
-        material/immaterial) — done via mapping when possible,
-        VLM reasoning otherwise (see Section 6)
+        material/immaterial) — mapping when possible, VLM reasoning
+        otherwise, routed per object (see Section 6)
      Produces a full per-image prediction scoreable with standard
      accuracy/precision/recall/F1, same framework as the closed-set
      baselines already built.
@@ -82,9 +120,8 @@ added separately at call-time depending on stage.
          penalized stylized depictions by omission).
      This closes the gap flagged in v1/v2 of this recap.
 
-  b) big5_taxonomy_axes.txt (UPDATED) — material/immaterial and
-     biotic/abiotic definitions. Used during structured extraction
-     / labeling.
+  b) material/immaterial + biotic/abiotic definitions. Used during
+     labeling.
        - CHANGE: the five immaterial "format subcategories"
          (videogame, infographic, AI-generated, plain text,
          illustration) are NO LONGER presented as a classification
@@ -95,6 +132,14 @@ added separately at call-time depending on stage.
          representation / art-cultural-scientific representation),
          to aid recognition without implying a required output
          field.
+       - IMPLEMENTED: these live as TWO separate files,
+         big5_biotic_definition.txt and big5_material_definition.txt
+         (not one combined big5_taxonomy_axes.txt). They are composed
+         into the labeling system prompt per routing (Section 3/6):
+         the UNMAPPED-object labeling call sees nature+biotic+material
+         definitions; the MAPPED-nature material-only call sees the
+         material definition ALONE (nature/biotic already fixed by the
+         mapping, so their definitions are omitted from that prompt).
 
 ===============================================================
 3. SERVING / FRAMEWORK DECISIONS
@@ -107,8 +152,21 @@ added separately at call-time depending on stage.
   scale rather than reprocessed every call.
 - Different system prompts per stage = different cache prefixes
   (fine; confirm Ramin's serving config allows this).
+  IMPLEMENTED: three distinct system prompts — caption/extraction
+  (nature definition only), unmapped-labeling (all three definitions),
+  mapped-nature material-only labeling (material definition only) —
+  so each is a stable, separately-cacheable prefix.
 - Files read from disk once at startup, not per-call, so the token
   sequence stays stable (identical string = cache hit).
+  IMPLEMENTED: build_system_prompts() reads the definition files once
+  in phase_infer; run_inference reuses the fixed strings per batch.
+- IMPLEMENTED (VRAM): --stage all runs infer and score in separate
+  'spawn' subprocesses. When the infer subprocess exits, the OS
+  reclaims the VLM's GPU memory in full before CLIP loads — more
+  reliable than the earlier in-process unload_vlm (vLLM/torch do not
+  release CUDA memory dependably on GC). Only the picklable args
+  Namespace crosses the boundary; a shared W&B run id (resume="allow")
+  keeps both subprocesses logging into one run.
 - DSPy: protocol text maps to a Signature's "instructions" field;
   underlying calls still hit vLLM, caching still applies.
 - Need to empirically verify smaller models (e.g. Qwen3.5-0.8B)
@@ -121,13 +179,14 @@ which won't have this conversation's context by default. Claude
 Code automatically reads a file named CLAUDE.md at the start of
 every session if present in the project directory — this is the
 standard mechanism for giving it persistent project context.
-Recommended setup:
+Recommended setup (DONE — CLAUDE.md exists at the repo root and
+references the definition files under data/big5_taxonomy/):
   - Put a (trimmed) version of this recap in a CLAUDE.md at the
     repo root.
-  - Keep big5_nature_definition.txt and big5_taxonomy_axes.txt as
-    separate files in the repo (e.g. under docs/ or context/) and
-    reference them from CLAUDE.md rather than pasting their full
-    content in.
+  - Keep the definition files (IMPLEMENTED as big5_nature_definition.txt,
+    big5_biotic_definition.txt, big5_material_definition.txt under
+    data/big5_taxonomy/) as separate files in the repo and reference
+    them from CLAUDE.md rather than pasting their full content in.
   - CAVEAT: very long CLAUDE.md files can reduce how consistently
     Claude Code follows every instruction in them. Full discussion/
     rationale (the "why," e.g. everything in this recap) should
@@ -147,14 +206,15 @@ Recommended setup:
   F-CLIPScore and Object-CLIPScore metrics converge and stop being
   meaningfully different.
 
-- Caption prompt (baseline, NEUTRAL — no nature-priming):
-  "Describe this image in detail, including the main subject,
-  the background, the setting, and any secondary elements
-  present."
+- Caption prompt (baseline, NEUTRAL — no nature-priming).
+  IMPLEMENTED (verbatim, src/models/prompts.py CAPTION_PROMPT):
+  "Describe this image in 3-4 sentences, covering the main subject,
+  the background, the setting, and any secondary elements present.
+  Be specific but concise."
   Reasoning: plain "describe the scene" suffers from (a) salience
   bias (only prominent subject described) and (b) brevity bias
-  (short captions leave no room for secondary elements). Rewritten
-  prompt addresses both without leading toward nature specifically.
+  (short captions leave no room for secondary elements). This prompt
+  addresses both without leading toward nature specifically.
 
 - Explicit decision: do NOT add "pay special attention to nature-
   related elements" to the baseline. Reasoning: leading question →
@@ -186,6 +246,10 @@ study, undecided which is default:
      cross-VLM comparison.
 Plan: build (a) first for week-1 speed, formally compare vs (b)
 once the pipeline exists.
+IMPLEMENTED: (a) — the same VLM captions and extracts (extraction
+re-sends the image, the "second look"). (b) remains an ablation
+(Section 7), not yet built. Extraction uses a structured schema
+(ObjectExtractionResponse) returning a de-duplicated object list.
 
 CONSTRAINT ON THIS ABLATION: material/immaterial labeling
 (Section 6) cannot be handed to a text-only agnostic LLM regardless
@@ -222,6 +286,30 @@ not just concept lookup):
     disambiguate real/painted/video-game; the pixels can). Drives
     the constraint in Section 5 — material/immaterial can't be
     delegated to a text-only agnostic LLM.
+
+IMPLEMENTED (routing + where it runs):
+  Mapping runs in PHASE-1 INFERENCE, BEFORE the VLM labeling calls
+  (not deferred to scoring — saves compute and the artifact ships
+  fully resolved). Each extracted object is mapped via the dataset's
+  authoritative class->synset table (build_mapping_vocab; no
+  word-sense guessing), then the labeling call is ROUTED:
+    - UNMAPPED object -> ONE full VLM call, all three axes at once
+      (TaxonomyResponse; system prompt = all three definitions).
+    - MAPPED-nature object -> MATERIAL-ONLY VLM call (MaterialResponse;
+      system prompt = material definition only). nature/biotic taken
+      from the mapping, so the VLM is not asked to re-derive them.
+    - MAPPED non-nature object -> NO VLM call (nature=False from the
+      map; biotic/material are n/a).
+  Two batched generate_batch calls per image-batch (one per system
+  prompt) keep each prefix cache-friendly. EVERY extracted object ends
+  up labeled on all three axes.
+
+  --max_hops (CLI) bounds how far an extracted object may resolve onto
+  a labeled taxonomy node (TaxonomyGraph.resolve_labels): 0 = only a
+  directly-annotated synset counts (no inherited label); 1 = also one
+  hypernym/hyponym hop; default 3. Stored in the artifact header and
+  reused by --stage score. Lower values push more objects to the VLM
+  fallback; higher values map more aggressively.
 
 VALIDATION / CALIBRATION:
   Rather than an ablation comparing "mapping-first" vs "always use
@@ -408,15 +496,48 @@ f) Hierarchical Precision / Recall (hP/hR) + Wu-Palmer, per
        granularity-mismatch failure mode already discussed in the
        SOTA review (Yu et al.'s fine-grained-task finding).
      - Method: take the predicted GT class from ClipMatch (e,
-       above), then use a BGE cross-encoder to find the maximum
-       similarity between that predicted class and the extracted
-       object list, mapping the result directly onto WordNet to
-       compute hP/hR.
+       above), then map it onto a WordNet node via the extracted
+       object list and compute hP/hR against the GT node.
+     - IMPLEMENTED (taxonomy_metrics.resolve_to_wordnet): the
+       predicted-class -> WordNet-node step is NOT a BGE cross-encoder
+       (that was the design sketch). Instead the extracted objects are
+       ranked by their CLIP similarity to the predicted class (reusing
+       the per-object sims ClipMatch already computed), the top phrase
+       that resolves in WordNet is taken, and polysemy is broken by
+       maximizing Wu-Palmer similarity to the predicted class. hP/hR
+       are then the ancestral-closure overlap of GT node vs. predicted
+       node (compute_hierarchical_metrics).
 
 Report BOTH EM/Contains (strict) and hP/hR (graded closeness) per
 dataset — they answer different questions; together they give a
 richer results table (exact-match rate + how far off misses were)
 than either alone.
+
+IMPLEMENTED — AXIS SCORING (nature/biotic/material acc/P/R/F1),
+SPLIT BY DATASET TYPE:
+  - ImageNet/Places (single-label): nature/biotic are read off the
+    FORCED top-1 ClipMatch class's taxonomy position — NOT lexical
+    extraction matching, NO similarity threshold (global argmax over
+    the full candidate vocab always returns a class). This fixes a
+    real bug: ORing nature across every extracted object penalized a
+    correctly-detected incidental object (e.g. a real cat in a
+    GT-"couch" image). Robust to species-level mismatch (GT "golden
+    retriever" vs. pred "dog" still agree on nature/biotic).
+    material stays the VLM's own label (never mapped, per this
+    section's rule) — taken from the best-matching extracted object.
+  - COCO (multi-label) + BIG-5 (holistic scene): image-level nature =
+    OR over extracted objects; biotic/material scored on the matched
+    GT object (lexical class-name/synonym match).
+    FUTURE WORK (needs the Grounding pipeline): replace COCO's lexical
+    matching with Hungarian box-IoU assignment (IoU>=0.5) once
+    Grounding DINO 1.5 gives predicted boxes — matched GT boxes score
+    as usual; unmatched GT boxes penalized as wrong; unmatched
+    PREDICTED boxes EXCLUDED not penalized (COCO's 80 classes are a
+    curated subset, so an extra real object is not a hallucination).
+    A TODO to this effect is left in run_vlm_pipeline.py.
+  - "extraction-hit rate" (exact-match: was the GT object mentioned)
+    is kept as a REPORTING-ONLY diagnostic; it no longer gates or
+    feeds any axis score.
 
 ===============================================================
 9. GROUNDING PIPELINE — ROLE IN FINAL CROSS-VLM METRICS (GOAL 1)
@@ -455,10 +576,11 @@ unmapped-object gap directly, cost permitting.
 10. TIMELINE (8 WEEKS, JUL 16 → SEP 10)
 ===============================================================
 
-Week 1 (Jul 16-22): VLM pipeline baseline (caption → extraction →
-  labeling) + F-CLIPScore + Object-CLIPScore implemented on
-  Qwen3.5-0.8B. Send code + first metric to Ramin early for fast
-  feedback loop on BSC infra.
+Week 1 (Jul 16-22) — DONE (code): VLM pipeline baseline (caption →
+  extraction → mapping-routed labeling) + F-CLIPScore +
+  Object-CLIPScore + per-axis acc/P/R/F1 + ClipMatch/hP/hR
+  implemented. Next: spot-check on Qwen3.5-0.8B and send code + first
+  metric to Ramin for the BSC infra feedback loop.
 
 Week 2 (Jul 23-29): Iterate on Ramin's feedback; begin Grounding
   pipeline setup (Grounding DINO 1.5 + SAM / CLIPSeg).
@@ -506,5 +628,17 @@ Week 8 (Sep 3-10): Finish Discussion/Conclusion/Abstract,
 - Whether to also test ClipMatch/hP/hR against the raw caption for
   comparison, despite the concerns raised, or go straight to
   object-list-only
-- CLAUDE.md trimming — decide what stays vs. gets moved to a linked
-  doc once Claude Code work actually starts (Section 3)
+
+RESOLVED IN v4 (decided during implementation):
+- hP/hR predicted-class -> WordNet-node step: uses CLIP-ranked object
+  list + Wu-Palmer disambiguation (resolve_to_wordnet), NOT a BGE
+  cross-encoder (Section 8f).
+- Mapping location: done in Phase-1 inference, not scoring; labeling
+  routed per object; every object labeled on all three axes (Section 6).
+- --max_hops added as a CLI knob for the extracted-object mapping
+  radius (0 = annotator-labeled only; default 3).
+- Single-label axis scoring uses the forced top-1 ClipMatch class for
+  nature/biotic (+ VLM material of the best-matching object), fixing
+  the incidental-object penalty (Section 8, IMPLEMENTED block).
+- CLAUDE.md now carries the trimmed "what" (schemas, formulas, paths,
+  conventions); this recap keeps the "why" + design history.
