@@ -104,7 +104,7 @@ def parse_args():
                              "--results_dir.")
     parser.add_argument("--max_samples", type=int, default=None, help="Limit number of evaluations.")
     parser.add_argument("--num_preds_to_store", type=int, default=None,
-                        help="Number of images whose per-instance predictions get written to the "
+                        help="Number of images whose per-instance predictions get written to the " 
                              "_predictions.csv file. Images are chosen deterministically (sorted "
                              "by image_path), so the SAME fixed set of images is stored across "
                              "different models/runs on the same dataset, keeping CSVs comparable. "

@@ -363,7 +363,7 @@ def phase_score(args):
     image_paths = [r["image_path"] for r in records]
     captions = [r["caption"] for r in records]
     image_embs = scorer.encode_images(image_paths)
-    caption_embs = scorer.encode_text(captions, warn_truncation=True)
+    caption_embs = scorer.encode_text(captions, warn_truncation=False)
 
     # Flatten object texts with per-image offsets, encode once.
     # Every image has a DIFFERENT number of extracted objects, so we can't

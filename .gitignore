@@ -2,6 +2,7 @@
 first_ideas/
 notebooks/
 temporal.ipynb
+labeling_app/
 
 #IDE
 .vscode/
