@@ -4,16 +4,16 @@ run_vlm_pipeline.py
 
 End-to-end driver for the baseline BIG-5 VLM pipeline, in three stages:
 
-  --stage all   : THE STANDARD WAY TO RUN THIS PIPELINE. Loads the VLM, runs
-                  caption -> extraction -> per-object labeling over every image,
-                  and writes a JSON-lines artifact of raw responses to
-                  --responses_file. The VLM is then explicitly unloaded
-                  (src.models.vlm_models.unload_vlm — tears down vLLM's
-                  distributed process group / KV-cache, or the HF model's
-                  tensors, then empties the CUDA cache) BEFORE open_clip + the
-                  TaxonomyGraph are loaded to score the stored artifact. One
-                  command, one process, the VLM and CLIP never hold GPU memory
-                  at the same time.
+  --stage all   : THE STANDARD WAY TO RUN THIS PIPELINE. Runs inference then
+                  scoring, but each in its OWN spawned subprocess (see main()):
+                  the infer subprocess loads the VLM, writes the JSON-lines
+                  artifact to --responses_file, then EXITS — which makes the OS
+                  reclaim 100% of the VLM's VRAM before the score subprocess
+                  loads open_clip + the TaxonomyGraph. The VLM and CLIP never
+                  hold GPU memory at the same time, and we don't rely on
+                  in-process CUDA cleanup (vLLM/torch release it unreliably on
+                  GC). 'spawn' is required for CUDA; only the picklable args
+                  Namespace crosses the process boundary.
 
   --stage infer : run ONLY the inference half (VLM -> --responses_file) and
                   exit. Useful to run inference on one machine/job and defer
@@ -25,14 +25,20 @@ End-to-end driver for the baseline BIG-5 VLM pipeline, in three stages:
                   change) without re-running inference.
 
 Metrics (per CLAUDE.md scoping):
-  - accuracy / precision / recall / F1   : ALL datasets. Nature is image-level
-    (nature=1 if ANY extracted object is nature). Biotic/material are scored on
-    the GT object when it is matched among the extractions (extraction-hit
-    subset).
+  - accuracy / precision / recall / F1   : ALL datasets, but scored differently
+    by dataset type (recap §6):
+      * ImageNet/Places (single-label): nature/biotic/material are read off the
+        FORCED top-1 ClipMatch class's taxonomy position — one predicted class
+        per image, no lexical extraction matching, no similarity threshold.
+        Robust to species-level mismatch (GT "golden retriever" vs. pred "dog").
+      * COCO/BIG-5: image-level nature (nature=1 if ANY extracted object is
+        nature) + matched-object biotic/material (COCO box-IoU matching is
+        future work, gated on the Grounding pipeline — §6.4).
   - F-CLIPScore + Object-CLIPScore       : ALL datasets (reference-free).
   - ClipMatch + hP/hR/hF1                : ImageNet + Places ONLY (fixed vocab).
-  - Diagnostics: extraction-hit rate, WordNet-mapping vs VLM-fallback rate,
-    objects/image, parse-failure rate.
+  - Diagnostics: extraction-hit rate (exact-match, reporting-only — no longer
+    gates axis scores), WordNet-mapping vs VLM-fallback rate, objects/image,
+    parse-failure rate.
 
 HOW TO READ THIS FILE
 This is the biggest, most "top-level" file in the pipeline — it's the actual
@@ -48,6 +54,7 @@ backward through phase_infer/phase_score.
 import argparse
 import csv
 import json
+import multiprocessing as mp
 import random
 import sys
 import time
@@ -55,8 +62,8 @@ from pathlib import Path
 
 from src.evaluation import taxonomy_metrics
 from src.loaders.excel_loader import TaxonomyGraph
-from src.loaders.dataset_loader import load_dataset, get_candidate_vocab, build_mapping_vocab
-from src.models.vlm_models import MODEL_REGISTRY, VLLM_FAMILIES, create_vlm, unload_vlm
+from src.loaders.dataset_loader import load_dataset, get_candidate_vocab, build_mapping_vocab, get_gt_from_graph
+from src.models.vlm_models import MODEL_REGISTRY, VLLM_FAMILIES, create_vlm
 from src.vlm_pipeline import run_inference, resolve_hybrid_label, normalize_objects, _normalize_object
 from src.evaluation import clip_metrics
 from src.utils import update_results_store
@@ -66,20 +73,30 @@ from src.utils import update_results_store
 # System prompts (built from the ../data/big5_taxonomy/ definition files)
 # =============================================================================
 def build_system_prompts(nature_path, biotic_path, material_path):
-    """Caption stage sees the NATURE definition only (no axis-priming, per the
-    recap). Labeling stage sees all three axis definitions — identical to
-    evaluate_taxonomy_labeling.py's system prompt, so the fallback matches the
-    calibration eval."""
+    """Build the three system prompts the pipeline needs:
+
+      - caption_system         : NATURE definition only (no axis-priming, per
+                                 the recap) — used for captioning + extraction.
+      - label_system_full      : ALL THREE axis definitions — used ONLY for
+                                 UNMAPPED objects, where the VLM must decide
+                                 nature/biotic/material from scratch (identical
+                                 to evaluate_taxonomy_labeling.py's system
+                                 prompt, so the fallback matches the calibration
+                                 eval).
+      - label_system_material  : MATERIAL definition only — used for MAPPED-nature
+                                 objects, where WordNet already fixed nature and
+                                 biotic and only material/immaterial remains.
+                                 Showing the model only the relevant definition
+                                 (not all three) keeps the material-only call
+                                 focused and its prefix cache-friendly.
+    """
     nature = Path(nature_path).read_text()
     biotic = Path(biotic_path).read_text()
     material = Path(material_path).read_text()
-    # The caption call only needs to know what "nature" looks like in general
-    # (so it can describe the scene without being biased toward a specific
-    # axis); the per-object labeling call needs ALL THREE definitions since it
-    # has to answer nature/biotic/material questions directly.
     caption_system = nature
-    label_system = f"{nature}\n\n{biotic}\n\n{material}"
-    return caption_system, label_system
+    label_system_full = f"{nature}\n\n{biotic}\n\n{material}"
+    label_system_material = material
+    return caption_system, label_system_full, label_system_material
 
 
 # =============================================================================
@@ -169,6 +186,33 @@ def image_pred_nature(object_final_labels):
     return any(bool(o["final_nature"]) for o in object_final_labels)
 
 
+def _pred_axes_from_class(graph, pred_class_synset):
+    """Derive predicted (nature, biotic, material) for a single-label image from
+    the ClipMatch top-1 predicted CLASS's taxonomy position (recap §6.2).
+
+    Resolves the predicted class synset to its nearest labeled node via
+    get_gt_from_graph — the SAME resolution used to build the GT labels — so the
+    axes are inherited from the correct branch of the hierarchy even when the
+    prediction misses at species level (e.g. GT "golden retriever" vs. predicted
+    "dog" still agree on nature/biotic). Returns None if the predicted class
+    resolves to no labeled node (caller penalizes that as a wrong prediction,
+    never drops it — CLAUDE.md convention).
+
+    NOTE (material): for ImageNet/Places this returns the class's taxonomy-level
+    material (get_gt_from_graph defaults it to True for real-photo datasets),
+    NOT a per-instance VLM material judgment. That is an intentional §6.2
+    simplification for these single-label benchmark datasets, whose material GT
+    is itself the heuristic real-photo default; genuine per-instance material
+    labeling (VLM) still governs BIG-5.
+    """
+    if not pred_class_synset:
+        return None
+    lbl = get_gt_from_graph(pred_class_synset, graph)
+    if not lbl:
+        return None
+    return {"nature": lbl["gt_nature"], "biotic": lbl["gt_biotic"], "material": lbl["gt_material"]}
+
+
 # =============================================================================
 # Metric aggregation
 # =============================================================================
@@ -199,8 +243,8 @@ def phase_infer(args):
     taxonomy graph, create the VLM, run caption -> extraction -> labeling over
     every image (src.vlm_pipeline.run_inference), and stream the results out to
     --responses_file as they're produced (rather than holding them all in
-    memory). Returns the created `vlm` object so --stage all can explicitly
-    release its GPU memory afterward (see unload_vlm below / main()).
+    memory). Returns the created `vlm` object (unused by --stage all now, which
+    reclaims VRAM by exiting the infer subprocess — see main()).
     """
     print(f"🚀 [infer] dataset='{args.dataset}', model='{args.model_family}/{args.model_name}'")
 
@@ -239,7 +283,7 @@ def phase_infer(args):
     mapping_vocab = build_mapping_vocab(args.dataset, **vocab_kwargs)
     candidate_vocab = get_candidate_vocab(args.dataset, **vocab_kwargs)  # None for coco/big5
 
-    caption_system, label_system = build_system_prompts(
+    caption_system, label_system_full, label_system_material = build_system_prompts(
         args.nature_definition_path, args.biotic_definition_path, args.material_definition_path)
 
     # Different VLM backends need different constructor keyword arguments —
@@ -264,6 +308,7 @@ def phase_infer(args):
         "model": f"{args.model_family}/{args.model_name}",
         "mapping_vocab": mapping_vocab,
         "candidate_vocab": candidate_vocab,
+        "max_hops": args.max_hops,
     }
 
     out_path = Path(args.responses_file)
@@ -278,7 +323,10 @@ def phase_infer(args):
         f.write(json.dumps(header) + "\n")
         for rec in run_inference(
             vlm, dataset,
-            caption_system_prompt=caption_system, label_system_prompt=label_system,
+            caption_system_prompt=caption_system,
+            label_system_full=label_system_full,
+            label_system_material=label_system_material,
+            tax_graph=graph, mapping_vocab=mapping_vocab, max_hops=args.max_hops,
             batch_size=args.batch_size,
             caption_max_new_tokens=args.max_new_tokens_caption,
             label_max_new_tokens=args.max_new_tokens_label,
@@ -331,6 +379,11 @@ def phase_score(args):
     # ClipMatch/hP/hR only make sense for datasets with a fixed candidate
     # class list (ImageNet/Places) — see clip_metrics.CLIPMATCH_DATASETS.
     run_clipmatch = dataset in clip_metrics.CLIPMATCH_DATASETS and candidate_vocab
+    # Single-label datasets drive their nature/biotic/material metrics off the
+    # forced top-1 ClipMatch class (recap §6.1/§6.2); that requires the fixed
+    # candidate vocab, so it coincides exactly with run_clipmatch. COCO/BIG-5
+    # keep the image-level-OR + matched-object path instead.
+    single_label = bool(run_clipmatch)
     if args.max_samples is not None:
         records = records[: args.max_samples]
 
@@ -344,16 +397,18 @@ def phase_score(args):
     scorer = clip_metrics.CLIPScorer(model_name=args.clip_model, pretrained=args.clip_pretrained,
                                      device=args.device, batch_size=args.clip_batch_size)
 
-    # ---- Resolve hybrid labels for every object, up front (needs the graph) ----
-    # `resolve_hybrid_label` combines each object's raw VLM answer with a
-    # WordNet lookup (see src/vlm_pipeline.py) to get its FINAL nature/biotic/
-    # material labels. We do this once for every object across every image up
-    # front, storing the results as `rec["object_finals"]`, so the big scoring
-    # loop below can just read them off rather than recomputing per metric.
+    # ---- Hybrid labels per object ----
+    # Mapping + hybrid resolution now happen in Phase 1 (see
+    # src/vlm_pipeline.run_inference), so records written by the current infer
+    # stage already carry `object_finals`. We only recompute here for BACKWARD
+    # COMPATIBILITY with older artifacts that predate that change.
+    max_hops = header.get("max_hops", args.max_hops)
     for rec in records:
+        if rec.get("object_finals") is not None:
+            continue
         finals = []
         for obj, lab in zip(rec["objects"], rec["object_labels"]):
-            finals.append(resolve_hybrid_label(obj, lab, graph, mapping_vocab))
+            finals.append(resolve_hybrid_label(obj, lab, graph, mapping_vocab, max_hops=max_hops))
         rec["object_finals"] = finals
 
     # ---- CLIP encodings (batched across ALL images for efficiency) ----
@@ -439,69 +494,100 @@ def phase_score(args):
             fclip_vals.append(clip_metrics.f_clipscore(image_embs[idx], caption_embs[idx], rec_obj_embs))
             objclip_vals.append(clip_metrics.object_clipscore(image_embs[idx], rec_obj_embs))
 
-        # --- image-level nature ---
-        g_nat = image_gt_nature(targets)
-        if g_nat is not None:
-            nat_true.append(bool(g_nat))
-            nat_pred.append(bool(image_pred_nature(finals)))
-
-        # --- matched-object biotic/material + extraction hit ---
+        # --- extraction-hit diagnostic (ALL datasets; reporting-only) ---
+        # recap §6.3: keep the exact-match extraction rate as a descriptive
+        # diagnostic, but it NO LONGER gates or feeds the nature/biotic/material
+        # scores (those come from the forced top-1 ClipMatch class on single-
+        # label datasets, and from matched-object finals on COCO/BIG-5).
         for t in targets:
             if t.get("gt_nature") is None:
                 continue
             n_gt_targets += 1
-            # Did the model actually EXTRACT (mention) an object matching this
-            # ground-truth target at all? If not, we can't score its
-            # biotic/material prediction (there IS no prediction to compare).
-            mi = find_matching_object(objs, t)
-            if mi is None:
-                continue
-            n_extraction_hits += 1
-            fin = finals[mi]
-            # A present GT with a failed/absent prediction (final_* is None) is
-            # PENALIZED AS WRONG, not dropped (CLAUDE.md: "Prediction-unmapped
-            # instances: penalized as wrong (never defaulted)"). We encode a
-            # failed prediction as the negation of the GT so it always counts as
-            # an error rather than silently inflating the metric.
-            if t.get("gt_biotic") is not None:
-                gt_b = bool(t["gt_biotic"])
-                pred_b = fin["final_biotic"]
-                bio_true.append(gt_b)
-                bio_pred.append(bool(pred_b) if pred_b is not None else (not gt_b))
-            if t.get("gt_material") is not None:
-                gt_m = bool(t["gt_material"])
-                pred_m = fin["final_material"]
-                mat_true.append(gt_m)
-                mat_pred.append(bool(pred_m) if pred_m is not None else (not gt_m))
+            if find_matching_object(objs, t) is not None:
+                n_extraction_hits += 1
 
-        # --- ClipMatch + hP/hR (imagenet/places, single-label) ---
-        # An image with a GT synset ALWAYS counts toward ClipMatch/hP support.
-        # If the model extracted no objects (or none map), it cannot predict a
-        # class — that is a top-1 miss and hP/hR = 0, NOT an excluded sample
-        # (CLAUDE.md: prediction-unmapped penalized as wrong).
-        pred_class_synset = pred_node = None
-        gt_syn = targets[0].get("synset_id") if (run_clipmatch and targets) else None
-        if gt_syn:
-            clipmatch_support += 1
+        if single_label:
+            # --- ImageNet/Places (single-label): axes from forced top-1 ClipMatch ---
+            # recap §6.1/§6.2: the single predicted class (global argmax over the
+            # full candidate vocab — always returns a class, no threshold) is the
+            # SOLE source of the image's nature/biotic/material, read off that
+            # class's taxonomy position. This fixes the old bug where ORing
+            # nature across every extracted object penalized a correctly-detected
+            # incidental object (e.g. a real cat in a GT-"couch" image).
+            pred_class_synset = pred_node = None
+            gt_syn = targets[0].get("synset_id") if targets else None
             if rec_obj_embs is not None and rec_obj_embs.shape[0] > 0:
-                # ClipMatch picks whichever candidate class has the strongest
-                # matching object among everything the model extracted (see
-                # clip_metrics.clipmatch for the full algorithm).
                 _, pred_idx, per_obj_sim = clip_metrics.clipmatch(rec_obj_embs, candidate_embs)
                 if pred_idx >= 0:
                     pred_class_synset = candidate_vocab[pred_idx]["synset_id"]
-                    if pred_class_synset == gt_syn:
-                        clipmatch_top1 += 1
                     # Turn the predicted CLASS into a specific WordNet synset
                     # NODE by picking whichever extracted object phrase best
                     # represents that prediction (needed for hP/hR below).
                     pred_node = taxonomy_metrics.resolve_to_wordnet(
                         list(per_obj_sim), pred_class_synset, objs)
-            # hP/hR compare the GT synset's ancestor chain against the
-            # predicted node's ancestor chain — computed even when pred_node
-            # is None (a total miss), giving all-zero scores in that case.
-            hier = taxonomy_metrics.compute_hierarchical_metrics(graph, gt_syn, pred_node)
-            hp_vals.append(hier["hp"]); hr_vals.append(hier["hr"]); hf1_vals.append(hier["hf1"])
+
+            pred_axes = _pred_axes_from_class(graph, pred_class_synset)
+            t0 = targets[0]
+            # A present GT with an unresolvable predicted class (pred_axes None,
+            # or a None axis) is PENALIZED AS WRONG — encoded as the negation of
+            # the GT — never dropped (CLAUDE.md: prediction-unmapped penalized).
+            if t0.get("gt_nature") is not None:
+                gt_n = bool(t0["gt_nature"])
+                pn = pred_axes["nature"] if pred_axes else None
+                nat_true.append(gt_n)
+                nat_pred.append(bool(pn) if pn is not None else (not gt_n))
+            if t0.get("gt_biotic") is not None:
+                gt_b = bool(t0["gt_biotic"])
+                pb = pred_axes["biotic"] if pred_axes else None
+                bio_true.append(gt_b)
+                bio_pred.append(bool(pb) if pb is not None else (not gt_b))
+            if t0.get("gt_material") is not None:
+                gt_m = bool(t0["gt_material"])
+                pm = pred_axes["material"] if pred_axes else None
+                mat_true.append(gt_m)
+                mat_pred.append(bool(pm) if pm is not None else (not gt_m))
+
+            # ClipMatch top-1 (exact synset) + hP/hR. Every image with a GT
+            # synset counts toward support; a total miss (no prediction) scores
+            # top-1=0 and hP/hR=0, not excluded.
+            if gt_syn:
+                clipmatch_support += 1
+                if pred_class_synset is not None and pred_class_synset == gt_syn:
+                    clipmatch_top1 += 1
+                hier = taxonomy_metrics.compute_hierarchical_metrics(graph, gt_syn, pred_node)
+                hp_vals.append(hier["hp"]); hr_vals.append(hier["hr"]); hf1_vals.append(hier["hf1"])
+        else:
+            # --- COCO (multi-label) + BIG-5 (holistic): image-level nature OR
+            #     + matched-object biotic/material ---
+            # TODO(grounding-pipeline, recap §6.4): for COCO, replace this
+            # lexical find_matching_object matching with Hungarian box-IoU
+            # assignment (IoU>=0.5) once Grounding DINO 1.5 provides predicted
+            # boxes — matched GT boxes score bio/material/nature as usual;
+            # unmatched GT boxes are penalized as wrong; unmatched PREDICTED
+            # boxes are excluded, NOT penalized (COCO's 80 classes are a curated
+            # subset, so an extra real object is not a hallucination). Not
+            # implementable until the Grounding pipeline exists.
+            g_nat = image_gt_nature(targets)
+            if g_nat is not None:
+                nat_true.append(bool(g_nat))
+                nat_pred.append(bool(image_pred_nature(finals)))
+            for t in targets:
+                if t.get("gt_nature") is None:
+                    continue
+                mi = find_matching_object(objs, t)
+                if mi is None:
+                    continue
+                fin = finals[mi]
+                if t.get("gt_biotic") is not None:
+                    gt_b = bool(t["gt_biotic"])
+                    pred_b = fin["final_biotic"]
+                    bio_true.append(gt_b)
+                    bio_pred.append(bool(pred_b) if pred_b is not None else (not gt_b))
+                if t.get("gt_material") is not None:
+                    gt_m = bool(t["gt_material"])
+                    pred_m = fin["final_material"]
+                    mat_true.append(gt_m)
+                    mat_pred.append(bool(pred_m) if pred_m is not None else (not gt_m))
 
         # per-object CSV rows
         # Build one output row per extracted object, capturing both the raw
@@ -537,9 +623,16 @@ def phase_score(args):
         "nature": _binary_metrics(nat_true, nat_pred),
         "biotic_matched": _binary_metrics(bio_true, bio_pred),
         "material_matched": _binary_metrics(mat_true, mat_pred),
+        "axis_scoring_note": ("imagenet/places: nature/biotic/material are derived from the "
+                              "forced top-1 ClipMatch class's taxonomy position (recap §6.2), "
+                              "NOT from lexical extraction matching. coco/big5: image-level "
+                              "nature (OR) + matched-object biotic/material (coco box-IoU is "
+                              "future work, recap §6.4)."),
         "material_caveat": ("Material GT for imagenet/coco/places is the heuristic "
                             "gt_material=True default (real photos); only BIG-5 has genuine "
-                            "material GT."),
+                            "material GT. For imagenet/places the predicted material is likewise "
+                            "taxonomy-derived (§6.2), so this axis is near-trivially high there "
+                            "and is not a meaningful material benchmark — BIG-5 is."),
     }
     if run_clipmatch:
         summary["clipmatch"] = {
@@ -606,8 +699,15 @@ def _log_wandb(args, summary, run_clipmatch):
     """Push the final summary metrics to Weights & Biases for tracking/
     comparison across runs, if --wandb was passed."""
     import wandb
+    # Under --stage all each stage runs in its OWN subprocess (see main()), so a
+    # shared run id (generated once in main, passed through the pickled args) +
+    # resume="allow" makes every subprocess log into the SAME W&B run instead of
+    # spawning a separate run per process. For a standalone --stage score run no
+    # id is set, so this falls back to a fresh auto-id run.
+    run_id = getattr(args, "wandb_run_id", None)
     wandb.init(entity="paumonserrat03-universitat-aut-noma-de-barcelona", project="TFM_VLM",
-               config=vars(args), name=f"vlm_pipeline_{summary['dataset']}_{summary['model']}".replace("/", "_"))
+               config=vars(args), name=f"vlm_pipeline_{summary['dataset']}_{summary['model']}".replace("/", "_"),
+               id=run_id, resume="allow" if run_id else None)
     log = {
         "ObjectsPerImage": summary["diagnostics"]["objects_per_image"],
         "ExtractionHitRate": summary["diagnostics"]["extraction_hit_rate"],
@@ -670,6 +770,15 @@ def parse_args():
     p.add_argument("--max_new_tokens_caption", type=int, default=256)
     p.add_argument("--max_new_tokens_label", type=int, default=300)
     p.add_argument("--temperature", type=float, default=0.0)
+    p.add_argument("--max_hops", type=int, default=3,
+                   help="Maximum WordNet hop distance allowed when mapping an EXTRACTED "
+                        "object onto the labeled taxonomy (map_object_to_taxonomy -> "
+                        "resolve_labels). 0 = map only when an annotator labeled that exact "
+                        "synset (no inherited labels); 1 = also accept a label inherited "
+                        "across one hypernym/hyponym hop; etc. Lower values make the VLM "
+                        "fallback fire more often (fewer objects map), higher values map "
+                        "more aggressively. Default 3 (previous behavior). Stored in the "
+                        "artifact header and reused by --stage score.")
 
     # CLIP (score)
     p.add_argument("--clip_model", type=str, default="ViT-L-14")
@@ -711,24 +820,60 @@ def parse_args():
     return args
 
 
+# =============================================================================
+# Subprocess workers (for --stage all)
+# =============================================================================
+def _infer_worker(args):
+    """Subprocess entrypoint for the inference half of --stage all. Runs
+    phase_infer and then simply RETURNS/EXITS: letting the whole subprocess die
+    is what actually reclaims the VLM's VRAM — the OS tears down the process's
+    entire CUDA context, which is more reliable than an in-process unload (vLLM
+    and torch do not dependably release CUDA memory on Python GC)."""
+    phase_infer(args)
+
+
+def _score_worker(args):
+    """Subprocess entrypoint for the scoring half of --stage all — loads CLIP in
+    a FRESH process that starts with zero GPU memory held (the infer subprocess
+    that held the VLM has already exited)."""
+    phase_score(args)
+
+
 def main():
     args = parse_args()
 
-    vlm = None
-    if args.stage in ("infer", "all"):
-        vlm = phase_infer(args)
-
-    if args.stage == "all":
-        # Free the VLM's GPU memory BEFORE loading CLIP for scoring — neither
-        # vLLM nor plain torch/transformers release CUDA memory on Python GC
-        # alone, so without this explicit step the CLIP load below would
-        # contend with (or OOM against) the still-resident VLM.
-        print("🧹 [all] releasing VLM GPU memory before loading CLIP for scoring...")
-        unload_vlm(vlm)
-        del vlm
-
-    if args.stage in ("score", "all"):
+    if args.stage == "infer":
+        phase_infer(args)
+        return
+    if args.stage == "score":
         phase_score(args)
+        return
+
+    # --stage all: run each half in its OWN spawned subprocess so GPU memory is
+    # fully reclaimed by the OS between stages — the VLM (infer) and CLIP (score)
+    # never coexist on the GPU, and we don't rely on in-process CUDA cleanup.
+    #   - 'spawn' (NOT 'fork') is required to use CUDA in a child process.
+    #   - Only the picklable argparse Namespace crosses the boundary — paths and
+    #     plain scalars, never tensors or model handles.
+    #   - A shared W&B run id (below) is threaded through so both subprocesses
+    #     log into one run (see _log_wandb).
+    if args.wandb:
+        import wandb
+        args.wandb_run_id = wandb.util.generate_id()
+
+    ctx = mp.get_context("spawn")
+
+    p1 = ctx.Process(target=_infer_worker, args=(args,))
+    p1.start()
+    p1.join()
+    if p1.exitcode != 0:
+        raise RuntimeError(f"VLM inference stage failed (exit code {p1.exitcode}).")
+
+    p2 = ctx.Process(target=_score_worker, args=(args,))
+    p2.start()
+    p2.join()
+    if p2.exitcode != 0:
+        raise RuntimeError(f"Scoring stage failed (exit code {p2.exitcode}).")
 
 
 if __name__ == "__main__":
