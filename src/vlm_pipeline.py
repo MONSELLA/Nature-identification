@@ -83,8 +83,14 @@ _UNSET = object()
 # =============================================================================
 def label_to_bool(value: Optional[str], axis: str) -> Optional[bool]:
     """Standardize a TaxonomyResponse string answer into boolean logic.
-    nature: yes->True/no->False; biotic: biotic->True/abiotic->False/n_a->None;
-    material: material->True/immaterial->False/n_a->None. Unknown -> None.
+    nature: yes->True/no->False; biotic: biotic->True/abiotic->False/
+    n_a-or-none->None; material: material->True/immaterial->False/
+    n_a-or-none->None. Unknown -> None.
+
+    Both "n/a" and "none" are accepted as the not-applicable sentinel: the
+    current TaxonomyResponse schema (src/models/prompts.py) uses "none", but
+    "n/a" is accepted too so this still reads older stored artifacts written
+    before that schema change without silently misparsing them.
 
     Why convert to bool/None instead of just keeping the string? Because every
     downstream metric (accuracy/precision/recall/F1 in
@@ -105,17 +111,17 @@ def label_to_bool(value: Optional[str], axis: str) -> Optional[bool]:
             return True
         if v == "abiotic":
             return False
-        if v == "n/a":
-            # "n/a" is a valid/expected answer (nature was "no", so biotic
-            # doesn't apply) — distinguish it from an unrecognized value by
-            # returning None either way, but note it's not an ERROR case.
+        if v in ("none", "n/a"):
+            # A valid/expected answer (nature was "no", so biotic doesn't
+            # apply) — distinguish it from an unrecognized value by returning
+            # None either way, but note it's not an ERROR case.
             return None
     elif axis == "material":
         if v == "material":
             return True
         if v == "immaterial":
             return False
-        if v == "n/a":
+        if v in ("none", "n/a"):
             return None
     # Axis not recognized, or value didn't match any expected string for this
     # axis (e.g. a stray typo the model produced) — treat as "no answer".
@@ -224,6 +230,19 @@ def extract_objects_batch(
 # =============================================================================
 # Stage 3 — per-object taxonomy labeling (mapping-aware, batched)
 # =============================================================================
+def _combine_taxonomy_reasoning(out: Dict[str, Any]) -> Optional[str]:
+    """TaxonomyResponse (src/models/prompts.py) splits the model's
+    justification into TWO fields — `nature_reasoning` (Step 1, the nature
+    gate) then `sub_axes_reasoning` (Step 2, conditioned on that decision) —
+    rather than one `reasoning` field. Combine them back into a single string
+    here so the rest of the pipeline's object_labels shape (CSV output,
+    diagnostics, etc.) keeps working against one stable `reasoning` key
+    regardless of how many reasoning steps the schema asks for."""
+    parts = [out.get("nature_reasoning"), out.get("sub_axes_reasoning")]
+    parts = [p for p in parts if p]
+    return " ".join(parts) if parts else None
+
+
 def _empty_label(parse_failed: bool, vlm_called: bool) -> Dict[str, Any]:
     """A raw-label dict with every axis absent — used for a parse failure
     (vlm_called=True) or a mapped non-nature object the VLM was never asked
@@ -301,7 +320,7 @@ def label_objects_batch(
         for (i, j), out in zip(full_owner, outs):
             if isinstance(out, dict):
                 per_image[i][j] = {
-                    "reasoning": out.get("reasoning"), "nature": out.get("nature"),
+                    "reasoning": _combine_taxonomy_reasoning(out), "nature": out.get("nature"),
                     "biotic": out.get("biotic"), "material": out.get("material"),
                     "parse_failed": False, "vlm_called": True,
                 }

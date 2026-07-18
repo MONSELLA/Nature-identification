@@ -135,7 +135,8 @@ def _label_to_bool(value, axis):
     """Standardizes string answers into boolean logic depending on the axis.
     Mirrors src/vlm_pipeline.py's label_to_bool exactly (kept as a separate
     local copy here rather than importing it, since this script predates that
-    refactor — behavior is identical)."""
+    refactor — behavior is identical), including accepting BOTH "none" (the
+    current TaxonomyResponse sentinel) and "n/a" (older stored artifacts)."""
     if value is None:
         return None
     normalized = str(value).strip().lower()
@@ -146,12 +147,22 @@ def _label_to_bool(value, axis):
     elif axis == "biotic":
         if normalized == "biotic": return True
         if normalized == "abiotic": return False
-        if normalized == "n/a": return None
+        if normalized in ("none", "n/a"): return None
     elif axis == "material":
         if normalized == "material": return True
         if normalized == "immaterial": return False
-        if normalized == "n/a": return None
+        if normalized in ("none", "n/a"): return None
     return None
+
+
+def _combine_taxonomy_reasoning(pred):
+    """Mirrors src/vlm_pipeline.py's _combine_taxonomy_reasoning: TaxonomyResponse
+    splits the model's justification into `nature_reasoning` (Step 1) and
+    `sub_axes_reasoning` (Step 2) rather than one `reasoning` field — combine
+    them back into a single string for the predictions CSV."""
+    parts = [pred.get("nature_reasoning"), pred.get("sub_axes_reasoning")]
+    parts = [p for p in parts if p]
+    return " ".join(parts) if parts else None
 
 
 def calculate_binary_metrics(y_true, y_pred):
@@ -323,7 +334,7 @@ def main():
                 # We do this by scoring it as the OPPOSITE of the ground
                 # truth, which guarantees it counts as an error in the metrics
                 # below rather than accidentally counting as correct.
-                r["prediction"] = {"reasoning": None, "parse_failed": True}
+                r["prediction"] = {"parse_failed": True}
                 r["scored_pred_nature"] = not r["gt_nature"]
                 r["scored_pred_biotic"] = not r["gt_biotic"] if r["gt_biotic"] is not None else None
                 r["scored_pred_material"] = not r["gt_material"] if r["gt_material"] is not None else None
@@ -426,7 +437,7 @@ def main():
             "pred_nature": r["prediction"].get("nature"),
             "pred_biotic": r["prediction"].get("biotic"),
             "pred_material": r["prediction"].get("material"),
-            "reasoning": r["prediction"].get("reasoning"),
+            "reasoning": _combine_taxonomy_reasoning(r["prediction"]),
             "parse_failed": r["prediction"]["parse_failed"]
         })
 
