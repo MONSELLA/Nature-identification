@@ -55,19 +55,17 @@ backward through phase_infer/phase_score.
 
 import os
 
-# Quiet the very chatty third-party STARTUP logs by default — none of this comes
-# from the pipeline itself, it's vLLM's engine-config dump / torch.compile
-# timings, transformers deprecation notices, HF Hub download bars, and the HF
-# "unauthenticated requests" notice. Set here (before torch/vllm/transformers
-# are imported, and inherited by the spawned infer/score subprocesses) via
-# setdefault, so you can still override any of them from the shell to get the
-# verbose output back, e.g.:
-#     VLLM_LOGGING_LEVEL=INFO python scripts/run_vlm_pipeline.py ...
+# Quiet a couple of low-value third-party STARTUP notices by default — neither
+# comes from the pipeline itself. vLLM's own INFO logging (engine config dump,
+# torch.compile timings, etc.) and the HF Hub download/load progress bars are
+# LEFT ALONE (deliberately not touched here) since they're useful run-progress
+# signal on a cluster job. Set here (before torch/vllm/transformers are
+# imported, and inherited by the spawned infer/score subprocesses) via
+# setdefault, so you can still override either from the shell, e.g.:
+#     TRANSFORMERS_VERBOSITY=info python scripts/run_vlm_pipeline.py ...
 # To silence the HF-token warning for good (and get faster downloads), export a
 # real token instead: `export HF_TOKEN=hf_...`.
-os.environ.setdefault("VLLM_LOGGING_LEVEL", "WARNING")   # drops the vLLM INFO firehose
 os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")  # silences the use_fast deprecation etc.
-os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")  # no safetensors download bars
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")   # avoids the fork/parallelism warning
 
 import argparse
