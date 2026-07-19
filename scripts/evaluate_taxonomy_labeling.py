@@ -27,8 +27,9 @@ import csv
 import json
 import random
 import sys
-import time
 from pathlib import Path
+import time
+import datetime
 
 import wandb
 
@@ -358,7 +359,10 @@ def main():
             scored_results.append(r)
 
         if args.verbose:
-            print(f"[INFO] Batch {batch_idx + 1}/{num_batches} done in {time.time() - t0:.1f}s.")
+            batch_seconds = time.time() - t0
+            remaining_seconds = batch_seconds * (num_batches - batch_idx + 1)
+            formatted_time = datetime.timedelta(seconds=int(remaining_seconds))
+            print(f"[INFO] Batch {batch_idx + 1}/{num_batches} done in {batch_seconds}s. Estimated remaining time: {formatted_time}")
 
     # Calculate Metrics
     parse_failure_rate = sum(r["prediction"]["parse_failed"] for r in scored_results) / len(scored_results)
