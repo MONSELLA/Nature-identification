@@ -533,8 +533,15 @@ class InstructBlipVLM(HuggingFaceBackedVLM):
     own generate()/generate_batch() rather than sharing BlipFamilyVLM's."""
 
     def _load_model(self) -> None:
-        from transformers import AutoProcessor, InstructBlipForConditionalGeneration
-        self.processor = AutoProcessor.from_pretrained(self.model_name)
+        from transformers import InstructBlipForConditionalGeneration, InstructBlipProcessor
+        # NOTE: deliberately InstructBlipProcessor, not AutoProcessor —
+        # AutoProcessor.from_pretrained() resolves "instructblip-vicuna-7b"
+        # to InstructBlipVideoProcessor on some transformers versions (an
+        # auto-class resolution quirk from InstructBlipVideo being added
+        # later). That video processor treats a batch of still images as
+        # frames of one video and np.stacks them, which requires identical
+        # shapes and crashes on a batch of differently-sized images.
+        self.processor = InstructBlipProcessor.from_pretrained(self.model_name)
         self.model = (
             InstructBlipForConditionalGeneration.from_pretrained(
                 self.model_name, torch_dtype=self.dtype
