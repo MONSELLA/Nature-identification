@@ -166,6 +166,45 @@ def _combine_taxonomy_reasoning(pred):
     return " ".join(parts) if parts else None
 
 
+def _is_overflow_error(e):
+    return isinstance(e, ValueError) and "longer than the maximum model length" in str(e)
+
+
+def generate_batch_with_overflow_guard(vlm, batch, prompts, images, system_prompt, args, label):
+    """Runs `vlm.generate_batch` over one batch, tolerating per-sample prompt
+    overflow (a prompt longer than max_model_len) WITHOUT sacrificing
+    batching for the rest. vLLM's single `.chat()` call covers the whole
+    batch and fails it entirely if even one conversation overflows, with no
+    indication of which one — so on that specific failure we BISECT the
+    batch in half and recurse, each half still generated as one batched
+    call. This isolates the oversized prompt(s) down to single-item
+    granularity while every other sample stays batched together, instead of
+    falling back to generating the whole batch one item at a time."""
+    if not batch:
+        return []
+    try:
+        return vlm.generate_batch(
+            prompts=prompts, images=images, system_prompt=system_prompt,
+            max_new_tokens=args.max_new_tokens, temperature=args.temperature,
+            output_mode=args.output_mode, schema=TaxonomyResponse
+        )
+    except ValueError as e:
+        if not _is_overflow_error(e):
+            raise
+        if len(batch) == 1:
+            print(f"⚠️ Skipping '{batch[0]['image_path']}' / '{batch[0]['class_name']}' "
+                  f"({label}): prompt too long for max_model_len ({e}).")
+            return [None]
+        mid = len(batch) // 2
+        print(f"⚠️ {label}: a prompt exceeded max_model_len — bisecting "
+              f"{len(batch)} instances into two sub-batches to isolate it.")
+        left = generate_batch_with_overflow_guard(
+            vlm, batch[:mid], prompts[:mid], images[:mid], system_prompt, args, f"{label}/left")
+        right = generate_batch_with_overflow_guard(
+            vlm, batch[mid:], prompts[mid:], images[mid:], system_prompt, args, f"{label}/right")
+        return left + right
+
+
 def calculate_binary_metrics(y_true, y_pred):
     """Standard binary classification metrics (accuracy/precision/recall/F1)
     via scikit-learn, for one taxonomy axis at a time — computed for BOTH the
@@ -315,44 +354,15 @@ def main():
 
         t0 = time.time()
         try:
-            batch_results = vlm.generate_batch(
-                prompts=batch_prompts, images=batch_images, system_prompt=system_prompt,
-                max_new_tokens=args.max_new_tokens, temperature=args.temperature,
-                output_mode=args.output_mode, schema=TaxonomyResponse
+            batch_results = generate_batch_with_overflow_guard(
+                vlm, batch, batch_prompts, batch_images, system_prompt, args,
+                label=f"Batch {batch_idx + 1}/{num_batches}"
             )
-        except ValueError as e:
-            if "longer than the maximum model length" in str(e):
-                # A single oversized prompt in this batch overflowed
-                # max_model_len, which fails vLLM's ENTIRE chat() call (it
-                # doesn't tell us which conversation was the culprit). Rather
-                # than penalize every OTHER instance in the batch for one
-                # outlier, retry one-by-one so only the actual offender is
-                # skipped and its GPU-time-wasting neighbors still get scored.
-                print(f"⚠️ Batch {batch_idx + 1}/{num_batches}: a prompt exceeded max_model_len — "
-                      f"retrying batch instances individually.")
-                batch_results = []
-                for r, prompt, image in zip(batch, batch_prompts, batch_images):
-                    try:
-                        batch_results.append(vlm.generate_batch(
-                            prompts=[prompt], images=[image], system_prompt=system_prompt,
-                            max_new_tokens=args.max_new_tokens, temperature=args.temperature,
-                            output_mode=args.output_mode, schema=TaxonomyResponse
-                        )[0])
-                    except ValueError as single_e:
-                        if "longer than the maximum model length" in str(single_e):
-                            print(f"⚠️ Skipping '{r['image_path']}' / '{r['class_name']}': "
-                                  f"prompt too long for max_model_len ({single_e}).")
-                            batch_results.append(None)
-                        else:
-                            raise
-            else:
-                # If the ENTIRE batch call fails for some other reason (e.g.
-                # an out-of-memory error), don't crash the whole run — treat
-                # every instance in this batch as a parse failure (scored as
-                # wrong below) and keep going.
-                print(f"⚠️ Batch {batch_idx + 1}/{num_batches} FAILED ({e!r}).")
-                batch_results = [None] * len(batch)
         except Exception as e:
+            # If the batch call fails for a reason OTHER than a single
+            # oversized prompt (e.g. an out-of-memory error), don't crash the
+            # whole run — treat every instance in this batch as a parse
+            # failure (scored as wrong below) and keep going.
             print(f"⚠️ Batch {batch_idx + 1}/{num_batches} FAILED ({e!r}).")
             batch_results = [None] * len(batch)
 
