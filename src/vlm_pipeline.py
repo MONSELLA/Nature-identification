@@ -499,7 +499,7 @@ def _normalize_object(object_str: str) -> str:
     return s.strip()
 
 
-def map_object_to_taxonomy(object_str: str, tax_graph, max_hops: int = 3) -> Optional[Dict[str, Any]]:
+def map_object_to_taxonomy(object_str: str, tax_graph, max_hops: int = 0) -> Optional[Dict[str, Any]]:
     """
     Try to map a free-text object phrase into the taxonomy graph we already
     have (`tax_graph`, built by excel_loader.TaxonomyGraph.load_excel):
