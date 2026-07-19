@@ -548,8 +548,8 @@ def map_object_to_taxonomy(object_str: str, tax_graph, mapping_vocab: Dict[str, 
         if labels is not None:
             is_nature = labels["is_nature"]
             biotic = None
-            if is_nature and labels.get("biotic_abiotic"):
-                biotic = labels["biotic_abiotic"] == "biotic"
+            if is_nature and labels.get("life_category"):
+                biotic = labels["life_category"] == "biotic"
             return {"synset": synset, "is_nature": is_nature, "biotic": biotic}
     # Nothing matched, or matched but didn't resolve to a label.
     return None

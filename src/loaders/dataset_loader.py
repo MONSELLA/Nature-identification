@@ -125,18 +125,18 @@ def get_gt_from_graph(synset_str, taxonomy_graph):
 
     resolved_node = labels["resolved_from_node"]
     node_attrs = taxonomy_graph.graph.nodes.get(resolved_node, {})
-    mat_val = node_attrs.get("material_immaterial")
+    mat_val = node_attrs.get("tangibility")
 
     is_nature = labels["is_nature"]
 
     # Critical Fix: If nature is False, downstream labels MUST be None (N/A)
     # to match the prompt rules we are enforcing on the VLM.
     if is_nature:
-        # `labels.get("biotic_abiotic")` is the string "biotic"/"abiotic"/None;
+        # `labels.get("life_category")` is the string "biotic"/"abiotic"/None;
         # convert it into True/False/None the same way `label_to_bool` does
         # for VLM answers elsewhere in the pipeline (kept as inline logic here
         # rather than a shared helper since this file predates that one).
-        gt_biotic = labels.get("biotic_abiotic") == "biotic" if labels.get("biotic_abiotic") else None
+        gt_biotic = labels.get("life_category") == "biotic" if labels.get("life_category") else None
         gt_material = mat_val == "material" if mat_val else True # Default to True for real datasets if not explicitly modeled
     else:
         # This class isn't nature at all — biotic/material simply don't
