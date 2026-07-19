@@ -34,7 +34,8 @@ have to regex-parse and hope for the best.
 
 from __future__ import annotations
 
-from typing import List, Literal
+from pathlib import Path
+from typing import List, Literal, Tuple
 
 from pydantic import BaseModel, Field
 
@@ -144,7 +145,8 @@ class TaxonomyResponse(BaseModel):
     # 3. Now, initiate a second reasoning block conditioned on the decision just made.
     sub_axes_reasoning: str = Field(
         description=(
-            "Step 2: If nature is 'yes', apply the definitions to determine the 'biotic' and 'material' axes. "
+            "Step 2: If nature is 'yes', apply the definitions to determine the classification for the "
+            "life_cateogry and tangibility axes. "
             "If nature is 'no', explicitly state 'Not applicable since the entity is not nature'."
         )
     )
@@ -173,7 +175,7 @@ class MaterialResponse(BaseModel):
     """
 
     reasoning: str = Field(
-        description="One concise sentence justifying the material/immaterial classification based on the visual evidence."
+        description="One concise sentence justifying the tangibility a based on the visual evidence."
     )
     tangibility: Literal["material", "immaterial"]
 
@@ -276,3 +278,119 @@ FIFTH EXAMPLE OUTPUT FOR TARGET "sunset":
   "tangibility": "immaterial"
 }}
 """
+
+
+# =============================================================================
+# Stage 3b — Material-only prompt (the MAPPED-nature fast path)
+# =============================================================================
+# Companion to MaterialResponse (above): the MAPPED-nature fast path in
+# src/vlm_pipeline.py's label_objects_batch already knows nature=True and, when
+# the mapped node carries one, the biotic/abiotic value too (both come from
+# WordNet, not this call) — only material/immaterial still needs the VLM. This
+# used to reuse build_classification_prompt(obj, axes=["tangibility"]), which
+# was WRONG on two counts: (1) its few-shot examples are all full
+# TaxonomyResponse-shaped JSON (nature_reasoning/nature/sub_axes_reasoning/
+# life_category/tangibility), mismatched against the MaterialResponse schema
+# (reasoning/tangibility only) actually requested on this call; and (2) it
+# never told the model the nature/biotic verdict was already settled by
+# mapping, so the model had to (redundantly, and possibly inconsistently)
+# re-derive "is this nature" and "biotic or abiotic" from scratch even though
+# those answers are thrown away. This prompt instead STATES the already-known
+# nature/biotic verdict up front and asks for material/immaterial only, with
+# examples that match MaterialResponse's actual shape.
+def build_material_classification_prompt(class_name, biotic):
+    """
+    Build the per-object prompt for the MAPPED-nature material-only labeling
+    call (paired with schema=MaterialResponse).
+
+    Args:
+        class_name: the object's name as a plain string, e.g. "oak tree" — same
+            role as in build_classification_prompt.
+        biotic: the mapped node's biotic/abiotic verdict — True ("biotic"),
+            False ("abiotic"), or None when the mapped node is nature but
+            carries no biotic/abiotic label (stated only as "nature" in that
+            case, since we don't actually know which).
+
+    Returns:
+        The full prompt string ready to send to the VLM alongside the image.
+    """
+    if biotic is True:
+        established = (
+            f'This "{class_name}" has ALREADY been established as NATURE, and specifically as '
+            f'BIOTIC (a living organism, or the material/immaterial result of a biotic process).'
+        )
+    elif biotic is False:
+        established = (
+            f'This "{class_name}" has ALREADY been established as NATURE, and specifically as '
+            f'ABIOTIC (a non-living natural element or process).'
+        )
+    else:
+        established = f'This "{class_name}" has ALREADY been established as NATURE.'
+
+    return f"""You are analyzing a specific target entity identified in the provided image.
+TARGET ENTITY TO CLASSIFY: "{class_name}"
+
+{established} Do NOT re-evaluate the nature or biotic/abiotic classification — treat both as
+settled and given.
+
+Your ONLY remaining task is to classify this specific "{class_name}" instance's tangibility, based
+on the visual evidence in the image and the strict definitions provided. First, provide a one-sentence 
+reasoning step explaining what you see. Then, output your final classification as either "material" or "immaterial".
+
+EXAMPLE OUTPUT FOR TARGET "river" (already classified as nature, abiotic):
+{{
+  "reasoning": "The image shows a real, physically flowing river occupying space in the landscape, not a depiction of one.",
+  "tangibility": "material"
+}}
+
+EXAMPLE OUTPUT FOR TARGET "dog" (already classified as nature, biotic):
+{{
+  "reasoning": "The image shows a stylized cartoon drawing of a dog rather than a real, physically present animal.",
+  "tangibility": "immaterial"
+}}
+"""
+
+
+# =============================================================================
+# System prompts (built from the data/big5_taxonomy/ definition files)
+# =============================================================================
+# SINGLE HOME for this composition logic. Previously run_vlm_pipeline.py
+# (build_system_prompts) and evaluate_taxonomy_labeling.py (load_system_prompt)
+# each built their own copy of the "all three definitions" system prompt string
+# — same content, two separate implementations that could silently drift apart.
+# Both now import this one function, guaranteeing the pipeline's UNMAPPED-object
+# labeling call and the calibration eval's system prompt stay byte-identical
+# (the whole point of that eval is to measure the exact same fallback prompt
+# the pipeline uses — see evaluate_taxonomy_labeling.py's module docstring).
+def build_system_prompts(nature_path: str, biotic_path: str, material_path: str) -> Tuple[str, str, str]:
+    """Build the three system prompts the pipeline needs, reading each
+    definition file once:
+
+      - caption_system         : NATURE definition only (no axis-priming, per
+                                 the recap) — used for captioning + extraction.
+      - label_system_full      : ALL THREE axis definitions — used for
+                                 UNMAPPED objects (where the VLM must decide
+                                 nature/biotic/material from scratch) AND for
+                                 evaluate_taxonomy_labeling.py's calibration
+                                 eval, which measures that exact fallback path.
+      - label_system_material  : MATERIAL definition only — used for MAPPED-
+                                 nature objects, where WordNet already fixed
+                                 nature and biotic and only material/immaterial
+                                 remains. Showing the model only the relevant
+                                 definition (not all three) keeps the
+                                 material-only call focused and its prefix
+                                 cache-friendly.
+
+    Returns (caption_system, label_system_full, label_system_material).
+    """
+    nature = Path(nature_path).read_text()
+    biotic = Path(biotic_path).read_text()
+    material = Path(material_path).read_text()
+    caption_system = f"# NATURE DEFINITION\n{nature}"
+    label_system_full = (
+        "# 1. NATURE DEFINITION\n" f"{nature}\n\n"
+        "# 2. LIFE CATEGORY AXIS\n" f"{biotic}\n\n"
+        "# 3. TANGIBILITY AXIS\n" f"{material}"
+    )
+    label_system_material = f"# TANGIBILITY AXIS\n{material}"
+    return caption_system, label_system_full, label_system_material

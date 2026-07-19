@@ -30,7 +30,8 @@ USAGE:
     graph.load_excel("/home/pmonserrat/code/data/big5_taxonomy/flat_wordnet_tree_fixed.xlsx")
     mapped = graph.get_mapped_classes(class_synset_pairs)
     # mapped = [{"class_name": ..., "synset_id": ..., "is_nature": ...,
-    #            "biotic_abiotic": ..., "resolved_from_node": ..., "hops": ...}, ...]
+    #            "life_category": ..., "resolved_from_node": ..., "hops": ...}, ...]
+    #            "life_category": ..., "resolved_from_node": ..., "hops": ...}, ...]
 
 NOTE ON DEFAULTS: bio_col="Biotic/abiotic", mat_col="Material/immaterial",
 sheet_name="data corrected" — taken directly from evaluate_imagenet.py's
@@ -100,11 +101,17 @@ class TaxonomyGraph:
     Builds and queries the WordNet-based BIG-5 taxonomy graph from the
     curated Excel annotation file.
 
-    Node attributes set on labeled (anchor) nodes only:
+    Node attributes set on labeled (anchor) nodes only (named to match the
+    VLM pipeline's own axis-field names — TaxonomyResponse.life_category /
+    TaxonomyResponse.tangibility, src/models/prompts.py — rather than the
+    Excel's own "Biotic/abiotic" / "Material/immaterial" column headers,
+    which are unrelated: those are read via `bio_col`/`mat_col` in
+    load_excel() and only determine which SPREADSHEET COLUMNS get parsed;
+    this is what the parsed values are stored as ON THE GRAPH):
       - is_nature: bool
-      - biotic_abiotic: "biotic" | "abiotic" (only meaningful if is_nature)
-      - material_immaterial: "material" | "immaterial" (loaded but unused
-        by this evaluation — material/immaterial isn't well-defined at the
+      - life_category: "biotic" | "abiotic" (only meaningful if is_nature)
+      - tangibility: "material" | "immaterial" (loaded but unused by this
+        evaluation — material/immaterial isn't well-defined at the
         class-name level; see resolve_labels() docstring)
 
     Unlabeled nodes inherit attributes from their nearest labeled node
@@ -118,6 +125,9 @@ class TaxonomyGraph:
         # we can ask "what are ALL of this node's ancestors" by following
         # edges backwards, or "what's the nearest labeled ancestor" the same way.
         self.graph = nx.DiGraph()
+        # Lazily built, cached by graph_lemma_vocab() below — the graph is
+        # static once load_excel() has run, so this only needs computing once.
+        self._lemma_vocab: Optional[Dict[str, str]] = None
 
     # -------------------------------------------------------------------
     # Graph construction (ported from evaluation.py's
@@ -277,8 +287,10 @@ class TaxonomyGraph:
                 # (`index + 2` converts pandas' 0-based row index into the
                 # 1-based Excel row number a human would actually see, plus 1
                 # more for the header row.)
-                existing_bio = self.graph.nodes[synset_str].get("biotic_abiotic")
-                existing_mat = self.graph.nodes[synset_str].get("material_immaterial")
+                existing_bio = self.graph.nodes[synset_str].get("life_category")
+                existing_mat = self.graph.nodes[synset_str].get("tangibility")
+                existing_bio = self.graph.nodes[synset_str].get("life_category")
+                existing_mat = self.graph.nodes[synset_str].get("tangibility")
                 excel_row = index + 2
                 if existing_bio is not None and incoming_bio is not None and existing_bio != incoming_bio:
                     print(
@@ -299,9 +311,11 @@ class TaxonomyGraph:
             # provided a value, so we never overwrite a real label with a blank.
             self.graph.nodes[synset_str]["is_nature"] = is_nature
             if incoming_bio:
-                self.graph.nodes[synset_str]["biotic_abiotic"] = incoming_bio
+                self.graph.nodes[synset_str]["life_category"] = incoming_bio
+                self.graph.nodes[synset_str]["life_category"] = incoming_bio
             if incoming_mat:
-                self.graph.nodes[synset_str]["material_immaterial"] = incoming_mat
+                self.graph.nodes[synset_str]["tangibility"] = incoming_mat
+                self.graph.nodes[synset_str]["tangibility"] = incoming_mat
 
     # -------------------------------------------------------------------
     # Querying / resolution (new in this module)
@@ -373,7 +387,8 @@ class TaxonomyGraph:
                     "resolved_from_node": node,
                     "hops": hops,
                     "is_nature": attrs["is_nature"],
-                    "biotic_abiotic": attrs.get("biotic_abiotic"),
+                    "life_category": attrs.get("life_category"),
+                    "life_category": attrs.get("life_category"),
                 }
             if hops >= max_hops:
                 # We've hit the search radius limit — don't expand any
@@ -392,6 +407,46 @@ class TaxonomyGraph:
         # Searched the full radius without ever finding a labeled node — this
         # synset has no nearby connection to anything the Excel annotated.
         return None
+
+    def graph_lemma_vocab(self) -> Dict[str, str]:
+        """
+        {normalized lemma surface form -> synset_id}, built from EVERY synset
+        currently IN THE GRAPH — the Excel-labeled anchor nodes AND the
+        unlabeled ancestor/descendant nodes add_synset_and_ancestors added
+        while wiring the hierarchy up to entity.n.01 — NOT all of WordNet.
+
+        Used by map_object_to_taxonomy (src/vlm_pipeline.py): an extracted
+        object phrase counts as matching THE GRAPH iff it equals one of a
+        graph synset's own WordNet lemma names (e.g.
+        "hound" is a lemma of "dog.n.01", so an extracted "hound" would match
+        that node if it's in the graph). This is intentionally NOT an
+        open-ended `wn.synsets(word)` sense search — a word with several
+        WordNet senses only matches here if one of those senses happens to be
+        a synset our own curated taxonomy already contains; senses that lead
+        nowhere near anything the Excel annotated are never considered.
+
+        Built once and cached on this instance (the graph is static once
+        load_excel() has run). If the SAME lemma names two different graph
+        synsets, the first one encountered wins — a rare collision, same
+        "first candidate wins" convention used elsewhere in this module.
+        """
+        if self._lemma_vocab is not None:
+            return self._lemma_vocab
+        vocab: Dict[str, str] = {}
+        for node in self.graph.nodes():
+            try:
+                synset = wn.synset(node)
+            except Exception:
+                # Defensive: every node was added FROM a successful
+                # wn.synset() lookup in add_synset_and_ancestors, so this
+                # shouldn't happen in practice, but skip rather than crash if
+                # WordNet can't re-resolve a node's id string for some reason.
+                continue
+            for lemma in synset.lemmas():
+                name = lemma.name().replace("_", " ").strip().lower()
+                vocab.setdefault(name, node)
+        self._lemma_vocab = vocab
+        return vocab
 
     def get_mapped_classes(
         self,
@@ -416,7 +471,8 @@ class TaxonomyGraph:
                     "class_name": class_name,
                     "synset_id": synset_id,
                     "is_nature": labels["is_nature"],
-                    "biotic_abiotic": labels["biotic_abiotic"],
+                    "life_category": labels["life_category"],
+                    "life_category": labels["life_category"],
                     "resolved_from_node": labels["resolved_from_node"],
                     "hops": labels["hops"],
                 }

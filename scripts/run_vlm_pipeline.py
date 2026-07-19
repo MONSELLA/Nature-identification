@@ -13,7 +13,10 @@ End-to-end driver for the baseline BIG-5 VLM pipeline, in three stages:
                   hold GPU memory at the same time, and we don't rely on
                   in-process CUDA cleanup (vLLM/torch release it unreliably on
                   GC). 'spawn' is required for CUDA; only the picklable args
-                  Namespace crosses the process boundary.
+                  Namespace crosses the process boundary. --responses_file is
+                  PURELY that internal handoff in this mode, so it is deleted
+                  once scoring finishes successfully (pass --keep_responses_file
+                  to retain it).
 
   --stage infer : run ONLY the inference half (VLM -> --responses_file) and
                   exit. Useful to run inference on one machine/job and defer
@@ -27,12 +30,15 @@ End-to-end driver for the baseline BIG-5 VLM pipeline, in three stages:
 Metrics (per CLAUDE.md scoping):
   - accuracy / precision / recall / F1   : ALL datasets, but scored differently
     by dataset type (recap §6):
-      * ImageNet/Places (single-label): nature/biotic are read off the FORCED
-        top-1 ClipMatch class's taxonomy position — one predicted class per
-        image, no lexical extraction matching, no similarity threshold; robust
-        to species-level mismatch (GT "golden retriever" vs. pred "dog").
-        material is ALWAYS the VLM's own label (CLAUDE.md — never mapped), taken
-        from the best-matching extracted object.
+      * ImageNet/Places (single-label): nature/biotic/material all come from
+        the extracted object with the highest CLIP embedding similarity to
+        the GT class's own template embedding (embedding-based "exact match",
+        not the ClipMatch top-1 class's taxonomy position, and not lexical
+        extraction matching) — that object's own hybrid-resolved label is
+        used directly for all three axes. material is ALWAYS the VLM's own
+        label regardless (CLAUDE.md — never mapped). ClipMatch top-1 + hP/hR
+        remain a SEPARATE metric (still the global argmax over the full
+        candidate vocabulary — see below).
       * COCO/BIG-5: image-level nature (nature=1 if ANY extracted object is
         nature) + matched-object biotic/material (COCO box-IoU matching is
         future work, gated on the Grounding pipeline — §6.4).
@@ -85,45 +91,12 @@ logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 
 from src.evaluation import taxonomy_metrics
 from src.loaders.excel_loader import TaxonomyGraph
-from src.loaders.dataset_loader import load_dataset, get_candidate_vocab, build_mapping_vocab, get_gt_from_graph
+from src.loaders.dataset_loader import load_dataset, get_candidate_vocab
+from src.models.prompts import build_system_prompts
 from src.models.vlm_models import MODEL_REGISTRY, VLLM_FAMILIES, create_vlm
 from src.vlm_pipeline import run_inference, resolve_hybrid_label, normalize_objects, _normalize_object
 from src.evaluation import clip_metrics
 from src.utils import update_results_store, update_dataset_class_stats, compute_class_stats, format_duration
-
-
-# =============================================================================
-# System prompts (built from the ../data/big5_taxonomy/ definition files)
-# =============================================================================
-def build_system_prompts(nature_path, biotic_path, material_path):
-    """Build the three system prompts the pipeline needs:
-
-      - caption_system         : NATURE definition only (no axis-priming, per
-                                 the recap) — used for captioning + extraction.
-      - label_system_full      : ALL THREE axis definitions — used ONLY for
-                                 UNMAPPED objects, where the VLM must decide
-                                 nature/biotic/material from scratch (identical
-                                 to evaluate_taxonomy_labeling.py's system
-                                 prompt, so the fallback matches the calibration
-                                 eval).
-      - label_system_material  : MATERIAL definition only — used for MAPPED-nature
-                                 objects, where WordNet already fixed nature and
-                                 biotic and only material/immaterial remains.
-                                 Showing the model only the relevant definition
-                                 (not all three) keeps the material-only call
-                                 focused and its prefix cache-friendly.
-    """
-    nature = Path(nature_path).read_text()
-    biotic = Path(biotic_path).read_text()
-    material = Path(material_path).read_text()
-    caption_system = f"# NATURE DEFINITION\n{nature}"
-    label_system_full = (
-        "# 1. NATURE DEFINITION\n" f"{nature}\n\n"
-        "# 2. LIFE CATEGORY AXIS\n" f"{biotic}\n\n"
-        "# 3. TANGIBILITY AXIS\n" f"{material}"
-    )
-    label_system_material = f"# TANGIBILITY AXIS\n{material}"
-    return caption_system, label_system_full, label_system_material
 
 
 # =============================================================================
@@ -213,32 +186,6 @@ def image_pred_nature(object_final_labels):
     return any(bool(o["final_nature"]) for o in object_final_labels)
 
 
-def _pred_axes_from_class(graph, pred_class_synset):
-    """Derive predicted (nature, biotic) for a single-label image from the
-    ClipMatch top-1 predicted CLASS's taxonomy position (recap §6.2).
-
-    Resolves the predicted class synset to its nearest labeled node via
-    get_gt_from_graph — the SAME resolution used to build the GT labels — so the
-    axes are inherited from the correct branch of the hierarchy even when the
-    prediction misses at species level (e.g. GT "golden retriever" vs. predicted
-    "dog" still agree on nature/biotic). Returns None if the predicted class
-    resolves to no labeled node (caller penalizes that as a wrong prediction,
-    never drops it — CLAUDE.md convention).
-
-    MATERIAL IS DELIBERATELY NOT RETURNED HERE. Per CLAUDE.md's hard convention,
-    material/immaterial is ALWAYS VLM-predicted, NEVER mapped — it depends on
-    whether THIS instance is a real object vs. a representation, which a class
-    name cannot encode. The caller sources predicted material from the VLM label
-    of the best-matching extracted object instead (see phase_score).
-    """
-    if not pred_class_synset:
-        return None
-    lbl = get_gt_from_graph(pred_class_synset, graph)
-    if not lbl:
-        return None
-    return {"nature": lbl["gt_nature"], "biotic": lbl["gt_biotic"]}
-
-
 # =============================================================================
 # Metric aggregation
 # =============================================================================
@@ -285,7 +232,8 @@ def phase_infer(args):
     memory). Returns the created `vlm` object (unused by --stage all now, which
     reclaims VRAM by exiting the infer subprocess — see main()).
     """
-    print(f"🚀 [infer] dataset='{args.dataset}', model='{args.model_family}/{args.model_name}'")
+    print(f"🚀 [infer] dataset='{args.dataset}', model='{args.model_family}/{args.model_name}' "
+          f"-> responses_file='{args.responses_file}'")
     phase_t0 = time.time()
 
     graph = TaxonomyGraph()
@@ -311,16 +259,14 @@ def phase_infer(args):
         random.seed(42)
         dataset = random.sample(dataset, min(args.max_samples, len(dataset)))
 
-    # Authoritative vocabularies (Phase 1 has the data access) — stored in the
-    # artifact header so Phase 2 needs no dataset files.
-    # These two vocabularies need the SAME dataset-specific file paths (e.g.
-    # ImageNet's data_dir, Places' categories file) that we just used to load
-    # the dataset itself — we compute them here (while we still have those
-    # paths handy) and save them straight into the output artifact's header,
-    # so Phase 2 (scoring) never needs to re-open any dataset files at all.
+    # Authoritative candidate vocabulary for ClipMatch/hP-hR (Phase 1 has the
+    # data access) — stored in the artifact header so Phase 2 needs no dataset
+    # files. Needs the SAME dataset-specific file paths (e.g. ImageNet's
+    # data_dir, Places' categories file) that we just used to load the dataset
+    # itself — computed here (while we still have those paths handy) and saved
+    # straight into the output artifact's header.
     vocab_kwargs = dict(data_dir=args.data_dir, places_categories_txt=args.places_categories_txt,
                         excel_path=args.excel_path)
-    mapping_vocab = build_mapping_vocab(args.dataset, **vocab_kwargs)
     candidate_vocab = get_candidate_vocab(args.dataset, **vocab_kwargs)  # None for coco/big5
 
     caption_system, label_system_full, label_system_material = build_system_prompts(
@@ -346,12 +292,12 @@ def phase_infer(args):
         "record_type": "header",
         "dataset": args.dataset,
         "model": f"{args.model_family}/{args.model_name}",
-        "mapping_vocab": mapping_vocab,
         "candidate_vocab": candidate_vocab,
         "max_hops": args.max_hops,
     }
 
     out_path = Path(args.responses_file)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     loop_t0 = time.time()
     n = 0
     # "JSON Lines" format: one complete, independent JSON object per line of
@@ -366,7 +312,7 @@ def phase_infer(args):
             caption_system_prompt=caption_system,
             label_system_full=label_system_full,
             label_system_material=label_system_material,
-            tax_graph=graph, mapping_vocab=mapping_vocab, max_hops=args.max_hops,
+            tax_graph=graph, max_hops=args.max_hops,
             batch_size=args.batch_size,
             caption_max_new_tokens=args.max_new_tokens_caption,
             label_max_new_tokens=args.max_new_tokens_label,
@@ -430,7 +376,6 @@ def phase_score(args):
     phase_t0 = time.time()
     header, records = _read_artifact(args.responses_file)
     dataset = header["dataset"]
-    mapping_vocab = header.get("mapping_vocab") or {}
     candidate_vocab = header.get("candidate_vocab")
     # ClipMatch/hP/hR only make sense for datasets with a fixed candidate
     # class list (ImageNet/Places) — see clip_metrics.CLIPMATCH_DATASETS.
@@ -464,7 +409,7 @@ def phase_score(args):
             continue
         finals = []
         for obj, lab in zip(rec["objects"], rec["object_labels"]):
-            finals.append(resolve_hybrid_label(obj, lab, graph, mapping_vocab, max_hops=max_hops))
+            finals.append(resolve_hybrid_label(obj, lab, graph, max_hops=max_hops))
         rec["object_finals"] = finals
 
     # ---- CLIP encodings (batched across ALL images for efficiency) ----
@@ -489,15 +434,27 @@ def phase_score(args):
         offsets.append(len(flat_texts))
         flat_texts.extend(clip_metrics.object_texts(r["objects"]))
     offsets.append(len(flat_texts))  # sentinel end-offset for the last image
-    obj_embs_all = scorer.encode_text(flat_texts) if flat_texts else None
+    # encode_text([]) itself returns a correctly-shaped zero-row array (see
+    # CLIPScorer.encode_text), so this is called unconditionally — NOT gated
+    # on `if flat_texts` — so a dataset where every image happens to extract
+    # zero objects still gets f_clipscore's sentence-only term per image below
+    # instead of silently skipping reference-free scoring for the whole run.
+    obj_embs_all = scorer.encode_text(flat_texts)
 
     candidate_embs = None
+    synset_to_candidate_idx = {}
     if run_clipmatch:
         # Also encode the FIXED candidate-class vocabulary just once (rather
         # than per image) — every image's ClipMatch score is computed against
         # this same set of candidate-class embeddings.
         candidate_embs = scorer.encode_text(
             [clip_metrics.OBJECT_TEMPLATE.format(c["class_name"]) for c in candidate_vocab])
+        # Reverse lookup synset -> its own row in candidate_embs, reused below
+        # to fetch a single image's GT-class embedding without re-encoding it
+        # (every single-label image's GT synset is one of these candidates,
+        # since candidate_vocab is a superset of every taxonomy-labeled class
+        # in the dataset — see get_candidate_vocab's docstring).
+        synset_to_candidate_idx = {c["synset_id"]: i for i, c in enumerate(candidate_vocab)}
 
     # ---- Per-image metric accumulation ----
     # These lists/counters accumulate results across every image in the
@@ -512,6 +469,12 @@ def phase_score(args):
     n_map_nature = n_vlm_nature = 0
     clipmatch_top1 = 0
     clipmatch_support = 0
+    # EXPERIMENTAL caption-based ClipMatch variant (recap §11 open item) —
+    # accumulated in parallel with the object-list version above, purely for
+    # side-by-side comparison at the end (see clip_metrics.clipmatch_from_caption).
+    clipmatch_cap_top1 = 0
+    clipmatch_cap_support = 0
+    hp_cap_vals, hr_cap_vals, hf1_cap_vals = [], [], []
     flat_rows = []  # per-object rows for the output CSV
 
     # Which images get their per-object predictions written to the CSV.
@@ -532,7 +495,7 @@ def phase_score(args):
         # Slice this image's own chunk of object embeddings out of the big
         # flat array we built above, using the offsets we remembered.
         obj_slice = slice(offsets[idx], offsets[idx + 1])
-        rec_obj_embs = obj_embs_all[obj_slice] if obj_embs_all is not None else None
+        rec_obj_embs = obj_embs_all[obj_slice]
 
         # diagnostics
         n_objects_total += len(objs)
@@ -546,9 +509,8 @@ def phase_score(args):
                 n_vlm_nature += 1
 
         # --- reference-free CLIP metrics (all datasets) ---
-        if rec_obj_embs is not None:
-            fclip_vals.append(clip_metrics.f_clipscore(image_embs[idx], caption_embs[idx], rec_obj_embs))
-            objclip_vals.append(clip_metrics.object_clipscore(image_embs[idx], rec_obj_embs))
+        fclip_vals.append(clip_metrics.f_clipscore(image_embs[idx], caption_embs[idx], rec_obj_embs))
+        objclip_vals.append(clip_metrics.object_clipscore(image_embs[idx], rec_obj_embs))
 
         # --- extraction-hit diagnostic (ALL datasets; reporting-only) ---
         # recap §6.3: keep the exact-match extraction rate as a descriptive
@@ -563,65 +525,107 @@ def phase_score(args):
                 n_extraction_hits += 1
 
         if single_label:
-            # --- ImageNet/Places (single-label): axes from forced top-1 ClipMatch ---
-            # recap §6.1/§6.2: the single predicted class (global argmax over the
-            # full candidate vocab — always returns a class, no threshold) is the
-            # SOLE source of the image's nature/biotic/material, read off that
-            # class's taxonomy position. This fixes the old bug where ORing
-            # nature across every extracted object penalized a correctly-detected
-            # incidental object (e.g. a real cat in a GT-"couch" image).
-            pred_class_synset = pred_node = None
-            best_obj_idx = None  # extracted object most representative of the pred class
+            # --- ImageNet/Places (single-label): axes from an embedding-matched
+            # extracted object ---
+            # The GT class is embedded via CLIP, and the extracted object with
+            # the highest cosine similarity to THAT embedding is taken as this
+            # image's representative of the (single, already-known) GT class.
+            # Its OWN hybrid-resolved final_nature/final_biotic/final_material
+            # (see src/vlm_pipeline.resolve_hybrid_label) are used directly as
+            # the prediction for all three axes.
+            #
+            # This replaces the earlier approach of reading nature/biotic off the
+            # taxonomy position of the ClipMatch top-1 PREDICTED CLASS (a global
+            # argmax over the ENTIRE candidate vocabulary, e.g. all 1000 ImageNet
+            # classes). That global argmax is noisy in a busy scene: a handful of
+            # extracted objects can push the argmax onto a semantically-unrelated
+            # candidate class just because it happened to score marginally higher
+            # against one of them, even though the model correctly recognized and
+            # correctly labeled the actual GT object. Matching against the GT
+            # class's OWN embedding (rather than competing across every other
+            # candidate class) only asks "which extracted object represents the
+            # thing we already know is in this image", which is far less exposed
+            # to that cross-class noise.
+            best_obj_idx = None
             gt_syn = targets[0].get("synset_id") if targets else None
-            if rec_obj_embs is not None and rec_obj_embs.shape[0] > 0:
-                _, pred_idx, per_obj_sim = clip_metrics.clipmatch(rec_obj_embs, candidate_embs)
-                if pred_idx >= 0:
-                    pred_class_synset = candidate_vocab[pred_idx]["synset_id"]
-                    # The extracted object with the highest similarity to the
-                    # predicted class is the pipeline's representative of it —
-                    # used to source the VLM material label below.
-                    best_obj_idx = int(per_obj_sim.argmax())
-                    # Turn the predicted CLASS into a specific WordNet synset
-                    # NODE by picking whichever extracted object phrase best
-                    # represents that prediction (needed for hP/hR below).
-                    pred_node = taxonomy_metrics.resolve_to_wordnet(
-                        list(per_obj_sim), pred_class_synset, objs)
+            if gt_syn is not None and rec_obj_embs.shape[0] > 0:
+                gt_idx = synset_to_candidate_idx.get(gt_syn)
+                if gt_idx is not None:
+                    sims_to_gt = rec_obj_embs @ candidate_embs[gt_idx]
+                    best_obj_idx = int(sims_to_gt.argmax())
 
-            pred_axes = _pred_axes_from_class(graph, pred_class_synset)
             t0 = targets[0]
-            # A present GT with an unresolvable predicted class (pred_axes None,
-            # or a None axis) is PENALIZED AS WRONG — encoded as the negation of
-            # the GT — never dropped (CLAUDE.md: prediction-unmapped penalized).
-            # nature/biotic: from the predicted class's taxonomy position.
+            # A present GT with no matched object (best_obj_idx None — no objects
+            # extracted, or the GT synset isn't in the candidate vocab) is
+            # PENALIZED AS WRONG — encoded as the negation of the GT — never
+            # dropped (CLAUDE.md: prediction-unmapped penalized).
             if t0.get("gt_nature") is not None:
                 gt_n = bool(t0["gt_nature"])
-                pn = pred_axes["nature"] if pred_axes else None
+                pn = finals[best_obj_idx]["final_nature"] if best_obj_idx is not None else None
                 nat_true.append(gt_n)
                 nat_pred.append(bool(pn) if pn is not None else (not gt_n))
             if t0.get("gt_biotic") is not None:
                 gt_b = bool(t0["gt_biotic"])
-                pb = pred_axes["biotic"] if pred_axes else None
+                pb = finals[best_obj_idx]["final_biotic"] if best_obj_idx is not None else None
                 bio_true.append(gt_b)
                 bio_pred.append(bool(pb) if pb is not None else (not gt_b))
             # material: ALWAYS the VLM's own prediction (CLAUDE.md — never mapped),
-            # taken from the best-matching extracted object's final_material.
-            # None (object judged non-nature, parse failure, or no prediction)
-            # is penalized as wrong, never taxonomy-defaulted.
+            # taken from the same embedding-matched object's final_material. None
+            # (object judged non-nature, parse failure, or no match) is penalized
+            # as wrong, never taxonomy-defaulted.
             if t0.get("gt_material") is not None:
                 gt_m = bool(t0["gt_material"])
                 pm = finals[best_obj_idx]["final_material"] if best_obj_idx is not None else None
                 mat_true.append(gt_m)
                 mat_pred.append(bool(pm) if pm is not None else (not gt_m))
 
-            # ClipMatch top-1 (exact synset) + hP/hR. Every image with a GT
-            # synset counts toward support; a total miss (no prediction) scores
-            # top-1=0 and hP/hR=0, not excluded.
+            # ClipMatch top-1 (exact synset) + hP/hR: UNCHANGED — this is a
+            # separate reported metric (recap §8e/§8f), a genuine classification-
+            # into-the-fixed-candidate-vocabulary question, not the axis scores
+            # above. Still needs the global argmax over every candidate class.
+            pred_class_synset = pred_node = None
+            if rec_obj_embs.shape[0] > 0:
+                _, pred_idx, per_obj_sim = clip_metrics.clipmatch(rec_obj_embs, candidate_embs)
+                if pred_idx >= 0:
+                    pred_class_synset = candidate_vocab[pred_idx]["synset_id"]
+                    # Turn the predicted CLASS into a specific WordNet synset
+                    # NODE by picking whichever extracted object phrase best
+                    # represents that prediction (needed for hP/hR below).
+                    pred_node = taxonomy_metrics.resolve_to_wordnet(
+                        list(per_obj_sim), pred_class_synset, objs)
+
+            # Every image with a GT synset counts toward support; a total miss
+            # (no prediction) scores top-1=0 and hP/hR=0, not excluded.
             if gt_syn:
                 clipmatch_support += 1
                 if pred_class_synset is not None and pred_class_synset == gt_syn:
                     clipmatch_top1 += 1
                 hier = taxonomy_metrics.compute_hierarchical_metrics(graph, gt_syn, pred_node)
                 hp_vals.append(hier["hp"]); hr_vals.append(hier["hr"]); hf1_vals.append(hier["hf1"])
+
+            # --- EXPERIMENTAL: caption-based ClipMatch variant (recap §11 open
+            # item), computed in PARALLEL with the object-list version above for
+            # side-by-side comparison — NOT used for the axis scores, and not
+            # (yet) the default. Predicts the class from the WHOLE CAPTION's
+            # similarity to each candidate, then asks which extracted object
+            # best aligns with THAT predicted class (for hP/hR resolution) —
+            # see clip_metrics.clipmatch_from_caption.
+            pred_class_synset_cap = pred_node_cap = None
+            _, pred_idx_cap = clip_metrics.clipmatch_from_caption(caption_embs[idx], candidate_embs)
+            if pred_idx_cap >= 0:
+                pred_class_synset_cap = candidate_vocab[pred_idx_cap]["synset_id"]
+                if rec_obj_embs.shape[0] > 0:
+                    sims_to_pred_cap = rec_obj_embs @ candidate_embs[pred_idx_cap]
+                    pred_node_cap = taxonomy_metrics.resolve_to_wordnet(
+                        list(sims_to_pred_cap), pred_class_synset_cap, objs)
+
+            if gt_syn:
+                clipmatch_cap_support += 1
+                if pred_class_synset_cap is not None and pred_class_synset_cap == gt_syn:
+                    clipmatch_cap_top1 += 1
+                hier_cap = taxonomy_metrics.compute_hierarchical_metrics(graph, gt_syn, pred_node_cap)
+                hp_cap_vals.append(hier_cap["hp"]); hr_cap_vals.append(hier_cap["hr"])
+                hf1_cap_vals.append(hier_cap["hf1"])
         else:
             # --- COCO (multi-label) + BIG-5 (holistic): image-level nature OR
             #     + matched-object biotic/material ---
@@ -689,12 +693,15 @@ def phase_score(args):
         "nature": _binary_metrics(nat_true, nat_pred),
         "biotic_matched": _binary_metrics(bio_true, bio_pred),
         "material_matched": _binary_metrics(mat_true, mat_pred),
-        "axis_scoring_note": ("imagenet/places: nature/biotic come from the forced top-1 "
-                              "ClipMatch class's taxonomy position (recap §6.2), NOT lexical "
-                              "extraction matching; material is the VLM's own label for the "
-                              "best-matching extracted object (CLAUDE.md — material is ALWAYS "
-                              "VLM-predicted, never mapped). coco/big5: image-level nature (OR) "
-                              "+ matched-object biotic/material (coco box-IoU is future work, "
+        "axis_scoring_note": ("imagenet/places: nature/biotic/material all come from the "
+                              "extracted object with the highest CLIP embedding similarity to "
+                              "the GT class's OWN template embedding (NOT the ClipMatch top-1 "
+                              "class's taxonomy position, and NOT lexical extraction matching) "
+                              "— that object's hybrid-resolved final_nature/final_biotic/"
+                              "final_material are used directly. ClipMatch top-1 + hP/hR (below) "
+                              "remain a separate metric, still the global argmax over the full "
+                              "candidate vocabulary. coco/big5: image-level nature (OR) + "
+                              "matched-object biotic/material (coco box-IoU is future work, "
                               "recap §6.4)."),
         "material_caveat": ("Material GT for imagenet/coco/places is the heuristic "
                             "gt_material=True default (real photos); only BIG-5 has genuine "
@@ -709,6 +716,14 @@ def phase_score(args):
         }
         summary["hierarchical"] = {"hp": _mean(hp_vals), "hr": _mean(hr_vals),
                                    "hf1": _mean(hf1_vals), "support": len(hf1_vals)}
+        # EXPERIMENTAL caption-based variant (recap §11), printed alongside the
+        # object-list version above for comparison — see clipmatch_from_caption.
+        summary["clipmatch_caption"] = {
+            "top1_accuracy": (clipmatch_cap_top1 / clipmatch_cap_support) if clipmatch_cap_support else 0.0,
+            "support": clipmatch_cap_support,
+        }
+        summary["hierarchical_caption"] = {"hp": _mean(hp_cap_vals), "hr": _mean(hr_cap_vals),
+                                           "hf1": _mean(hf1_cap_vals), "support": len(hf1_cap_vals)}
 
     # Wall-clock time this model took to finish this run, formatted "D-HH:MM:SS"
     # (SLURM-style elapsed time). inference_time_seconds comes from phase_infer's
@@ -784,11 +799,18 @@ def _print_summary(s, run_clipmatch):
         print(f"  {axis.split('_')[0]:<12} (pos) P {m['precision']:.4f} | R {m['recall']:.4f} | F1 {m['f1']:.4f}")
         print(f"  {neg_labels[axis]:<12} (neg) P {m['precision_neg']:.4f} | R {m['recall_neg']:.4f} | F1 {m['f1_neg']:.4f}")
     if run_clipmatch:
-        print(f"\n--- ClipMatch (support {s['clipmatch']['support']}) ---")
+        print(f"\n--- ClipMatch [object-list] (support {s['clipmatch']['support']}) ---")
         print(f"Top-1: {s['clipmatch']['top1_accuracy']:.4f}")
         h = s["hierarchical"]
-        print(f"--- Hierarchical (support {h['support']}) ---")
+        print(f"--- Hierarchical [object-list] (support {h['support']}) ---")
         print(f"hP {h['hp']:.4f} | hR {h['hr']:.4f} | hF1 {h['hf1']:.4f}")
+        # EXPERIMENTAL caption-based variant (recap §11), printed for direct
+        # comparison against the object-list version above.
+        print(f"\n--- ClipMatch [caption, EXPERIMENTAL] (support {s['clipmatch_caption']['support']}) ---")
+        print(f"Top-1: {s['clipmatch_caption']['top1_accuracy']:.4f}")
+        hc = s["hierarchical_caption"]
+        print(f"--- Hierarchical [caption, EXPERIMENTAL] (support {hc['support']}) ---")
+        print(f"hP {hc['hp']:.4f} | hR {hc['hr']:.4f} | hF1 {hc['hf1']:.4f}")
     t = s["execution_time"]
     inf_str = t["inference"] if t["inference"] is not None else "n/a"
     print(f"\nExecution time (D-HH:MM:SS): inference {inf_str} | scoring {t['scoring']} | total {t['total']}")
@@ -822,6 +844,9 @@ def _log_wandb(args, summary, run_clipmatch):
     if run_clipmatch:
         log["ClipMatch/Top1"] = summary["clipmatch"]["top1_accuracy"]
         log["Hierarchical/hF1"] = summary["hierarchical"]["hf1"]
+        # EXPERIMENTAL caption-based variant (recap §11).
+        log["ClipMatchCaption/Top1"] = summary["clipmatch_caption"]["top1_accuracy"]
+        log["HierarchicalCaption/hF1"] = summary["hierarchical_caption"]["hf1"]
     wandb.log(log)
     wandb.finish()
 
@@ -840,8 +865,24 @@ def parse_args():
                         "releasing the VLM's GPU memory before loading CLIP for scoring. "
                         "'infer'/'score' split the two halves across separate invocations.")
     p.add_argument("--dataset", choices=["coco", "imagenet", "places365", "big5"], required=True)
-    p.add_argument("--responses_file", type=str, default="vlm_responses.jsonl",
-                   help="Intermediate artifact: written by infer, read by score.")
+    p.add_argument("--responses_file", type=str, default=None,
+                   help="Intermediate artifact: written by infer, read by score. Default: "
+                        "'vlm_responses.jsonl' inside --results_dir/--run_name (the SAME "
+                        "folder --output_file lands in), so a run's artifact and its results "
+                        "JSON/CSV are always co-located and both respect --results_dir/"
+                        "--run_name. Pass an explicit path to override (e.g. to write it "
+                        "somewhere else, or to point --stage score at a specific prior "
+                        "artifact). Under --stage all this file is PURELY an internal handoff "
+                        "between the infer and score subprocesses, so it is deleted once "
+                        "scoring finishes successfully — see --keep_responses_file to retain "
+                        "it. --stage infer/score never delete it (infer's whole point is to "
+                        "persist it for a later --stage score; score's whole point is to "
+                        "reread an existing artifact, possibly after a metrics-code change).")
+    p.add_argument("--keep_responses_file", action="store_true",
+                   help="Under --stage all, keep --responses_file on disk after scoring "
+                        "finishes instead of deleting it (e.g. to inspect the raw VLM outputs, "
+                        "or to re-run --stage score later without re-running inference). "
+                        "Ignored for --stage infer/score, which never delete the file regardless.")
 
     # taxonomy / context
     p.add_argument("--excel_path", type=str, default="../data/big5_taxonomy/flat_wordnet_tree_fixed.xlsx")
@@ -922,6 +963,24 @@ def parse_args():
     return args
 
 
+def _resolve_responses_file(args):
+    """Fill in --responses_file's default (None until now) as
+    '<results_dir>/<run_name>/vlm_responses.jsonl' — the SAME directory
+    --output_file lands in — so the intermediate artifact respects
+    --results_dir/--run_name exactly like every other output this script
+    writes, instead of always landing at a fixed cwd-relative path regardless
+    of those flags. An explicitly-passed --responses_file is left untouched.
+    Creates that directory so phase_infer can open the file for writing.
+    Mutates and returns `args`."""
+    if args.responses_file is None:
+        out_dir = Path(args.results_dir)
+        if args.run_name:
+            out_dir = out_dir / args.run_name
+        out_dir.mkdir(parents=True, exist_ok=True)
+        args.responses_file = str(out_dir / "vlm_responses.jsonl")
+    return args
+
+
 # =============================================================================
 # Subprocess workers (for --stage all)
 # =============================================================================
@@ -943,6 +1002,7 @@ def _score_worker(args):
 
 def main():
     args = parse_args()
+    args = _resolve_responses_file(args)
 
     if args.stage == "infer":
         phase_infer(args)
@@ -976,6 +1036,22 @@ def main():
     p2.join()
     if p2.exitcode != 0:
         raise RuntimeError(f"Scoring stage failed (exit code {p2.exitcode}).")
+
+    # --stage all's --responses_file is purely the internal handoff between
+    # the two subprocesses above — scoring just finished reading it, so
+    # nothing downstream needs it anymore. Delete it by default (opt out with
+    # --keep_responses_file) so a run doesn't silently leave a
+    # potentially-large JSON-Lines artifact behind that the user never
+    # explicitly asked to keep. --stage infer/score never reach this code
+    # path at all, so a standalone infer run (or a later standalone re-score)
+    # is never affected.
+    if not args.keep_responses_file:
+        try:
+            Path(args.responses_file).unlink()
+            print(f"🗑️  [all] removed intermediate {args.responses_file} "
+                  f"(pass --keep_responses_file to retain it)")
+        except FileNotFoundError:
+            pass
 
 
 if __name__ == "__main__":

@@ -326,6 +326,40 @@ def clipmatch(
     return per_candidate_max, pred_index, per_object_sim_to_pred
 
 
+def clipmatch_from_caption(
+    caption_emb: np.ndarray,
+    candidate_embs: np.ndarray,
+) -> Tuple[np.ndarray, int]:
+    """
+    EXPERIMENTAL variant of ClipMatch (recap §11 open item: "test ClipMatch/
+    hP/hR against the raw caption... despite the concerns raised") — predicts
+    the class from the single WHOLE-CAPTION embedding's similarity to each
+    candidate class, instead of clipmatch()'s max-over-extracted-objects.
+    Printed alongside the object-list version for direct comparison, NOT used
+    to feed the axis (nature/biotic/material) scores.
+
+    Known caveat this variant reintroduces (the reason the object-list version
+    was chosen as the default — see clip_metrics.py's module docstring and
+    CLAUDE.md): a long caption risks CLIP's 77-token truncation, and ClipMatch
+    was designed/validated on short single-answer responses, not multi-sentence
+    captions.
+
+    Args:
+        caption_emb:    [d] L2-normalized single caption embedding.
+        candidate_embs: [N_cand, d] L2-normalized candidate-class embeddings.
+
+    Returns:
+        per_candidate_sim: [N_cand] caption-to-candidate similarity.
+        pred_index:        argmax candidate index (or -1 if no candidates).
+    """
+    n_cand = candidate_embs.shape[0]
+    if n_cand == 0:
+        return np.zeros((0,), dtype=np.float32), -1
+    per_candidate_sim = candidate_embs @ caption_emb   # [N_cand]
+    pred_index = int(np.argmax(per_candidate_sim))
+    return per_candidate_sim, pred_index
+
+
 def object_texts(objects: List[str]) -> List[str]:
     """Wrap raw object phrases in the ClipMatch/Object-CLIPScore template."""
     # e.g. ["oak tree", "river"] -> ["a photo of a oak tree", "a photo of a river"]

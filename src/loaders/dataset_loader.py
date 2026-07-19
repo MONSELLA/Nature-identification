@@ -125,18 +125,18 @@ def get_gt_from_graph(synset_str, taxonomy_graph):
 
     resolved_node = labels["resolved_from_node"]
     node_attrs = taxonomy_graph.graph.nodes.get(resolved_node, {})
-    mat_val = node_attrs.get("material_immaterial")
+    mat_val = node_attrs.get("tangibility")
 
     is_nature = labels["is_nature"]
 
     # Critical Fix: If nature is False, downstream labels MUST be None (N/A)
     # to match the prompt rules we are enforcing on the VLM.
     if is_nature:
-        # `labels.get("biotic_abiotic")` is the string "biotic"/"abiotic"/None;
+        # `labels.get("life_category")` is the string "biotic"/"abiotic"/None;
         # convert it into True/False/None the same way `label_to_bool` does
         # for VLM answers elsewhere in the pipeline (kept as inline logic here
         # rather than a shared helper since this file predates that one).
-        gt_biotic = labels.get("biotic_abiotic") == "biotic" if labels.get("biotic_abiotic") else None
+        gt_biotic = labels.get("life_category") == "biotic" if labels.get("life_category") else None
         gt_material = mat_val == "material" if mat_val else True # Default to True for real datasets if not explicitly modeled
     else:
         # This class isn't nature at all — biotic/material simply don't
@@ -558,56 +558,3 @@ def get_candidate_vocab(dataset_name, **kwargs):
 
     # COCO (multi-label) and BIG-5 (open scene) have no closed candidate vocab.
     return None
-
-
-# ============================================================================
-# MAPPING VOCABULARY (authoritative class_name -> synset, for the hybrid
-# object-labeling step — nature/biotic WordNet mapping vs VLM fallback)
-# ============================================================================
-def build_mapping_vocab(dataset_name, **kwargs):
-    """
-    Returns {normalized_class_name: synset_id} for the dataset — the authoritative
-    lookup used to map an EXTRACTED OBJECT phrase onto a WordNet synset WITHOUT
-    word-sense guessing. Synsets come from the dataset's own class tables
-    (ImageNet WNIDs, COCO_TO_WNSYNSET, Places MIT-resolved), so e.g. "tiger"
-    maps to tiger.n.02 (the animal), never tiger.n.01 ("a fierce person").
-
-    Objects whose (normalized) phrase is not a key here are UNMAPPED and go to
-    the image-supported VLM fallback. BIG-5 has no class vocabulary -> {}.
-
-    Names are lowercased/space-normalized. Cross-dataset union mapping (recap §9)
-    is a deliberate future enhancement, not done here.
-
-    WHY IS THIS DIFFERENT FROM get_candidate_vocab? get_candidate_vocab gives
-    ClipMatch a list of classes to CHOOSE FROM (for a specific single-label
-    dataset). build_mapping_vocab instead gives the hybrid labeling step (see
-    src/vlm_pipeline.py's map_object_to_taxonomy) a plain word->synset LOOKUP
-    TABLE, used regardless of which axis-scoring metric is running — this is
-    why COCO (which has no ClipMatch candidate vocab at all) still gets a
-    mapping vocab here, built straight from COCO_TO_WNSYNSET.
-    """
-    vocab = {}
-
-    if dataset_name in ("imagenet", "places365"):
-        # Reuse the already-built candidate vocab and just reshape it into a
-        # {name: synset} dict instead of a list of dicts.
-        for entry in (get_candidate_vocab(dataset_name, **kwargs) or []):
-            vocab[entry["class_name"].strip().lower()] = entry["synset_id"]
-        return vocab
-
-    if dataset_name == "coco":
-        # Key the lookup on COCO's OWN category names (COCO_LABELS), not on a
-        # name reconstructed from the synset lemma — the reconstruction is
-        # inaccurate for the many classes whose synset is a near-synonym rather
-        # than COCO's wording (e.g. "couch"/sofa.n.01, "tv"/television_receiver.n.01),
-        # which would make an extracted "couch" or "tv" fail to map.
-        for cat_id, synset in COCO_TO_WNSYNSET.items():
-            name = COCO_LABELS.get(cat_id, synset.split('.')[0].replace('_', ' ')).strip().lower()
-            # `setdefault` only inserts if the key isn't already present —
-            # guards against two different COCO labels accidentally
-            # producing the same display name (unlikely here, but safe).
-            vocab.setdefault(name, synset)
-        return vocab
-
-    # big5 (holistic scene) — no closed class vocabulary.
-    return vocab
