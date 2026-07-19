@@ -13,7 +13,10 @@ End-to-end driver for the baseline BIG-5 VLM pipeline, in three stages:
                   hold GPU memory at the same time, and we don't rely on
                   in-process CUDA cleanup (vLLM/torch release it unreliably on
                   GC). 'spawn' is required for CUDA; only the picklable args
-                  Namespace crosses the process boundary.
+                  Namespace crosses the process boundary. --responses_file is
+                  PURELY that internal handoff in this mode, so it is deleted
+                  once scoring finishes successfully (pass --keep_responses_file
+                  to retain it).
 
   --stage infer : run ONLY the inference half (VLM -> --responses_file) and
                   exit. Useful to run inference on one machine/job and defer
@@ -825,7 +828,17 @@ def parse_args():
                         "JSON/CSV are always co-located and both respect --results_dir/"
                         "--run_name. Pass an explicit path to override (e.g. to write it "
                         "somewhere else, or to point --stage score at a specific prior "
-                        "artifact).")
+                        "artifact). Under --stage all this file is PURELY an internal handoff "
+                        "between the infer and score subprocesses, so it is deleted once "
+                        "scoring finishes successfully — see --keep_responses_file to retain "
+                        "it. --stage infer/score never delete it (infer's whole point is to "
+                        "persist it for a later --stage score; score's whole point is to "
+                        "reread an existing artifact, possibly after a metrics-code change).")
+    p.add_argument("--keep_responses_file", action="store_true",
+                   help="Under --stage all, keep --responses_file on disk after scoring "
+                        "finishes instead of deleting it (e.g. to inspect the raw VLM outputs, "
+                        "or to re-run --stage score later without re-running inference). "
+                        "Ignored for --stage infer/score, which never delete the file regardless.")
 
     # taxonomy / context
     p.add_argument("--excel_path", type=str, default="../data/big5_taxonomy/flat_wordnet_tree_fixed.xlsx")
@@ -979,6 +992,22 @@ def main():
     p2.join()
     if p2.exitcode != 0:
         raise RuntimeError(f"Scoring stage failed (exit code {p2.exitcode}).")
+
+    # --stage all's --responses_file is purely the internal handoff between
+    # the two subprocesses above — scoring just finished reading it, so
+    # nothing downstream needs it anymore. Delete it by default (opt out with
+    # --keep_responses_file) so a run doesn't silently leave a
+    # potentially-large JSON-Lines artifact behind that the user never
+    # explicitly asked to keep. --stage infer/score never reach this code
+    # path at all, so a standalone infer run (or a later standalone re-score)
+    # is never affected.
+    if not args.keep_responses_file:
+        try:
+            Path(args.responses_file).unlink()
+            print(f"🗑️  [all] removed intermediate {args.responses_file} "
+                  f"(pass --keep_responses_file to retain it)")
+        except FileNotFoundError:
+            pass
 
 
 if __name__ == "__main__":
