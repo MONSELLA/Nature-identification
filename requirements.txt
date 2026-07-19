@@ -48,6 +48,8 @@ timm>=0.9              # canonical ImageNet index->WNID mapping (baseline/evalua
 # dev toolchain and want the real fused kernel instead of the shim:
 # inplace-abn
 
+# TO FINISH, run pip install -e .
+
 # --- NOT on PyPI, not included here ---
 # baseline/count_classes.py, evaluate_imagenet.py, evaluate_coco.py,
 # evaluate_places.py, and evaluate_big5.py all import
