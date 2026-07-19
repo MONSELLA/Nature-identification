@@ -54,6 +54,19 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
+import nltk
+from nltk.corpus import wordnet as wn
+
+# Same "probe, download if missing" pattern as src/loaders/excel_loader.py —
+# map_object_to_taxonomy's graph-wide fallback tier (below) calls wn.synsets()
+# directly, so make sure the corpus data is actually present rather than
+# relying on some OTHER module having already triggered the download first.
+try:
+    wn.synsets("dog")
+except LookupError:
+    nltk.download("wordnet")
+    nltk.download("omw-1.4")
+
 from src.models.prompts import (
     CAPTION_PROMPT,
     EXTRACTION_PROMPT,
@@ -500,30 +513,57 @@ def _normalize_object(object_str: str) -> str:
     return s.strip()
 
 
+def _mapping_result(synset: str, labels: Dict[str, Any]) -> Dict[str, Any]:
+    """Turn a resolve_labels() result into map_object_to_taxonomy's
+    {"synset", "is_nature", "biotic"} return shape (shared by both lookup
+    tiers below)."""
+    is_nature = labels["is_nature"]
+    biotic = None
+    if is_nature and labels.get("life_category"):
+        biotic = labels["life_category"] == "biotic"
+    return {"synset": synset, "is_nature": is_nature, "biotic": biotic}
+
+
 def map_object_to_taxonomy(object_str: str, tax_graph, mapping_vocab: Dict[str, str], max_hops: int = 3) -> Optional[Dict[str, Any]]:
     """
-    Map a free-text object phrase onto a WordNet synset using the AUTHORITATIVE
-    dataset class->synset table (`mapping_vocab`, from
-    dataset_loader.build_mapping_vocab) — NOT word-sense guessing. This avoids
-    picking the wrong WordNet sense (e.g. "tiger" -> "a fierce person"): the
-    synset comes from the dataset's own class mapping (tiger -> tiger.n.02).
+    Map a free-text object phrase onto a WordNet synset, in TWO priority tiers:
+
+      1. AUTHORITATIVE dataset mapping (`mapping_vocab`, from
+         dataset_loader.build_mapping_vocab) — NOT word-sense guessing. This
+         avoids picking the wrong WordNet sense (e.g. "tiger" -> "a fierce
+         person"): the synset comes straight from the dataset's own class
+         mapping (tiger -> tiger.n.02). Tried FIRST, since it's risk-free.
+
+      2. GRAPH-WIDE WordNet fallback (recap §9's "extend WordNet mapping
+         beyond the three fixed dataset vocabularies" open item) — if the
+         phrase isn't a known dataset class name (or `mapping_vocab` is empty
+         entirely, e.g. BIG-5, which has no per-dataset class list at all), it
+         is looked up DIRECTLY in WordNet (`wn.synsets(phrase, pos="n")`)
+         instead of being limited to the current dataset's own ~80-1000-class
+         vocabulary. Every noun sense is tried, most-common-sense-first (that
+         being wn.synsets()'s own default ordering), against
+         tax_graph.resolve_labels — which, per its own docstring, can add and
+         search from ANY valid WordNet synset, not just ones already in the
+         graph, so this in effect compares the object against the WHOLE
+         taxonomy graph rather than only the dataset's own vocabulary. This
+         DOES reintroduce the word-sense-guessing risk tier 1 avoids (a
+         polysemous word's sense that happens to resolve first may not be the
+         one actually depicted) — accepted as a tradeoff for shrinking the
+         unmapped-object / VLM-fallback rate, and only ever reached after
+         tier 1 fails to match at all.
 
     `max_hops` bounds how far tax_graph.resolve_labels may search outward from
-    the matched synset for a labeled node: 0 accepts ONLY a directly-annotated
-    node (an annotator labeled that exact synset), 1 also accepts a node one
-    hop away (label inherited across a single hypernym/hyponym edge), etc.
+    the matched synset for a labeled node (same bound applied in both tiers):
+    0 accepts ONLY a directly-annotated node (an annotator labeled that exact
+    synset), 1 also accepts a node one hop away (label inherited across a
+    single hypernym/hyponym edge), etc.
 
     Returns {"synset", "is_nature", "biotic"} when the object's (normalized)
-    phrase — or its trailing head noun — is a known class whose synset resolves
-    to a labeled node within `max_hops`; else None (→ image-supported VLM
-    fallback). `biotic` is True/False/None (None when nature-True but the node
-    carries no biotic label).
+    phrase — or its trailing head noun — resolves to a labeled node within
+    `max_hops` via either tier; else None (→ image-supported VLM fallback).
+    `biotic` is True/False/None (None when nature-True but the node carries no
+    biotic label).
     """
-    if not mapping_vocab:
-        # This dataset has no closed class vocabulary at all (e.g. BIG-5) —
-        # every object automatically falls back to the VLM's own judgment.
-        return None
-
     norm = _normalize_object(object_str)
     candidates = [norm]
     if " " in norm:
@@ -534,6 +574,7 @@ def map_object_to_taxonomy(object_str: str, tax_graph, mapping_vocab: Dict[str, 
         # only tries the single trailing word, not every possible sub-phrase.)
         candidates.append(norm.split()[-1])  # trailing head noun (e.g. "polar bear" -> "bear")
 
+    # --- Tier 1: authoritative dataset mapping ---
     for cand in candidates:
         synset = mapping_vocab.get(cand)
         if synset is None:
@@ -546,12 +587,20 @@ def map_object_to_taxonomy(object_str: str, tax_graph, mapping_vocab: Dict[str, 
         # dataset's vocabulary might still be unmapped in the Excel.
         labels = tax_graph.resolve_labels(synset, max_hops=max_hops)
         if labels is not None:
-            is_nature = labels["is_nature"]
-            biotic = None
-            if is_nature and labels.get("life_category"):
-                biotic = labels["life_category"] == "biotic"
-            return {"synset": synset, "is_nature": is_nature, "biotic": biotic}
-    # Nothing matched, or matched but didn't resolve to a label.
+            return _mapping_result(synset, labels)
+
+    # --- Tier 2: graph-wide WordNet fallback ---
+    for cand in candidates:
+        try:
+            synsets = wn.synsets(cand, pos="n")
+        except Exception:
+            continue
+        for syn in synsets:
+            labels = tax_graph.resolve_labels(syn.name(), max_hops=max_hops)
+            if labels is not None:
+                return _mapping_result(syn.name(), labels)
+
+    # Nothing matched in either tier.
     return None
 
 
