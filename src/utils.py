@@ -28,6 +28,47 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
+def generate_batch_with_overflow_guard(vlm, prompts, images, generate_kwargs, label="batch", item_labels=None):
+    """Runs `vlm.generate_batch(prompts=prompts, images=images, **generate_kwargs)`,
+    tolerating a per-sample prompt-length overflow (a prompt longer than
+    max_model_len) WITHOUT sacrificing batching for the rest of the batch.
+    vLLM's single `.chat()` call covers the whole batch and fails it
+    entirely if even one conversation overflows, with no indication of which
+    one — so on that specific failure we BISECT the batch in half and
+    recurse, each half still generated as one batched call. This isolates
+    the oversized prompt(s) down to single-item granularity (returned as
+    None, aligned with the input order) while every other sample stays
+    batched together, instead of degrading the whole batch to one-at-a-time
+    generation.
+
+    `item_labels` (optional, same length as prompts) is used purely for the
+    warning message identifying which item was skipped; falls back to a
+    generic "item" if not provided.
+    """
+    n = len(prompts)
+    if n == 0:
+        return []
+    try:
+        return vlm.generate_batch(prompts=prompts, images=images, **generate_kwargs)
+    except ValueError as e:
+        if "longer than the maximum model length" not in str(e):
+            raise
+        if n == 1:
+            name = item_labels[0] if item_labels else "item"
+            print(f"⚠️ Skipping {name} ({label}): prompt too long for max_model_len ({e}).")
+            return [None]
+        mid = n // 2
+        print(f"⚠️ {label}: a prompt exceeded max_model_len — bisecting "
+              f"{n} instances into two sub-batches to isolate it.")
+        left_labels = item_labels[:mid] if item_labels else None
+        right_labels = item_labels[mid:] if item_labels else None
+        left = generate_batch_with_overflow_guard(
+            vlm, prompts[:mid], images[:mid], generate_kwargs, f"{label}/left", left_labels)
+        right = generate_batch_with_overflow_guard(
+            vlm, prompts[mid:], images[mid:], generate_kwargs, f"{label}/right", right_labels)
+        return left + right
+
+
 def format_duration(seconds):
     """Format a duration in seconds as "D-HH:MM:SS" (SLURM-style elapsed-time
     format), e.g. 3725.4 -> "0-01:02:05". Returns None unchanged (so callers

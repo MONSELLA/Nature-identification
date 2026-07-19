@@ -36,7 +36,10 @@ import wandb
 from src.loaders.excel_loader import TaxonomyGraph
 from src.models.vlm_models import MODEL_REGISTRY, VLLM_FAMILIES, create_vlm
 from src.loaders.dataset_loader import load_dataset
-from src.utils import update_results_store, update_dataset_class_stats, compute_class_stats, format_duration
+from src.utils import (
+    update_results_store, update_dataset_class_stats, compute_class_stats, format_duration,
+    generate_batch_with_overflow_guard,
+)
 # TaxonomyResponse + build_classification_prompt live in prompts.py so this
 # calibration eval and the VLM pipeline's fallback path share the EXACT same
 # prompt and schema (they cannot drift — same imported objects).
@@ -164,45 +167,6 @@ def _combine_taxonomy_reasoning(pred):
     parts = [pred.get("nature_reasoning"), pred.get("sub_axes_reasoning")]
     parts = [p for p in parts if p]
     return " ".join(parts) if parts else None
-
-
-def _is_overflow_error(e):
-    return isinstance(e, ValueError) and "longer than the maximum model length" in str(e)
-
-
-def generate_batch_with_overflow_guard(vlm, batch, prompts, images, system_prompt, args, label):
-    """Runs `vlm.generate_batch` over one batch, tolerating per-sample prompt
-    overflow (a prompt longer than max_model_len) WITHOUT sacrificing
-    batching for the rest. vLLM's single `.chat()` call covers the whole
-    batch and fails it entirely if even one conversation overflows, with no
-    indication of which one — so on that specific failure we BISECT the
-    batch in half and recurse, each half still generated as one batched
-    call. This isolates the oversized prompt(s) down to single-item
-    granularity while every other sample stays batched together, instead of
-    falling back to generating the whole batch one item at a time."""
-    if not batch:
-        return []
-    try:
-        return vlm.generate_batch(
-            prompts=prompts, images=images, system_prompt=system_prompt,
-            max_new_tokens=args.max_new_tokens, temperature=args.temperature,
-            output_mode=args.output_mode, schema=TaxonomyResponse
-        )
-    except ValueError as e:
-        if not _is_overflow_error(e):
-            raise
-        if len(batch) == 1:
-            print(f"⚠️ Skipping '{batch[0]['image_path']}' / '{batch[0]['class_name']}' "
-                  f"({label}): prompt too long for max_model_len ({e}).")
-            return [None]
-        mid = len(batch) // 2
-        print(f"⚠️ {label}: a prompt exceeded max_model_len — bisecting "
-              f"{len(batch)} instances into two sub-batches to isolate it.")
-        left = generate_batch_with_overflow_guard(
-            vlm, batch[:mid], prompts[:mid], images[:mid], system_prompt, args, f"{label}/left")
-        right = generate_batch_with_overflow_guard(
-            vlm, batch[mid:], prompts[mid:], images[mid:], system_prompt, args, f"{label}/right")
-        return left + right
 
 
 def calculate_binary_metrics(y_true, y_pred):
@@ -355,8 +319,13 @@ def main():
         t0 = time.time()
         try:
             batch_results = generate_batch_with_overflow_guard(
-                vlm, batch, batch_prompts, batch_images, system_prompt, args,
-                label=f"Batch {batch_idx + 1}/{num_batches}"
+                vlm, batch_prompts, batch_images,
+                generate_kwargs=dict(
+                    system_prompt=system_prompt, max_new_tokens=args.max_new_tokens,
+                    temperature=args.temperature, output_mode=args.output_mode, schema=TaxonomyResponse,
+                ),
+                label=f"Batch {batch_idx + 1}/{num_batches}",
+                item_labels=[f"'{r['image_path']}' / '{r['class_name']}'" for r in batch],
             )
         except Exception as e:
             # If the batch call fails for a reason OTHER than a single
