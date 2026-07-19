@@ -571,18 +571,17 @@ def resolve_hybrid_label(object_str: str, vlm_label: Dict[str, Any], tax_graph, 
 
     if mapping is not None:
         # This object's phrase matched a known class AND that class resolves
-        # to a labeled taxonomy node — use WordNet's answer for nature.
+        # to a labeled taxonomy node — use WordNet's answer for both nature
+        # and biotic. NOTE: biotic is NEVER sourced from the VLM here, even
+        # when the mapped node carries no biotic/abiotic label of its own
+        # (mapping["biotic"] is None in that case) — label_objects_batch's
+        # material-only call for mapped-nature objects never asks the VLM
+        # about biotic at all, so vlm_biotic is unconditionally None on this
+        # path; there is nothing to fall back to.
         final_nature = mapping["is_nature"]
+        final_biotic = mapping["biotic"] if final_nature else None
         nature_source = "wordnet"
-        if mapping["biotic"] is not None:
-            # The resolved node also carries an explicit biotic/abiotic label
-            # — use it.
-            final_biotic = mapping["biotic"]
-            biotic_source = "wordnet"
-        else:
-            # mapped & nature but node has no biotic label -> VLM decides biotic
-            final_biotic = vlm_biotic if final_nature else None
-            biotic_source = "vlm" if final_nature else "wordnet"
+        biotic_source = "wordnet"
         mapped_synset = mapping["synset"]
     else:
         # No usable WordNet mapping at all — fall back entirely to the VLM's
