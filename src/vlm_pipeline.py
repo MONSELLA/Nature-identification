@@ -69,8 +69,8 @@ from src.models.prompts import (
 #             three separate calls, and lets the model reason jointly).
 #   - MATERIAL: a MAPPED-nature object — nature/biotic are already fixed by the
 #             WordNet mapping, so the VLM is only asked material/immaterial.
-_FULL_AXES = ["nature", "biotic", "material"]
-_MATERIAL_AXES = ["material"]
+_FULL_AXES = ["nature", "life_category", "tangibility"]
+_MATERIAL_AXES = ["tangibility"]
 
 # Sentinel distinguishing "mapping not provided, compute it" from "mapping is
 # genuinely None (unmapped)" in resolve_hybrid_label — a plain None default
@@ -321,7 +321,7 @@ def label_objects_batch(
             if isinstance(out, dict):
                 per_image[i][j] = {
                     "reasoning": _combine_taxonomy_reasoning(out), "nature": out.get("nature"),
-                    "biotic": out.get("biotic"), "material": out.get("material"),
+                    "biotic": out.get("life_category"), "material": out.get("tangibility"),
                     "parse_failed": False, "vlm_called": True,
                 }
             else:
@@ -341,7 +341,7 @@ def label_objects_batch(
                 # WordNet mapping in resolve_hybrid_label, not from this call.
                 rec = _empty_label(parse_failed=False, vlm_called=True)
                 rec["reasoning"] = out.get("reasoning")
-                rec["material"] = out.get("material")
+                rec["material"] = out.get("tangibility")
                 per_image[i][j] = rec
             else:
                 per_image[i][j] = _empty_label(parse_failed=True, vlm_called=True)

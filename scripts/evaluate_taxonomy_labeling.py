@@ -35,7 +35,7 @@ import wandb
 from src.loaders.excel_loader import TaxonomyGraph
 from src.models.vlm_models import MODEL_REGISTRY, VLLM_FAMILIES, create_vlm
 from src.loaders.dataset_loader import load_dataset
-from src.utils import update_results_store
+from src.utils import update_results_store, update_dataset_class_stats, compute_class_stats
 # TaxonomyResponse + build_classification_prompt live in prompts.py so this
 # calibration eval and the VLM pipeline's fallback path share the EXACT same
 # prompt and schema (they cannot drift — same imported objects).
@@ -308,7 +308,7 @@ def main():
 
         # Build one taxonomy-classification prompt per instance in this batch
         # (using each instance's own GT class_name), paired with its own image.
-        batch_prompts = [build_classification_prompt(r["class_name"], axes=["nature", "biotic", "material"]) for r in batch]
+        batch_prompts = [build_classification_prompt(r["class_name"], axes=["nature", "life_category", "tangibility"]) for r in batch]
         batch_images = [r["image_path"] for r in batch]
 
         t0 = time.time()
@@ -434,8 +434,8 @@ def main():
             "class_name": r["class_name"],
             "gt_nature": r["gt_nature"], "gt_biotic": r["gt_biotic"], "gt_material": r["gt_material"],
             "pred_nature": r["prediction"].get("nature"),
-            "pred_biotic": r["prediction"].get("biotic"),
-            "pred_material": r["prediction"].get("material"),
+            "pred_biotic": r["prediction"].get("life_category"),
+            "pred_material": r["prediction"].get("tangibility"),
             "reasoning": _combine_taxonomy_reasoning(r["prediction"]),
             "parse_failed": r["prediction"]["parse_failed"]
         })
@@ -455,6 +455,14 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     output_path = out_dir / Path(args.output_file).name
     update_results_store(output_path, dataset=args.dataset, model=model_label, metrics=summary_results)
+    # Distinct-target-class nature/biotic/material composition of THIS run's
+    # sampled dataset (sampling is deterministic — the same --max_samples
+    # always yields the same subset — so this is stable across reruns of the
+    # same config). Keyed by --max_samples so different configurations (e.g.
+    # 1000 vs the full dataset) accumulate side by side instead of overwriting.
+    class_stats = compute_class_stats(scored_results)
+    config_key = str(args.max_samples) if args.max_samples is not None else "full"
+    update_dataset_class_stats(output_path, dataset=args.dataset, config_key=config_key, stats=class_stats)
     # Include dataset + model in the filename — otherwise every model run
     # writes to the same "<stem>_predictions.csv" and each rerun (e.g. a
     # different VLM on the same dataset) silently overwrites the previous
