@@ -89,7 +89,7 @@ from src.loaders.dataset_loader import load_dataset, get_candidate_vocab, build_
 from src.models.vlm_models import MODEL_REGISTRY, VLLM_FAMILIES, create_vlm
 from src.vlm_pipeline import run_inference, resolve_hybrid_label, normalize_objects, _normalize_object
 from src.evaluation import clip_metrics
-from src.utils import update_results_store
+from src.utils import update_results_store, update_dataset_class_stats, compute_class_stats
 
 
 # =============================================================================
@@ -701,6 +701,15 @@ def phase_score(args):
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / Path(args.output_file).name
     update_results_store(out_path, dataset=dataset, model=header.get("model"), metrics=summary)
+    # Distinct-target-class nature/biotic/material composition of THIS run's
+    # sampled dataset (recap: sampling is deterministic — a fixed --max_samples
+    # always yields the same subset — so this is stable across reruns of the
+    # same config). Keyed by n_images so different configurations (e.g. 1000
+    # vs the full dataset) accumulate side by side instead of overwriting.
+    all_targets = [t for rec in records for t in rec.get("targets", [])]
+    class_stats = compute_class_stats(all_targets)
+    config_key = str(args.max_samples) if args.max_samples is not None else "full"
+    update_dataset_class_stats(out_path, dataset=dataset, config_key=config_key, stats=class_stats)
     if flat_rows:
         # Include dataset + model in the filename — otherwise every model run
         # writes to the same "<stem>_predictions.csv" and each rerun (e.g. a
