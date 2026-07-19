@@ -320,10 +320,39 @@ def main():
                 max_new_tokens=args.max_new_tokens, temperature=args.temperature,
                 output_mode=args.output_mode, schema=TaxonomyResponse
             )
+        except ValueError as e:
+            if "longer than the maximum model length" in str(e):
+                # A single oversized prompt in this batch overflowed
+                # max_model_len, which fails vLLM's ENTIRE chat() call (it
+                # doesn't tell us which conversation was the culprit). Rather
+                # than penalize every OTHER instance in the batch for one
+                # outlier, retry one-by-one so only the actual offender is
+                # skipped and its GPU-time-wasting neighbors still get scored.
+                print(f"⚠️ Batch {batch_idx + 1}/{num_batches}: a prompt exceeded max_model_len — "
+                      f"retrying batch instances individually.")
+                batch_results = []
+                for r, prompt, image in zip(batch, batch_prompts, batch_images):
+                    try:
+                        batch_results.append(vlm.generate_batch(
+                            prompts=[prompt], images=[image], system_prompt=system_prompt,
+                            max_new_tokens=args.max_new_tokens, temperature=args.temperature,
+                            output_mode=args.output_mode, schema=TaxonomyResponse
+                        )[0])
+                    except ValueError as single_e:
+                        if "longer than the maximum model length" in str(single_e):
+                            print(f"⚠️ Skipping '{r['image_path']}' / '{r['class_name']}': "
+                                  f"prompt too long for max_model_len ({single_e}).")
+                            batch_results.append(None)
+                        else:
+                            raise
+            else:
+                # If the ENTIRE batch call fails for some other reason (e.g.
+                # an out-of-memory error), don't crash the whole run — treat
+                # every instance in this batch as a parse failure (scored as
+                # wrong below) and keep going.
+                print(f"⚠️ Batch {batch_idx + 1}/{num_batches} FAILED ({e!r}).")
+                batch_results = [None] * len(batch)
         except Exception as e:
-            # If the ENTIRE batch call fails (e.g. an out-of-memory error),
-            # don't crash the whole run — treat every instance in this batch
-            # as a parse failure (scored as wrong below) and keep going.
             print(f"⚠️ Batch {batch_idx + 1}/{num_batches} FAILED ({e!r}).")
             batch_results = [None] * len(batch)
 
