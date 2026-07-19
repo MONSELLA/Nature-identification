@@ -119,6 +119,63 @@ class BaseVLM(ABC):
             for p, img in zip(prompts, images)
         ]
 
+    def _is_recoverable_overflow(self, exc: Exception) -> bool:
+        """Hook for subclasses: does `exc` mean "one prompt in this batch was
+        too long for the model's context window" (as opposed to some other
+        failure, e.g. OOM)? Base default is False — a backend that never
+        raises this kind of error (or hasn't been taught to recognize its own
+        error shape yet) gets a safe no-op: `generate_batch_safe` below just
+        re-raises everything, identical to plain `generate_batch`."""
+        return False
+
+    def generate_batch_safe(
+        self,
+        prompts: List[str],
+        images: Optional[List[ImageInput]] = None,
+        label: str = "batch",
+        item_labels: Optional[List[str]] = None,
+        **kwargs: Any,
+    ) -> List[Union[str, Dict[str, Any], None]]:
+        """Like `generate_batch`, but tolerant of a single-prompt context-
+        window overflow WITHOUT sacrificing batching for the rest of the
+        batch. A batched call (e.g. vLLM's single `.chat()` covering every
+        conversation) fails ENTIRELY if even one prompt overflows, with no
+        indication of which one — so on a `_is_recoverable_overflow` failure
+        we BISECT the batch in half and recurse, each half still generated as
+        one batched call. This isolates the oversized prompt(s) down to
+        single-item granularity (returned as None, aligned with input order)
+        while every other sample stays batched together, instead of
+        degrading the whole batch to one-at-a-time generation.
+
+        `item_labels` (optional, same length as prompts) is used purely for
+        the warning message identifying which item was skipped; falls back
+        to a generic "item" if not provided.
+        """
+        n = len(prompts)
+        if n == 0:
+            return []
+        if images is None:
+            images = [None] * n
+        try:
+            return self.generate_batch(prompts=prompts, images=images, **kwargs)
+        except Exception as e:
+            if not self._is_recoverable_overflow(e):
+                raise
+            if n == 1:
+                name = item_labels[0] if item_labels else "item"
+                print(f"⚠️ Skipping {name} ({label}): prompt too long for max_model_len ({e}).")
+                return [None]
+            mid = n // 2
+            print(f"⚠️ {label}: a prompt exceeded max_model_len — bisecting "
+                  f"{n} instances into two sub-batches to isolate it.")
+            left_labels = item_labels[:mid] if item_labels else None
+            right_labels = item_labels[mid:] if item_labels else None
+            left = self.generate_batch_safe(
+                prompts[:mid], images[:mid], f"{label}/left", left_labels, **kwargs)
+            right = self.generate_batch_safe(
+                prompts[mid:], images[mid:], f"{label}/right", right_labels, **kwargs)
+            return left + right
+
 
 # =============================================================================
 # Backend base classes
@@ -143,6 +200,13 @@ class VLLMBackedVLM(BaseVLM):
         # take a while and use a lot of VRAM — see unload_vlm() further down
         # for how we later release this memory).
         self.llm = LLM(model=model_name, **kwargs)
+
+    def _is_recoverable_overflow(self, exc: Exception) -> bool:
+        """vLLM's `.chat()` raises a ValueError with this exact substring
+        when a conversation's prompt (text + image tokens) exceeds
+        max_model_len — the specific, bisectable overflow case
+        `generate_batch_safe` knows how to recover from."""
+        return isinstance(exc, ValueError) and "longer than the maximum model length" in str(exc)
 
     @staticmethod
     def _encode_image(image: ImageInput) -> str:

@@ -173,13 +173,11 @@ def caption_batch(
     # every image the identical question, just pairing it with a different
     # picture each time.
     prompts = [CAPTION_PROMPT] * len(image_paths)
-    outs = vlm.generate_batch(
-        prompts=prompts,
-        images=image_paths,
-        system_prompt=system_prompt,
-        max_new_tokens=max_new_tokens,
-        temperature=temperature,
-        output_mode="free_form",  # no JSON schema — just get back plain text
+    outs = vlm.generate_batch_safe(
+        prompts, image_paths,
+        label="caption_batch", item_labels=image_paths,
+        system_prompt=system_prompt, max_new_tokens=max_new_tokens,
+        temperature=temperature, output_mode="free_form",  # no JSON schema — just get back plain text
     )
     # Guard against a non-string response (e.g. None on total generation
     # failure) by substituting an empty string, so callers never have to
@@ -204,12 +202,10 @@ def extract_objects_batch(
     # template (see src/models/prompts.py) — so each per-image prompt is
     # slightly different this time, referencing that image's own description.
     prompts = [EXTRACTION_PROMPT.format(caption=c) for c in captions]
-    outs = vlm.generate_batch(
-        prompts=prompts,
-        images=image_paths,
-        system_prompt=system_prompt,
-        max_new_tokens=max_new_tokens,
-        temperature=temperature,
+    outs = vlm.generate_batch_safe(
+        prompts, image_paths,
+        label="extract_objects_batch", item_labels=image_paths,
+        system_prompt=system_prompt, max_new_tokens=max_new_tokens, temperature=temperature,
         output_mode="structured",       # this time we DO want JSON back...
         schema=ObjectExtractionResponse,  # ...shaped exactly like this schema
     )
@@ -311,11 +307,12 @@ def label_objects_batch(
 
     # --- FULL group (unmapped objects): all three axes ---
     if full_prompts:
-        outs = vlm.generate_batch(
-            prompts=full_prompts, images=full_images,
-            system_prompt=label_system_full,
-            max_new_tokens=max_new_tokens, temperature=temperature,
-            output_mode="structured", schema=TaxonomyResponse,
+        outs = vlm.generate_batch_safe(
+            full_prompts, full_images,
+            label="label_objects_batch/full",
+            item_labels=[f"{image_paths[i]}#{j}" for i, j in full_owner],
+            system_prompt=label_system_full, max_new_tokens=max_new_tokens,
+            temperature=temperature, output_mode="structured", schema=TaxonomyResponse,
         )
         for (i, j), out in zip(full_owner, outs):
             if isinstance(out, dict):
@@ -329,11 +326,12 @@ def label_objects_batch(
 
     # --- MATERIAL group (mapped-nature objects): material axis only ---
     if mat_prompts:
-        outs = vlm.generate_batch(
-            prompts=mat_prompts, images=mat_images,
-            system_prompt=label_system_material,
-            max_new_tokens=max_new_tokens, temperature=temperature,
-            output_mode="structured", schema=MaterialResponse,
+        outs = vlm.generate_batch_safe(
+            mat_prompts, mat_images,
+            label="label_objects_batch/material",
+            item_labels=[f"{image_paths[i]}#{j}" for i, j in mat_owner],
+            system_prompt=label_system_material, max_new_tokens=max_new_tokens,
+            temperature=temperature, output_mode="structured", schema=MaterialResponse,
         )
         for (i, j), out in zip(mat_owner, outs):
             if isinstance(out, dict):

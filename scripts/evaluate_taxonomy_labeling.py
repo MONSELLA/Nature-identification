@@ -316,17 +316,18 @@ def main():
 
         t0 = time.time()
         try:
-            batch_results = vlm.generate_batch(
-                prompts=batch_prompts, images=batch_images, system_prompt=system_prompt,
-                max_new_tokens=args.max_new_tokens, temperature=args.temperature,
-                output_mode=args.output_mode, schema=TaxonomyResponse
+            batch_results = vlm.generate_batch_safe(
+                batch_prompts, batch_images,
+                label=f"Batch {batch_idx + 1}/{num_batches}",
+                item_labels=[f"'{r['image_path']}' / '{r['class_name']}'" for r in batch],
+                system_prompt=system_prompt, max_new_tokens=args.max_new_tokens,
+                temperature=args.temperature, output_mode=args.output_mode, schema=TaxonomyResponse,
             )
         except Exception as e:
-            # If the ENTIRE batch call fails (e.g. an out-of-memory error),
-            # don't crash the whole run — treat every instance in this batch
-            # as a parse failure (scored as wrong below) and keep going.
-            # Full traceback (not just repr(e)) so the actual failing line is
-            # visible in logs instead of just the exception message.
+            # If the batch call fails for a reason OTHER than a single
+            # oversized prompt (e.g. an out-of-memory error), don't crash the
+            # whole run — treat every instance in this batch as a parse
+            # failure (scored as wrong below) and keep going.
             print(f"⚠️ Batch {batch_idx + 1}/{num_batches} FAILED ({e!r}).")
             traceback.print_exc()
             batch_results = [None] * len(batch)
