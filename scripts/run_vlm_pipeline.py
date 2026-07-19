@@ -473,6 +473,12 @@ def phase_score(args):
     n_map_nature = n_vlm_nature = 0
     clipmatch_top1 = 0
     clipmatch_support = 0
+    # EXPERIMENTAL caption-based ClipMatch variant (recap §11 open item) —
+    # accumulated in parallel with the object-list version above, purely for
+    # side-by-side comparison at the end (see clip_metrics.clipmatch_from_caption).
+    clipmatch_cap_top1 = 0
+    clipmatch_cap_support = 0
+    hp_cap_vals, hr_cap_vals, hf1_cap_vals = [], [], []
     flat_rows = []  # per-object rows for the output CSV
 
     # Which images get their per-object predictions written to the CSV.
@@ -600,6 +606,30 @@ def phase_score(args):
                     clipmatch_top1 += 1
                 hier = taxonomy_metrics.compute_hierarchical_metrics(graph, gt_syn, pred_node)
                 hp_vals.append(hier["hp"]); hr_vals.append(hier["hr"]); hf1_vals.append(hier["hf1"])
+
+            # --- EXPERIMENTAL: caption-based ClipMatch variant (recap §11 open
+            # item), computed in PARALLEL with the object-list version above for
+            # side-by-side comparison — NOT used for the axis scores, and not
+            # (yet) the default. Predicts the class from the WHOLE CAPTION's
+            # similarity to each candidate, then asks which extracted object
+            # best aligns with THAT predicted class (for hP/hR resolution) —
+            # see clip_metrics.clipmatch_from_caption.
+            pred_class_synset_cap = pred_node_cap = None
+            _, pred_idx_cap = clip_metrics.clipmatch_from_caption(caption_embs[idx], candidate_embs)
+            if pred_idx_cap >= 0:
+                pred_class_synset_cap = candidate_vocab[pred_idx_cap]["synset_id"]
+                if rec_obj_embs.shape[0] > 0:
+                    sims_to_pred_cap = rec_obj_embs @ candidate_embs[pred_idx_cap]
+                    pred_node_cap = taxonomy_metrics.resolve_to_wordnet(
+                        list(sims_to_pred_cap), pred_class_synset_cap, objs)
+
+            if gt_syn:
+                clipmatch_cap_support += 1
+                if pred_class_synset_cap is not None and pred_class_synset_cap == gt_syn:
+                    clipmatch_cap_top1 += 1
+                hier_cap = taxonomy_metrics.compute_hierarchical_metrics(graph, gt_syn, pred_node_cap)
+                hp_cap_vals.append(hier_cap["hp"]); hr_cap_vals.append(hier_cap["hr"])
+                hf1_cap_vals.append(hier_cap["hf1"])
         else:
             # --- COCO (multi-label) + BIG-5 (holistic): image-level nature OR
             #     + matched-object biotic/material ---
@@ -690,6 +720,14 @@ def phase_score(args):
         }
         summary["hierarchical"] = {"hp": _mean(hp_vals), "hr": _mean(hr_vals),
                                    "hf1": _mean(hf1_vals), "support": len(hf1_vals)}
+        # EXPERIMENTAL caption-based variant (recap §11), printed alongside the
+        # object-list version above for comparison — see clipmatch_from_caption.
+        summary["clipmatch_caption"] = {
+            "top1_accuracy": (clipmatch_cap_top1 / clipmatch_cap_support) if clipmatch_cap_support else 0.0,
+            "support": clipmatch_cap_support,
+        }
+        summary["hierarchical_caption"] = {"hp": _mean(hp_cap_vals), "hr": _mean(hr_cap_vals),
+                                           "hf1": _mean(hf1_cap_vals), "support": len(hf1_cap_vals)}
 
     # Wall-clock time this model took to finish this run, formatted "D-HH:MM:SS"
     # (SLURM-style elapsed time). inference_time_seconds comes from phase_infer's
@@ -765,11 +803,18 @@ def _print_summary(s, run_clipmatch):
         print(f"  {axis.split('_')[0]:<12} (pos) P {m['precision']:.4f} | R {m['recall']:.4f} | F1 {m['f1']:.4f}")
         print(f"  {neg_labels[axis]:<12} (neg) P {m['precision_neg']:.4f} | R {m['recall_neg']:.4f} | F1 {m['f1_neg']:.4f}")
     if run_clipmatch:
-        print(f"\n--- ClipMatch (support {s['clipmatch']['support']}) ---")
+        print(f"\n--- ClipMatch [object-list] (support {s['clipmatch']['support']}) ---")
         print(f"Top-1: {s['clipmatch']['top1_accuracy']:.4f}")
         h = s["hierarchical"]
-        print(f"--- Hierarchical (support {h['support']}) ---")
+        print(f"--- Hierarchical [object-list] (support {h['support']}) ---")
         print(f"hP {h['hp']:.4f} | hR {h['hr']:.4f} | hF1 {h['hf1']:.4f}")
+        # EXPERIMENTAL caption-based variant (recap §11), printed for direct
+        # comparison against the object-list version above.
+        print(f"\n--- ClipMatch [caption, EXPERIMENTAL] (support {s['clipmatch_caption']['support']}) ---")
+        print(f"Top-1: {s['clipmatch_caption']['top1_accuracy']:.4f}")
+        hc = s["hierarchical_caption"]
+        print(f"--- Hierarchical [caption, EXPERIMENTAL] (support {hc['support']}) ---")
+        print(f"hP {hc['hp']:.4f} | hR {hc['hr']:.4f} | hF1 {hc['hf1']:.4f}")
     t = s["execution_time"]
     inf_str = t["inference"] if t["inference"] is not None else "n/a"
     print(f"\nExecution time (D-HH:MM:SS): inference {inf_str} | scoring {t['scoring']} | total {t['total']}")
@@ -803,6 +848,9 @@ def _log_wandb(args, summary, run_clipmatch):
     if run_clipmatch:
         log["ClipMatch/Top1"] = summary["clipmatch"]["top1_accuracy"]
         log["Hierarchical/hF1"] = summary["hierarchical"]["hf1"]
+        # EXPERIMENTAL caption-based variant (recap §11).
+        log["ClipMatchCaption/Top1"] = summary["clipmatch_caption"]["top1_accuracy"]
+        log["HierarchicalCaption/hF1"] = summary["hierarchical_caption"]["hf1"]
     wandb.log(log)
     wandb.finish()
 
