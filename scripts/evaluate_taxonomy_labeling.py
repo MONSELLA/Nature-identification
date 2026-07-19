@@ -35,7 +35,7 @@ import wandb
 from src.loaders.excel_loader import TaxonomyGraph
 from src.models.vlm_models import MODEL_REGISTRY, VLLM_FAMILIES, create_vlm
 from src.loaders.dataset_loader import load_dataset
-from src.utils import update_results_store, update_dataset_class_stats, compute_class_stats
+from src.utils import update_results_store, update_dataset_class_stats, compute_class_stats, format_duration
 # TaxonomyResponse + build_classification_prompt live in prompts.py so this
 # calibration eval and the VLM pipeline's fallback path share the EXACT same
 # prompt and schema (they cannot drift — same imported objects).
@@ -198,6 +198,7 @@ def calculate_binary_metrics(y_true, y_pred):
 
 
 def main():
+    run_t0 = time.time()
     args = parse_args()
     if args.output_mode == "free_form":
         # This calibration is only meaningful with STRUCTURED output — a
@@ -346,6 +347,20 @@ def main():
                 pred_biotic = _label_to_bool(result.get("life_category"), "biotic")
                 pred_material = _label_to_bool(result.get("tangibility"), "material")
 
+                # The schema TELLS the model to answer "none" for the sub-axes
+                # whenever nature is "no", but nothing mechanically enforces
+                # that — a model can violate it (e.g. nature="no" but
+                # life_category="biotic"). Whenever pred_nature isn't a
+                # confirmed True (explicit "no", or an unparseable/missing
+                # nature answer), we cannot trust any sub-axis value it
+                # printed, so force both to "not applicable" here rather than
+                # scoring the stray answer as-is — otherwise it could
+                # accidentally match GT by luck instead of being penalized
+                # like every other unconfirmed prediction.
+                if pred_nature is not True:
+                    pred_biotic = None
+                    pred_material = None
+
                 # Even when the JSON parsed successfully, an individual field
                 # might still be an unexpected/missing value (pred_* is None).
                 # Same "penalize as wrong" rule applies at the per-field level:
@@ -444,6 +459,11 @@ def main():
         "model": model_label, "dataset": args.dataset,
         "parse_failure_rate": parse_failure_rate,
         "nature": nature_metrics, "biotic": biotic_metrics, "material": material_metrics,
+        # Total wall-clock time for this run (dataset load, model creation,
+        # every batched generation call, and metric computation) — how long
+        # THIS model took to finish this evaluation end-to-end. Formatted as
+        # "D-HH:MM:SS" (SLURM-style elapsed time).
+        "execution_time": format_duration(time.time() - run_t0),
     }
 
     # Everything lands under --results_dir ("results/" by default); --run_name

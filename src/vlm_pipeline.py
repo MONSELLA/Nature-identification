@@ -602,12 +602,18 @@ def resolve_hybrid_label(object_str: str, vlm_label: Dict[str, Any], tax_graph, 
         biotic_source = "vlm"
         mapped_synset = None
 
-    # Enforce the schema rule: no downstream labels when the instance is not nature.
-    # If the final decision is "this is not nature" (whether that came from
-    # WordNet or the VLM), biotic/material simply don't apply — force both to
-    # None regardless of what the VLM might have said for them, so we never
-    # accidentally report a biotic/material label for a non-nature object.
-    if final_nature is False:
+    # Enforce the schema rule: no downstream labels when the instance is not
+    # CONFIRMED nature. Force biotic/material to None whenever final_nature is
+    # anything other than True — covers both an explicit "no" AND an
+    # unresolved/unparseable nature answer (final_nature is None) — regardless
+    # of what the VLM might have said for biotic/material. This matters
+    # because the schema does not mechanically ENFORCE "sub-axes must be
+    # 'none' when nature is 'no'" — a model can violate that constraint (e.g.
+    # answer nature="no" but life_category="biotic") — so we cannot trust a
+    # stray biotic/material answer whenever nature itself isn't a confirmed
+    # "yes"; scoring it as-is could let that answer accidentally match GT by
+    # luck instead of being penalized like every other unconfirmed prediction.
+    if final_nature is not True:
         final_biotic = None
         final_material = None
     else:
