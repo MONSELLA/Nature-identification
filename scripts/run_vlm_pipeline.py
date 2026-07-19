@@ -116,9 +116,13 @@ def build_system_prompts(nature_path, biotic_path, material_path):
     nature = Path(nature_path).read_text()
     biotic = Path(biotic_path).read_text()
     material = Path(material_path).read_text()
-    caption_system = nature
-    label_system_full = f"{nature}\n\n{biotic}\n\n{material}"
-    label_system_material = material
+    caption_system = f"# NATURE DEFINITION\n{nature}"
+    label_system_full = (
+        "# 1. NATURE DEFINITION\n" f"{nature}\n\n"
+        "# 2. LIFE CATEGORY AXIS\n" f"{biotic}\n\n"
+        "# 3. TANGIBILITY AXIS\n" f"{material}"
+    )
+    label_system_material = f"# TANGIBILITY AXIS\n{material}"
     return caption_system, label_system_full, label_system_material
 
 

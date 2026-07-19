@@ -78,8 +78,8 @@ EXTRACTION_PROMPT = (
     "\"{caption}\"\n\n"
     "Using BOTH the image and the description, list every distinct physical "
     "object, element, or entity that appears in the image. Follow these rules:\n"
-    "  - Return each object as a short noun phrase (e.g. \"wooden bench\", "
-    "\"golden retriever\", \"mountain\").\n"
+    "  - Return each object as a noun or a compound noun (e.g. \"bench\", "
+    "\"golden retriever\", \"mountain\", \"hen of the woods\").\n"
     "  - Include secondary and background elements, not just the main subject.\n"
     "  - Include an element even when it is only PART of a larger object or is "
     "depicted on its surface (e.g. a flower printed on a dress -> list "
@@ -106,7 +106,7 @@ class ObjectExtractionResponse(BaseModel):
     objects: List[str] = Field(
         description=(
             "The distinct physical objects, elements, or entities present in the "
-            "image, each as a short noun phrase. Include part-objects and "
+            "image, each as a noun or a compound noun. Include part-objects and "
             "background elements."
         )
     )
