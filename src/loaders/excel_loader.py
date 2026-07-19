@@ -415,9 +415,9 @@ class TaxonomyGraph:
         unlabeled ancestor/descendant nodes add_synset_and_ancestors added
         while wiring the hierarchy up to entity.n.01 — NOT all of WordNet.
 
-        Used by map_object_to_taxonomy's (src/vlm_pipeline.py) graph-wide
-        lookup tier: an extracted object phrase counts as matching THE GRAPH
-        iff it equals one of a graph synset's own WordNet lemma names (e.g.
+        Used by map_object_to_taxonomy (src/vlm_pipeline.py): an extracted
+        object phrase counts as matching THE GRAPH iff it equals one of a
+        graph synset's own WordNet lemma names (e.g.
         "hound" is a lemma of "dog.n.01", so an extracted "hound" would match
         that node if it's in the graph). This is intentionally NOT an
         open-ended `wn.synsets(word)` sense search — a word with several

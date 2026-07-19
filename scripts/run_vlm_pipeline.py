@@ -91,7 +91,7 @@ logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 
 from src.evaluation import taxonomy_metrics
 from src.loaders.excel_loader import TaxonomyGraph
-from src.loaders.dataset_loader import load_dataset, get_candidate_vocab, build_mapping_vocab
+from src.loaders.dataset_loader import load_dataset, get_candidate_vocab
 from src.models.prompts import build_system_prompts
 from src.models.vlm_models import MODEL_REGISTRY, VLLM_FAMILIES, create_vlm
 from src.vlm_pipeline import run_inference, resolve_hybrid_label, normalize_objects, _normalize_object
@@ -259,16 +259,14 @@ def phase_infer(args):
         random.seed(42)
         dataset = random.sample(dataset, min(args.max_samples, len(dataset)))
 
-    # Authoritative vocabularies (Phase 1 has the data access) — stored in the
-    # artifact header so Phase 2 needs no dataset files.
-    # These two vocabularies need the SAME dataset-specific file paths (e.g.
-    # ImageNet's data_dir, Places' categories file) that we just used to load
-    # the dataset itself — we compute them here (while we still have those
-    # paths handy) and save them straight into the output artifact's header,
-    # so Phase 2 (scoring) never needs to re-open any dataset files at all.
+    # Authoritative candidate vocabulary for ClipMatch/hP-hR (Phase 1 has the
+    # data access) — stored in the artifact header so Phase 2 needs no dataset
+    # files. Needs the SAME dataset-specific file paths (e.g. ImageNet's
+    # data_dir, Places' categories file) that we just used to load the dataset
+    # itself — computed here (while we still have those paths handy) and saved
+    # straight into the output artifact's header.
     vocab_kwargs = dict(data_dir=args.data_dir, places_categories_txt=args.places_categories_txt,
                         excel_path=args.excel_path)
-    mapping_vocab = build_mapping_vocab(args.dataset, **vocab_kwargs)
     candidate_vocab = get_candidate_vocab(args.dataset, **vocab_kwargs)  # None for coco/big5
 
     caption_system, label_system_full, label_system_material = build_system_prompts(
@@ -294,7 +292,6 @@ def phase_infer(args):
         "record_type": "header",
         "dataset": args.dataset,
         "model": f"{args.model_family}/{args.model_name}",
-        "mapping_vocab": mapping_vocab,
         "candidate_vocab": candidate_vocab,
         "max_hops": args.max_hops,
     }
@@ -315,7 +312,7 @@ def phase_infer(args):
             caption_system_prompt=caption_system,
             label_system_full=label_system_full,
             label_system_material=label_system_material,
-            tax_graph=graph, mapping_vocab=mapping_vocab, max_hops=args.max_hops,
+            tax_graph=graph, max_hops=args.max_hops,
             batch_size=args.batch_size,
             caption_max_new_tokens=args.max_new_tokens_caption,
             label_max_new_tokens=args.max_new_tokens_label,
@@ -379,7 +376,6 @@ def phase_score(args):
     phase_t0 = time.time()
     header, records = _read_artifact(args.responses_file)
     dataset = header["dataset"]
-    mapping_vocab = header.get("mapping_vocab") or {}
     candidate_vocab = header.get("candidate_vocab")
     # ClipMatch/hP/hR only make sense for datasets with a fixed candidate
     # class list (ImageNet/Places) — see clip_metrics.CLIPMATCH_DATASETS.
@@ -413,7 +409,7 @@ def phase_score(args):
             continue
         finals = []
         for obj, lab in zip(rec["objects"], rec["object_labels"]):
-            finals.append(resolve_hybrid_label(obj, lab, graph, mapping_vocab, max_hops=max_hops))
+            finals.append(resolve_hybrid_label(obj, lab, graph, max_hops=max_hops))
         rec["object_finals"] = finals
 
     # ---- CLIP encodings (batched across ALL images for efficiency) ----

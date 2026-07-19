@@ -363,7 +363,6 @@ def run_inference(
     label_system_full: Optional[str],
     label_system_material: Optional[str],
     tax_graph,
-    mapping_vocab: Dict[str, str],
     extraction_system_prompt: Optional[str] = None,
     max_hops: int = 3,
     batch_size: int = 16,
@@ -438,7 +437,7 @@ def run_inference(
         # call it actually needs (or none). Computed once here and reused for
         # both the routing and the final hybrid resolution below.
         mappings_per_image = [
-            [map_object_to_taxonomy(obj, tax_graph, mapping_vocab, max_hops=max_hops) for obj in objs]
+            [map_object_to_taxonomy(obj, tax_graph, max_hops=max_hops) for obj in objs]
             for objs in objects_per_image
         ]
 
@@ -459,7 +458,7 @@ def run_inference(
             chunk, captions, objects_per_image, mappings_per_image, labels_per_image
         ):
             finals = [
-                resolve_hybrid_label(obj, lab, tax_graph, mapping_vocab, mapping=mp)
+                resolve_hybrid_label(obj, lab, tax_graph, mapping=mp)
                 for obj, lab, mp in zip(objs, labels, maps)
             ]
             yield {
@@ -500,95 +499,61 @@ def _normalize_object(object_str: str) -> str:
     return s.strip()
 
 
-def _mapping_result(synset: str, labels: Dict[str, Any]) -> Dict[str, Any]:
-    """Turn a resolve_labels() result into map_object_to_taxonomy's
-    {"synset", "is_nature", "biotic"} return shape (shared by both lookup
-    tiers below)."""
-    is_nature = labels["is_nature"]
-    biotic = None
-    if is_nature and labels.get("life_category"):
-        biotic = labels["life_category"] == "biotic"
-    return {"synset": synset, "is_nature": is_nature, "biotic": biotic}
-
-
-def map_object_to_taxonomy(object_str: str, tax_graph, mapping_vocab: Dict[str, str], max_hops: int = 3) -> Optional[Dict[str, Any]]:
+def map_object_to_taxonomy(object_str: str, tax_graph, max_hops: int = 3) -> Optional[Dict[str, Any]]:
     """
-    Map a free-text object phrase onto a WordNet synset, in TWO priority tiers:
+    Try to map a free-text object phrase into the taxonomy graph we already
+    have (`tax_graph`, built by excel_loader.TaxonomyGraph.load_excel):
 
-      1. AUTHORITATIVE dataset mapping (`mapping_vocab`, from
-         dataset_loader.build_mapping_vocab) — NOT word-sense guessing. This
-         avoids picking the wrong WordNet sense (e.g. "tiger" -> "a fierce
-         person"): the synset comes straight from the dataset's own class
-         mapping (tiger -> tiger.n.02). Tried FIRST, since it's risk-free.
+      - Normalize the phrase (and its trailing head noun, for a multi-word
+        phrase) and look it up in `tax_graph.graph_lemma_vocab()` — every
+        WordNet lemma of every synset already IN the loaded graph (the
+        Excel-labeled anchor nodes plus the ancestor/descendant nodes wired
+        in while building the hierarchy).
+      - If that lemma names a graph synset, resolve its labels via
+        `tax_graph.resolve_labels` (nearest labeled node within `max_hops`,
+        in either direction).
 
-      2. GRAPH-WIDE lookup (recap §9's "extend WordNet mapping beyond the
-         three fixed dataset vocabularies" open item) — if the phrase isn't a
-         known dataset class name (or `mapping_vocab` is empty entirely, e.g.
-         BIG-5, which has no per-dataset class list at all), it is matched
-         against `tax_graph.graph_lemma_vocab()`: every WordNet lemma of
-         every synset ALREADY IN THE LOADED TAXONOMY GRAPH (the Excel-labeled
-         anchor nodes plus the unlabeled ancestor/descendant nodes wired in
-         while building the hierarchy) — NOT an open-ended
-         `wn.synsets(phrase)` sense search across all of WordNet. A word only
-         matches here if one of ITS senses happens to already be a synset our
-         own curated taxonomy contains; unrelated senses that lead nowhere
-         near anything the Excel annotated are never considered, so this
-         stays far more constrained than raw word-sense guessing while still
-         comparing against the WHOLE graph rather than just the current
-         dataset's own vocabulary.
+    `max_hops` bounds how far resolve_labels may search outward from the
+    matched synset for a labeled node: 0 accepts ONLY a directly-annotated
+    node (an annotator labeled that exact synset), 1 also accepts a node one
+    hop away (label inherited across a single hypernym/hyponym edge), etc.
 
-    `max_hops` bounds how far tax_graph.resolve_labels may search outward from
-    the matched synset for a labeled node (same bound applied in both tiers):
-    0 accepts ONLY a directly-annotated node (an annotator labeled that exact
-    synset), 1 also accepts a node one hop away (label inherited across a
-    single hypernym/hyponym edge), etc.
-
-    Returns {"synset", "is_nature", "biotic"} when the object's (normalized)
-    phrase — or its trailing head noun — resolves to a labeled node within
-    `max_hops` via either tier; else None (→ image-supported VLM fallback).
-    `biotic` is True/False/None (None when nature-True but the node carries no
-    biotic label).
+    Returns {"synset", "is_nature", "biotic"} when the phrase resolves to a
+    labeled node within `max_hops`; else None (→ image-supported VLM
+    fallback). `biotic` is True/False/None (None when nature-True but the
+    node carries no biotic label).
     """
     norm = _normalize_object(object_str)
     candidates = [norm]
     if " " in norm:
         # Also try just the LAST word of a multi-word phrase — e.g. if the
-        # model said "large polar bear" but our vocabulary only has the entry
+        # model said "large polar bear" but the graph only has an entry for
         # "polar bear" or just "bear", this gives us another chance to match
         # by stripping down to the head noun. (Note: this simple heuristic
         # only tries the single trailing word, not every possible sub-phrase.)
         candidates.append(norm.split()[-1])  # trailing head noun (e.g. "polar bear" -> "bear")
 
-    # --- Tier 1: authoritative dataset mapping ---
-    for cand in candidates:
-        synset = mapping_vocab.get(cand)
-        if synset is None:
-            # This candidate string isn't a recognized class name — try the
-            # next candidate (if any) instead of giving up immediately.
-            continue
-        # Even if the WORD matched a known class, we still need to check
-        # whether that class's synset actually resolves to a LABELED taxonomy
-        # node (see excel_loader.py's resolve_labels) — some classes in the
-        # dataset's vocabulary might still be unmapped in the Excel.
-        labels = tax_graph.resolve_labels(synset, max_hops=max_hops)
-        if labels is not None:
-            return _mapping_result(synset, labels)
-
-    # --- Tier 2: graph-wide lemma lookup ---
     graph_vocab = tax_graph.graph_lemma_vocab()
     for cand in candidates:
         synset = graph_vocab.get(cand)
         if synset is None:
+            # This candidate string isn't a lemma of anything in the graph —
+            # try the next candidate (if any) instead of giving up immediately.
             continue
         labels = tax_graph.resolve_labels(synset, max_hops=max_hops)
-        if labels is not None:
-            return _mapping_result(synset, labels)
+        if labels is None:
+            continue
+        is_nature = labels["is_nature"]
+        biotic = None
+        if is_nature and labels.get("life_category"):
+            biotic = labels["life_category"] == "biotic"
+        return {"synset": synset, "is_nature": is_nature, "biotic": biotic}
 
-    # Nothing matched in either tier.
+    # Nothing matched.
     return None
 
 
-def resolve_hybrid_label(object_str: str, vlm_label: Dict[str, Any], tax_graph, mapping_vocab: Dict[str, str], mapping: Any = _UNSET, max_hops: int = 3) -> Dict[str, Any]:
+def resolve_hybrid_label(object_str: str, vlm_label: Dict[str, Any], tax_graph, mapping: Any = _UNSET, max_hops: int = 3) -> Dict[str, Any]:
     """
     Combine WordNet mapping with the VLM's TaxonomyResponse into final per-object
     labels, recording the source of each axis (diagnostics):
@@ -618,7 +583,7 @@ def resolve_hybrid_label(object_str: str, vlm_label: Dict[str, Any], tax_graph, 
     vlm_material = label_to_bool(vlm_label.get("material"), "material")
 
     if mapping is _UNSET:
-        mapping = map_object_to_taxonomy(object_str, tax_graph, mapping_vocab, max_hops=max_hops)
+        mapping = map_object_to_taxonomy(object_str, tax_graph, max_hops=max_hops)
 
     if mapping is not None:
         # This object's phrase matched a known class AND that class resolves
