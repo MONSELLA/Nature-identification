@@ -150,11 +150,11 @@ class TaxonomyResponse(BaseModel):
     )
     
     # 4. Apply the strict mutual exclusivity rule to the final labels.
-    biotic: Literal["biotic", "abiotic", "none"] = Field(
+    life_category: Literal["biotic", "abiotic", "none"] = Field(
         description="ALL nature entities MUST be classified as either 'biotic' or 'abiotic'. Non-nature entities MUST be 'none'."
     )
     
-    material: Literal["material", "immaterial", "none"] = Field(
+    tangibility: Literal["material", "immaterial", "none"] = Field(
         description="ALL nature entities MUST be classified as either 'material' or 'immaterial'. Non-nature entities MUST be 'none'."
     )
 
@@ -175,7 +175,7 @@ class MaterialResponse(BaseModel):
     reasoning: str = Field(
         description="One concise sentence justifying the material/immaterial classification based on the visual evidence."
     )
-    material: Literal["material", "immaterial"]
+    tangibility: Literal["material", "immaterial"]
 
 
 # One line of plain-English instructions per taxonomy axis, injected into the
@@ -184,8 +184,8 @@ class MaterialResponse(BaseModel):
 # if a caller only cares about e.g. nature+biotic and not material.
 _AXIS_INSTRUCTIONS = {
     "nature": '"nature": either "yes" or "no" — whether this instance counts as nature under the provided definition.',
-    "biotic": '"biotic": either "biotic", "abiotic", or "none" — only answer "biotic"/"abiotic" if "nature" is "yes"; use "none" if "nature" is "no"',
-    "material": '"material": either "material", "immaterial", or "none" — only answer "material"/"immaterial" if "nature" is "yes"; use "none" if "nature" is "no"',
+    "life_category": '"biotic": either "biotic", "abiotic", or "none" — only answer "biotic"/"abiotic" if "nature" is "yes"; use "none" if "nature" is "no"',
+    "tangibility": '"tangibility": either "material", "immaterial", or "none" — only answer "material"/"immaterial" if "nature" is "yes"; use "none" if "nature" is "no"',
 }
 
 
@@ -201,8 +201,8 @@ def build_classification_prompt(class_name, axes):
             gets dropped straight into the prompt text so the model knows
             EXACTLY which object (among possibly many in the image) it must
             classify right now.
-        axes: which of "nature"/"biotic"/"material" to ask about, e.g.
-            ["nature", "biotic", "material"] for the full three-axis question,
+        axes: which of "nature"/"life_category"/"tangibility" to ask about, e.g.
+            ["nature", "life_category", "tangibility"] for the full three-axis question,
             or just ["nature"] if that's all a caller needs.
 
     Returns:
@@ -227,8 +227,6 @@ def build_classification_prompt(class_name, axes):
     return f"""You are analyzing a specific target entity identified in the provided image.
 TARGET ENTITY TO CLASSIFY: "{class_name}"
 
-You must evaluate ONLY the "{class_name}".
-Important to avoid logical stretches. If the object does not explicitly fit the definitions, do not invent justifications to force it into a category.
 Based on the visual evidence in the image and the strict definitions provided, classify this specific "{class_name}" instance.
 Follow the interleaved reasoning structure: evaluate nature first, lock in the decision, and only then evaluate the sub-axes according to these rules:
 {field_lines}
@@ -239,7 +237,7 @@ FIRST EXAMPLE OUTPUT FOR TARGET "wooden chair":
   "nature": "yes",
   "sub_axes_reasoning": "Since nature is 'yes', I must evaluate the sub-axes. Wood is a derivative of flora, making it biotic. The chair has physical mass and is perceived through the senses, making it material.",
   "biotic": "biotic",
-  "material": "material"
+  "tangibility": "material"
 }}
 
 SECOND EXAMPLE OUTPUT FOR TARGET "fan":
@@ -248,6 +246,6 @@ SECOND EXAMPLE OUTPUT FOR TARGET "fan":
   "nature": "no",
   "sub_axes_reasoning": "Not applicable since the entity is not nature.",
   "biotic": "none",
-  "material": "none"
+  "tangibility": "none"
 }}
 """

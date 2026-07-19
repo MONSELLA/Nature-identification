@@ -33,7 +33,7 @@ from pathlib import Path
 import wandb
 
 from src.loaders.excel_loader import TaxonomyGraph
-from src.models.vlm_models import MODEL_REGISTRY, create_vlm
+from src.models.vlm_models import MODEL_REGISTRY, VLLM_FAMILIES, create_vlm
 from src.loaders.dataset_loader import load_dataset
 from src.utils import update_results_store
 # TaxonomyResponse + build_classification_prompt live in prompts.py so this
@@ -126,8 +126,8 @@ def load_system_prompt(nature_def_path, biotic_def_path, material_def_path):
     material_def = Path(material_def_path).read_text()
     return (
         "# 1. NATURE DEFINITION\n" f"{nature_def}\n\n"
-        "# 2. BIOTIC VS ABIOTIC AXIS\n" f"{biotic_def}\n\n"
-        "# 3. MATERIAL VS IMMATERIAL AXIS\n" f"{material_def}"
+        "# 2. LIFE CATEGORY AXIS\n" f"{biotic_def}\n\n"
+        "# 3. TANGIBILITY AXIS\n" f"{material_def}"
     )
 
 
@@ -282,10 +282,9 @@ def main():
         print(f"[INFO] Creating VLM: family='{args.model_family}', model='{args.model_name}'...")
 
     # Different VLM backends need different constructor arguments: vLLM-served
-    # models (qwen/mistral/llava) take vLLM-specific settings like GPU memory
+    # models take vLLM-specific settings like GPU memory
     # fraction and max sequence length, while the HuggingFace-served BLIP
     # family just needs a device string.
-    VLLM_FAMILIES = ("qwen", "mistral", "llava")
     if args.model_family in VLLM_FAMILIES:
         vlm_kwargs = {
             "dtype": args.dtype, "gpu_memory_utilization": args.gpu_memory_utilization, "trust_remote_code": args.trust_remote_code
@@ -344,8 +343,8 @@ def main():
                 r["prediction"] = result
 
                 pred_nature = _label_to_bool(result.get("nature"), "nature")
-                pred_biotic = _label_to_bool(result.get("biotic"), "biotic")
-                pred_material = _label_to_bool(result.get("material"), "material")
+                pred_biotic = _label_to_bool(result.get("life_category"), "biotic")
+                pred_material = _label_to_bool(result.get("tangibility"), "material")
 
                 # Even when the JSON parsed successfully, an individual field
                 # might still be an unexpected/missing value (pred_* is None).

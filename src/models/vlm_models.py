@@ -759,6 +759,8 @@ MODEL_REGISTRY: Dict[str, type] = {
     "qwen": VLLMBackedVLM,
     "mistral": VLLMBackedVLM,
     "llava": VLLMBackedVLM,
+    "internvl": VLLMBackedVLM,
+    "gemma": VLLMBackedVLM,
     "blip": BlipVLM,
     "blip2": Blip2VLM,
     "instructblip": InstructBlipVLM,
@@ -768,7 +770,7 @@ MODEL_REGISTRY: Dict[str, type] = {
 # Which family names are served via vLLM (as opposed to HuggingFace directly)
 # — used by the calling scripts to decide which set of constructor keyword
 # arguments (vLLM-specific vs HuggingFace-specific) to pass to create_vlm().
-VLLM_FAMILIES = ("qwen", "mistral", "llava")
+VLLM_FAMILIES = ("qwen", "mistral", "llava", "internvl", "gemma")
 
 def create_vlm(family: str, model_name: str, **kwargs: Any) -> BaseVLM:
     """Construct the right VLM subclass for the given family name, e.g.
