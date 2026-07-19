@@ -24,9 +24,16 @@ pydantic>=2.0          # v2 API required (model_json_schema / model_fields)
 vllm>=0.5.0
 # HuggingFace-served families (blip/blip2/instructblip/blip3): guided
 # (structured) decoding on this backend goes through outlines' transformers
-# integration.
+# integration (outlines.integrations.transformers.JSONPrefixAllowedTokens).
+# outlines 1.0.0 removed that module in a full API rewrite (whole-model
+# wrapper instead of a prefix_allowed_tokens_fn-compatible class), so pin
+# below 1.0.0 — 0.0.46 is the last release with the old integrations API.
+# NOTE: we also force vLLM's structured_outputs backend="outlines" (see
+# VLLMBackedVLM._make_sampling_params) — if that raises a version-mismatch
+# error against this pin, tell Claude the vllm version so it can check
+# vLLM's own outlines requirement for that release.
 transformers>=4.40
-outlines>=0.0.40
+outlines>=0.0.40,<1.0.0
 torch>=2.1
 torchvision>=0.16
 Pillow>=10.0
@@ -47,6 +54,8 @@ timm>=0.9              # canonical ImageNet index->WNID mapping (baseline/evalua
 # install_inplace_abn_shim_if_missing). Uncomment if you have a working CUDA
 # dev toolchain and want the real fused kernel instead of the shim:
 # inplace-abn
+
+# TO FINISH, run pip install -e .
 
 # --- NOT on PyPI, not included here ---
 # baseline/count_classes.py, evaluate_imagenet.py, evaluate_coco.py,

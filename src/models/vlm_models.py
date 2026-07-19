@@ -364,6 +364,15 @@ class HuggingFaceBackedVLM(BaseVLM):
         import torch
 
         self.device = device
+        # `dtype` may arrive as a string from the CLI (e.g. "auto", "bfloat16")
+        # rather than an actual torch.dtype. `from_pretrained(torch_dtype=...)`
+        # accepts the string "auto" directly, but tensor `.to(device, dtype)`
+        # calls elsewhere do not — they need a real torch.dtype. Resolve here,
+        # once, so every downstream use gets a concrete dtype: "auto"/None
+        # fall back to the bfloat16 default, other strings (e.g. "float16")
+        # are looked up on the `torch` module.
+        if isinstance(dtype, str):
+            dtype = None if dtype == "auto" else getattr(torch, dtype, None)
         # Default to bfloat16 precision (a reduced-precision float format
         # commonly used for faster/lighter-weight inference) if the caller
         # didn't specify one.
@@ -377,12 +386,23 @@ class HuggingFaceBackedVLM(BaseVLM):
         (or self.tokenizer / self.image_processor for Blip3VLM)."""
         raise NotImplementedError
 
-    def _get_prefix_allowed_tokens_fn(self, output_mode: str, schema: Optional[Any]) -> Optional[Any]:
+    def _get_prefix_allowed_tokens_fn(
+        self, output_mode: str, schema: Optional[Any], model_inputs: Optional[Dict[str, Any]] = None
+    ) -> Optional[Any]:
         """Build the guided-decoding function for HuggingFace's `.generate()`
         (the HF equivalent of vLLM's StructuredOutputsParams above) — this is
         what forces the model's token-by-token output to stay valid JSON
         matching `schema`, via the third-party `outlines` library. Returns
-        None (no constraint) in free_form mode."""
+        None (no constraint) in free_form mode.
+
+        All four BLIP-family classes here (BLIP, BLIP-2, InstructBLIP, BLIP-3)
+        feed the full text prompt into `input_ids` before generation, so
+        `.generate()` hands `prefix_allowed_tokens_fn` the PROMPT tokens too,
+        not just the newly generated ones. Outlines' FSM would then try to
+        parse the prompt itself as JSON and immediately reject it. We slice
+        off the prompt length (read from `model_inputs["input_ids"]`, which
+        is already padded to a uniform width across the batch) so the FSM
+        only ever sees the generated continuation."""
         if output_mode == "structured" and schema is not None:
             from outlines.integrations.transformers import JSONPrefixAllowedTokens
             tokenizer = getattr(self, "tokenizer", None)
@@ -392,7 +412,17 @@ class HuggingFaceBackedVLM(BaseVLM):
                 # object instead (or the processor even acts as the tokenizer
                 # directly), so fall back to that.
                 tokenizer = getattr(self.processor, "tokenizer", self.processor)
-            return JSONPrefixAllowedTokens(schema, tokenizer)
+            base_fn = JSONPrefixAllowedTokens(schema, tokenizer)
+
+            prompt_length = 0
+            if model_inputs is not None and "input_ids" in model_inputs:
+                prompt_length = model_inputs["input_ids"].shape[1]
+
+            def vision_prefix_allowed_tokens_fn(batch_id: int, current_input_ids: Any) -> List[int]:
+                generated_ids = current_input_ids[prompt_length:]
+                return base_fn(batch_id, generated_ids)
+
+            return vision_prefix_allowed_tokens_fn
         return None
 
     def _parse_response(self, text: str, output_mode: str) -> Union[str, Dict[str, Any], None]:
@@ -456,7 +486,7 @@ class BlipFamilyVLM(HuggingFaceBackedVLM):
             # text-only evaluation; see evaluate_taxonomy_labeling.py's IMAGE_REQUIRED_FAMILIES guard.
             inputs = self.processor(text=full_prompt, return_tensors="pt").to(self.device)
 
-        prefix_allowed_tokens_fn = self._get_prefix_allowed_tokens_fn(output_mode, schema)
+        prefix_allowed_tokens_fn = self._get_prefix_allowed_tokens_fn(output_mode, schema, inputs)
 
         with torch.no_grad():
             # temperature > 0 means "sample randomly" (do_sample=True);
@@ -513,7 +543,7 @@ class BlipFamilyVLM(HuggingFaceBackedVLM):
             # model.generate(**inputs) below requires pixel_values; this branch omits it.
             inputs = self.processor(text=full_prompts, return_tensors="pt", padding=True).to(self.device)
 
-        prefix_allowed_tokens_fn = self._get_prefix_allowed_tokens_fn(output_mode, schema)
+        prefix_allowed_tokens_fn = self._get_prefix_allowed_tokens_fn(output_mode, schema, inputs)
 
         with torch.no_grad():
             do_sample = temperature > 0.0
@@ -562,8 +592,15 @@ class InstructBlipVLM(HuggingFaceBackedVLM):
     own generate()/generate_batch() rather than sharing BlipFamilyVLM's."""
 
     def _load_model(self) -> None:
-        from transformers import AutoProcessor, InstructBlipForConditionalGeneration
-        self.processor = AutoProcessor.from_pretrained(self.model_name)
+        from transformers import InstructBlipForConditionalGeneration, InstructBlipProcessor
+        # NOTE: deliberately InstructBlipProcessor, not AutoProcessor —
+        # AutoProcessor.from_pretrained() resolves "instructblip-vicuna-7b"
+        # to InstructBlipVideoProcessor on some transformers versions (an
+        # auto-class resolution quirk from InstructBlipVideo being added
+        # later). That video processor treats a batch of still images as
+        # frames of one video and np.stacks them, which requires identical
+        # shapes and crashes on a batch of differently-sized images.
+        self.processor = InstructBlipProcessor.from_pretrained(self.model_name)
         self.model = (
             InstructBlipForConditionalGeneration.from_pretrained(
                 self.model_name, torch_dtype=self.dtype
@@ -598,7 +635,7 @@ class InstructBlipVLM(HuggingFaceBackedVLM):
             self.device, self.dtype
         )
 
-        prefix_allowed_tokens_fn = self._get_prefix_allowed_tokens_fn(output_mode, schema)
+        prefix_allowed_tokens_fn = self._get_prefix_allowed_tokens_fn(output_mode, schema, inputs)
 
         with torch.no_grad():
             do_sample = temperature > 0.0
@@ -641,7 +678,7 @@ class InstructBlipVLM(HuggingFaceBackedVLM):
             self.device, self.dtype
         )
 
-        prefix_allowed_tokens_fn = self._get_prefix_allowed_tokens_fn(output_mode, schema)
+        prefix_allowed_tokens_fn = self._get_prefix_allowed_tokens_fn(output_mode, schema, inputs)
 
         with torch.no_grad():
             do_sample = temperature > 0.0
@@ -733,7 +770,7 @@ class Blip3VLM(HuggingFaceBackedVLM):
         inputs.update(language_inputs)
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
-        prefix_allowed_tokens_fn = self._get_prefix_allowed_tokens_fn(output_mode, schema)
+        prefix_allowed_tokens_fn = self._get_prefix_allowed_tokens_fn(output_mode, schema, inputs)
 
         with torch.no_grad():
             do_sample = temperature > 0.0
@@ -792,7 +829,7 @@ class Blip3VLM(HuggingFaceBackedVLM):
         inputs.update(language_inputs)
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
-        prefix_allowed_tokens_fn = self._get_prefix_allowed_tokens_fn(output_mode, schema)
+        prefix_allowed_tokens_fn = self._get_prefix_allowed_tokens_fn(output_mode, schema, inputs)
 
         with torch.no_grad():
             do_sample = temperature > 0.0

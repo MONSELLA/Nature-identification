@@ -868,7 +868,7 @@ def parse_args():
     p.add_argument("--max_new_tokens_caption", type=int, default=256)
     p.add_argument("--max_new_tokens_label", type=int, default=300)
     p.add_argument("--temperature", type=float, default=0.0)
-    p.add_argument("--max_hops", type=int, default=3,
+    p.add_argument("--max_hops", type=int, default=0,
                    help="Maximum WordNet hop distance allowed when mapping an EXTRACTED "
                         "object onto the labeled taxonomy (map_object_to_taxonomy -> "
                         "resolve_labels). 0 = map only when an annotator labeled that exact "

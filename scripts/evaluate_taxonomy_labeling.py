@@ -27,6 +27,7 @@ import csv
 import json
 import random
 import sys
+import traceback
 from pathlib import Path
 import time
 import datetime
@@ -328,6 +329,7 @@ def main():
             # whole run — treat every instance in this batch as a parse
             # failure (scored as wrong below) and keep going.
             print(f"⚠️ Batch {batch_idx + 1}/{num_batches} FAILED ({e!r}).")
+            traceback.print_exc()
             batch_results = [None] * len(batch)
 
         for r, result in zip(batch, batch_results):
@@ -380,7 +382,7 @@ def main():
             batch_seconds = time.time() - t0
             remaining_seconds = batch_seconds * (num_batches - batch_idx + 1)
             formatted_time = datetime.timedelta(seconds=int(remaining_seconds))
-            print(f"[INFO] Batch {batch_idx + 1}/{num_batches} done in {batch_seconds}s. Estimated remaining time: {formatted_time}")
+            print(f"[INFO] Batch {batch_idx + 1}/{num_batches} done in {batch_seconds:.1f}s. Estimated remaining time: {formatted_time}")
 
     # Calculate Metrics
     parse_failure_rate = sum(r["prediction"]["parse_failed"] for r in scored_results) / len(scored_results)
