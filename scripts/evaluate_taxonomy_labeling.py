@@ -36,10 +36,7 @@ import wandb
 from src.loaders.excel_loader import TaxonomyGraph
 from src.models.vlm_models import MODEL_REGISTRY, VLLM_FAMILIES, create_vlm
 from src.loaders.dataset_loader import load_dataset
-from src.utils import (
-    update_results_store, update_dataset_class_stats, compute_class_stats, format_duration,
-    generate_batch_with_overflow_guard,
-)
+from src.utils import update_results_store, update_dataset_class_stats, compute_class_stats, format_duration
 # TaxonomyResponse + build_classification_prompt live in prompts.py so this
 # calibration eval and the VLM pipeline's fallback path share the EXACT same
 # prompt and schema (they cannot drift — same imported objects).
@@ -318,14 +315,12 @@ def main():
 
         t0 = time.time()
         try:
-            batch_results = generate_batch_with_overflow_guard(
-                vlm, batch_prompts, batch_images,
-                generate_kwargs=dict(
-                    system_prompt=system_prompt, max_new_tokens=args.max_new_tokens,
-                    temperature=args.temperature, output_mode=args.output_mode, schema=TaxonomyResponse,
-                ),
+            batch_results = vlm.generate_batch_safe(
+                batch_prompts, batch_images,
                 label=f"Batch {batch_idx + 1}/{num_batches}",
                 item_labels=[f"'{r['image_path']}' / '{r['class_name']}'" for r in batch],
+                system_prompt=system_prompt, max_new_tokens=args.max_new_tokens,
+                temperature=args.temperature, output_mode=args.output_mode, schema=TaxonomyResponse,
             )
         except Exception as e:
             # If the batch call fails for a reason OTHER than a single
