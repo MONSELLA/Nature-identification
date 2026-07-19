@@ -125,6 +125,9 @@ class TaxonomyGraph:
         # we can ask "what are ALL of this node's ancestors" by following
         # edges backwards, or "what's the nearest labeled ancestor" the same way.
         self.graph = nx.DiGraph()
+        # Lazily built, cached by graph_lemma_vocab() below — the graph is
+        # static once load_excel() has run, so this only needs computing once.
+        self._lemma_vocab: Optional[Dict[str, str]] = None
 
     # -------------------------------------------------------------------
     # Graph construction (ported from evaluation.py's
@@ -404,6 +407,46 @@ class TaxonomyGraph:
         # Searched the full radius without ever finding a labeled node — this
         # synset has no nearby connection to anything the Excel annotated.
         return None
+
+    def graph_lemma_vocab(self) -> Dict[str, str]:
+        """
+        {normalized lemma surface form -> synset_id}, built from EVERY synset
+        currently IN THE GRAPH — the Excel-labeled anchor nodes AND the
+        unlabeled ancestor/descendant nodes add_synset_and_ancestors added
+        while wiring the hierarchy up to entity.n.01 — NOT all of WordNet.
+
+        Used by map_object_to_taxonomy's (src/vlm_pipeline.py) graph-wide
+        lookup tier: an extracted object phrase counts as matching THE GRAPH
+        iff it equals one of a graph synset's own WordNet lemma names (e.g.
+        "hound" is a lemma of "dog.n.01", so an extracted "hound" would match
+        that node if it's in the graph). This is intentionally NOT an
+        open-ended `wn.synsets(word)` sense search — a word with several
+        WordNet senses only matches here if one of those senses happens to be
+        a synset our own curated taxonomy already contains; senses that lead
+        nowhere near anything the Excel annotated are never considered.
+
+        Built once and cached on this instance (the graph is static once
+        load_excel() has run). If the SAME lemma names two different graph
+        synsets, the first one encountered wins — a rare collision, same
+        "first candidate wins" convention used elsewhere in this module.
+        """
+        if self._lemma_vocab is not None:
+            return self._lemma_vocab
+        vocab: Dict[str, str] = {}
+        for node in self.graph.nodes():
+            try:
+                synset = wn.synset(node)
+            except Exception:
+                # Defensive: every node was added FROM a successful
+                # wn.synset() lookup in add_synset_and_ancestors, so this
+                # shouldn't happen in practice, but skip rather than crash if
+                # WordNet can't re-resolve a node's id string for some reason.
+                continue
+            for lemma in synset.lemmas():
+                name = lemma.name().replace("_", " ").strip().lower()
+                vocab.setdefault(name, node)
+        self._lemma_vocab = vocab
+        return vocab
 
     def get_mapped_classes(
         self,
