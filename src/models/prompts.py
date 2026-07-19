@@ -231,12 +231,12 @@ Based on the visual evidence in the image and the strict definitions provided, c
 Follow the interleaved reasoning structure: evaluate nature first, lock in the decision, and only then evaluate the sub-axes according to these rules:
 {field_lines}
 
-FIRST EXAMPLE OUTPUT FOR TARGET "wooden chair":
+FIRST EXAMPLE OUTPUT FOR TARGET "chair":
 {{
-  "nature_reasoning": "The target is a chair made of wood with visible grain. Wood with an identifiable natural texture counts as a nature-based artefact, fulfilling the criteria for nature.",
+  "nature_reasoning": "The target is a chair. The visual evidence shows it is made of wood with visible grain. Manufactured objects where the natural material of origin is visually identifiable count as nature-based artefacts, fulfilling the criteria for nature.",
   "nature": "yes",
-  "sub_axes_reasoning": "Since nature is 'yes', I must evaluate the sub-axes. Wood is a derivative of flora, making it biotic. The chair has physical mass and is perceived through the senses, making it material.",
-  "biotic": "biotic",
+  "sub_axes_reasoning": "Since nature is 'yes', I evaluate the sub-axes. Wood is a derivative of flora, making it biotic. The chair is a physical object that occupies space, making it material.",
+  "life_category": "biotic",
   "tangibility": "material"
 }}
 
@@ -245,7 +245,34 @@ SECOND EXAMPLE OUTPUT FOR TARGET "fan":
   "nature_reasoning": "The target is a manufactured electric fan made of plastic and metal. It is a fully artificial object with no unaltered natural elements or identifiable natural textures, so it fails the criteria for nature.",
   "nature": "no",
   "sub_axes_reasoning": "Not applicable since the entity is not nature.",
-  "biotic": "none",
+  "life_category": "none",
   "tangibility": "none"
+}}
+
+THIRD EXAMPLE OUTPUT FOR TARGET "river":
+{{
+  "nature_reasoning": "The target is a flowing body of water. Hydrological components are explicitly classified as natural elements, fulfilling the criteria for nature.",
+  "nature": "yes",
+  "sub_axes_reasoning": "Since nature is 'yes', I must evaluate the sub-axes. Water is a non-living hydrological component, making it abiotic. It has a physical presence in the landscape, making it material.",
+  "life_category": "abiotic",
+  "tangibility": "material"
+}}
+
+FOURTH EXAMPLE OUTPUT FOR TARGET "dog":
+{{
+  "nature_reasoning": "The target is a dog. The image shows this is a stylized, cartoon depiction rather than a photograph of a real animal. Fictional or stylized depictions of non-human living entities still count as nature representations, fulfilling the criteria.",
+  "nature": "yes",
+  "sub_axes_reasoning": "Since nature is 'yes', I evaluate the sub-axes. A dog is an animal (fauna), making it biotic. Because the image shows a digital or animated representation rather than a physical organism, it is immaterial.",
+  "life_category": "biotic",
+  "tangibility": "immaterial"
+}}
+
+FIFTH EXAMPLE OUTPUT FOR TARGET "sunset":
+{{
+  "nature_reasoning": "The target is a sunset. The visual evidence reveals this is an artistic painting of a sunset rather than a photograph of the sky. Artistic representations of astrophysical processes explicitly count as nature-relevant, fulfilling the criteria.",
+  "nature": "yes",
+  "sub_axes_reasoning": "Since nature is 'yes', I evaluate the sub-axes. A sunset is an astrophysical process, making it abiotic. Because this specific instance is an artistic medium (a painting) rather than the literal physical event, it is immaterial.",
+  "life_category": "abiotic",
+  "tangibility": "immaterial"
 }}
 """
