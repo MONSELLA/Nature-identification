@@ -219,7 +219,12 @@ class VLLMBackedVLM(BaseVLM):
             # into the plain JSON Schema dict format vLLM's guided decoding
             # actually needs (if `schema` is already a plain dict, use it as-is).
             js = schema.model_json_schema() if hasattr(schema, "model_json_schema") else schema
-            gd = StructuredOutputsParams(json=js)
+            # Force the `outlines` backend explicitly rather than vLLM's
+            # default (xgrammar in recent versions), so the vLLM-served
+            # families use the same constrained-decoding engine as the
+            # HuggingFace-served BLIP family (see
+            # HuggingFaceBackedVLM._get_prefix_allowed_tokens_fn above).
+            gd = StructuredOutputsParams(json=js, backend="outlines")
         return SamplingParams(temperature=temperature, max_tokens=max_new_tokens,
                             structured_outputs=gd, **kwargs)
 
