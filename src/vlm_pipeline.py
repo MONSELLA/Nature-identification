@@ -422,11 +422,24 @@ def run_inference(
         chunk = dataset_instances[b * batch_size : (b + 1) * batch_size]
         image_paths = [inst["image_path"] for inst in chunk]
 
+        # Stage-level verbose prints (gated by `verbose`, flush=True so they
+        # show up immediately in a redirected/piped log rather than sitting in
+        # a buffer): the end-of-batch progress line only fires after ALL
+        # three stages below finish, so if a run stalls mid-batch, these are
+        # what actually pinpoint WHICH stage it's stuck in (free_form caption
+        # vs. structured extraction vs. structured labeling) instead of the
+        # log just going silent with no way to tell which call is hanging.
+        if verbose:
+            print(f"[infer] batch {b + 1}/{num_batches}: caption_batch "
+                  f"({len(image_paths)} images, free_form)...", flush=True)
         # Stages 1-2: caption, then structured object extraction.
         captions = caption_batch(
             vlm, image_paths, caption_system_prompt,
             max_new_tokens=caption_max_new_tokens, temperature=temperature,
         )
+        if verbose:
+            print(f"[infer] batch {b + 1}/{num_batches}: extract_objects_batch "
+                  f"(structured, ObjectExtractionResponse)...", flush=True)
         objects_per_image = extract_objects_batch(
             vlm, image_paths, captions, extraction_system_prompt,
             max_new_tokens=caption_max_new_tokens, temperature=temperature,
@@ -441,6 +454,12 @@ def run_inference(
             for objs in objects_per_image
         ]
 
+        if verbose:
+            n_full = sum(1 for maps in mappings_per_image for m in maps if m is None)
+            n_mat = sum(1 for maps in mappings_per_image for m in maps if m is not None and m["is_nature"])
+            print(f"[infer] batch {b + 1}/{num_batches}: label_objects_batch "
+                  f"(structured; {n_full} full/TaxonomyResponse calls, "
+                  f"{n_mat} material-only/MaterialResponse calls)...", flush=True)
         # Stage 3: mapping-aware labeling (full for unmapped, material-only for
         # mapped-nature, skipped for mapped non-nature).
         labels_per_image = label_objects_batch(
@@ -448,6 +467,8 @@ def run_inference(
             label_system_full, label_system_material,
             max_new_tokens=label_max_new_tokens, temperature=temperature,
         )
+        if verbose:
+            print(f"[infer] batch {b + 1}/{num_batches}: label_objects_batch done.", flush=True)
 
         # `zip(...)` walks all lists together in lockstep — for each image in
         # this batch we have its original dataset entry (`inst`, carrying the
