@@ -35,7 +35,7 @@ import wandb
 from src.loaders.excel_loader import TaxonomyGraph
 from src.models.vlm_models import MODEL_REGISTRY, VLLM_FAMILIES, create_vlm
 from src.loaders.dataset_loader import load_dataset
-from src.utils import update_results_store, update_dataset_class_stats, compute_class_stats
+from src.utils import update_results_store, update_dataset_class_stats, compute_class_stats, format_duration
 # TaxonomyResponse + build_classification_prompt live in prompts.py so this
 # calibration eval and the VLM pipeline's fallback path share the EXACT same
 # prompt and schema (they cannot drift — same imported objects).
@@ -461,8 +461,9 @@ def main():
         "nature": nature_metrics, "biotic": biotic_metrics, "material": material_metrics,
         # Total wall-clock time for this run (dataset load, model creation,
         # every batched generation call, and metric computation) — how long
-        # THIS model took to finish this evaluation end-to-end.
-        "execution_time_seconds": time.time() - run_t0,
+        # THIS model took to finish this evaluation end-to-end. Formatted as
+        # "D-HH:MM:SS" (SLURM-style elapsed time).
+        "execution_time": format_duration(time.time() - run_t0),
     }
 
     # Everything lands under --results_dir ("results/" by default); --run_name

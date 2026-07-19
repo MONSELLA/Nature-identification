@@ -89,7 +89,7 @@ from src.loaders.dataset_loader import load_dataset, get_candidate_vocab, build_
 from src.models.vlm_models import MODEL_REGISTRY, VLLM_FAMILIES, create_vlm
 from src.vlm_pipeline import run_inference, resolve_hybrid_label, normalize_objects, _normalize_object
 from src.evaluation import clip_metrics
-from src.utils import update_results_store, update_dataset_class_stats, compute_class_stats
+from src.utils import update_results_store, update_dataset_class_stats, compute_class_stats, format_duration
 
 
 # =============================================================================
@@ -706,19 +706,21 @@ def phase_score(args):
         summary["hierarchical"] = {"hp": _mean(hp_vals), "hr": _mean(hr_vals),
                                    "hf1": _mean(hf1_vals), "support": len(hf1_vals)}
 
-    # Wall-clock time this model took to finish this run. inference_time_seconds
-    # comes from phase_infer's footer record (dataset load + VLM creation +
-    # generation loop); it's None on an artifact written before footers existed,
-    # or on a --stage score-only rerun of such an artifact — in that case "total"
-    # falls back to just the scoring time actually measured here, so it's never
-    # silently wrong, just incomplete. scoring_time_seconds always covers this
-    # ENTIRE phase_score call (artifact read, CLIP load + encode, metric loop).
+    # Wall-clock time this model took to finish this run, formatted "D-HH:MM:SS"
+    # (SLURM-style elapsed time). inference_time_seconds comes from phase_infer's
+    # footer record (dataset load + VLM creation + generation loop); it's None
+    # on an artifact written before footers existed, or on a --stage
+    # score-only rerun of such an artifact — in that case "total" falls back to
+    # just the scoring time actually measured here, so it's never silently
+    # wrong, just incomplete. scoring_time_seconds always covers this ENTIRE
+    # phase_score call (artifact read, CLIP load + encode, metric loop).
     inference_time = header.get("inference_time_seconds")
     scoring_time = time.time() - phase_t0
-    summary["execution_time_seconds"] = {
-        "inference": inference_time,
-        "scoring": scoring_time,
-        "total": (inference_time or 0.0) + scoring_time,
+    total_time = (inference_time or 0.0) + scoring_time
+    summary["execution_time"] = {
+        "inference": format_duration(inference_time),
+        "scoring": format_duration(scoring_time),
+        "total": format_duration(total_time),
     }
 
     _print_summary(summary, run_clipmatch)
@@ -783,9 +785,9 @@ def _print_summary(s, run_clipmatch):
         h = s["hierarchical"]
         print(f"--- Hierarchical (support {h['support']}) ---")
         print(f"hP {h['hp']:.4f} | hR {h['hr']:.4f} | hF1 {h['hf1']:.4f}")
-    t = s["execution_time_seconds"]
-    inf_str = f"{t['inference']:.1f}s" if t["inference"] is not None else "n/a"
-    print(f"\nExecution time: inference {inf_str} | scoring {t['scoring']:.1f}s | total {t['total']:.1f}s")
+    t = s["execution_time"]
+    inf_str = t["inference"] if t["inference"] is not None else "n/a"
+    print(f"\nExecution time (D-HH:MM:SS): inference {inf_str} | scoring {t['scoring']} | total {t['total']}")
     print("=" * 60)
 
 

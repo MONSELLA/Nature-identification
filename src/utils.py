@@ -28,6 +28,20 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
+def format_duration(seconds):
+    """Format a duration in seconds as "D-HH:MM:SS" (SLURM-style elapsed-time
+    format), e.g. 3725.4 -> "0-01:02:05". Returns None unchanged (so callers
+    storing an unavailable timing, e.g. an artifact without an inference
+    footer, keep null rather than a misleading "0-00:00:00")."""
+    if seconds is None:
+        return None
+    total_seconds = int(round(seconds))
+    days, rem = divmod(total_seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, secs = divmod(rem, 60)
+    return f"{days}-{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
 def update_results_store(path, dataset, model, metrics):
     """Merge `metrics` into results_store[dataset][model] at `path`, creating
     or updating the file on disk, and return the full updated store."""
