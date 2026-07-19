@@ -198,6 +198,7 @@ def calculate_binary_metrics(y_true, y_pred):
 
 
 def main():
+    run_t0 = time.time()
     args = parse_args()
     if args.output_mode == "free_form":
         # This calibration is only meaningful with STRUCTURED output — a
@@ -458,6 +459,10 @@ def main():
         "model": model_label, "dataset": args.dataset,
         "parse_failure_rate": parse_failure_rate,
         "nature": nature_metrics, "biotic": biotic_metrics, "material": material_metrics,
+        # Total wall-clock time for this run (dataset load, model creation,
+        # every batched generation call, and metric computation) — how long
+        # THIS model took to finish this evaluation end-to-end.
+        "execution_time_seconds": time.time() - run_t0,
     }
 
     # Everything lands under --results_dir ("results/" by default); --run_name

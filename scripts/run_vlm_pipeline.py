@@ -282,6 +282,7 @@ def phase_infer(args):
     reclaims VRAM by exiting the infer subprocess — see main()).
     """
     print(f"🚀 [infer] dataset='{args.dataset}', model='{args.model_family}/{args.model_name}'")
+    phase_t0 = time.time()
 
     graph = TaxonomyGraph()
     # --sheet_name may be a sheet NAME (string) or a numeric INDEX (still a
@@ -347,7 +348,7 @@ def phase_infer(args):
     }
 
     out_path = Path(args.responses_file)
-    t0 = time.time()
+    loop_t0 = time.time()
     n = 0
     # "JSON Lines" format: one complete, independent JSON object per line of
     # the file (as opposed to one giant JSON array for the whole file). This
@@ -370,7 +371,16 @@ def phase_infer(args):
             rec["record_type"] = "image"
             f.write(json.dumps(rec) + "\n")
             n += 1
-    print(f"💾 [infer] wrote {n} image records to {out_path} in {time.time()-t0:.1f}s")
+        # The header (written above, before dataset loading finished vs the
+        # inference loop) can't carry the total elapsed time since it's
+        # written before that time is known — so a "footer" record (last line
+        # of the file) carries it instead. Includes dataset-load + VLM-creation
+        # time (phase_t0), not just the generation loop, since that's the full
+        # wall-clock cost of "this model finishing this run".
+        footer = {"record_type": "footer", "inference_time_seconds": time.time() - phase_t0}
+        f.write(json.dumps(footer) + "\n")
+    print(f"💾 [infer] wrote {n} image records to {out_path} in {time.time()-loop_t0:.1f}s "
+          f"(total inference phase: {footer['inference_time_seconds']:.1f}s)")
     return vlm
 
 
@@ -379,9 +389,11 @@ def phase_infer(args):
 # =============================================================================
 def _read_artifact(path):
     """Read back a JSON-Lines artifact written by phase_infer: the first
-    header-tagged line, plus every per-image record line, as plain Python
-    dicts."""
+    header-tagged line (merged with the footer line's timing info, if
+    present — older artifacts written before footers existed simply won't
+    have it), plus every per-image record line, as plain Python dicts."""
     header = None
+    footer = None
     records = []
     with open(path) as f:
         for line in f:
@@ -391,10 +403,14 @@ def _read_artifact(path):
             obj = json.loads(line)
             if obj.get("record_type") == "header":
                 header = obj
+            elif obj.get("record_type") == "footer":
+                footer = obj
             else:
                 records.append(obj)
     if header is None:
         raise ValueError(f"Artifact {path} has no header line.")
+    if footer:
+        header = {**header, **{k: v for k, v in footer.items() if k != "record_type"}}
     return header, records
 
 
@@ -407,6 +423,7 @@ def phase_score(args):
     (JSON summary) plus a per-object CSV.
     """
     print(f"📊 [score] reading {args.responses_file}")
+    phase_t0 = time.time()
     header, records = _read_artifact(args.responses_file)
     dataset = header["dataset"]
     mapping_vocab = header.get("mapping_vocab") or {}
@@ -689,6 +706,21 @@ def phase_score(args):
         summary["hierarchical"] = {"hp": _mean(hp_vals), "hr": _mean(hr_vals),
                                    "hf1": _mean(hf1_vals), "support": len(hf1_vals)}
 
+    # Wall-clock time this model took to finish this run. inference_time_seconds
+    # comes from phase_infer's footer record (dataset load + VLM creation +
+    # generation loop); it's None on an artifact written before footers existed,
+    # or on a --stage score-only rerun of such an artifact — in that case "total"
+    # falls back to just the scoring time actually measured here, so it's never
+    # silently wrong, just incomplete. scoring_time_seconds always covers this
+    # ENTIRE phase_score call (artifact read, CLIP load + encode, metric loop).
+    inference_time = header.get("inference_time_seconds")
+    scoring_time = time.time() - phase_t0
+    summary["execution_time_seconds"] = {
+        "inference": inference_time,
+        "scoring": scoring_time,
+        "total": (inference_time or 0.0) + scoring_time,
+    }
+
     _print_summary(summary, run_clipmatch)
 
     # Everything lands under --results_dir ("results/" by default); --run_name
@@ -704,8 +736,8 @@ def phase_score(args):
     # Distinct-target-class nature/biotic/material composition of THIS run's
     # sampled dataset (recap: sampling is deterministic — a fixed --max_samples
     # always yields the same subset — so this is stable across reruns of the
-    # same config). Keyed by n_images so different configurations (e.g. 1000
-    # vs the full dataset) accumulate side by side instead of overwriting.
+    # same config). Keyed by --max_samples so different configurations (e.g.
+    # 1000 vs the full dataset) accumulate side by side instead of overwriting.
     all_targets = [t for rec in records for t in rec.get("targets", [])]
     class_stats = compute_class_stats(all_targets)
     config_key = str(args.max_samples) if args.max_samples is not None else "full"
@@ -751,6 +783,9 @@ def _print_summary(s, run_clipmatch):
         h = s["hierarchical"]
         print(f"--- Hierarchical (support {h['support']}) ---")
         print(f"hP {h['hp']:.4f} | hR {h['hr']:.4f} | hF1 {h['hf1']:.4f}")
+    t = s["execution_time_seconds"]
+    inf_str = f"{t['inference']:.1f}s" if t["inference"] is not None else "n/a"
+    print(f"\nExecution time: inference {inf_str} | scoring {t['scoring']:.1f}s | total {t['total']:.1f}s")
     print("=" * 60)
 
 
