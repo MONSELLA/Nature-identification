@@ -300,6 +300,15 @@ class HuggingFaceBackedVLM(BaseVLM):
         import torch
 
         self.device = device
+        # `dtype` may arrive as a string from the CLI (e.g. "auto", "bfloat16")
+        # rather than an actual torch.dtype. `from_pretrained(torch_dtype=...)`
+        # accepts the string "auto" directly, but tensor `.to(device, dtype)`
+        # calls elsewhere do not — they need a real torch.dtype. Resolve here,
+        # once, so every downstream use gets a concrete dtype: "auto"/None
+        # fall back to the bfloat16 default, other strings (e.g. "float16")
+        # are looked up on the `torch` module.
+        if isinstance(dtype, str):
+            dtype = None if dtype == "auto" else getattr(torch, dtype, None)
         # Default to bfloat16 precision (a reduced-precision float format
         # commonly used for faster/lighter-weight inference) if the caller
         # didn't specify one.
