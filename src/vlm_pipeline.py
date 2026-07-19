@@ -504,11 +504,10 @@ def map_object_to_taxonomy(object_str: str, tax_graph, max_hops: int = 3) -> Opt
     Try to map a free-text object phrase into the taxonomy graph we already
     have (`tax_graph`, built by excel_loader.TaxonomyGraph.load_excel):
 
-      - Normalize the phrase (and its trailing head noun, for a multi-word
-        phrase) and look it up in `tax_graph.graph_lemma_vocab()` — every
-        WordNet lemma of every synset already IN the loaded graph (the
-        Excel-labeled anchor nodes plus the ancestor/descendant nodes wired
-        in while building the hierarchy).
+      - Normalize the phrase and look it up in `tax_graph.graph_lemma_vocab()`
+        — every WordNet lemma of every synset already IN the loaded graph
+        (the Excel-labeled anchor nodes plus the ancestor/descendant nodes
+        wired in while building the hierarchy).
       - If that lemma names a graph synset, resolve its labels via
         `tax_graph.resolve_labels` (nearest labeled node within `max_hops`,
         in either direction).
@@ -524,33 +523,18 @@ def map_object_to_taxonomy(object_str: str, tax_graph, max_hops: int = 3) -> Opt
     node carries no biotic label).
     """
     norm = _normalize_object(object_str)
-    candidates = [norm]
-    if " " in norm:
-        # Also try just the LAST word of a multi-word phrase — e.g. if the
-        # model said "large polar bear" but the graph only has an entry for
-        # "polar bear" or just "bear", this gives us another chance to match
-        # by stripping down to the head noun. (Note: this simple heuristic
-        # only tries the single trailing word, not every possible sub-phrase.)
-        candidates.append(norm.split()[-1])  # trailing head noun (e.g. "polar bear" -> "bear")
-
-    graph_vocab = tax_graph.graph_lemma_vocab()
-    for cand in candidates:
-        synset = graph_vocab.get(cand)
-        if synset is None:
-            # This candidate string isn't a lemma of anything in the graph —
-            # try the next candidate (if any) instead of giving up immediately.
-            continue
-        labels = tax_graph.resolve_labels(synset, max_hops=max_hops)
-        if labels is None:
-            continue
-        is_nature = labels["is_nature"]
-        biotic = None
-        if is_nature and labels.get("life_category"):
-            biotic = labels["life_category"] == "biotic"
-        return {"synset": synset, "is_nature": is_nature, "biotic": biotic}
-
-    # Nothing matched.
-    return None
+    synset = tax_graph.graph_lemma_vocab().get(norm)
+    if synset is None:
+        # Not a lemma of anything in the graph.
+        return None
+    labels = tax_graph.resolve_labels(synset, max_hops=max_hops)
+    if labels is None:
+        return None
+    is_nature = labels["is_nature"]
+    biotic = None
+    if is_nature and labels.get("life_category"):
+        biotic = labels["life_category"] == "biotic"
+    return {"synset": synset, "is_nature": is_nature, "biotic": biotic}
 
 
 def resolve_hybrid_label(object_str: str, vlm_label: Dict[str, Any], tax_graph, mapping: Any = _UNSET, max_hops: int = 3) -> Dict[str, Any]:
