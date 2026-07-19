@@ -62,6 +62,7 @@ from src.models.prompts import (
     TaxonomyResponse,
     build_classification_prompt,
 )
+from src.utils import BatchProgress
 
 # Axis sets for the two per-object labeling paths (see label_objects_batch):
 #   - FULL  : an UNMAPPED object — WordNet told us nothing, so the VLM must
@@ -408,6 +409,7 @@ def run_inference(
     # partial final batch still gets its own iteration (e.g. 10 images with
     # batch_size=3 needs 4 batches: 3+3+3+1).
     num_batches = (n + batch_size - 1) // batch_size
+    progress = BatchProgress(num_batches, label="[infer] batch", verbose=verbose)
 
     for b in range(num_batches):
         # Slice out this batch's images. Python slicing handles the last,
@@ -466,7 +468,11 @@ def run_inference(
 
         if verbose:
             done = min((b + 1) * batch_size, n)
-            print(f"[infer] {done}/{n} images processed", flush=True)
+            n_objs_batch = sum(len(o) for o in objects_per_image)
+            n_mapped_batch = sum(1 for maps in mappings_per_image for m in maps if m is not None)
+            extra = (f"objects {n_objs_batch} (mapped {n_mapped_batch}/{n_objs_batch})"
+                     if n_objs_batch else "objects 0")
+            progress.tick(b, n_done=done, n_total=n, extra=extra)
 
 
 # =============================================================================

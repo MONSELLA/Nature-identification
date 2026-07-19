@@ -34,7 +34,8 @@ have to regex-parse and hope for the best.
 
 from __future__ import annotations
 
-from typing import List, Literal
+from pathlib import Path
+from typing import List, Literal, Tuple
 
 from pydantic import BaseModel, Field
 
@@ -276,3 +277,48 @@ FIFTH EXAMPLE OUTPUT FOR TARGET "sunset":
   "tangibility": "immaterial"
 }}
 """
+
+
+# =============================================================================
+# System prompts (built from the data/big5_taxonomy/ definition files)
+# =============================================================================
+# SINGLE HOME for this composition logic. Previously run_vlm_pipeline.py
+# (build_system_prompts) and evaluate_taxonomy_labeling.py (load_system_prompt)
+# each built their own copy of the "all three definitions" system prompt string
+# — same content, two separate implementations that could silently drift apart.
+# Both now import this one function, guaranteeing the pipeline's UNMAPPED-object
+# labeling call and the calibration eval's system prompt stay byte-identical
+# (the whole point of that eval is to measure the exact same fallback prompt
+# the pipeline uses — see evaluate_taxonomy_labeling.py's module docstring).
+def build_system_prompts(nature_path: str, biotic_path: str, material_path: str) -> Tuple[str, str, str]:
+    """Build the three system prompts the pipeline needs, reading each
+    definition file once:
+
+      - caption_system         : NATURE definition only (no axis-priming, per
+                                 the recap) — used for captioning + extraction.
+      - label_system_full      : ALL THREE axis definitions — used for
+                                 UNMAPPED objects (where the VLM must decide
+                                 nature/biotic/material from scratch) AND for
+                                 evaluate_taxonomy_labeling.py's calibration
+                                 eval, which measures that exact fallback path.
+      - label_system_material  : MATERIAL definition only — used for MAPPED-
+                                 nature objects, where WordNet already fixed
+                                 nature and biotic and only material/immaterial
+                                 remains. Showing the model only the relevant
+                                 definition (not all three) keeps the
+                                 material-only call focused and its prefix
+                                 cache-friendly.
+
+    Returns (caption_system, label_system_full, label_system_material).
+    """
+    nature = Path(nature_path).read_text()
+    biotic = Path(biotic_path).read_text()
+    material = Path(material_path).read_text()
+    caption_system = f"# NATURE DEFINITION\n{nature}"
+    label_system_full = (
+        "# 1. NATURE DEFINITION\n" f"{nature}\n\n"
+        "# 2. LIFE CATEGORY AXIS\n" f"{biotic}\n\n"
+        "# 3. TANGIBILITY AXIS\n" f"{material}"
+    )
+    label_system_material = f"# TANGIBILITY AXIS\n{material}"
+    return caption_system, label_system_full, label_system_material

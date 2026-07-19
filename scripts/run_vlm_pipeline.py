@@ -86,44 +86,11 @@ logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 from src.evaluation import taxonomy_metrics
 from src.loaders.excel_loader import TaxonomyGraph
 from src.loaders.dataset_loader import load_dataset, get_candidate_vocab, build_mapping_vocab, get_gt_from_graph
+from src.models.prompts import build_system_prompts
 from src.models.vlm_models import MODEL_REGISTRY, VLLM_FAMILIES, create_vlm
 from src.vlm_pipeline import run_inference, resolve_hybrid_label, normalize_objects, _normalize_object
 from src.evaluation import clip_metrics
 from src.utils import update_results_store, update_dataset_class_stats, compute_class_stats, format_duration
-
-
-# =============================================================================
-# System prompts (built from the ../data/big5_taxonomy/ definition files)
-# =============================================================================
-def build_system_prompts(nature_path, biotic_path, material_path):
-    """Build the three system prompts the pipeline needs:
-
-      - caption_system         : NATURE definition only (no axis-priming, per
-                                 the recap) — used for captioning + extraction.
-      - label_system_full      : ALL THREE axis definitions — used ONLY for
-                                 UNMAPPED objects, where the VLM must decide
-                                 nature/biotic/material from scratch (identical
-                                 to evaluate_taxonomy_labeling.py's system
-                                 prompt, so the fallback matches the calibration
-                                 eval).
-      - label_system_material  : MATERIAL definition only — used for MAPPED-nature
-                                 objects, where WordNet already fixed nature and
-                                 biotic and only material/immaterial remains.
-                                 Showing the model only the relevant definition
-                                 (not all three) keeps the material-only call
-                                 focused and its prefix cache-friendly.
-    """
-    nature = Path(nature_path).read_text()
-    biotic = Path(biotic_path).read_text()
-    material = Path(material_path).read_text()
-    caption_system = f"# NATURE DEFINITION\n{nature}"
-    label_system_full = (
-        "# 1. NATURE DEFINITION\n" f"{nature}\n\n"
-        "# 2. LIFE CATEGORY AXIS\n" f"{biotic}\n\n"
-        "# 3. TANGIBILITY AXIS\n" f"{material}"
-    )
-    label_system_material = f"# TANGIBILITY AXIS\n{material}"
-    return caption_system, label_system_full, label_system_material
 
 
 # =============================================================================
@@ -285,7 +252,8 @@ def phase_infer(args):
     memory). Returns the created `vlm` object (unused by --stage all now, which
     reclaims VRAM by exiting the infer subprocess — see main()).
     """
-    print(f"🚀 [infer] dataset='{args.dataset}', model='{args.model_family}/{args.model_name}'")
+    print(f"🚀 [infer] dataset='{args.dataset}', model='{args.model_family}/{args.model_name}' "
+          f"-> responses_file='{args.responses_file}'")
     phase_t0 = time.time()
 
     graph = TaxonomyGraph()
@@ -352,6 +320,7 @@ def phase_infer(args):
     }
 
     out_path = Path(args.responses_file)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     loop_t0 = time.time()
     n = 0
     # "JSON Lines" format: one complete, independent JSON object per line of
@@ -489,7 +458,12 @@ def phase_score(args):
         offsets.append(len(flat_texts))
         flat_texts.extend(clip_metrics.object_texts(r["objects"]))
     offsets.append(len(flat_texts))  # sentinel end-offset for the last image
-    obj_embs_all = scorer.encode_text(flat_texts) if flat_texts else None
+    # encode_text([]) itself returns a correctly-shaped zero-row array (see
+    # CLIPScorer.encode_text), so this is called unconditionally — NOT gated
+    # on `if flat_texts` — so a dataset where every image happens to extract
+    # zero objects still gets f_clipscore's sentence-only term per image below
+    # instead of silently skipping reference-free scoring for the whole run.
+    obj_embs_all = scorer.encode_text(flat_texts)
 
     candidate_embs = None
     if run_clipmatch:
@@ -532,7 +506,7 @@ def phase_score(args):
         # Slice this image's own chunk of object embeddings out of the big
         # flat array we built above, using the offsets we remembered.
         obj_slice = slice(offsets[idx], offsets[idx + 1])
-        rec_obj_embs = obj_embs_all[obj_slice] if obj_embs_all is not None else None
+        rec_obj_embs = obj_embs_all[obj_slice]
 
         # diagnostics
         n_objects_total += len(objs)
@@ -546,9 +520,8 @@ def phase_score(args):
                 n_vlm_nature += 1
 
         # --- reference-free CLIP metrics (all datasets) ---
-        if rec_obj_embs is not None:
-            fclip_vals.append(clip_metrics.f_clipscore(image_embs[idx], caption_embs[idx], rec_obj_embs))
-            objclip_vals.append(clip_metrics.object_clipscore(image_embs[idx], rec_obj_embs))
+        fclip_vals.append(clip_metrics.f_clipscore(image_embs[idx], caption_embs[idx], rec_obj_embs))
+        objclip_vals.append(clip_metrics.object_clipscore(image_embs[idx], rec_obj_embs))
 
         # --- extraction-hit diagnostic (ALL datasets; reporting-only) ---
         # recap §6.3: keep the exact-match extraction rate as a descriptive
@@ -573,7 +546,7 @@ def phase_score(args):
             pred_class_synset = pred_node = None
             best_obj_idx = None  # extracted object most representative of the pred class
             gt_syn = targets[0].get("synset_id") if targets else None
-            if rec_obj_embs is not None and rec_obj_embs.shape[0] > 0:
+            if rec_obj_embs.shape[0] > 0:
                 _, pred_idx, per_obj_sim = clip_metrics.clipmatch(rec_obj_embs, candidate_embs)
                 if pred_idx >= 0:
                     pred_class_synset = candidate_vocab[pred_idx]["synset_id"]
@@ -840,8 +813,14 @@ def parse_args():
                         "releasing the VLM's GPU memory before loading CLIP for scoring. "
                         "'infer'/'score' split the two halves across separate invocations.")
     p.add_argument("--dataset", choices=["coco", "imagenet", "places365", "big5"], required=True)
-    p.add_argument("--responses_file", type=str, default="vlm_responses.jsonl",
-                   help="Intermediate artifact: written by infer, read by score.")
+    p.add_argument("--responses_file", type=str, default=None,
+                   help="Intermediate artifact: written by infer, read by score. Default: "
+                        "'vlm_responses.jsonl' inside --results_dir/--run_name (the SAME "
+                        "folder --output_file lands in), so a run's artifact and its results "
+                        "JSON/CSV are always co-located and both respect --results_dir/"
+                        "--run_name. Pass an explicit path to override (e.g. to write it "
+                        "somewhere else, or to point --stage score at a specific prior "
+                        "artifact).")
 
     # taxonomy / context
     p.add_argument("--excel_path", type=str, default="../data/big5_taxonomy/flat_wordnet_tree_fixed.xlsx")
@@ -922,6 +901,24 @@ def parse_args():
     return args
 
 
+def _resolve_responses_file(args):
+    """Fill in --responses_file's default (None until now) as
+    '<results_dir>/<run_name>/vlm_responses.jsonl' — the SAME directory
+    --output_file lands in — so the intermediate artifact respects
+    --results_dir/--run_name exactly like every other output this script
+    writes, instead of always landing at a fixed cwd-relative path regardless
+    of those flags. An explicitly-passed --responses_file is left untouched.
+    Creates that directory so phase_infer can open the file for writing.
+    Mutates and returns `args`."""
+    if args.responses_file is None:
+        out_dir = Path(args.results_dir)
+        if args.run_name:
+            out_dir = out_dir / args.run_name
+        out_dir.mkdir(parents=True, exist_ok=True)
+        args.responses_file = str(out_dir / "vlm_responses.jsonl")
+    return args
+
+
 # =============================================================================
 # Subprocess workers (for --stage all)
 # =============================================================================
@@ -943,6 +940,7 @@ def _score_worker(args):
 
 def main():
     args = parse_args()
+    args = _resolve_responses_file(args)
 
     if args.stage == "infer":
         phase_infer(args)

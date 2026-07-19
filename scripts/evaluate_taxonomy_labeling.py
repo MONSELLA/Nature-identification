@@ -30,18 +30,18 @@ import sys
 import traceback
 from pathlib import Path
 import time
-import datetime
 
 import wandb
 
 from src.loaders.excel_loader import TaxonomyGraph
 from src.models.vlm_models import MODEL_REGISTRY, VLLM_FAMILIES, create_vlm
 from src.loaders.dataset_loader import load_dataset
-from src.utils import update_results_store, update_dataset_class_stats, compute_class_stats, format_duration
-# TaxonomyResponse + build_classification_prompt live in prompts.py so this
-# calibration eval and the VLM pipeline's fallback path share the EXACT same
-# prompt and schema (they cannot drift — same imported objects).
-from src.models.prompts import TaxonomyResponse, build_classification_prompt
+from src.utils import update_results_store, update_dataset_class_stats, compute_class_stats, format_duration, BatchProgress
+# TaxonomyResponse + build_classification_prompt + build_system_prompts live in
+# prompts.py so this calibration eval and the VLM pipeline's fallback path
+# share the EXACT same prompt/schema/system-prompt construction (they cannot
+# drift — same imported objects).
+from src.models.prompts import TaxonomyResponse, build_classification_prompt, build_system_prompts
 
 
 def parse_args():
@@ -115,22 +115,6 @@ def parse_args():
     parser.add_argument("--wandb", action="store_true", help="Store the results on WandB.")
 
     return parser.parse_args()
-
-
-def load_system_prompt(nature_def_path, biotic_def_path, material_def_path):
-    """Read the three plain-text axis-definition files and concatenate them
-    into ONE system prompt. This is sent as context on EVERY VLM call in this
-    script, so the model always has the exact rules for nature/biotic/material
-    available when making its judgment — identical to what the main pipeline
-    sends during its own fallback labeling calls."""
-    nature_def = Path(nature_def_path).read_text()
-    biotic_def = Path(biotic_def_path).read_text()
-    material_def = Path(material_def_path).read_text()
-    return (
-        "# 1. NATURE DEFINITION\n" f"{nature_def}\n\n"
-        "# 2. LIFE CATEGORY AXIS\n" f"{biotic_def}\n\n"
-        "# 3. TANGIBILITY AXIS\n" f"{material_def}"
-    )
 
 
 def _label_to_bool(value, axis):
@@ -277,7 +261,12 @@ def main():
         print("No mapped evaluation instances found — exiting.")
         sys.exit(1)
 
-    system_prompt = load_system_prompt(
+    # build_system_prompts (src/models/prompts.py) returns
+    # (caption_system, label_system_full, label_system_material) — this eval
+    # only needs the "full" one (all three axis definitions), the SAME string
+    # the pipeline sends on its unmapped-object fallback call, so this
+    # calibration measures that exact prompt.
+    _, system_prompt, _ = build_system_prompts(
         args.nature_definition_path, args.biotic_definition_path, args.material_definition_path
     )
 
@@ -304,6 +293,7 @@ def main():
     # Ceiling division: how many batches of size batch_size are needed to
     # cover every evaluation instance (the last batch may be smaller).
     num_batches = (len(eval_instances) + args.batch_size - 1) // args.batch_size
+    progress = BatchProgress(num_batches, label="batch", verbose=args.verbose)
 
     for batch_idx in range(num_batches):
         start = batch_idx * args.batch_size
@@ -314,7 +304,6 @@ def main():
         batch_prompts = [build_classification_prompt(r["class_name"], axes=["nature", "life_category", "tangibility"]) for r in batch]
         batch_images = [r["image_path"] for r in batch]
 
-        t0 = time.time()
         try:
             batch_results = vlm.generate_batch_safe(
                 batch_prompts, batch_images,
@@ -378,11 +367,9 @@ def main():
 
             scored_results.append(r)
 
-        if args.verbose:
-            batch_seconds = time.time() - t0
-            remaining_seconds = batch_seconds * (num_batches - batch_idx + 1)
-            formatted_time = datetime.timedelta(seconds=int(remaining_seconds))
-            print(f"[INFO] Batch {batch_idx + 1}/{num_batches} done in {batch_seconds:.1f}s. Estimated remaining time: {formatted_time}")
+        n_parsed_ok = sum(1 for r in batch if r["prediction"].get("parse_failed") is False)
+        progress.tick(batch_idx, n_done=start + len(batch), n_total=len(eval_instances),
+                      extra=f"parsed {n_parsed_ok}/{len(batch)}")
 
     # Calculate Metrics
     parse_failure_rate = sum(r["prediction"]["parse_failed"] for r in scored_results) / len(scored_results)

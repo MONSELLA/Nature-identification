@@ -24,6 +24,7 @@ with the newest results.
 """
 
 import json
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -40,6 +41,52 @@ def format_duration(seconds):
     hours, rem = divmod(rem, 3600)
     minutes, secs = divmod(rem, 60)
     return f"{days}-{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+class BatchProgress:
+    """Shared --verbose progress logger for the two top-level scripts' batched
+    VLM-inference loops (run_vlm_pipeline.py's run_inference,
+    evaluate_taxonomy_labeling.py's main batch loop). Previously each script
+    hand-rolled its own version; run_vlm_pipeline.py's just printed "N/M images
+    processed" with no timing, while evaluate_taxonomy_labeling.py printed a
+    per-batch ETA but computed it off an off-by-one batch count
+    (`num_batches - batch_idx + 1`, which over-counts the remaining batches by
+    2). This one fixes that and is used by both, so progress output stays
+    identical in format and doesn't drift between scripts again.
+
+    ETA is a RUNNING AVERAGE over every batch completed so far (elapsed /
+    done), not just the last batch's duration — a single batch can be an
+    outlier (a retry, a slow image download), so the running average gives a
+    more stable estimate of time remaining.
+    """
+
+    def __init__(self, num_batches, label="batch", verbose=True):
+        self.num_batches = num_batches
+        self.label = label
+        self.verbose = verbose
+        self._t0 = time.time()
+        self._last = self._t0
+
+    def tick(self, batch_idx, n_done=None, n_total=None, extra=None):
+        """Call once after finishing batch `batch_idx` (0-indexed). No-op when
+        verbose=False, so callers don't need to guard every call site."""
+        now = time.time()
+        batch_seconds = now - self._last
+        self._last = now
+        if not self.verbose:
+            return
+        done = batch_idx + 1
+        elapsed = now - self._t0
+        avg = elapsed / done
+        remaining = avg * (self.num_batches - done)
+        msg = (f"[INFO] {self.label} {done}/{self.num_batches} done in {batch_seconds:.1f}s "
+               f"(avg {avg:.1f}s/batch)")
+        if n_done is not None and n_total is not None:
+            msg += f" | {n_done}/{n_total} items"
+        msg += f" | elapsed {format_duration(elapsed)} | ETA {format_duration(remaining)}"
+        if extra:
+            msg += f" | {extra}"
+        print(msg, flush=True)
 
 
 def update_results_store(path, dataset, model, metrics):
