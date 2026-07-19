@@ -61,17 +61,18 @@ from src.models.prompts import (
     ObjectExtractionResponse,
     TaxonomyResponse,
     build_classification_prompt,
+    build_material_classification_prompt,
 )
 from src.utils import BatchProgress
 
-# Axis sets for the two per-object labeling paths (see label_objects_batch):
-#   - FULL  : an UNMAPPED object — WordNet told us nothing, so the VLM must
-#             decide all three axes at once (one prompt/schema, cheaper than
-#             three separate calls, and lets the model reason jointly).
-#   - MATERIAL: a MAPPED-nature object — nature/biotic are already fixed by the
-#             WordNet mapping, so the VLM is only asked material/immaterial.
+# Axis set for the FULL labeling path (see label_objects_batch): an UNMAPPED
+# object — WordNet told us nothing, so the VLM must decide all three axes at
+# once (one prompt/schema, cheaper than three separate calls, and lets the
+# model reason jointly). The MATERIAL path (a MAPPED-nature object, where
+# nature/biotic are already fixed by the WordNet mapping) uses its own
+# dedicated prompt builder, build_material_classification_prompt, instead of
+# an axes-subset of this one — see that function's docstring for why.
 _FULL_AXES = ["nature", "life_category", "tangibility"]
-_MATERIAL_AXES = ["tangibility"]
 
 # Sentinel distinguishing "mapping not provided, compute it" from "mapping is
 # genuinely None (unmapped)" in resolve_hybrid_label — a plain None default
@@ -301,7 +302,11 @@ def label_objects_batch(
                 full_images.append(image_paths[i])
                 full_owner.append((i, j))
             elif mp["is_nature"]:
-                mat_prompts.append(build_classification_prompt(obj, axes=_MATERIAL_AXES))
+                # Tell the model the nature/biotic verdict WordNet already
+                # settled (mp["biotic"] is True/False/None — None only when
+                # the mapped node is nature but carries no biotic/abiotic
+                # label at all) instead of leaving it to re-derive silently.
+                mat_prompts.append(build_material_classification_prompt(obj, biotic=mp["biotic"]))
                 mat_images.append(image_paths[i])
                 mat_owner.append((i, j))
             # else: mapped & not nature -> keep the synthetic (vlm_called=False) label.

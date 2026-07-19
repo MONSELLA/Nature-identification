@@ -280,6 +280,80 @@ FIFTH EXAMPLE OUTPUT FOR TARGET "sunset":
 
 
 # =============================================================================
+# Stage 3b — Material-only prompt (the MAPPED-nature fast path)
+# =============================================================================
+# Companion to MaterialResponse (above): the MAPPED-nature fast path in
+# src/vlm_pipeline.py's label_objects_batch already knows nature=True and, when
+# the mapped node carries one, the biotic/abiotic value too (both come from
+# WordNet, not this call) — only material/immaterial still needs the VLM. This
+# used to reuse build_classification_prompt(obj, axes=["tangibility"]), which
+# was WRONG on two counts: (1) its few-shot examples are all full
+# TaxonomyResponse-shaped JSON (nature_reasoning/nature/sub_axes_reasoning/
+# life_category/tangibility), mismatched against the MaterialResponse schema
+# (reasoning/tangibility only) actually requested on this call; and (2) it
+# never told the model the nature/biotic verdict was already settled by
+# mapping, so the model had to (redundantly, and possibly inconsistently)
+# re-derive "is this nature" and "biotic or abiotic" from scratch even though
+# those answers are thrown away. This prompt instead STATES the already-known
+# nature/biotic verdict up front and asks for material/immaterial only, with
+# examples that match MaterialResponse's actual shape.
+def build_material_classification_prompt(class_name, biotic):
+    """
+    Build the per-object prompt for the MAPPED-nature material-only labeling
+    call (paired with schema=MaterialResponse).
+
+    Args:
+        class_name: the object's name as a plain string, e.g. "oak tree" — same
+            role as in build_classification_prompt.
+        biotic: the mapped node's biotic/abiotic verdict — True ("biotic"),
+            False ("abiotic"), or None when the mapped node is nature but
+            carries no biotic/abiotic label (stated only as "nature" in that
+            case, since we don't actually know which).
+
+    Returns:
+        The full prompt string ready to send to the VLM alongside the image.
+    """
+    if biotic is True:
+        established = (
+            f'This "{class_name}" has ALREADY been established as NATURE, and specifically as '
+            f'BIOTIC (a living organism, or the material/immaterial result of a biotic process).'
+        )
+    elif biotic is False:
+        established = (
+            f'This "{class_name}" has ALREADY been established as NATURE, and specifically as '
+            f'ABIOTIC (a non-living natural element or process).'
+        )
+    else:
+        established = f'This "{class_name}" has ALREADY been established as NATURE.'
+
+    return f"""You are analyzing a specific target entity identified in the provided image.
+TARGET ENTITY TO CLASSIFY: "{class_name}"
+
+{established} Do NOT re-evaluate the nature or biotic/abiotic classification — treat both as
+settled and given.
+
+Your ONLY remaining task is to classify this specific "{class_name}" instance's TANGIBILITY, based
+on the visual evidence in the image and the strict definitions provided:
+  - "tangibility": either "material" or "immaterial" — does the image show a real, physically
+    present instance of this entity (material), or a representation of it — e.g. a painting,
+    cartoon, video game, stylized/fictional depiction, or an artefact whose natural material of
+    origin is not visually identifiable (immaterial)?
+
+EXAMPLE OUTPUT FOR TARGET "river" (already established as nature, abiotic):
+{{
+  "reasoning": "The image shows a real, physically flowing river occupying space in the landscape, not a depiction of one.",
+  "tangibility": "material"
+}}
+
+EXAMPLE OUTPUT FOR TARGET "dog" (already established as nature, biotic):
+{{
+  "reasoning": "The image shows a stylized cartoon drawing of a dog rather than a real, physically present animal.",
+  "tangibility": "immaterial"
+}}
+"""
+
+
+# =============================================================================
 # System prompts (built from the data/big5_taxonomy/ definition files)
 # =============================================================================
 # SINGLE HOME for this composition logic. Previously run_vlm_pipeline.py
