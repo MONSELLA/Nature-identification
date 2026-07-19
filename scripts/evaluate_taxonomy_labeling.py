@@ -27,6 +27,7 @@ import csv
 import json
 import random
 import sys
+import traceback
 from pathlib import Path
 import time
 import datetime
@@ -324,7 +325,10 @@ def main():
             # If the ENTIRE batch call fails (e.g. an out-of-memory error),
             # don't crash the whole run — treat every instance in this batch
             # as a parse failure (scored as wrong below) and keep going.
+            # Full traceback (not just repr(e)) so the actual failing line is
+            # visible in logs instead of just the exception message.
             print(f"⚠️ Batch {batch_idx + 1}/{num_batches} FAILED ({e!r}).")
+            traceback.print_exc()
             batch_results = [None] * len(batch)
 
         for r, result in zip(batch, batch_results):
