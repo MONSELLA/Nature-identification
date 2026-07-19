@@ -145,7 +145,8 @@ class TaxonomyResponse(BaseModel):
     # 3. Now, initiate a second reasoning block conditioned on the decision just made.
     sub_axes_reasoning: str = Field(
         description=(
-            "Step 2: If nature is 'yes', apply the definitions to determine the 'biotic' and 'material' axes. "
+            "Step 2: If nature is 'yes', apply the definitions to determine the classification for the "
+            "life_cateogry and tangibility axes. "
             "If nature is 'no', explicitly state 'Not applicable since the entity is not nature'."
         )
     )
@@ -174,7 +175,7 @@ class MaterialResponse(BaseModel):
     """
 
     reasoning: str = Field(
-        description="One concise sentence justifying the material/immaterial classification based on the visual evidence."
+        description="One concise sentence justifying the tangibility a based on the visual evidence."
     )
     tangibility: Literal["material", "immaterial"]
 
@@ -332,20 +333,17 @@ TARGET ENTITY TO CLASSIFY: "{class_name}"
 {established} Do NOT re-evaluate the nature or biotic/abiotic classification — treat both as
 settled and given.
 
-Your ONLY remaining task is to classify this specific "{class_name}" instance's TANGIBILITY, based
-on the visual evidence in the image and the strict definitions provided:
-  - "tangibility": either "material" or "immaterial" — does the image show a real, physically
-    present instance of this entity (material), or a representation of it — e.g. a painting,
-    cartoon, video game, stylized/fictional depiction, or an artefact whose natural material of
-    origin is not visually identifiable (immaterial)?
+Your ONLY remaining task is to classify this specific "{class_name}" instance's tangibility, based
+on the visual evidence in the image and the strict definitions provided. First, provide a one-sentence 
+reasoning step explaining what you see. Then, output your final classification as either "material" or "immaterial".
 
-EXAMPLE OUTPUT FOR TARGET "river" (already established as nature, abiotic):
+EXAMPLE OUTPUT FOR TARGET "river" (already classified as nature, abiotic):
 {{
   "reasoning": "The image shows a real, physically flowing river occupying space in the landscape, not a depiction of one.",
   "tangibility": "material"
 }}
 
-EXAMPLE OUTPUT FOR TARGET "dog" (already established as nature, biotic):
+EXAMPLE OUTPUT FOR TARGET "dog" (already classified as nature, biotic):
 {{
   "reasoning": "The image shows a stylized cartoon drawing of a dog rather than a real, physically present animal.",
   "tangibility": "immaterial"

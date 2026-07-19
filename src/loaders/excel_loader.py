@@ -31,6 +31,7 @@ USAGE:
     mapped = graph.get_mapped_classes(class_synset_pairs)
     # mapped = [{"class_name": ..., "synset_id": ..., "is_nature": ...,
     #            "life_category": ..., "resolved_from_node": ..., "hops": ...}, ...]
+    #            "life_category": ..., "resolved_from_node": ..., "hops": ...}, ...]
 
 NOTE ON DEFAULTS: bio_col="Biotic/abiotic", mat_col="Material/immaterial",
 sheet_name="data corrected" — taken directly from evaluate_imagenet.py's
@@ -285,6 +286,8 @@ class TaxonomyGraph:
                 # more for the header row.)
                 existing_bio = self.graph.nodes[synset_str].get("life_category")
                 existing_mat = self.graph.nodes[synset_str].get("tangibility")
+                existing_bio = self.graph.nodes[synset_str].get("life_category")
+                existing_mat = self.graph.nodes[synset_str].get("tangibility")
                 excel_row = index + 2
                 if existing_bio is not None and incoming_bio is not None and existing_bio != incoming_bio:
                     print(
@@ -306,7 +309,9 @@ class TaxonomyGraph:
             self.graph.nodes[synset_str]["is_nature"] = is_nature
             if incoming_bio:
                 self.graph.nodes[synset_str]["life_category"] = incoming_bio
+                self.graph.nodes[synset_str]["life_category"] = incoming_bio
             if incoming_mat:
+                self.graph.nodes[synset_str]["tangibility"] = incoming_mat
                 self.graph.nodes[synset_str]["tangibility"] = incoming_mat
 
     # -------------------------------------------------------------------
@@ -380,6 +385,7 @@ class TaxonomyGraph:
                     "hops": hops,
                     "is_nature": attrs["is_nature"],
                     "life_category": attrs.get("life_category"),
+                    "life_category": attrs.get("life_category"),
                 }
             if hops >= max_hops:
                 # We've hit the search radius limit — don't expand any
@@ -422,6 +428,7 @@ class TaxonomyGraph:
                     "class_name": class_name,
                     "synset_id": synset_id,
                     "is_nature": labels["is_nature"],
+                    "life_category": labels["life_category"],
                     "life_category": labels["life_category"],
                     "resolved_from_node": labels["resolved_from_node"],
                     "hops": labels["hops"],
