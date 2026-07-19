@@ -346,6 +346,20 @@ def main():
                 pred_biotic = _label_to_bool(result.get("life_category"), "biotic")
                 pred_material = _label_to_bool(result.get("tangibility"), "material")
 
+                # The schema TELLS the model to answer "none" for the sub-axes
+                # whenever nature is "no", but nothing mechanically enforces
+                # that — a model can violate it (e.g. nature="no" but
+                # life_category="biotic"). Whenever pred_nature isn't a
+                # confirmed True (explicit "no", or an unparseable/missing
+                # nature answer), we cannot trust any sub-axis value it
+                # printed, so force both to "not applicable" here rather than
+                # scoring the stray answer as-is — otherwise it could
+                # accidentally match GT by luck instead of being penalized
+                # like every other unconfirmed prediction.
+                if pred_nature is not True:
+                    pred_biotic = None
+                    pred_material = None
+
                 # Even when the JSON parsed successfully, an individual field
                 # might still be an unexpected/missing value (pred_* is None).
                 # Same "penalize as wrong" rule applies at the per-field level:
