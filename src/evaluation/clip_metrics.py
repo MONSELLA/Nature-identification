@@ -234,47 +234,67 @@ class CLIPScorer:
             repo_id, trust_remote_code=trust_remote_code, torch_dtype=torch_dtype
         )
 
+    @staticmethod
+    def _pool(output):
+        """Pull the per-sample pooled vector out of an encoder's raw
+        `ModelOutput` — `pooler_output` when the checkpoint defines one,
+        otherwise the [CLS]/first-token slice of `last_hidden_state`."""
+        pooled = getattr(output, "pooler_output", None)
+        return pooled if pooled is not None else output.last_hidden_state[:, 0, :]
+
     def _unwrap_embedding(self, output, projection_attr: str):
-        """`get_text_features`/`get_image_features` are meant to return the
-        already-projected embedding tensor. On some `transformers` versions
-        (observed with plain `openai/clip-vit-large-patch14` under a
-        transformers>=5.5.3-family install — see requirements.txt's vLLM
-        pin) that convenience method regresses and instead returns the raw
-        encoder `ModelOutput` (e.g. `BaseModelOutputWithPooling`), which has
-        no `.norm()`/is not a tensor. Recover manually: pull the pooled
-        output and run it through the model's own projection layer, i.e.
-        exactly what the convenience method was supposed to do.
+        """Fallback for checkpoints WITHOUT a directly-callable submodule
+        (see `_text_features`/`_image_features`): `get_text_features`/
+        `get_image_features` are meant to return the already-projected
+        embedding tensor, but on some `transformers` versions that
+        convenience method regresses and returns the raw encoder
+        `ModelOutput` instead (no `.norm()`/not a tensor). Recover by
+        pooling + projecting manually, i.e. what the method was meant to do.
         """
         if isinstance(output, self._torch.Tensor):
             return output
-        pooled = getattr(output, "pooler_output", None)
-        if pooled is None:
-            pooled = output.last_hidden_state[:, 0, :]
         projection = getattr(self.model, projection_attr, None)
+        pooled = self._pool(output)
         return projection(pooled) if projection is not None else pooled
 
     def _text_features(self, inputs: dict):
+        # Call the text submodule + its projection layer directly rather
+        # than through get_text_features(): on the transformers build this
+        # project runs (pinned >=4.40, but resolved to a >=5.5.3-family
+        # install for vLLM compat — see requirements.txt), get_text_features/
+        # get_image_features are unreliable — for get_image_features
+        # specifically it was observed returning a pooled vector shaped like
+        # the TEXT tower (768-d) rather than the vision tower (1024-d) for
+        # openai/clip-vit-large-patch14, i.e. not just "missing the
+        # projection step" but actually wrong data. Going straight to the
+        # submodule sidesteps whatever is broken in the convenience wrapper.
+        if hasattr(self.model, "text_model") and hasattr(self.model, "text_projection"):
+            pooled = self._pool(self.model.text_model(**inputs))
+            return self.model.text_projection(pooled)
         if hasattr(self.model, "get_text_features"):
-            out = self.model.get_text_features(**inputs)
-            return self._unwrap_embedding(out, "text_projection")
+            return self._unwrap_embedding(self.model.get_text_features(**inputs), "text_projection")
         if hasattr(self.model, "encode_text"):
             return self.model.encode_text(inputs["input_ids"])
         raise AttributeError(
-            f"{self.repo_id}: model exposes neither get_text_features() nor "
-            f"encode_text() — CLIPScorer doesn't know how to run text encoding "
-            f"for this checkpoint's API."
+            f"{self.repo_id}: model exposes neither text_model+text_projection, "
+            f"get_text_features(), nor encode_text() — CLIPScorer doesn't know "
+            f"how to run text encoding for this checkpoint's API."
         )
 
     def _image_features(self, inputs: dict):
+        # See _text_features's comment — same rationale for bypassing
+        # get_image_features() in favor of the vision submodule directly.
+        if hasattr(self.model, "vision_model") and hasattr(self.model, "visual_projection"):
+            pooled = self._pool(self.model.vision_model(**inputs))
+            return self.model.visual_projection(pooled)
         if hasattr(self.model, "get_image_features"):
-            out = self.model.get_image_features(**inputs)
-            return self._unwrap_embedding(out, "visual_projection")
+            return self._unwrap_embedding(self.model.get_image_features(**inputs), "visual_projection")
         if hasattr(self.model, "encode_image"):
             return self.model.encode_image(inputs["pixel_values"])
         raise AttributeError(
-            f"{self.repo_id}: model exposes neither get_image_features() nor "
-            f"encode_image() — CLIPScorer doesn't know how to run image "
-            f"encoding for this checkpoint's API."
+            f"{self.repo_id}: model exposes neither vision_model+visual_projection, "
+            f"get_image_features(), nor encode_image() — CLIPScorer doesn't know "
+            f"how to run image encoding for this checkpoint's API."
         )
 
     def _to_device(self, inputs: dict) -> dict:
