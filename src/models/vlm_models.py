@@ -181,6 +181,49 @@ class BaseVLM(ABC):
 # Backend base classes
 # =============================================================================
 
+def _patch_transformers_config_registration() -> None:
+    """Work around a real vLLM bug that breaks `from vllm import LLM` outright
+    on newer `transformers` releases: vLLM's Ovis config shim
+    (vllm/transformers_utils/configs/ovis.py) calls
+    `AutoConfig.register("aimv2", AIMv2Config)` WITHOUT `exist_ok=True`. That
+    was fine when `transformers` had no native "aimv2" model type — but once
+    a `transformers` release adds native support for it (Apple's AIMv2 vision
+    encoder), the SAME registration collides and `CONFIG_MAPPING.register`
+    raises `ValueError: 'aimv2' is already used by a Transformers config,
+    pick another name.` — which happens at vLLM's own import time, so it's
+    not something --clip_model/--model_family choices, or any `transformers`/
+    `vllm` version PIN, can dodge: it depends on which side (vLLM's shim vs.
+    transformers' own native support) landed the "aimv2" name first, which
+    isn't expressed as a version constraint pip can resolve around.
+
+    Patches the actual `CONFIG_MAPPING` singleton instance's bound
+    `register()` (the exact object vLLM's shim calls into per the traceback)
+    to always pass `exist_ok=True`, so a name that's already registered is
+    silently skipped — keeping transformers' own native config, which is what
+    we want anyway — instead of crashing the whole `from vllm import LLM`
+    import chain. Idempotent (checked via an attribute on the mapping
+    instance) and a no-op if `transformers` isn't installed or this exact
+    collision doesn't occur on your version pair.
+    """
+    # Defensive: this pokes at a third-party library's internals, which can
+    # shift across transformers versions. Any failure here should silently
+    # fall back to unpatched (still-broken-on-that-collision) behavior rather
+    # than introduce a NEW crash on top of the one we're trying to work around.
+    try:
+        from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+        if getattr(CONFIG_MAPPING, "_big5_register_patched", False):
+            return
+        _orig_register = CONFIG_MAPPING.register
+
+        def _safe_register(model_type, config, exist_ok=False):
+            return _orig_register(model_type, config, exist_ok=True)
+
+        CONFIG_MAPPING.register = _safe_register
+        CONFIG_MAPPING._big5_register_patched = True
+    except Exception:
+        return
+
+
 class VLLMBackedVLM(BaseVLM):
     """VLM family served through vLLM (used for qwen/mistral/llava — see
     MODEL_REGISTRY at the bottom of this file). vLLM exposes an OpenAI-style
@@ -189,6 +232,7 @@ class VLLMBackedVLM(BaseVLM):
 
     def __init__(self, model_name: str, **kwargs: Any) -> None:
         super().__init__(model_name, **kwargs)
+        _patch_transformers_config_registration()
         try:
             from vllm import LLM
         except ImportError as e:
@@ -236,7 +280,7 @@ class VLLMBackedVLM(BaseVLM):
         self,
         prompt: str,
         image: ImageInput,
-        system_prompt: Optional[str],
+        system_prompt: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Build one "conversation" in the OpenAI chat-style format vLLM
         expects: an optional system message, then a single user message
@@ -953,7 +997,7 @@ def unload_vlm(vlm: BaseVLM) -> None:
             # blocks (to speed up future allocations) rather than immediately
             # returning them to the OS/driver — empty_cache() forces that
             # memory to actually be released so another process/library
-            # (like open_clip loading afterward) can use it.
+            # (like CLIPScorer loading afterward) can use it.
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect()
     except Exception:

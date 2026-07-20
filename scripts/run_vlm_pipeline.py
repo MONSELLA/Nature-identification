@@ -5,17 +5,33 @@ run_vlm_pipeline.py
 End-to-end driver for the baseline BIG-5 VLM pipeline, in three stages:
 
   --stage all   : THE STANDARD WAY TO RUN THIS PIPELINE. Runs inference then
-                  scoring, but each in its OWN spawned subprocess (see main()):
-                  the infer subprocess loads the VLM, writes the JSON-lines
-                  artifact to --responses_file, then EXITS — which makes the OS
-                  reclaim 100% of the VLM's VRAM before the score subprocess
-                  loads open_clip + the TaxonomyGraph. The VLM and CLIP never
-                  hold GPU memory at the same time, and we don't rely on
-                  in-process CUDA cleanup (vLLM/torch release it unreliably on
-                  GC). 'spawn' is required for CUDA; only the picklable args
-                  Namespace crosses the process boundary. --responses_file is
-                  PURELY that internal handoff in this mode, so it is deleted
-                  once scoring finishes successfully (pass --keep_responses_file
+                  scoring, but each as its OWN genuinely separate OS process
+                  (see main()): a real `subprocess.run([sys.executable,
+                  __file__, "--stage", "infer", ...])` child, NOT a
+                  `multiprocessing.Process`. The infer child loads the VLM,
+                  writes the JSON-lines artifact to --responses_file, then
+                  EXITS — which makes the OS reclaim 100% of the VLM's VRAM
+                  before the score child loads the CLIP model + the
+                  TaxonomyGraph. The VLM and CLIP never hold GPU memory at
+                  the same time, and we don't rely on in-process CUDA cleanup
+                  (vLLM/torch release it unreliably on GC).
+                  WHY subprocess.run AND NOT multiprocessing.Process: vLLM's
+                  own V1 engine spawns ITS OWN internal subprocess for the
+                  engine core (visible in logs as "(EngineCore pid=...)").
+                  Wrapping that in another `multiprocessing.Process` (even
+                  with the 'spawn' start method) nests one spawned-process
+                  tree inside another and can silently DEADLOCK right at
+                  vLLM's async-engine IPC handshake — confirmed in practice:
+                  `--stage infer` alone completed engine init and started
+                  generating, while the exact same run under the old
+                  `--stage all` (multiprocessing.Process wrapper) hung
+                  forever at that same point. A plain OS subprocess has no
+                  such nesting — it's the same relationship `--stage infer`
+                  run by hand has to vLLM's own child process. Args cross the
+                  boundary as reconstructed CLI flags (see _args_to_cli),
+                  not a pickled Namespace. --responses_file is PURELY that
+                  internal handoff in this mode, so it is deleted once
+                  scoring finishes successfully (pass --keep_responses_file
                   to retain it).
 
   --stage infer : run ONLY the inference half (VLM -> --responses_file) and
@@ -78,8 +94,8 @@ import csv
 import itertools
 import json
 import logging
-import multiprocessing as mp
 import random
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -94,7 +110,7 @@ from src.loaders.excel_loader import TaxonomyGraph
 from src.loaders.dataset_loader import load_dataset, get_candidate_vocab
 from src.models.prompts import build_system_prompts
 from src.models.vlm_models import MODEL_REGISTRY, VLLM_FAMILIES, create_vlm
-from src.vlm_pipeline import run_inference, resolve_hybrid_label, normalize_objects, _normalize_object
+from src.vlm_pipeline import run_inference, resolve_hybrid_label, _normalize_object
 from src.evaluation import clip_metrics
 from src.utils import update_results_store, update_dataset_class_stats, compute_class_stats, format_duration
 
@@ -395,8 +411,11 @@ def phase_score(args):
     # This is where CLIP actually gets loaded onto the GPU — by this point in
     # `--stage all`, the VLM has already been unloaded (see main() below), so
     # CLIP has the GPU memory to itself.
-    scorer = clip_metrics.CLIPScorer(model_name=args.clip_model, pretrained=args.clip_pretrained,
-                                     device=args.device, batch_size=args.clip_batch_size)
+    scorer = clip_metrics.CLIPScorer(model_name=args.clip_model, device=args.device,
+                                     batch_size=args.clip_batch_size,
+                                     trust_remote_code=args.clip_trust_remote_code)
+    
+    if args.verbose: print(f"{args.clip_model} loaded. Handles a context length of {scorer.context_length} tokens!\n")
 
     # ---- Hybrid labels per object ----
     # Mapping + hybrid resolution now happen in Phase 1 (see
@@ -418,8 +437,9 @@ def phase_score(args):
     # large batched GPU calls is much faster than thousands of tiny ones.
     image_paths = [r["image_path"] for r in records]
     captions = [r["caption"] for r in records]
-    image_embs = scorer.encode_images(image_paths)
-    caption_embs = scorer.encode_text(captions, warn_truncation=False)
+    image_embs = scorer.encode_images(image_paths, verbose=args.verbose)
+    caption_embs = scorer.encode_text(captions, warn_truncation=False,
+                                      verbose=args.verbose, desc="captions")
 
     # Flatten object texts with per-image offsets, encode once.
     # Every image has a DIFFERENT number of extracted objects, so we can't
@@ -439,7 +459,7 @@ def phase_score(args):
     # on `if flat_texts` — so a dataset where every image happens to extract
     # zero objects still gets f_clipscore's sentence-only term per image below
     # instead of silently skipping reference-free scoring for the whole run.
-    obj_embs_all = scorer.encode_text(flat_texts)
+    obj_embs_all = scorer.encode_text(flat_texts, verbose=args.verbose, desc="objects")
 
     candidate_embs = None
     if run_clipmatch:
@@ -451,7 +471,8 @@ def phase_score(args):
         # gt_nature/gt_biotic and the ClipMatch top-1 prediction can be read
         # straight off its candidate_vocab entry — no separate graph lookup.
         candidate_embs = scorer.encode_text(
-            [clip_metrics.OBJECT_TEMPLATE.format(c["class_name"]) for c in candidate_vocab])
+            [clip_metrics.OBJECT_TEMPLATE.format(c["class_name"]) for c in candidate_vocab],
+            verbose=args.verbose, desc="candidate_vocab")
 
     # ---- Per-image metric accumulation ----
     # These lists/counters accumulate results across every image in the
@@ -461,6 +482,7 @@ def phase_score(args):
     bio_true, bio_pred, mat_true, mat_pred = [], [], [], []
     fclip_vals, objclip_vals = [], []
     hp_vals, hr_vals, hf1_vals = [], [], []
+    wup_vals = []
     n_gt_targets = n_extraction_hits = 0
     n_objects_total = n_parse_fail = n_object_records = 0
     n_map_nature = n_vlm_nature = 0
@@ -472,6 +494,7 @@ def phase_score(args):
     clipmatch_cap_top1 = 0
     clipmatch_cap_support = 0
     hp_cap_vals, hr_cap_vals, hf1_cap_vals = [], [], []
+    wup_cap_vals = []
     flat_rows = []  # one row per stored IMAGE for the output CSV (see below)
 
     # Which images get a row written to the CSV. Fixed at --num_preds_to_store
@@ -508,7 +531,16 @@ def phase_score(args):
     else:
         preds_to_store = {r["image_path"] for r in records}
 
+    # How often to print per-image progress under --verbose: every 5% of the
+    # dataset (at least every 1 image, at most every 500) rather than a fixed
+    # step, so the cadence stays sensible on both tiny (--max_samples) and
+    # full-scale runs.
+    progress_every = max(1, min(500, len(records) // 20)) if args.verbose else None
+
     for idx, rec in enumerate(records):
+        if progress_every and (idx % progress_every == 0 or idx == len(records) - 1):
+            done = idx + 1
+            print(f"🔎 [CLIP] scoring: {done}/{len(records)} images ({done / len(records):.1%})", flush=True)
         objs = rec["objects"]
         finals = rec["object_finals"]
         targets = rec.get("targets", [])
@@ -520,35 +552,61 @@ def phase_score(args):
         # Reset every loop iteration (not just inside `if single_label:`) so a
         # COCO/BIG-5 image never accidentally inherits a stale value left over
         # from a PRECEDING single-label image (Python has no block scoping).
+        # These are ALL the per-image values a --num_preds_to_store CSV row
+        # can carry; populated below depending on single_label vs COCO/BIG-5,
+        # left None wherever a given dataset type has no such value.
         pred_vocab_entry = None
         best_obj_idx = None
+        gt_syn = pred_class_synset = pred_node = None
+        hier = {"hp": None, "hr": None, "hf1": None}
+        wup_sim = None
+        clipmatch_correct = None
+        clipmatch_pred_similarity = None
+        pred_class_synset_cap = pred_node_cap = None
+        hier_cap = {"hp": None, "hr": None, "hf1": None}
+        wup_sim_cap = None
+        clipmatch_cap_correct = None
+        gt_nature_val = pred_nature_val = None
+        gt_biotic_val = pred_biotic_val = None
+        gt_material_val = pred_material_val = None
+        image_gt_nature_val = image_pred_nature_val = None
+        target_matches = None
 
         # diagnostics
         n_objects_total += len(objs)
+        image_n_map_nature = image_n_vlm_nature = image_n_parse_fail = 0
         for lab, fin in zip(rec["object_labels"], finals):
             n_object_records += 1
             if lab.get("parse_failed"):
                 n_parse_fail += 1
+                image_n_parse_fail += 1
             if fin["nature_source"] == "wordnet":
                 n_map_nature += 1
+                image_n_map_nature += 1
             else:
                 n_vlm_nature += 1
+                image_n_vlm_nature += 1
 
         # --- reference-free CLIP metrics (all datasets) ---
-        fclip_vals.append(clip_metrics.f_clipscore(image_embs[idx], caption_embs[idx], rec_obj_embs))
-        objclip_vals.append(clip_metrics.object_clipscore(image_embs[idx], rec_obj_embs))
+        image_fclip = clip_metrics.f_clipscore(image_embs[idx], caption_embs[idx], rec_obj_embs)
+        image_objclip = clip_metrics.object_clipscore(image_embs[idx], rec_obj_embs)
+        fclip_vals.append(image_fclip)
+        objclip_vals.append(image_objclip)
 
         # --- extraction-hit diagnostic (ALL datasets; reporting-only) ---
         # recap §6.3: keep the exact-match extraction rate as a descriptive
         # diagnostic, but it NO LONGER gates or feeds the nature/biotic/material
         # scores (those come from the forced top-1 ClipMatch class on single-
         # label datasets, and from matched-object finals on COCO/BIG-5).
+        image_n_gt_targets = image_n_extraction_hits = 0
         for t in targets:
             if t.get("gt_nature") is None:
                 continue
             n_gt_targets += 1
+            image_n_gt_targets += 1
             if find_matching_object(objs, t) is not None:
                 n_extraction_hits += 1
+                image_n_extraction_hits += 1
 
         if single_label:
             # --- ImageNet/Places (single-label): axes from the ClipMatch TOP-1
@@ -566,10 +624,11 @@ def phase_score(args):
             pred_class_synset = pred_node = None
             best_obj_idx = None
             if rec_obj_embs.shape[0] > 0:
-                _, pred_idx, per_obj_sim = clip_metrics.clipmatch(rec_obj_embs, candidate_embs)
+                per_cand_max, pred_idx, per_obj_sim = clip_metrics.clipmatch(rec_obj_embs, candidate_embs)
                 if pred_idx >= 0:
                     pred_vocab_entry = candidate_vocab[pred_idx]
                     pred_class_synset = pred_vocab_entry["synset_id"]
+                    clipmatch_pred_similarity = float(per_cand_max[pred_idx])
                     # The extracted object most responsible for this prediction
                     # (highest similarity to the predicted class) — used both to
                     # resolve a specific WordNet NODE for hP/hR below, and as the
@@ -585,13 +644,15 @@ def phase_score(args):
             if t0.get("gt_nature") is not None:
                 gt_n = bool(t0["gt_nature"])
                 pn = pred_vocab_entry["gt_nature"] if pred_vocab_entry else None
+                gt_nature_val, pred_nature_val = gt_n, bool(pn) if pn is not None else (not gt_n)
                 nat_true.append(gt_n)
-                nat_pred.append(bool(pn) if pn is not None else (not gt_n))
+                nat_pred.append(pred_nature_val)
             if t0.get("gt_biotic") is not None:
                 gt_b = bool(t0["gt_biotic"])
                 pb = pred_vocab_entry["gt_biotic"] if pred_vocab_entry else None
+                gt_biotic_val, pred_biotic_val = gt_b, bool(pb) if pb is not None else (not gt_b)
                 bio_true.append(gt_b)
-                bio_pred.append(bool(pb) if pb is not None else (not gt_b))
+                bio_pred.append(pred_biotic_val)
             # material: ALWAYS the VLM's own prediction (CLAUDE.md — never mapped),
             # taken from the extracted object most representative of the
             # ClipMatch top-1 predicted class. None (no prediction, object judged
@@ -600,17 +661,27 @@ def phase_score(args):
             if t0.get("gt_material") is not None:
                 gt_m = bool(t0["gt_material"])
                 pm = finals[best_obj_idx]["final_material"] if best_obj_idx is not None else None
+                gt_material_val, pred_material_val = gt_m, bool(pm) if pm is not None else (not gt_m)
                 mat_true.append(gt_m)
-                mat_pred.append(bool(pm) if pm is not None else (not gt_m))
+                mat_pred.append(pred_material_val)
 
             # Every image with a GT synset counts toward support; a total miss
             # (no prediction) scores top-1=0 and hP/hR=0, not excluded.
             if gt_syn:
                 clipmatch_support += 1
-                if pred_class_synset is not None and pred_class_synset == gt_syn:
+                clipmatch_correct = pred_class_synset is not None and pred_class_synset == gt_syn
+                if clipmatch_correct:
                     clipmatch_top1 += 1
                 hier = taxonomy_metrics.compute_hierarchical_metrics(graph, gt_syn, pred_node)
                 hp_vals.append(hier["hp"]); hr_vals.append(hier["hr"]); hf1_vals.append(hier["hf1"])
+                # Wu-Palmer similarity between the predicted object's resolved
+                # WordNet node and the GT synset — a single 0-1 "how close is
+                # the miss" number, complementary to hP/hR's ancestor-overlap
+                # view. compute_wup_similarity already returns 0.0 (not a
+                # crash) when pred_node is None, matching the project's
+                # "prediction-unmapped penalized as wrong" convention.
+                wup_sim = taxonomy_metrics.compute_wup_similarity(gt_syn, pred_node)
+                wup_vals.append(wup_sim)
 
             # --- EXPERIMENTAL: caption-based ClipMatch variant (recap §11 open
             # item), computed in PARALLEL with the object-list version above for
@@ -619,7 +690,6 @@ def phase_score(args):
             # similarity to each candidate, then asks which extracted object
             # best aligns with THAT predicted class (for hP/hR resolution) —
             # see clip_metrics.clipmatch_from_caption.
-            pred_class_synset_cap = pred_node_cap = None
             _, pred_idx_cap = clip_metrics.clipmatch_from_caption(caption_embs[idx], candidate_embs)
             if pred_idx_cap >= 0:
                 pred_class_synset_cap = candidate_vocab[pred_idx_cap]["synset_id"]
@@ -630,11 +700,14 @@ def phase_score(args):
 
             if gt_syn:
                 clipmatch_cap_support += 1
-                if pred_class_synset_cap is not None and pred_class_synset_cap == gt_syn:
+                clipmatch_cap_correct = pred_class_synset_cap is not None and pred_class_synset_cap == gt_syn
+                if clipmatch_cap_correct:
                     clipmatch_cap_top1 += 1
                 hier_cap = taxonomy_metrics.compute_hierarchical_metrics(graph, gt_syn, pred_node_cap)
                 hp_cap_vals.append(hier_cap["hp"]); hr_cap_vals.append(hier_cap["hr"])
                 hf1_cap_vals.append(hier_cap["hf1"])
+                wup_sim_cap = taxonomy_metrics.compute_wup_similarity(gt_syn, pred_node_cap)
+                wup_cap_vals.append(wup_sim_cap)
         else:
             # --- COCO (multi-label) + BIG-5 (holistic): image-level nature OR
             #     + matched-object biotic/material ---
@@ -648,25 +721,40 @@ def phase_score(args):
             # implementable until the Grounding pipeline exists.
             g_nat = image_gt_nature(targets)
             if g_nat is not None:
-                nat_true.append(bool(g_nat))
-                nat_pred.append(bool(image_pred_nature(finals)))
+                image_gt_nature_val = bool(g_nat)
+                image_pred_nature_val = bool(image_pred_nature(finals))
+                nat_true.append(image_gt_nature_val)
+                nat_pred.append(image_pred_nature_val)
+            # Per-target matched-object detail (multi-label datasets can have
+            # several GT targets per image), kept for the CSV's enriched
+            # "gt_targets" field so each target's own matched object + scored
+            # biotic/material prediction is visible, not just the aggregate.
+            target_matches = []
             for t in targets:
                 if t.get("gt_nature") is None:
                     continue
                 mi = find_matching_object(objs, t)
+                match_info = {"class_name": t.get("class_name"), "matched_object_idx": mi,
+                             "matched_object_text": objs[mi] if mi is not None else None}
                 if mi is None:
+                    target_matches.append(match_info)
                     continue
                 fin = finals[mi]
                 if t.get("gt_biotic") is not None:
                     gt_b = bool(t["gt_biotic"])
                     pred_b = fin["final_biotic"]
+                    pred_b = bool(pred_b) if pred_b is not None else (not gt_b)
                     bio_true.append(gt_b)
-                    bio_pred.append(bool(pred_b) if pred_b is not None else (not gt_b))
+                    bio_pred.append(pred_b)
+                    match_info["gt_biotic"], match_info["pred_biotic"] = gt_b, pred_b
                 if t.get("gt_material") is not None:
                     gt_m = bool(t["gt_material"])
                     pred_m = fin["final_material"]
+                    pred_m = bool(pred_m) if pred_m is not None else (not gt_m)
                     mat_true.append(gt_m)
-                    mat_pred.append(bool(pred_m) if pred_m is not None else (not gt_m))
+                    mat_pred.append(pred_m)
+                    match_info["gt_material"], match_info["pred_material"] = gt_m, pred_m
+                target_matches.append(match_info)
 
         # One CSV row PER IMAGE (not per object) — everything needed to
         # spot-check a single image's whole prediction lives on one line:
@@ -687,16 +775,55 @@ def phase_score(args):
                 }
                 for obj, lab, fin in zip(objs, rec["object_labels"], finals)
             ])
+            # "gt_targets" carries the raw target dicts, PLUS (multi-label
+            # datasets only) "target_matches" — which object matched each
+            # target and what it scored on biotic/material (see the coco/big5
+            # branch above). None on single-label datasets, where there's only
+            # ever one target and it's covered by the clipmatch_* columns.
+            gt_targets_json = json.dumps({"targets": targets, "target_matches": target_matches})
             flat_rows.append({
                 "image_path": rec["image_path"],
+                "dataset": dataset,
+                "model": header.get("model"),
                 "caption": rec["caption"],
                 "objects": objects_json,
-                "gt_targets": json.dumps(targets),
+                "gt_targets": gt_targets_json,
+                "n_objects": len(objs),
+                "f_clipscore": image_fclip,
+                "object_clipscore": image_objclip,
+                "wordnet_mapping_rate_image": (image_n_map_nature / (image_n_map_nature + image_n_vlm_nature))
+                                               if (image_n_map_nature + image_n_vlm_nature) else None,
+                "parse_failure_count_image": image_n_parse_fail,
+                "extraction_hit_rate_image": (image_n_extraction_hits / image_n_gt_targets)
+                                              if image_n_gt_targets else None,
+                # image-level nature (COCO/BIG-5 only; single-label's nature
+                # verdict is the clipmatch_pred_nature column below instead)
+                "image_gt_nature": image_gt_nature_val,
+                "image_pred_nature": image_pred_nature_val,
+                # single-label (ImageNet/Places) axis verdicts
+                "gt_nature": gt_nature_val, "pred_nature": pred_nature_val,
+                "gt_biotic": gt_biotic_val, "pred_biotic": pred_biotic_val,
+                "gt_material": gt_material_val, "pred_material": pred_material_val,
+                # ClipMatch [object-list] — the metric actually used for scoring
                 "clipmatch_pred_class": pred_vocab_entry["class_name"] if pred_vocab_entry else None,
                 "clipmatch_pred_synset": pred_vocab_entry["synset_id"] if pred_vocab_entry else None,
+                "clipmatch_pred_similarity": clipmatch_pred_similarity,
                 "clipmatch_pred_nature": pred_vocab_entry["gt_nature"] if pred_vocab_entry else None,
                 "clipmatch_pred_biotic": pred_vocab_entry["gt_biotic"] if pred_vocab_entry else None,
                 "clipmatch_pred_material": finals[best_obj_idx]["final_material"] if best_obj_idx is not None else None,
+                "clipmatch_top1_correct": clipmatch_correct,
+                "gt_synset": gt_syn,
+                "resolved_pred_synset": pred_node,
+                "hierarchical_precision": hier["hp"], "hierarchical_recall": hier["hr"],
+                "hierarchical_f1": hier["hf1"],
+                "wup_similarity": wup_sim,
+                # ClipMatch [caption, EXPERIMENTAL] — recap §11, not used for scoring
+                "clipmatch_caption_pred_synset": pred_class_synset_cap,
+                "clipmatch_caption_top1_correct": clipmatch_cap_correct,
+                "resolved_pred_synset_caption": pred_node_cap,
+                "hierarchical_precision_caption": hier_cap["hp"], "hierarchical_recall_caption": hier_cap["hr"],
+                "hierarchical_f1_caption": hier_cap["hf1"],
+                "wup_similarity_caption": wup_sim_cap,
             })
 
     # ---- Assemble summary ----
@@ -737,7 +864,8 @@ def phase_score(args):
             "support": clipmatch_support,
         }
         summary["hierarchical"] = {"hp": _mean(hp_vals), "hr": _mean(hr_vals),
-                                   "hf1": _mean(hf1_vals), "support": len(hf1_vals)}
+                                   "hf1": _mean(hf1_vals), "wup": _mean(wup_vals),
+                                   "support": len(hf1_vals)}
         # EXPERIMENTAL caption-based variant (recap §11), printed alongside the
         # object-list version above for comparison — see clipmatch_from_caption.
         summary["clipmatch_caption"] = {
@@ -745,7 +873,8 @@ def phase_score(args):
             "support": clipmatch_cap_support,
         }
         summary["hierarchical_caption"] = {"hp": _mean(hp_cap_vals), "hr": _mean(hr_cap_vals),
-                                           "hf1": _mean(hf1_cap_vals), "support": len(hf1_cap_vals)}
+                                           "hf1": _mean(hf1_cap_vals), "wup": _mean(wup_cap_vals),
+                                           "support": len(hf1_cap_vals)}
 
     # Wall-clock time this model took to finish this run, formatted "D-HH:MM:SS"
     # (SLURM-style elapsed time). inference_time_seconds comes from phase_infer's
@@ -825,14 +954,14 @@ def _print_summary(s, run_clipmatch):
         print(f"Top-1: {s['clipmatch']['top1_accuracy']:.4f}")
         h = s["hierarchical"]
         print(f"--- Hierarchical [object-list] (support {h['support']}) ---")
-        print(f"hP {h['hp']:.4f} | hR {h['hr']:.4f} | hF1 {h['hf1']:.4f}")
+        print(f"hP {h['hp']:.4f} | hR {h['hr']:.4f} | hF1 {h['hf1']:.4f} | Wu-Palmer {h['wup']:.4f}")
         # EXPERIMENTAL caption-based variant (recap §11), printed for direct
         # comparison against the object-list version above.
         print(f"\n--- ClipMatch [caption, EXPERIMENTAL] (support {s['clipmatch_caption']['support']}) ---")
         print(f"Top-1: {s['clipmatch_caption']['top1_accuracy']:.4f}")
         hc = s["hierarchical_caption"]
         print(f"--- Hierarchical [caption, EXPERIMENTAL] (support {hc['support']}) ---")
-        print(f"hP {hc['hp']:.4f} | hR {hc['hr']:.4f} | hF1 {hc['hf1']:.4f}")
+        print(f"hP {hc['hp']:.4f} | hR {hc['hr']:.4f} | hF1 {hc['hf1']:.4f} | Wu-Palmer {hc['wup']:.4f}")
     t = s["execution_time"]
     inf_str = t["inference"] if t["inference"] is not None else "n/a"
     print(f"\nExecution time (D-HH:MM:SS): inference {inf_str} | scoring {t['scoring']} | total {t['total']}")
@@ -866,9 +995,11 @@ def _log_wandb(args, summary, run_clipmatch):
     if run_clipmatch:
         log["ClipMatch/Top1"] = summary["clipmatch"]["top1_accuracy"]
         log["Hierarchical/hF1"] = summary["hierarchical"]["hf1"]
+        log["Hierarchical/WuPalmer"] = summary["hierarchical"]["wup"]
         # EXPERIMENTAL caption-based variant (recap §11).
         log["ClipMatchCaption/Top1"] = summary["clipmatch_caption"]["top1_accuracy"]
         log["HierarchicalCaption/hF1"] = summary["hierarchical_caption"]["hf1"]
+        log["HierarchicalCaption/WuPalmer"] = summary["hierarchical_caption"]["wup"]
     wandb.log(log)
     wandb.finish()
 
@@ -876,11 +1007,16 @@ def _log_wandb(args, summary, run_clipmatch):
 # =============================================================================
 # CLI
 # =============================================================================
-def parse_args():
+def build_arg_parser():
     """Define every command-line flag this script accepts. Grouped into:
     stage/dataset selection, taxonomy/context files, per-dataset paths, VLM
     settings (only used by --stage infer/all), CLIP settings (only used by
-    --stage score/all), and shared output options."""
+    --stage score/all), and shared output options.
+
+    Split out from parse_args() (which just calls this + .parse_args()) so
+    main()'s --stage all can also build a parser purely to INTROSPECT its
+    defaults via _args_to_cli, when reconstructing CLI flags to re-invoke
+    this same script as a real subprocess for --stage infer/score."""
     p = argparse.ArgumentParser(description="Two-phase baseline VLM pipeline (infer -> score).")
     p.add_argument("--stage", choices=["all", "infer", "score"], default="all",
                    help="'all' (default) runs the full end-to-end pipeline in one process, "
@@ -945,9 +1081,25 @@ def parse_args():
                         "more aggressively. Default 3 (previous behavior). Stored in the "
                         "artifact header and reused by --stage score.")
 
-    # CLIP (score)
-    p.add_argument("--clip_model", type=str, default="ViT-L-14")
-    p.add_argument("--clip_pretrained", type=str, default="openai")
+    # CLIP (score) — loaded via transformers (src/evaluation/clip_metrics.py's
+    # CLIPScorer), NOT open_clip. --clip_model accepts either a short alias
+    # from clip_metrics.CLIP_PRESETS ("original", "eva-clip", "fg-clip2") or
+    # any raw HuggingFace repo id directly (e.g. to override a preset's
+    # default checkpoint, or use a variant not in the preset table). llm2clip
+    # is deliberately NOT supported — its text tower needs the `llm2vec`
+    # package, which hard-pins transformers<=4.44.2 and is incompatible with
+    # vLLM's transformers>=5.5.3 in this project's single environment (see
+    # clip_metrics.CLIP_PRESETS's module comment).
+    p.add_argument("--clip_model", type=str, default="original",
+                   help="CLIP checkpoint: a clip_metrics.CLIP_PRESETS alias "
+                        "('original', 'eva-clip', 'fg-clip2') or a raw "
+                        "HuggingFace repo id.")
+    p.add_argument("--clip_trust_remote_code", type=lambda s: s.lower() != "false", default=True,
+                   help="Passed to transformers' from_pretrained calls (default True). Several "
+                        "CLIP variants (EVA-CLIP, FG-CLIP2) ship custom modeling code on the Hub "
+                        "that requires this; it's a no-op for checkpoints that don't need it "
+                        "(e.g. the original OpenAI CLIP). Pass --clip_trust_remote_code false to "
+                        "disable.")
     p.add_argument("--clip_batch_size", type=int, default=64)
 
     # shared
@@ -975,7 +1127,18 @@ def parse_args():
                         "images.")
     p.add_argument("--verbose", action="store_true")
     p.add_argument("--wandb", action="store_true")
+    p.add_argument("--wandb_run_id", type=str, default=None, help=argparse.SUPPRESS)
+    # ^ Internal plumbing, not meant to be passed by hand: under --stage all,
+    # main() generates ONE shared W&B run id and this flag is how it's threaded
+    # into the infer/score subprocess CLI (see _args_to_cli + _log_wandb's
+    # resume="allow" if run_id else None), so both halves log into the same
+    # W&B run instead of each starting its own. Hidden from --help.
 
+    return p
+
+
+def parse_args():
+    p = build_arg_parser()
     args = p.parse_args()
     if args.stage in ("infer", "all"):
         # These two flags are only conditionally required (argparse can't
@@ -1006,22 +1169,50 @@ def _resolve_responses_file(args):
 
 
 # =============================================================================
-# Subprocess workers (for --stage all)
+# Subprocess re-invocation (for --stage all)
 # =============================================================================
-def _infer_worker(args):
-    """Subprocess entrypoint for the inference half of --stage all. Runs
-    phase_infer and then simply RETURNS/EXITS: letting the whole subprocess die
-    is what actually reclaims the VLM's VRAM — the OS tears down the process's
-    entire CUDA context, which is more reliable than an in-process unload (vLLM
-    and torch do not dependably release CUDA memory on Python GC)."""
-    phase_infer(args)
+def _args_to_cli(args, parser, stage):
+    """Rebuild a `sys.argv`-style flag list from a parsed args Namespace, to
+    re-invoke THIS SAME SCRIPT as a genuinely separate OS process (see
+    main()'s --stage all for why — a real subprocess, not
+    multiprocessing.Process, to avoid nesting inside vLLM's own internal
+    engine-core subprocess).
+
+    Only emits a flag when its value differs from that action's own default
+    (so the subprocess falls back to the SAME defaults for anything the user
+    didn't explicitly set, rather than this function needing to know what
+    every default is). Introspects `parser`'s actions rather than
+    hardcoding each flag's name/type, so it stays correct as flags are
+    added/changed in build_arg_parser() without needing a parallel update
+    here.
+    """
+    argv = ["--stage", stage]
+    for action in parser._actions:
+        if not action.option_strings or action.dest in ("help", "stage"):
+            continue
+        value = getattr(args, action.dest, None)
+        if value == action.default:
+            continue
+        flag = action.option_strings[0]
+        if isinstance(action, argparse._StoreTrueAction):
+            if value:
+                argv.append(flag)
+        elif value is None:
+            continue
+        else:
+            argv.extend([flag, str(value)])
+    return argv
 
 
-def _score_worker(args):
-    """Subprocess entrypoint for the scoring half of --stage all — loads CLIP in
-    a FRESH process that starts with zero GPU memory held (the infer subprocess
-    that held the VLM has already exited)."""
-    phase_score(args)
+def _run_stage_subprocess(args, parser, stage):
+    """Re-invoke this script (`python run_vlm_pipeline.py --stage <stage> ...`)
+    as a genuine OS subprocess and wait for it to finish, raising if it
+    failed. Inherits this process's stdout/stderr/env/cwd, so logs interleave
+    live exactly as they would running that --stage by hand."""
+    cmd = [sys.executable, str(Path(__file__).resolve())] + _args_to_cli(args, parser, stage)
+    result = subprocess.run(cmd)
+    if result.returncode != 0:
+        raise RuntimeError(f"--stage {stage} subprocess failed (exit code {result.returncode}).")
 
 
 def main():
@@ -1035,31 +1226,22 @@ def main():
         phase_score(args)
         return
 
-    # --stage all: run each half in its OWN spawned subprocess so GPU memory is
-    # fully reclaimed by the OS between stages — the VLM (infer) and CLIP (score)
-    # never coexist on the GPU, and we don't rely on in-process CUDA cleanup.
-    #   - 'spawn' (NOT 'fork') is required to use CUDA in a child process.
-    #   - Only the picklable argparse Namespace crosses the boundary — paths and
-    #     plain scalars, never tensors or model handles.
-    #   - A shared W&B run id (below) is threaded through so both subprocesses
-    #     log into one run (see _log_wandb).
+    # --stage all: run each half as its OWN separate OS subprocess (see the
+    # module docstring's --stage all section for why this is subprocess.run,
+    # NOT multiprocessing.Process — the latter nests inside vLLM's own
+    # internal engine-core subprocess and can deadlock). GPU memory is fully
+    # reclaimed by the OS when the infer subprocess exits, before the score
+    # subprocess starts — the VLM and CLIP never coexist on the GPU, and we
+    # don't rely on in-process CUDA cleanup.
+    #   - A shared W&B run id (below) is threaded through via --wandb_run_id
+    #     so both subprocesses log into one run (see _log_wandb).
     if args.wandb:
         import wandb
         args.wandb_run_id = wandb.util.generate_id()
 
-    ctx = mp.get_context("spawn")
-
-    p1 = ctx.Process(target=_infer_worker, args=(args,))
-    p1.start()
-    p1.join()
-    if p1.exitcode != 0:
-        raise RuntimeError(f"VLM inference stage failed (exit code {p1.exitcode}).")
-
-    p2 = ctx.Process(target=_score_worker, args=(args,))
-    p2.start()
-    p2.join()
-    if p2.exitcode != 0:
-        raise RuntimeError(f"Scoring stage failed (exit code {p2.exitcode}).")
+    parser = build_arg_parser()
+    _run_stage_subprocess(args, parser, "infer")
+    _run_stage_subprocess(args, parser, "score")
 
     # --stage all's --responses_file is purely the internal handoff between
     # the two subprocesses above — scoring just finished reading it, so

@@ -18,29 +18,41 @@ tqdm>=4.65
 pydantic>=2.0          # v2 API required (model_json_schema / model_fields)
 
 # --- VLM inference backends (src/models/vlm_models.py) ---
-# vLLM-served families (qwen/mistral/llava): needs SamplingParams,
+# vLLM-served families (qwen/mistral/llava/gemma): needs SamplingParams,
 # GuidedDecodingParams, and vllm.distributed.parallel_state's
-# destroy_model_parallel/destroy_distributed_environment (recent vLLM).
-vllm>=0.5.0
-# HuggingFace-served families (blip/blip2/instructblip/blip3): guided
-# (structured) decoding on this backend goes through outlines' transformers
-# integration (outlines.integrations.transformers.JSONPrefixAllowedTokens).
-# outlines 1.0.0 removed that module in a full API rewrite (whole-model
-# wrapper instead of a prefix_allowed_tokens_fn-compatible class), so pin
-# below 1.0.0 — 0.0.46 is the last release with the old integrations API.
-# NOTE: we also force vLLM's structured_outputs backend="outlines" (see
-# VLLMBackedVLM._make_sampling_params) — if that raises a version-mismatch
-# error against this pin, tell Claude the vllm version so it can check
-# vLLM's own outlines requirement for that release.
+# destroy_model_parallel/destroy_distributed_environment.
+#
+# IMPORTANT — DO NOT re-add an `outlines<1.0.0` upper pin here, and DO NOT
+# pin transformers/torch/xformers/outlines to specific versions of your own.
+# Doing so caps vLLM at a stale release: `outlines<1.0.0` (previously here)
+# forced pip to backtrack to vllm 0.9.2, which (a) crashed on newer
+# transformers via the aimv2 config collision and (b) was too old to load
+# recent models (Gemma's rope_scaling config -> "rope_scaling should have a
+# 'rope_type' key"). vLLM pins its OWN coherent torch/xformers/transformers/
+# outlines set — let it win. Give it only a recent FLOOR and stay out of the way.
+vllm>=0.10.0
 transformers>=4.40
-outlines>=0.0.40,<1.0.0
 torch>=2.1
 torchvision>=0.16
 Pillow>=10.0
+# HuggingFace-served families (blip/blip2/instructblip/blip3) ONLY: their
+# structured decoding used outlines.integrations.transformers.JSONPrefixAllowedTokens,
+# which outlines 1.0 removed. vLLM now pulls outlines>=1.0, so if you actually
+# run a BLIP-family model, that specific code path in vlm_models.py needs
+# updating to the outlines 1.0 API — a separate task, and NOT something to
+# "fix" by pinning outlines back down (that re-breaks vLLM as described above).
 
 # --- CLIP-based metrics (src/evaluation/clip_metrics.py) ---
-# F-CLIPScore, Object-CLIPScore, ClipMatch all run on open_clip's ViT-L/14.
-open_clip_torch>=2.24
+# F-CLIPScore, Object-CLIPScore, ClipMatch all run through a CLIPScorer
+# (transformers AutoModel/AutoProcessor — see clip_metrics.CLIP_PRESETS for
+# the supported checkpoints: original CLIP, EVA-CLIP, FG-CLIP2). No open_clip
+# dependency; transformers>=4.40 above already covers all three.
+# NOTE: LLM2CLIP is intentionally NOT supported — its text tower requires the
+# `llm2vec` package, which hard-pins transformers<=4.44.2. That's incompatible
+# with vLLM's transformers>=5.5.3 requirement in this project's single
+# environment (confirmed: installing llm2vec force-downgrades transformers
+# and breaks vLLM). Would need a second, separate environment to use — not
+# worth the operational overhead here.
 
 # --- Experiment tracking ---
 wandb>=0.16

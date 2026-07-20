@@ -53,11 +53,13 @@ from pydantic import BaseModel, Field
 # only describe the single most obvious subject and skip everything else
 # (called "salience bias"), and tends to be too short to mention secondary
 # details ("brevity bias"). This neutral caption becomes the input to Stage 2.
-CAPTION_PROMPT = (
+"""CAPTION_PROMPT = (
     "Describe this image in 3-4 sentences, covering the main subject, the "
     "background, the setting, and any secondary elements present. Be "
     "specific but concise."
-)
+)"""
+
+CAPTION_PROMPT = "What is this?"
 
 # =============================================================================
 # Stage 2 — Object extraction (structured)
@@ -75,9 +77,9 @@ CAPTION_PROMPT = (
 # (one taxonomy-labeling call per object) and into the CLIP-based metrics
 # (each object becomes its own "a photo of a {object}" text embedding).
 EXTRACTION_PROMPT = (
-    "Below is a description of the image:\n\n"
+    "Below is a general description of the image:\n\n"
     "\"{caption}\"\n\n"
-    "Using BOTH the image and the description, list every distinct physical "
+    "Using BOTH the image and the description, list every distinct "
     "object, element, or entity that appears in the image. Follow these rules:\n"
     "  - Return each object as a noun or a compound noun (e.g. \"bench\", "
     "\"golden retriever\", \"mountain\", \"hen of the woods\").\n"
