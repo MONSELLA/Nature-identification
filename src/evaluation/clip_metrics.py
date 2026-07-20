@@ -217,9 +217,29 @@ class CLIPScorer:
         model_cls = get_class_from_dynamic_module(class_ref, repo_id)
         return model_cls.from_pretrained(repo_id, trust_remote_code=trust_remote_code)
 
+    def _unwrap_embedding(self, output, projection_attr: str):
+        """`get_text_features`/`get_image_features` are meant to return the
+        already-projected embedding tensor. On some `transformers` versions
+        (observed with plain `openai/clip-vit-large-patch14` under a
+        transformers>=5.5.3-family install — see requirements.txt's vLLM
+        pin) that convenience method regresses and instead returns the raw
+        encoder `ModelOutput` (e.g. `BaseModelOutputWithPooling`), which has
+        no `.norm()`/is not a tensor. Recover manually: pull the pooled
+        output and run it through the model's own projection layer, i.e.
+        exactly what the convenience method was supposed to do.
+        """
+        if isinstance(output, self._torch.Tensor):
+            return output
+        pooled = getattr(output, "pooler_output", None)
+        if pooled is None:
+            pooled = output.last_hidden_state[:, 0, :]
+        projection = getattr(self.model, projection_attr, None)
+        return projection(pooled) if projection is not None else pooled
+
     def _text_features(self, inputs: dict):
         if hasattr(self.model, "get_text_features"):
-            return self.model.get_text_features(**inputs)
+            out = self.model.get_text_features(**inputs)
+            return self._unwrap_embedding(out, "text_projection")
         if hasattr(self.model, "encode_text"):
             return self.model.encode_text(inputs["input_ids"])
         raise AttributeError(
@@ -230,7 +250,8 @@ class CLIPScorer:
 
     def _image_features(self, inputs: dict):
         if hasattr(self.model, "get_image_features"):
-            return self.model.get_image_features(**inputs)
+            out = self.model.get_image_features(**inputs)
+            return self._unwrap_embedding(out, "visual_projection")
         if hasattr(self.model, "encode_image"):
             return self.model.encode_image(inputs["pixel_values"])
         raise AttributeError(
