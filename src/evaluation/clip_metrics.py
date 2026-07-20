@@ -238,12 +238,29 @@ class CLIPScorer:
         dtype its own config declares, rather than transformers' unconditional
         fp32 fallback — load_in fp32 is fine for the small original CLIP, but
         would try to allocate ~32GB for the 8B-param EVA-CLIP-8B preset.
+
+        `low_cpu_mem_usage=False` is forced on every `from_pretrained` call
+        here for a real reason, not just a default: passing `torch_dtype`
+        at all makes `transformers` default to the "fast init" path, which
+        constructs the model on the meta device (empty shapes, no storage)
+        and materializes real tensors only for what the checkpoint's
+        state_dict covers. Custom trust_remote_code checkpoints that build a
+        buffer/tensor themselves in __init__ OUTSIDE that state_dict-driven
+        path (observed with fg-clip2's positional-embedding mask) never get
+        materialized under fast init, so using it later crashes with
+        `NotImplementedError: Cannot copy out of meta tensor; no data!` — a
+        real bug this project hit, not a hypothetical. Forcing eager
+        (non-meta) init avoids it, matching what a plain from_pretrained
+        call without torch_dtype (e.g. this checkpoint's own HF model-card
+        example) gets by default. The one-time cost is loading briefly in
+        full CPU RAM before the requested dtype/device takes over.
         """
         from transformers import AutoConfig, AutoModel
 
         try:
             return AutoModel.from_pretrained(
-                repo_id, trust_remote_code=trust_remote_code, torch_dtype=torch_dtype
+                repo_id, trust_remote_code=trust_remote_code, torch_dtype=torch_dtype,
+                low_cpu_mem_usage=False,
             )
         except ValueError as e:
             if "Unrecognized configuration class" not in str(e):
@@ -266,7 +283,8 @@ class CLIPScorer:
         from transformers.dynamic_module_utils import get_class_from_dynamic_module
         model_cls = get_class_from_dynamic_module(class_ref, repo_id)
         return model_cls.from_pretrained(
-            repo_id, trust_remote_code=trust_remote_code, torch_dtype=torch_dtype
+            repo_id, trust_remote_code=trust_remote_code, torch_dtype=torch_dtype,
+            low_cpu_mem_usage=False,
         )
 
     @staticmethod
