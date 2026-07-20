@@ -463,6 +463,7 @@ def phase_score(args):
     bio_true, bio_pred, mat_true, mat_pred = [], [], [], []
     fclip_vals, objclip_vals = [], []
     hp_vals, hr_vals, hf1_vals = [], [], []
+    wup_vals = []
     n_gt_targets = n_extraction_hits = 0
     n_objects_total = n_parse_fail = n_object_records = 0
     n_map_nature = n_vlm_nature = 0
@@ -474,6 +475,7 @@ def phase_score(args):
     clipmatch_cap_top1 = 0
     clipmatch_cap_support = 0
     hp_cap_vals, hr_cap_vals, hf1_cap_vals = [], [], []
+    wup_cap_vals = []
     flat_rows = []  # one row per stored IMAGE for the output CSV (see below)
 
     # Which images get a row written to the CSV. Fixed at --num_preds_to_store
@@ -531,35 +533,61 @@ def phase_score(args):
         # Reset every loop iteration (not just inside `if single_label:`) so a
         # COCO/BIG-5 image never accidentally inherits a stale value left over
         # from a PRECEDING single-label image (Python has no block scoping).
+        # These are ALL the per-image values a --num_preds_to_store CSV row
+        # can carry; populated below depending on single_label vs COCO/BIG-5,
+        # left None wherever a given dataset type has no such value.
         pred_vocab_entry = None
         best_obj_idx = None
+        gt_syn = pred_class_synset = pred_node = None
+        hier = {"hp": None, "hr": None, "hf1": None}
+        wup_sim = None
+        clipmatch_correct = None
+        clipmatch_pred_similarity = None
+        pred_class_synset_cap = pred_node_cap = None
+        hier_cap = {"hp": None, "hr": None, "hf1": None}
+        wup_sim_cap = None
+        clipmatch_cap_correct = None
+        gt_nature_val = pred_nature_val = None
+        gt_biotic_val = pred_biotic_val = None
+        gt_material_val = pred_material_val = None
+        image_gt_nature_val = image_pred_nature_val = None
+        target_matches = None
 
         # diagnostics
         n_objects_total += len(objs)
+        image_n_map_nature = image_n_vlm_nature = image_n_parse_fail = 0
         for lab, fin in zip(rec["object_labels"], finals):
             n_object_records += 1
             if lab.get("parse_failed"):
                 n_parse_fail += 1
+                image_n_parse_fail += 1
             if fin["nature_source"] == "wordnet":
                 n_map_nature += 1
+                image_n_map_nature += 1
             else:
                 n_vlm_nature += 1
+                image_n_vlm_nature += 1
 
         # --- reference-free CLIP metrics (all datasets) ---
-        fclip_vals.append(clip_metrics.f_clipscore(image_embs[idx], caption_embs[idx], rec_obj_embs))
-        objclip_vals.append(clip_metrics.object_clipscore(image_embs[idx], rec_obj_embs))
+        image_fclip = clip_metrics.f_clipscore(image_embs[idx], caption_embs[idx], rec_obj_embs)
+        image_objclip = clip_metrics.object_clipscore(image_embs[idx], rec_obj_embs)
+        fclip_vals.append(image_fclip)
+        objclip_vals.append(image_objclip)
 
         # --- extraction-hit diagnostic (ALL datasets; reporting-only) ---
         # recap §6.3: keep the exact-match extraction rate as a descriptive
         # diagnostic, but it NO LONGER gates or feeds the nature/biotic/material
         # scores (those come from the forced top-1 ClipMatch class on single-
         # label datasets, and from matched-object finals on COCO/BIG-5).
+        image_n_gt_targets = image_n_extraction_hits = 0
         for t in targets:
             if t.get("gt_nature") is None:
                 continue
             n_gt_targets += 1
+            image_n_gt_targets += 1
             if find_matching_object(objs, t) is not None:
                 n_extraction_hits += 1
+                image_n_extraction_hits += 1
 
         if single_label:
             # --- ImageNet/Places (single-label): axes from the ClipMatch TOP-1
@@ -577,10 +605,11 @@ def phase_score(args):
             pred_class_synset = pred_node = None
             best_obj_idx = None
             if rec_obj_embs.shape[0] > 0:
-                _, pred_idx, per_obj_sim = clip_metrics.clipmatch(rec_obj_embs, candidate_embs)
+                per_cand_max, pred_idx, per_obj_sim = clip_metrics.clipmatch(rec_obj_embs, candidate_embs)
                 if pred_idx >= 0:
                     pred_vocab_entry = candidate_vocab[pred_idx]
                     pred_class_synset = pred_vocab_entry["synset_id"]
+                    clipmatch_pred_similarity = float(per_cand_max[pred_idx])
                     # The extracted object most responsible for this prediction
                     # (highest similarity to the predicted class) — used both to
                     # resolve a specific WordNet NODE for hP/hR below, and as the
@@ -596,13 +625,15 @@ def phase_score(args):
             if t0.get("gt_nature") is not None:
                 gt_n = bool(t0["gt_nature"])
                 pn = pred_vocab_entry["gt_nature"] if pred_vocab_entry else None
+                gt_nature_val, pred_nature_val = gt_n, bool(pn) if pn is not None else (not gt_n)
                 nat_true.append(gt_n)
-                nat_pred.append(bool(pn) if pn is not None else (not gt_n))
+                nat_pred.append(pred_nature_val)
             if t0.get("gt_biotic") is not None:
                 gt_b = bool(t0["gt_biotic"])
                 pb = pred_vocab_entry["gt_biotic"] if pred_vocab_entry else None
+                gt_biotic_val, pred_biotic_val = gt_b, bool(pb) if pb is not None else (not gt_b)
                 bio_true.append(gt_b)
-                bio_pred.append(bool(pb) if pb is not None else (not gt_b))
+                bio_pred.append(pred_biotic_val)
             # material: ALWAYS the VLM's own prediction (CLAUDE.md — never mapped),
             # taken from the extracted object most representative of the
             # ClipMatch top-1 predicted class. None (no prediction, object judged
@@ -611,17 +642,27 @@ def phase_score(args):
             if t0.get("gt_material") is not None:
                 gt_m = bool(t0["gt_material"])
                 pm = finals[best_obj_idx]["final_material"] if best_obj_idx is not None else None
+                gt_material_val, pred_material_val = gt_m, bool(pm) if pm is not None else (not gt_m)
                 mat_true.append(gt_m)
-                mat_pred.append(bool(pm) if pm is not None else (not gt_m))
+                mat_pred.append(pred_material_val)
 
             # Every image with a GT synset counts toward support; a total miss
             # (no prediction) scores top-1=0 and hP/hR=0, not excluded.
             if gt_syn:
                 clipmatch_support += 1
-                if pred_class_synset is not None and pred_class_synset == gt_syn:
+                clipmatch_correct = pred_class_synset is not None and pred_class_synset == gt_syn
+                if clipmatch_correct:
                     clipmatch_top1 += 1
                 hier = taxonomy_metrics.compute_hierarchical_metrics(graph, gt_syn, pred_node)
                 hp_vals.append(hier["hp"]); hr_vals.append(hier["hr"]); hf1_vals.append(hier["hf1"])
+                # Wu-Palmer similarity between the predicted object's resolved
+                # WordNet node and the GT synset — a single 0-1 "how close is
+                # the miss" number, complementary to hP/hR's ancestor-overlap
+                # view. compute_wup_similarity already returns 0.0 (not a
+                # crash) when pred_node is None, matching the project's
+                # "prediction-unmapped penalized as wrong" convention.
+                wup_sim = taxonomy_metrics.compute_wup_similarity(gt_syn, pred_node)
+                wup_vals.append(wup_sim)
 
             # --- EXPERIMENTAL: caption-based ClipMatch variant (recap §11 open
             # item), computed in PARALLEL with the object-list version above for
@@ -630,7 +671,6 @@ def phase_score(args):
             # similarity to each candidate, then asks which extracted object
             # best aligns with THAT predicted class (for hP/hR resolution) —
             # see clip_metrics.clipmatch_from_caption.
-            pred_class_synset_cap = pred_node_cap = None
             _, pred_idx_cap = clip_metrics.clipmatch_from_caption(caption_embs[idx], candidate_embs)
             if pred_idx_cap >= 0:
                 pred_class_synset_cap = candidate_vocab[pred_idx_cap]["synset_id"]
@@ -641,11 +681,14 @@ def phase_score(args):
 
             if gt_syn:
                 clipmatch_cap_support += 1
-                if pred_class_synset_cap is not None and pred_class_synset_cap == gt_syn:
+                clipmatch_cap_correct = pred_class_synset_cap is not None and pred_class_synset_cap == gt_syn
+                if clipmatch_cap_correct:
                     clipmatch_cap_top1 += 1
                 hier_cap = taxonomy_metrics.compute_hierarchical_metrics(graph, gt_syn, pred_node_cap)
                 hp_cap_vals.append(hier_cap["hp"]); hr_cap_vals.append(hier_cap["hr"])
                 hf1_cap_vals.append(hier_cap["hf1"])
+                wup_sim_cap = taxonomy_metrics.compute_wup_similarity(gt_syn, pred_node_cap)
+                wup_cap_vals.append(wup_sim_cap)
         else:
             # --- COCO (multi-label) + BIG-5 (holistic): image-level nature OR
             #     + matched-object biotic/material ---
@@ -659,25 +702,40 @@ def phase_score(args):
             # implementable until the Grounding pipeline exists.
             g_nat = image_gt_nature(targets)
             if g_nat is not None:
-                nat_true.append(bool(g_nat))
-                nat_pred.append(bool(image_pred_nature(finals)))
+                image_gt_nature_val = bool(g_nat)
+                image_pred_nature_val = bool(image_pred_nature(finals))
+                nat_true.append(image_gt_nature_val)
+                nat_pred.append(image_pred_nature_val)
+            # Per-target matched-object detail (multi-label datasets can have
+            # several GT targets per image), kept for the CSV's enriched
+            # "gt_targets" field so each target's own matched object + scored
+            # biotic/material prediction is visible, not just the aggregate.
+            target_matches = []
             for t in targets:
                 if t.get("gt_nature") is None:
                     continue
                 mi = find_matching_object(objs, t)
+                match_info = {"class_name": t.get("class_name"), "matched_object_idx": mi,
+                             "matched_object_text": objs[mi] if mi is not None else None}
                 if mi is None:
+                    target_matches.append(match_info)
                     continue
                 fin = finals[mi]
                 if t.get("gt_biotic") is not None:
                     gt_b = bool(t["gt_biotic"])
                     pred_b = fin["final_biotic"]
+                    pred_b = bool(pred_b) if pred_b is not None else (not gt_b)
                     bio_true.append(gt_b)
-                    bio_pred.append(bool(pred_b) if pred_b is not None else (not gt_b))
+                    bio_pred.append(pred_b)
+                    match_info["gt_biotic"], match_info["pred_biotic"] = gt_b, pred_b
                 if t.get("gt_material") is not None:
                     gt_m = bool(t["gt_material"])
                     pred_m = fin["final_material"]
+                    pred_m = bool(pred_m) if pred_m is not None else (not gt_m)
                     mat_true.append(gt_m)
-                    mat_pred.append(bool(pred_m) if pred_m is not None else (not gt_m))
+                    mat_pred.append(pred_m)
+                    match_info["gt_material"], match_info["pred_material"] = gt_m, pred_m
+                target_matches.append(match_info)
 
         # One CSV row PER IMAGE (not per object) — everything needed to
         # spot-check a single image's whole prediction lives on one line:
@@ -698,16 +756,55 @@ def phase_score(args):
                 }
                 for obj, lab, fin in zip(objs, rec["object_labels"], finals)
             ])
+            # "gt_targets" carries the raw target dicts, PLUS (multi-label
+            # datasets only) "target_matches" — which object matched each
+            # target and what it scored on biotic/material (see the coco/big5
+            # branch above). None on single-label datasets, where there's only
+            # ever one target and it's covered by the clipmatch_* columns.
+            gt_targets_json = json.dumps({"targets": targets, "target_matches": target_matches})
             flat_rows.append({
                 "image_path": rec["image_path"],
+                "dataset": dataset,
+                "model": header.get("model"),
                 "caption": rec["caption"],
                 "objects": objects_json,
-                "gt_targets": json.dumps(targets),
+                "gt_targets": gt_targets_json,
+                "n_objects": len(objs),
+                "f_clipscore": image_fclip,
+                "object_clipscore": image_objclip,
+                "wordnet_mapping_rate_image": (image_n_map_nature / (image_n_map_nature + image_n_vlm_nature))
+                                               if (image_n_map_nature + image_n_vlm_nature) else None,
+                "parse_failure_count_image": image_n_parse_fail,
+                "extraction_hit_rate_image": (image_n_extraction_hits / image_n_gt_targets)
+                                              if image_n_gt_targets else None,
+                # image-level nature (COCO/BIG-5 only; single-label's nature
+                # verdict is the clipmatch_pred_nature column below instead)
+                "image_gt_nature": image_gt_nature_val,
+                "image_pred_nature": image_pred_nature_val,
+                # single-label (ImageNet/Places) axis verdicts
+                "gt_nature": gt_nature_val, "pred_nature": pred_nature_val,
+                "gt_biotic": gt_biotic_val, "pred_biotic": pred_biotic_val,
+                "gt_material": gt_material_val, "pred_material": pred_material_val,
+                # ClipMatch [object-list] — the metric actually used for scoring
                 "clipmatch_pred_class": pred_vocab_entry["class_name"] if pred_vocab_entry else None,
                 "clipmatch_pred_synset": pred_vocab_entry["synset_id"] if pred_vocab_entry else None,
+                "clipmatch_pred_similarity": clipmatch_pred_similarity,
                 "clipmatch_pred_nature": pred_vocab_entry["gt_nature"] if pred_vocab_entry else None,
                 "clipmatch_pred_biotic": pred_vocab_entry["gt_biotic"] if pred_vocab_entry else None,
                 "clipmatch_pred_material": finals[best_obj_idx]["final_material"] if best_obj_idx is not None else None,
+                "clipmatch_top1_correct": clipmatch_correct,
+                "gt_synset": gt_syn,
+                "resolved_pred_synset": pred_node,
+                "hierarchical_precision": hier["hp"], "hierarchical_recall": hier["hr"],
+                "hierarchical_f1": hier["hf1"],
+                "wup_similarity": wup_sim,
+                # ClipMatch [caption, EXPERIMENTAL] — recap §11, not used for scoring
+                "clipmatch_caption_pred_synset": pred_class_synset_cap,
+                "clipmatch_caption_top1_correct": clipmatch_cap_correct,
+                "resolved_pred_synset_caption": pred_node_cap,
+                "hierarchical_precision_caption": hier_cap["hp"], "hierarchical_recall_caption": hier_cap["hr"],
+                "hierarchical_f1_caption": hier_cap["hf1"],
+                "wup_similarity_caption": wup_sim_cap,
             })
 
     # ---- Assemble summary ----
@@ -748,7 +845,8 @@ def phase_score(args):
             "support": clipmatch_support,
         }
         summary["hierarchical"] = {"hp": _mean(hp_vals), "hr": _mean(hr_vals),
-                                   "hf1": _mean(hf1_vals), "support": len(hf1_vals)}
+                                   "hf1": _mean(hf1_vals), "wup": _mean(wup_vals),
+                                   "support": len(hf1_vals)}
         # EXPERIMENTAL caption-based variant (recap §11), printed alongside the
         # object-list version above for comparison — see clipmatch_from_caption.
         summary["clipmatch_caption"] = {
@@ -756,7 +854,8 @@ def phase_score(args):
             "support": clipmatch_cap_support,
         }
         summary["hierarchical_caption"] = {"hp": _mean(hp_cap_vals), "hr": _mean(hr_cap_vals),
-                                           "hf1": _mean(hf1_cap_vals), "support": len(hf1_cap_vals)}
+                                           "hf1": _mean(hf1_cap_vals), "wup": _mean(wup_cap_vals),
+                                           "support": len(hf1_cap_vals)}
 
     # Wall-clock time this model took to finish this run, formatted "D-HH:MM:SS"
     # (SLURM-style elapsed time). inference_time_seconds comes from phase_infer's
@@ -836,14 +935,14 @@ def _print_summary(s, run_clipmatch):
         print(f"Top-1: {s['clipmatch']['top1_accuracy']:.4f}")
         h = s["hierarchical"]
         print(f"--- Hierarchical [object-list] (support {h['support']}) ---")
-        print(f"hP {h['hp']:.4f} | hR {h['hr']:.4f} | hF1 {h['hf1']:.4f}")
+        print(f"hP {h['hp']:.4f} | hR {h['hr']:.4f} | hF1 {h['hf1']:.4f} | Wu-Palmer {h['wup']:.4f}")
         # EXPERIMENTAL caption-based variant (recap §11), printed for direct
         # comparison against the object-list version above.
         print(f"\n--- ClipMatch [caption, EXPERIMENTAL] (support {s['clipmatch_caption']['support']}) ---")
         print(f"Top-1: {s['clipmatch_caption']['top1_accuracy']:.4f}")
         hc = s["hierarchical_caption"]
         print(f"--- Hierarchical [caption, EXPERIMENTAL] (support {hc['support']}) ---")
-        print(f"hP {hc['hp']:.4f} | hR {hc['hr']:.4f} | hF1 {hc['hf1']:.4f}")
+        print(f"hP {hc['hp']:.4f} | hR {hc['hr']:.4f} | hF1 {hc['hf1']:.4f} | Wu-Palmer {hc['wup']:.4f}")
     t = s["execution_time"]
     inf_str = t["inference"] if t["inference"] is not None else "n/a"
     print(f"\nExecution time (D-HH:MM:SS): inference {inf_str} | scoring {t['scoring']} | total {t['total']}")
@@ -877,9 +976,11 @@ def _log_wandb(args, summary, run_clipmatch):
     if run_clipmatch:
         log["ClipMatch/Top1"] = summary["clipmatch"]["top1_accuracy"]
         log["Hierarchical/hF1"] = summary["hierarchical"]["hf1"]
+        log["Hierarchical/WuPalmer"] = summary["hierarchical"]["wup"]
         # EXPERIMENTAL caption-based variant (recap §11).
         log["ClipMatchCaption/Top1"] = summary["clipmatch_caption"]["top1_accuracy"]
         log["HierarchicalCaption/hF1"] = summary["hierarchical_caption"]["hf1"]
+        log["HierarchicalCaption/WuPalmer"] = summary["hierarchical_caption"]["wup"]
     wandb.log(log)
     wandb.finish()
 
