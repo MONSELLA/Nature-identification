@@ -512,6 +512,181 @@ class CLIPScorer:
 
 
 # =============================================================================
+# FG-CLIP2 — a DEDICATED wrapper, not routed through CLIPScorer's generic
+# duck-typing
+# =============================================================================
+# FG-CLIP2 (qihoo360/fg-clip2-large) doesn't fit the standard CLIPModel shape
+# CLIPScorer targets: it's loaded via AutoModelForCausalLM (not AutoModel),
+# its image processor takes a per-image `max_num_patches` sizing argument
+# (not a fixed resize), and its get_text_features() requires a `walk_type`
+# kwarg tied to a FIXED sequence length. Trying to cover this through
+# CLIPScorer's generic paths caused repeated, hard-to-diagnose failures
+# (a text/vision embedding-dim mismatch, a tokenizer/model vocab mismatch
+# false-alarm, and a meta-tensor crash from passing torch_dtype). Rather than
+# keep patching the generic wrapper, this class is a near-literal translation
+# of FG-CLIP2's OWN HF model-card usage snippet — same calls, same argument
+# names, same values — so there is no ambiguity about whether "generic
+# handling" introduced a mismatch.
+class FGCLIP2Scorer:
+    """Minimal, model-card-literal wrapper for qihoo360/fg-clip2-large.
+    Exposes the same `encode_text`/`encode_images`/`context_length`/
+    `batch_size` surface CLIPScorer does, so scripts/run_vlm_pipeline.py can
+    use either interchangeably — see clip_metrics.create_scorer()."""
+
+    REPO_ID = "qihoo360/fg-clip2-large"
+    # Per the model card: "Long captions: max_length=196 walk_type='long'".
+    # LONG (never "short"/64) is hardcoded — avoiding vanilla CLIP's 77-token
+    # sentence-term truncation is the entire reason FG-CLIP2 is used at all
+    # (see CLAUDE.md / data/llm_reference/vlm_pipeline_recap.txt).
+    WALK_TYPE = "long"
+    MAX_LENGTH = 196
+
+    def __init__(
+        self,
+        model_name: str = REPO_ID,
+        device: str = "cuda",
+        batch_size: int = 64,
+        trust_remote_code: bool = True,
+    ) -> None:
+        import torch
+        from transformers import AutoImageProcessor, AutoModelForCausalLM, AutoTokenizer
+
+        self._torch = torch
+        self.device = device
+        self.batch_size = batch_size
+        self.repo_id = model_name or self.REPO_ID
+        self.context_length = self.MAX_LENGTH
+
+        # Literal translation of the model card's "Load Model" snippet —
+        # no torch_dtype, no low_cpu_mem_usage, no device_map: those are
+        # exactly what caused the meta-tensor crash in earlier attempts.
+        self.model = AutoModelForCausalLM.from_pretrained(
+            self.repo_id, trust_remote_code=trust_remote_code
+        ).to(device)
+        self.model.eval()
+        self.tokenizer = AutoTokenizer.from_pretrained(self.repo_id)
+        self.image_processor = AutoImageProcessor.from_pretrained(self.repo_id)
+
+        # Embedding dimensionality, determined lazily on first real encode
+        # call rather than a throwaway one at load time — a throwaway text
+        # encode here would need a real image encode too to know both dims,
+        # and images require a per-image max_num_patches (no fixed-size
+        # placeholder to encode blind).
+        self._embed_dim = None
+
+    @staticmethod
+    def _determine_max_patches(image) -> int:
+        """Verbatim from the model card's `determine_max_value` helper —
+        picks the vision tower's patch budget from the image's own
+        resolution (16x16 patches), in discrete steps."""
+        w, h = image.size
+        max_val = (w // 16) * (h // 16)
+        if max_val > 784:
+            return 1024
+        elif max_val > 576:
+            return 784
+        elif max_val > 256:
+            return 576
+        elif max_val > 128:
+            return 256
+        else:
+            return 128
+
+    def encode_text(self, texts: List[str], warn_truncation: bool = False,
+                     verbose: bool = False, desc: str = "text") -> np.ndarray:
+        """Encode a list of strings → [len(texts), dim] L2-normalized float32.
+        `warn_truncation` is accepted for interface compatibility with
+        CLIPScorer but unused: every caption is padded/truncated to the
+        model's own fixed MAX_LENGTH regardless, per its model card."""
+        torch = self._torch
+        if not texts:
+            return np.zeros((0, self._embed_dim or 0), dtype=np.float32)
+
+        out = []
+        n_total = len(texts)
+        for i in range(0, n_total, self.batch_size):
+            batch = texts[i : i + self.batch_size]
+            # Model card: tokenizer(captions, padding="max_length",
+            # max_length=196, truncation=True, return_tensors="pt").to(device)
+            caption_input = self.tokenizer(
+                batch, padding="max_length", max_length=self.MAX_LENGTH,
+                truncation=True, return_tensors="pt",
+            ).to(self.device)
+            with torch.no_grad():
+                # Model card: model.get_text_features(**caption_input, walk_type="long")
+                text_feature = self.model.get_text_features(**caption_input, walk_type=self.WALK_TYPE)
+                text_feature = text_feature / text_feature.norm(p=2, dim=-1, keepdim=True)
+            feats = text_feature.cpu().float().numpy()
+            if self._embed_dim is None:
+                self._embed_dim = feats.shape[1]
+            out.append(feats)
+            if verbose:
+                done = min(i + self.batch_size, n_total)
+                print(f"🔎 [FG-CLIP2] {desc}: {done}/{n_total} ({done / n_total:.1%})", flush=True)
+        return np.concatenate(out, axis=0)
+
+    def encode_images(self, image_paths: List[str], verbose: bool = False) -> np.ndarray:
+        """Encode a list of image paths → [len(paths), dim] L2-normalized
+        float32. Processed ONE AT A TIME (not batched): `max_num_patches` is
+        computed per image from its own resolution (model card's
+        `determine_max_value`), so different images in the same call can
+        need different patch budgets — there is no single batch-wide value
+        to pass to the processor. An unreadable/corrupt image yields a zero
+        row rather than aborting the whole run."""
+        from PIL import Image
+        torch = self._torch
+
+        if not image_paths:
+            return np.zeros((0, self._embed_dim or 0), dtype=np.float32)
+
+        out = []
+        n_total = len(image_paths)
+        for i, p in enumerate(image_paths):
+            try:
+                # Force standard RGB — see CLIPScorer.encode_images for why.
+                image = Image.open(p).convert("RGB")
+                max_num_patches = self._determine_max_patches(image)
+                # Model card: image_processor(images=image,
+                # max_num_patches=determine_max_value(image),
+                # return_tensors="pt").to(device)
+                image_input = self.image_processor(
+                    images=image, max_num_patches=max_num_patches, return_tensors="pt",
+                ).to(self.device)
+                with torch.no_grad():
+                    # Model card: model.get_image_features(**image_input)
+                    image_feature = self.model.get_image_features(**image_input)
+                    image_feature = image_feature / image_feature.norm(p=2, dim=-1, keepdim=True)
+                feat = image_feature.cpu().float().numpy()
+            except Exception as e:
+                warnings.warn(f"FG-CLIP2: could not encode image '{p}' ({e!r}); using a zero embedding.", stacklevel=2)
+                feat = np.zeros((1, self._embed_dim or 768), dtype=np.float32)
+            if self._embed_dim is None:
+                self._embed_dim = feat.shape[1]
+            out.append(feat)
+            if verbose:
+                progress_every = max(1, min(500, n_total // 20))
+                if i % progress_every == 0 or i == n_total - 1:
+                    print(f"🔎 [FG-CLIP2] images: {i + 1}/{n_total} ({(i + 1) / n_total:.1%})", flush=True)
+        return np.concatenate(out, axis=0)
+
+
+_FG_CLIP2_NAMES = frozenset({"fg-clip2", FGCLIP2Scorer.REPO_ID})
+
+
+def create_scorer(model_name: str = "original", device: str = "cuda", batch_size: int = 64,
+                   trust_remote_code: bool = True):
+    """Factory dispatching to FGCLIP2Scorer for FG-CLIP2 (by CLIP_PRESETS
+    alias or raw repo id) and CLIPScorer for everything else — the one place
+    that needs to know FG-CLIP2 gets special treatment, so callers (e.g.
+    scripts/run_vlm_pipeline.py) don't need their own if/else."""
+    if model_name in _FG_CLIP2_NAMES:
+        return FGCLIP2Scorer(model_name=FGCLIP2Scorer.REPO_ID, device=device,
+                             batch_size=batch_size, trust_remote_code=trust_remote_code)
+    return CLIPScorer(model_name=model_name, device=device, batch_size=batch_size,
+                      trust_remote_code=trust_remote_code)
+
+
+# =============================================================================
 # Metric math (pure numpy on L2-normalized embeddings)
 # =============================================================================
 def _cos(image_emb: np.ndarray, text_embs: np.ndarray) -> np.ndarray:

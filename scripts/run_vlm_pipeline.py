@@ -411,9 +411,9 @@ def phase_score(args):
     # This is where CLIP actually gets loaded onto the GPU — by this point in
     # `--stage all`, the VLM has already been unloaded (see main() below), so
     # CLIP has the GPU memory to itself.
-    scorer = clip_metrics.CLIPScorer(model_name=args.clip_model, device=args.device,
-                                     batch_size=args.clip_batch_size,
-                                     trust_remote_code=args.clip_trust_remote_code)
+    scorer = clip_metrics.create_scorer(model_name=args.clip_model, device=args.device,
+                                        batch_size=args.clip_batch_size,
+                                        trust_remote_code=args.clip_trust_remote_code)
     
     if args.verbose: print(f"{args.clip_model} loaded. Handles a context length of {scorer.context_length} tokens!\n")
 
