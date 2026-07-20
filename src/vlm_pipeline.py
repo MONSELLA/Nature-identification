@@ -164,7 +164,7 @@ def normalize_objects(raw_objects: List[str]) -> List[str]:
 def caption_batch(
     vlm,
     image_paths: List[str],
-    system_prompt: Optional[str],
+    system_prompt: Optional[str] = None,
     max_new_tokens: int = 256,
     temperature: float = 0.0,
 ) -> List[str]:
@@ -178,7 +178,8 @@ def caption_batch(
     outs = vlm.generate_batch_safe(
         prompts, image_paths,
         label="caption_batch", item_labels=image_paths,
-        system_prompt=system_prompt, max_new_tokens=max_new_tokens,
+        system_prompt=system_prompt, 
+        max_new_tokens=max_new_tokens,
         temperature=temperature, output_mode="free_form",  # no JSON schema — just get back plain text
     )
     # Guard against a non-string response (e.g. None on total generation

@@ -110,7 +110,7 @@ from src.loaders.excel_loader import TaxonomyGraph
 from src.loaders.dataset_loader import load_dataset, get_candidate_vocab
 from src.models.prompts import build_system_prompts
 from src.models.vlm_models import MODEL_REGISTRY, VLLM_FAMILIES, create_vlm
-from src.vlm_pipeline import run_inference, resolve_hybrid_label, normalize_objects, _normalize_object
+from src.vlm_pipeline import run_inference, resolve_hybrid_label, _normalize_object
 from src.evaluation import clip_metrics
 from src.utils import update_results_store, update_dataset_class_stats, compute_class_stats, format_duration
 
@@ -414,6 +414,8 @@ def phase_score(args):
     scorer = clip_metrics.CLIPScorer(model_name=args.clip_model, device=args.device,
                                      batch_size=args.clip_batch_size,
                                      trust_remote_code=args.clip_trust_remote_code)
+    
+    if args.verbose: print(f"{args.clip_model} loaded. Handles a context length of {scorer.context_length} tokens!\n")
 
     # ---- Hybrid labels per object ----
     # Mapping + hybrid resolution now happen in Phase 1 (see

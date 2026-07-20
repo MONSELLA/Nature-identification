@@ -280,7 +280,7 @@ class VLLMBackedVLM(BaseVLM):
         self,
         prompt: str,
         image: ImageInput,
-        system_prompt: Optional[str],
+        system_prompt: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Build one "conversation" in the OpenAI chat-style format vLLM
         expects: an optional system message, then a single user message
