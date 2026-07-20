@@ -557,15 +557,57 @@ class FGCLIP2Scorer:
         self.repo_id = model_name or self.REPO_ID
         self.context_length = self.MAX_LENGTH
 
-        # Literal translation of the model card's "Load Model" snippet —
-        # no torch_dtype, no low_cpu_mem_usage, no device_map: those are
-        # exactly what caused the meta-tensor crash in earlier attempts.
+        # low_cpu_mem_usage=False: even the model card's own literal call
+        # (no torch_dtype, no device_map) still hit "Cannot copy out of meta
+        # tensor; no data!" on self.mask1 in this environment's transformers
+        # build — meaning this repo's __init__ ran under transformers'
+        # meta-device "fast init" context regardless of any dtype/device_map
+        # kwarg. mask1/mask2 are built directly in __init__ (not registered
+        # as nn.Parameter/nn.Buffer — a real buffer would at least get moved
+        # by model.to(device) below; this one only fails later, inside
+        # forward's own `self.mask1.to(...)` call, meaning nothing on the
+        # normal parameter/buffer path ever touches it). A plain attribute
+        # tensor built under a meta context has no state_dict entry to
+        # restore it, so it stays meta forever unless __init__ itself never
+        # entered that context — which is exactly what low_cpu_mem_usage=False
+        # disables (forces old-style eager construction, real tensors from
+        # the first line of __init__, no accelerate meta shell).
         self.model = AutoModelForCausalLM.from_pretrained(
-            self.repo_id, trust_remote_code=trust_remote_code
+            self.repo_id, trust_remote_code=trust_remote_code, low_cpu_mem_usage=False,
         ).to(device)
         self.model.eval()
         self.tokenizer = AutoTokenizer.from_pretrained(self.repo_id)
         self.image_processor = AutoImageProcessor.from_pretrained(self.repo_id)
+
+        # If low_cpu_mem_usage=False didn't actually stop __init__ from
+        # running under a meta context (possible if this transformers build
+        # ignores/repurposes that flag), fail HERE with the exact attribute
+        # name/shape instead of two encode calls from now inside a forward
+        # pass with an opaque NotImplementedError. mask1/mask2 aren't
+        # registered buffers, so a generic named_buffers()/named_parameters()
+        # sweep would miss them — check the specific known attribute path
+        # from the crash traceback (model.text_model.embeddings).
+        embeddings = getattr(getattr(self.model, "text_model", None), "embeddings", None)
+        if embeddings is not None:
+            meta_attrs = [
+                name for name in ("mask1", "mask2")
+                if isinstance(getattr(embeddings, name, None), torch.Tensor)
+                and getattr(embeddings, name).is_meta
+            ]
+            if meta_attrs:
+                raise RuntimeError(
+                    f"{self.repo_id}: model.text_model.embeddings.{meta_attrs} "
+                    f"loaded on the meta device with no real data even with "
+                    f"low_cpu_mem_usage=False — this transformers build isn't "
+                    f"giving this checkpoint's custom __init__ code a real, "
+                    f"non-meta construction context. This looks like a "
+                    f"genuine incompatibility between this repo's "
+                    f"trust_remote_code and this transformers version, not "
+                    f"something fixable from the calling side. Options: run "
+                    f"this scoring stage in a separate environment with an "
+                    f"older transformers version, or report this to "
+                    f"https://github.com/360CVGroup/FG-CLIP/issues."
+                )
 
         # Embedding dimensionality, determined lazily on first real encode
         # call rather than a throwaway one at load time — a throwaway text
