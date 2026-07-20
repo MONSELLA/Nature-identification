@@ -5,17 +5,33 @@ run_vlm_pipeline.py
 End-to-end driver for the baseline BIG-5 VLM pipeline, in three stages:
 
   --stage all   : THE STANDARD WAY TO RUN THIS PIPELINE. Runs inference then
-                  scoring, but each in its OWN spawned subprocess (see main()):
-                  the infer subprocess loads the VLM, writes the JSON-lines
-                  artifact to --responses_file, then EXITS — which makes the OS
-                  reclaim 100% of the VLM's VRAM before the score subprocess
-                  loads the CLIP model + the TaxonomyGraph. The VLM and CLIP never
-                  hold GPU memory at the same time, and we don't rely on
-                  in-process CUDA cleanup (vLLM/torch release it unreliably on
-                  GC). 'spawn' is required for CUDA; only the picklable args
-                  Namespace crosses the process boundary. --responses_file is
-                  PURELY that internal handoff in this mode, so it is deleted
-                  once scoring finishes successfully (pass --keep_responses_file
+                  scoring, but each as its OWN genuinely separate OS process
+                  (see main()): a real `subprocess.run([sys.executable,
+                  __file__, "--stage", "infer", ...])` child, NOT a
+                  `multiprocessing.Process`. The infer child loads the VLM,
+                  writes the JSON-lines artifact to --responses_file, then
+                  EXITS — which makes the OS reclaim 100% of the VLM's VRAM
+                  before the score child loads the CLIP model + the
+                  TaxonomyGraph. The VLM and CLIP never hold GPU memory at
+                  the same time, and we don't rely on in-process CUDA cleanup
+                  (vLLM/torch release it unreliably on GC).
+                  WHY subprocess.run AND NOT multiprocessing.Process: vLLM's
+                  own V1 engine spawns ITS OWN internal subprocess for the
+                  engine core (visible in logs as "(EngineCore pid=...)").
+                  Wrapping that in another `multiprocessing.Process` (even
+                  with the 'spawn' start method) nests one spawned-process
+                  tree inside another and can silently DEADLOCK right at
+                  vLLM's async-engine IPC handshake — confirmed in practice:
+                  `--stage infer` alone completed engine init and started
+                  generating, while the exact same run under the old
+                  `--stage all` (multiprocessing.Process wrapper) hung
+                  forever at that same point. A plain OS subprocess has no
+                  such nesting — it's the same relationship `--stage infer`
+                  run by hand has to vLLM's own child process. Args cross the
+                  boundary as reconstructed CLI flags (see _args_to_cli),
+                  not a pickled Namespace. --responses_file is PURELY that
+                  internal handoff in this mode, so it is deleted once
+                  scoring finishes successfully (pass --keep_responses_file
                   to retain it).
 
   --stage infer : run ONLY the inference half (VLM -> --responses_file) and
@@ -78,8 +94,8 @@ import csv
 import itertools
 import json
 import logging
-import multiprocessing as mp
 import random
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -989,11 +1005,16 @@ def _log_wandb(args, summary, run_clipmatch):
 # =============================================================================
 # CLI
 # =============================================================================
-def parse_args():
+def build_arg_parser():
     """Define every command-line flag this script accepts. Grouped into:
     stage/dataset selection, taxonomy/context files, per-dataset paths, VLM
     settings (only used by --stage infer/all), CLIP settings (only used by
-    --stage score/all), and shared output options."""
+    --stage score/all), and shared output options.
+
+    Split out from parse_args() (which just calls this + .parse_args()) so
+    main()'s --stage all can also build a parser purely to INTROSPECT its
+    defaults via _args_to_cli, when reconstructing CLI flags to re-invoke
+    this same script as a real subprocess for --stage infer/score."""
     p = argparse.ArgumentParser(description="Two-phase baseline VLM pipeline (infer -> score).")
     p.add_argument("--stage", choices=["all", "infer", "score"], default="all",
                    help="'all' (default) runs the full end-to-end pipeline in one process, "
@@ -1104,7 +1125,18 @@ def parse_args():
                         "images.")
     p.add_argument("--verbose", action="store_true")
     p.add_argument("--wandb", action="store_true")
+    p.add_argument("--wandb_run_id", type=str, default=None, help=argparse.SUPPRESS)
+    # ^ Internal plumbing, not meant to be passed by hand: under --stage all,
+    # main() generates ONE shared W&B run id and this flag is how it's threaded
+    # into the infer/score subprocess CLI (see _args_to_cli + _log_wandb's
+    # resume="allow" if run_id else None), so both halves log into the same
+    # W&B run instead of each starting its own. Hidden from --help.
 
+    return p
+
+
+def parse_args():
+    p = build_arg_parser()
     args = p.parse_args()
     if args.stage in ("infer", "all"):
         # These two flags are only conditionally required (argparse can't
@@ -1135,22 +1167,50 @@ def _resolve_responses_file(args):
 
 
 # =============================================================================
-# Subprocess workers (for --stage all)
+# Subprocess re-invocation (for --stage all)
 # =============================================================================
-def _infer_worker(args):
-    """Subprocess entrypoint for the inference half of --stage all. Runs
-    phase_infer and then simply RETURNS/EXITS: letting the whole subprocess die
-    is what actually reclaims the VLM's VRAM — the OS tears down the process's
-    entire CUDA context, which is more reliable than an in-process unload (vLLM
-    and torch do not dependably release CUDA memory on Python GC)."""
-    phase_infer(args)
+def _args_to_cli(args, parser, stage):
+    """Rebuild a `sys.argv`-style flag list from a parsed args Namespace, to
+    re-invoke THIS SAME SCRIPT as a genuinely separate OS process (see
+    main()'s --stage all for why — a real subprocess, not
+    multiprocessing.Process, to avoid nesting inside vLLM's own internal
+    engine-core subprocess).
+
+    Only emits a flag when its value differs from that action's own default
+    (so the subprocess falls back to the SAME defaults for anything the user
+    didn't explicitly set, rather than this function needing to know what
+    every default is). Introspects `parser`'s actions rather than
+    hardcoding each flag's name/type, so it stays correct as flags are
+    added/changed in build_arg_parser() without needing a parallel update
+    here.
+    """
+    argv = ["--stage", stage]
+    for action in parser._actions:
+        if not action.option_strings or action.dest in ("help", "stage"):
+            continue
+        value = getattr(args, action.dest, None)
+        if value == action.default:
+            continue
+        flag = action.option_strings[0]
+        if isinstance(action, argparse._StoreTrueAction):
+            if value:
+                argv.append(flag)
+        elif value is None:
+            continue
+        else:
+            argv.extend([flag, str(value)])
+    return argv
 
 
-def _score_worker(args):
-    """Subprocess entrypoint for the scoring half of --stage all — loads CLIP in
-    a FRESH process that starts with zero GPU memory held (the infer subprocess
-    that held the VLM has already exited)."""
-    phase_score(args)
+def _run_stage_subprocess(args, parser, stage):
+    """Re-invoke this script (`python run_vlm_pipeline.py --stage <stage> ...`)
+    as a genuine OS subprocess and wait for it to finish, raising if it
+    failed. Inherits this process's stdout/stderr/env/cwd, so logs interleave
+    live exactly as they would running that --stage by hand."""
+    cmd = [sys.executable, str(Path(__file__).resolve())] + _args_to_cli(args, parser, stage)
+    result = subprocess.run(cmd)
+    if result.returncode != 0:
+        raise RuntimeError(f"--stage {stage} subprocess failed (exit code {result.returncode}).")
 
 
 def main():
@@ -1164,31 +1224,22 @@ def main():
         phase_score(args)
         return
 
-    # --stage all: run each half in its OWN spawned subprocess so GPU memory is
-    # fully reclaimed by the OS between stages — the VLM (infer) and CLIP (score)
-    # never coexist on the GPU, and we don't rely on in-process CUDA cleanup.
-    #   - 'spawn' (NOT 'fork') is required to use CUDA in a child process.
-    #   - Only the picklable argparse Namespace crosses the boundary — paths and
-    #     plain scalars, never tensors or model handles.
-    #   - A shared W&B run id (below) is threaded through so both subprocesses
-    #     log into one run (see _log_wandb).
+    # --stage all: run each half as its OWN separate OS subprocess (see the
+    # module docstring's --stage all section for why this is subprocess.run,
+    # NOT multiprocessing.Process — the latter nests inside vLLM's own
+    # internal engine-core subprocess and can deadlock). GPU memory is fully
+    # reclaimed by the OS when the infer subprocess exits, before the score
+    # subprocess starts — the VLM and CLIP never coexist on the GPU, and we
+    # don't rely on in-process CUDA cleanup.
+    #   - A shared W&B run id (below) is threaded through via --wandb_run_id
+    #     so both subprocesses log into one run (see _log_wandb).
     if args.wandb:
         import wandb
         args.wandb_run_id = wandb.util.generate_id()
 
-    ctx = mp.get_context("spawn")
-
-    p1 = ctx.Process(target=_infer_worker, args=(args,))
-    p1.start()
-    p1.join()
-    if p1.exitcode != 0:
-        raise RuntimeError(f"VLM inference stage failed (exit code {p1.exitcode}).")
-
-    p2 = ctx.Process(target=_score_worker, args=(args,))
-    p2.start()
-    p2.join()
-    if p2.exitcode != 0:
-        raise RuntimeError(f"Scoring stage failed (exit code {p2.exitcode}).")
+    parser = build_arg_parser()
+    _run_stage_subprocess(args, parser, "infer")
+    _run_stage_subprocess(args, parser, "score")
 
     # --stage all's --responses_file is purely the internal handoff between
     # the two subprocesses above — scoring just finished reading it, so
