@@ -9,10 +9,12 @@ CLIP-based metrics for the BIG-5 VLM pipeline:
   - Object-CLIPScore (OURS, F-CLIPScore-INSPIRED — never call this "F-CLIPScore"):
         mean of CLIPScore("a photo of a {object}") over extracted objects only,
         no sentence term.
-  - ClipMatch        (Ging et al.; ImageNet + Places only):
-        score each extracted object independently via "a photo of a {object}",
-        take the MAX similarity across objects per GT candidate class; argmax
-        over candidates = predicted class.
+  - ClipMatch        (Ging et al.-INSPIRED, caption-based; ImageNet + Places
+    only): score the WHOLE CAPTION's CLIP embedding against each GT candidate
+    class; argmax over candidates = predicted class. (An earlier variant
+    matched each extracted object independently and took the max similarity
+    across objects instead — dropped after empirical comparison showed the
+    caption-based version performs better.)
 
 Design: the CLIP model wrapper (`CLIPScorer`) is kept separate from the metric
 math (pure NumPy on L2-normalized embeddings). This lets the aggregation logic
@@ -488,68 +490,24 @@ def f_clipscore(
 
 
 def clipmatch(
-    object_embs: np.ndarray,
-    candidate_embs: np.ndarray,
-) -> Tuple[np.ndarray, int, np.ndarray]:
-    """
-    ClipMatch (Ging et al.): score each candidate class as the MAX cosine
-    similarity of any extracted object's "a photo of a {object}" embedding to
-    that candidate's text embedding. The predicted class is the argmax candidate.
-
-    Args:
-        object_embs:    [N_obj, d] L2-normalized object-phrase embeddings.
-        candidate_embs: [N_cand, d] L2-normalized candidate-class embeddings.
-
-    Returns:
-        per_candidate_max: [N_cand] max-over-objects similarity per candidate.
-        pred_index:        argmax candidate index (or -1 if no objects).
-        per_object_sim_to_pred: [N_obj] each object's similarity to the
-            predicted class — the ranking scores handed to
-            taxonomy_metrics.resolve_to_wordnet for hP/hR.
-    """
-    n_cand = candidate_embs.shape[0]
-    if object_embs.shape[0] == 0 or n_cand == 0:
-        # No extracted objects (or no candidate classes at all) means there's
-        # nothing to compare — return an all-zero score row and pred_index=-1
-        # as a sentinel meaning "could not make a prediction" (checked by
-        # callers, e.g. scripts/run_vlm_pipeline.py's ClipMatch scoring).
-        return np.zeros((n_cand,), dtype=np.float32), -1, np.zeros((object_embs.shape[0],), dtype=np.float32)
-
-    # `object_embs @ candidate_embs.T` computes EVERY object-vs-candidate
-    # cosine similarity in a single matrix multiply: row i, column j is how
-    # similar extracted object i is to candidate class j. Shape [N_obj, N_cand].
-    sim = object_embs @ candidate_embs.T          # [N_obj, N_cand]
-    # For each candidate class (each COLUMN), take the single highest
-    # similarity across all extracted objects — i.e. "the best-matching
-    # object this image has for this candidate class".
-    per_candidate_max = sim.max(axis=0)           # [N_cand]
-    # The predicted class is whichever candidate got the highest best-match
-    # score overall.
-    pred_index = int(np.argmax(per_candidate_max))
-    # Pull out, for the winning candidate class specifically, how similar
-    # EACH extracted object was to it — this lets downstream code (hP/hR) know
-    # which extracted object phrase was most responsible for the prediction.
-    per_object_sim_to_pred = sim[:, pred_index]   # [N_obj]
-    return per_candidate_max, pred_index, per_object_sim_to_pred
-
-
-def clipmatch_from_caption(
     caption_emb: np.ndarray,
     candidate_embs: np.ndarray,
 ) -> Tuple[np.ndarray, int]:
     """
-    EXPERIMENTAL variant of ClipMatch (recap §11 open item: "test ClipMatch/
-    hP/hR against the raw caption... despite the concerns raised") — predicts
-    the class from the single WHOLE-CAPTION embedding's similarity to each
-    candidate class, instead of clipmatch()'s max-over-extracted-objects.
-    Printed alongside the object-list version for direct comparison, NOT used
-    to feed the axis (nature/biotic/material) scores.
+    ClipMatch (Ging et al.-inspired, caption-based): predicts the class from
+    the single WHOLE-CAPTION embedding's cosine similarity to each candidate
+    class; the predicted class is the argmax candidate.
 
-    Known caveat this variant reintroduces (the reason the object-list version
-    was chosen as the default — see clip_metrics.py's module docstring and
-    CLAUDE.md): a long caption risks CLIP's 77-token truncation, and ClipMatch
-    was designed/validated on short single-answer responses, not multi-sentence
-    captions.
+    Chosen over an earlier variant that matched each extracted object
+    independently and took the max similarity across objects — the
+    caption-based version empirically performs better, so it is now the only
+    ClipMatch implementation (the object-list variant has been removed).
+
+    KNOWN CAVEAT: a long caption risks CLIP's 77-token truncation, and
+    ClipMatch was originally designed/validated on short single-answer
+    responses, not multi-sentence captions — see clip_metrics.py's module
+    docstring for the 77-token limit discussion. Accepted as a stated
+    limitation given the empirical performance gain.
 
     Args:
         caption_emb:    [d] L2-normalized single caption embedding.
@@ -568,6 +526,10 @@ def clipmatch_from_caption(
 
 
 def object_texts(objects: List[str]) -> List[str]:
-    """Wrap raw object phrases in the ClipMatch/Object-CLIPScore template."""
+    """Wrap raw object phrases in the Object-CLIPScore template — also used
+    to embed extracted objects for Object-CLIPScore/F-CLIPScore's object
+    term, and to find the extracted object most representative of
+    ClipMatch's caption-predicted class (for the material axis + hP/hR
+    WordNet-node resolution)."""
     # e.g. ["oak tree", "river"] -> ["a photo of a oak tree", "a photo of a river"]
     return [OBJECT_TEMPLATE.format(o) for o in objects]

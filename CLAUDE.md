@@ -80,12 +80,14 @@ evaluating the models.
   sentence-level term. Check which CLIP variant is in use before assuming the
   full caption is encoded (FG-CLIP2 / Long-CLIP handle longer text; vanilla
   CLIP does not).
-- **ClipMatch** (ImageNet + Places only — not COCO, not BIG-5): score each
-  extracted object independently (`"a photo of a {object}"`), take the MAX
-  similarity across objects per GT candidate class. Do NOT run against the raw
-  caption or a concatenated object-list sentence — both were tried and
-  rejected (token limit + semantic dilution — see data/llm_reference/vlm_pipeline_recap.txt
-  for why).
+- **ClipMatch** (ImageNet + Places only — not COCO, not BIG-5): score the
+  WHOLE CAPTION's CLIP embedding against each GT candidate class; argmax =
+  predicted class. SUPERSEDES the earlier object-list variant (max similarity
+  across independently-embedded extracted objects) — the caption-based version
+  empirically performs better, so the object-list implementation has been
+  removed from the codebase (see data/llm_reference/vlm_pipeline_recap.txt for
+  the history). Known caveat carried over: long captions risk CLIP's 77-token
+  truncation — accepted given the empirical gain.
 - **hP/hR/hF1** (hierarchical precision/recall/F1): ImageNet + Places only. Map
   the ClipMatch-predicted class onto a WordNet node via the extracted-object list
   (`resolve_to_wordnet`: rank objects by CLIP sim to the predicted class,

@@ -1,7 +1,8 @@
-BIG-5 VLM PIPELINE — DESIGN RECAP (v4)
+BIG-5 VLM PIPELINE — DESIGN RECAP (v5)
 (v4: the VLM pipeline is now IMPLEMENTED — this doc records both the original
 design rationale AND, in "IMPLEMENTED:" notes, how the shipped code actually
-does it where the two differ.)
+does it where the two differ. v5: ClipMatch switched to the caption-based
+variant as the only implementation — see Section 8e and Section 11.)
 
 ===============================================================
 0. IMPLEMENTATION STATUS (NEW in v4)
@@ -457,33 +458,48 @@ d) COCO/ImageNet/Places — GT-mention accuracy (EM/Contains, per
    or any WordNet-synset synonym (not just the literal label
    string) appears among extracted objects.
 
-e) ClipMatch (Ging et al.), ImageNet + Places ONLY — COCO/BIG-5
-   excluded (COCO multi-label, BIG-5 has no closed class vocabulary
-   — ClipMatch needs a fixed candidate list, so this scoping is a
-   correctness requirement, not a compromise):
-     - Run against the EXTRACTED OBJECT LIST, not the raw caption
-       and NOT a concatenated sentence template ("a photo of a X,
-       a Y, and a Z" was considered and rejected — see below).
-     - Score each extracted object independently via its own short
-       phrase ("a photo of a {object}"), take the MAX similarity
-       across all objects as the model's implicit best guess for
-       each GT candidate class.
-     - REJECTED APPROACH — raw caption: risks CLIP 77-token
-       truncation on long captions, and ClipMatch was designed/
-       validated on short single-answer VQA responses, not
-       multi-sentence scene descriptions — using the full caption
-       deviates from how the metric was built and tested.
-     - REJECTED APPROACH — concatenated object-list sentence ("a
-       photo of a X, a Y ... and a Z"): (1) still risks the 77-token
-       limit with busy scenes (8-10+ objects), worse than the
-       caption case since triggered by object count not verbosity;
-       (2) semantic dilution — one joint embedding for many objects
-       is a smeared average, diluting the signal for any single
-       target GT class, hurting matching precisely in richer scenes.
-     - Independent per-object scoring avoids both problems, stays
-       truest to ClipMatch's original single-concept design, and
-       reuses the same object-list input as Object-CLIPScore (no
-       new extraction format needed).
+e) ClipMatch (Ging et al.-inspired), ImageNet + Places ONLY —
+   COCO/BIG-5 excluded (COCO multi-label, BIG-5 has no closed class
+   vocabulary — ClipMatch needs a fixed candidate list, so this
+   scoping is a correctness requirement, not a compromise):
+     - SUPERSEDED IN v5 (see below): originally run against the
+       EXTRACTED OBJECT LIST (max similarity across independently-
+       embedded objects per candidate) with the raw-caption and
+       concatenated-object-sentence variants explicitly REJECTED for
+       token-limit + semantic-dilution reasons (kept below for
+       history). After both variants were actually implemented and
+       compared empirically, the CAPTION-based version performed
+       better — so as of v5 it is the ONLY ClipMatch implementation;
+       the object-list code has been removed from clip_metrics.py.
+     - CURRENT (v5): score the WHOLE CAPTION's CLIP embedding
+       against each candidate class directly; argmax = predicted
+       class (clip_metrics.clipmatch). The 77-token truncation risk
+       this reintroduces (see the original rejection rationale below)
+       is accepted as a stated limitation given the empirical gain.
+     - ORIGINAL (v1-v4) DESIGN, kept for history — run against the
+       EXTRACTED OBJECT LIST, not the raw caption and NOT a
+       concatenated sentence template ("a photo of a X, a Y, and a
+       Z" was considered and rejected — see below):
+         - Score each extracted object independently via its own
+           short phrase ("a photo of a {object}"), take the MAX
+           similarity across all objects as the model's implicit
+           best guess for each GT candidate class.
+         - REJECTED APPROACH — raw caption: risks CLIP 77-token
+           truncation on long captions, and ClipMatch was designed/
+           validated on short single-answer VQA responses, not
+           multi-sentence scene descriptions — using the full caption
+           deviates from how the metric was built and tested. (This
+           is the approach v5 above ended up adopting anyway, after
+           empirical comparison showed it outperforming the
+           object-list version despite this caveat.)
+         - REJECTED APPROACH — concatenated object-list sentence ("a
+           photo of a X, a Y ... and a Z"): (1) still risks the
+           77-token limit with busy scenes (8-10+ objects), worse
+           than the caption case since triggered by object count not
+           verbosity; (2) semantic dilution — one joint embedding for
+           many objects is a smeared average, diluting the signal for
+           any single target GT class, hurting matching precisely in
+           richer scenes. (Still not used — this rejection stands.)
 
 f) Hierarchical Precision / Recall (hP/hR) + Wu-Palmer, per
    Snæbjarnarson et al.'s taxonomy-aware evaluation — ImageNet +
@@ -501,8 +517,11 @@ f) Hierarchical Precision / Recall (hP/hR) + Wu-Palmer, per
      - IMPLEMENTED (taxonomy_metrics.resolve_to_wordnet): the
        predicted-class -> WordNet-node step is NOT a BGE cross-encoder
        (that was the design sketch). Instead the extracted objects are
-       ranked by their CLIP similarity to the predicted class (reusing
-       the per-object sims ClipMatch already computed), the top phrase
+       ranked by their CLIP similarity to the predicted class (each
+       extracted object's embedding dotted against the ClipMatch-
+       predicted class's own embedding — computed in run_vlm_pipeline.py
+       right after the v5 caption-based ClipMatch call, since ClipMatch
+       itself no longer touches per-object embeddings), the top phrase
        that resolves in WordNet is taken, and polysemy is broken by
        maximizing Wu-Palmer similarity to the predicted class. hP/hR
        are then the ancestral-closure overlap of GT node vs. predicted
@@ -625,9 +644,13 @@ Week 8 (Sep 3-10): Finish Discussion/Conclusion/Abstract,
 - Final choice between same-VLM vs agnostic-LLM extraction —
   pending ablation results (material/immaterial stays VLM-based
   regardless, per Section 5)
-- Whether to also test ClipMatch/hP/hR against the raw caption for
-  comparison, despite the concerns raised, or go straight to
-  object-list-only
+
+RESOLVED IN v5 (decided from empirical comparison):
+- ClipMatch: caption-based similarity beats the object-list variant
+  (Section 8e) — object-list ClipMatch code removed from
+  clip_metrics.py; the raw-caption approach is now the ONLY
+  implementation, its 77-token truncation caveat accepted as a
+  stated limitation.
 
 RESOLVED IN v4 (decided during implementation):
 - hP/hR predicted-class -> WordNet-node step: uses CLIP-ranked object

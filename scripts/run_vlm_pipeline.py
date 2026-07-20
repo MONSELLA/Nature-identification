@@ -488,13 +488,6 @@ def phase_score(args):
     n_map_nature = n_vlm_nature = 0
     clipmatch_top1 = 0
     clipmatch_support = 0
-    # EXPERIMENTAL caption-based ClipMatch variant (recap §11 open item) —
-    # accumulated in parallel with the object-list version above, purely for
-    # side-by-side comparison at the end (see clip_metrics.clipmatch_from_caption).
-    clipmatch_cap_top1 = 0
-    clipmatch_cap_support = 0
-    hp_cap_vals, hr_cap_vals, hf1_cap_vals = [], [], []
-    wup_cap_vals = []
     flat_rows = []  # one row per stored IMAGE for the output CSV (see below)
 
     # Which images get a row written to the CSV. Fixed at --num_preds_to_store
@@ -562,10 +555,6 @@ def phase_score(args):
         wup_sim = None
         clipmatch_correct = None
         clipmatch_pred_similarity = None
-        pred_class_synset_cap = pred_node_cap = None
-        hier_cap = {"hp": None, "hr": None, "hf1": None}
-        wup_sim_cap = None
-        clipmatch_cap_correct = None
         gt_nature_val = pred_nature_val = None
         gt_biotic_val = pred_biotic_val = None
         gt_material_val = pred_material_val = None
@@ -611,31 +600,38 @@ def phase_score(args):
         if single_label:
             # --- ImageNet/Places (single-label): axes from the ClipMatch TOP-1
             # PREDICTED CLASS's own taxonomy position ---
-            # candidate_vocab is restricted to MAPPED-into-the-graph classes only
-            # (see get_candidate_vocab), so ClipMatch's global argmax over the
-            # candidate vocabulary can only ever land on a class our taxonomy
-            # actually annotates, and every candidate carries its own
-            # gt_nature/gt_biotic directly — no separate graph lookup needed.
-            # nature/biotic are read straight off the PREDICTED class's own
-            # taxonomy labels; material remains ALWAYS the VLM's own judgment
-            # (CLAUDE.md — never mapped), taken from whichever extracted object
-            # is most representative of the predicted class.
+            # ClipMatch predicts the class from the WHOLE CAPTION's CLIP
+            # similarity to each candidate (clip_metrics.clipmatch) — an
+            # earlier variant matched each extracted object independently and
+            # took the max similarity across objects instead, but the
+            # caption-based version empirically performs better and is now
+            # the only ClipMatch implementation. candidate_vocab is restricted
+            # to MAPPED-into-the-graph classes only (see get_candidate_vocab),
+            # so ClipMatch's argmax over the candidate vocabulary can only
+            # ever land on a class our taxonomy actually annotates, and every
+            # candidate carries its own gt_nature/gt_biotic directly — no
+            # separate graph lookup needed. nature/biotic are read straight
+            # off the PREDICTED class's own taxonomy labels; material remains
+            # ALWAYS the VLM's own judgment (CLAUDE.md — never mapped), taken
+            # from whichever extracted object is most representative of the
+            # predicted class.
             gt_syn = targets[0].get("synset_id") if targets else None
             pred_class_synset = pred_node = None
             best_obj_idx = None
-            if rec_obj_embs.shape[0] > 0:
-                per_cand_max, pred_idx, per_obj_sim = clip_metrics.clipmatch(rec_obj_embs, candidate_embs)
-                if pred_idx >= 0:
-                    pred_vocab_entry = candidate_vocab[pred_idx]
-                    pred_class_synset = pred_vocab_entry["synset_id"]
-                    clipmatch_pred_similarity = float(per_cand_max[pred_idx])
-                    # The extracted object most responsible for this prediction
-                    # (highest similarity to the predicted class) — used both to
-                    # resolve a specific WordNet NODE for hP/hR below, and as the
+            per_cand_sim, pred_idx = clip_metrics.clipmatch(caption_embs[idx], candidate_embs)
+            if pred_idx >= 0:
+                pred_vocab_entry = candidate_vocab[pred_idx]
+                pred_class_synset = pred_vocab_entry["synset_id"]
+                clipmatch_pred_similarity = float(per_cand_sim[pred_idx])
+                if rec_obj_embs.shape[0] > 0:
+                    # Which extracted object is most representative of the
+                    # caption-predicted class — used both to resolve a
+                    # specific WordNet NODE for hP/hR below, and as the
                     # source object for the material axis's VLM judgment.
-                    best_obj_idx = int(per_obj_sim.argmax())
+                    sims_to_pred = rec_obj_embs @ candidate_embs[pred_idx]
+                    best_obj_idx = int(sims_to_pred.argmax())
                     pred_node = taxonomy_metrics.resolve_to_wordnet(
-                        list(per_obj_sim), pred_class_synset, objs)
+                        list(sims_to_pred), pred_class_synset, objs)
 
             t0 = targets[0]
             # A present GT with no prediction (no objects extracted, or none
@@ -682,32 +678,6 @@ def phase_score(args):
                 # "prediction-unmapped penalized as wrong" convention.
                 wup_sim = taxonomy_metrics.compute_wup_similarity(gt_syn, pred_node)
                 wup_vals.append(wup_sim)
-
-            # --- EXPERIMENTAL: caption-based ClipMatch variant (recap §11 open
-            # item), computed in PARALLEL with the object-list version above for
-            # side-by-side comparison — NOT used for the axis scores, and not
-            # (yet) the default. Predicts the class from the WHOLE CAPTION's
-            # similarity to each candidate, then asks which extracted object
-            # best aligns with THAT predicted class (for hP/hR resolution) —
-            # see clip_metrics.clipmatch_from_caption.
-            _, pred_idx_cap = clip_metrics.clipmatch_from_caption(caption_embs[idx], candidate_embs)
-            if pred_idx_cap >= 0:
-                pred_class_synset_cap = candidate_vocab[pred_idx_cap]["synset_id"]
-                if rec_obj_embs.shape[0] > 0:
-                    sims_to_pred_cap = rec_obj_embs @ candidate_embs[pred_idx_cap]
-                    pred_node_cap = taxonomy_metrics.resolve_to_wordnet(
-                        list(sims_to_pred_cap), pred_class_synset_cap, objs)
-
-            if gt_syn:
-                clipmatch_cap_support += 1
-                clipmatch_cap_correct = pred_class_synset_cap is not None and pred_class_synset_cap == gt_syn
-                if clipmatch_cap_correct:
-                    clipmatch_cap_top1 += 1
-                hier_cap = taxonomy_metrics.compute_hierarchical_metrics(graph, gt_syn, pred_node_cap)
-                hp_cap_vals.append(hier_cap["hp"]); hr_cap_vals.append(hier_cap["hr"])
-                hf1_cap_vals.append(hier_cap["hf1"])
-                wup_sim_cap = taxonomy_metrics.compute_wup_similarity(gt_syn, pred_node_cap)
-                wup_cap_vals.append(wup_sim_cap)
         else:
             # --- COCO (multi-label) + BIG-5 (holistic): image-level nature OR
             #     + matched-object biotic/material ---
@@ -804,7 +774,7 @@ def phase_score(args):
                 "gt_nature": gt_nature_val, "pred_nature": pred_nature_val,
                 "gt_biotic": gt_biotic_val, "pred_biotic": pred_biotic_val,
                 "gt_material": gt_material_val, "pred_material": pred_material_val,
-                # ClipMatch [object-list] — the metric actually used for scoring
+                # ClipMatch (caption-based) — the metric actually used for scoring
                 "clipmatch_pred_class": pred_vocab_entry["class_name"] if pred_vocab_entry else None,
                 "clipmatch_pred_synset": pred_vocab_entry["synset_id"] if pred_vocab_entry else None,
                 "clipmatch_pred_similarity": clipmatch_pred_similarity,
@@ -817,13 +787,6 @@ def phase_score(args):
                 "hierarchical_precision": hier["hp"], "hierarchical_recall": hier["hr"],
                 "hierarchical_f1": hier["hf1"],
                 "wup_similarity": wup_sim,
-                # ClipMatch [caption, EXPERIMENTAL] — recap §11, not used for scoring
-                "clipmatch_caption_pred_synset": pred_class_synset_cap,
-                "clipmatch_caption_top1_correct": clipmatch_cap_correct,
-                "resolved_pred_synset_caption": pred_node_cap,
-                "hierarchical_precision_caption": hier_cap["hp"], "hierarchical_recall_caption": hier_cap["hr"],
-                "hierarchical_f1_caption": hier_cap["hf1"],
-                "wup_similarity_caption": wup_sim_cap,
             })
 
     # ---- Assemble summary ----
@@ -845,13 +808,14 @@ def phase_score(args):
         "biotic_matched": _binary_metrics(bio_true, bio_pred),
         "material_matched": _binary_metrics(mat_true, mat_pred),
         "axis_scoring_note": ("imagenet/places: nature/biotic come from the ClipMatch TOP-1 "
-                              "predicted class's OWN taxonomy position (the global argmax over "
-                              "candidate_vocab, which is restricted to classes mapped into the "
-                              "graph — see get_candidate_vocab); material is ALWAYS the VLM's own "
-                              "judgment (never mapped), taken from the extracted object most "
-                              "representative of that predicted class. coco/big5: image-level "
-                              "nature (OR) + matched-object biotic/material (coco box-IoU is "
-                              "future work, recap §6.4)."),
+                              "predicted class's OWN taxonomy position — ClipMatch predicts the "
+                              "class from the WHOLE CAPTION's CLIP similarity to candidate_vocab "
+                              "(which is restricted to classes mapped into the graph — see "
+                              "get_candidate_vocab); material is ALWAYS the VLM's own judgment "
+                              "(never mapped), taken from the extracted object most representative "
+                              "of that predicted class. coco/big5: image-level nature (OR) + "
+                              "matched-object biotic/material (coco box-IoU is future work, "
+                              "recap §6.4)."),
         "material_caveat": ("Material GT for imagenet/coco/places is the heuristic "
                             "gt_material=True default (real photos); only BIG-5 has genuine "
                             "material GT. Predicted material is always the VLM's judgment "
@@ -866,15 +830,6 @@ def phase_score(args):
         summary["hierarchical"] = {"hp": _mean(hp_vals), "hr": _mean(hr_vals),
                                    "hf1": _mean(hf1_vals), "wup": _mean(wup_vals),
                                    "support": len(hf1_vals)}
-        # EXPERIMENTAL caption-based variant (recap §11), printed alongside the
-        # object-list version above for comparison — see clipmatch_from_caption.
-        summary["clipmatch_caption"] = {
-            "top1_accuracy": (clipmatch_cap_top1 / clipmatch_cap_support) if clipmatch_cap_support else 0.0,
-            "support": clipmatch_cap_support,
-        }
-        summary["hierarchical_caption"] = {"hp": _mean(hp_cap_vals), "hr": _mean(hr_cap_vals),
-                                           "hf1": _mean(hf1_cap_vals), "wup": _mean(wup_cap_vals),
-                                           "support": len(hf1_cap_vals)}
 
     # Wall-clock time this model took to finish this run, formatted "D-HH:MM:SS"
     # (SLURM-style elapsed time). inference_time_seconds comes from phase_infer's
@@ -950,18 +905,11 @@ def _print_summary(s, run_clipmatch):
         print(f"  {axis.split('_')[0]:<12} (pos) P {m['precision']:.4f} | R {m['recall']:.4f} | F1 {m['f1']:.4f}")
         print(f"  {neg_labels[axis]:<12} (neg) P {m['precision_neg']:.4f} | R {m['recall_neg']:.4f} | F1 {m['f1_neg']:.4f}")
     if run_clipmatch:
-        print(f"\n--- ClipMatch [object-list] (support {s['clipmatch']['support']}) ---")
+        print(f"\n--- ClipMatch [caption-based] (support {s['clipmatch']['support']}) ---")
         print(f"Top-1: {s['clipmatch']['top1_accuracy']:.4f}")
         h = s["hierarchical"]
-        print(f"--- Hierarchical [object-list] (support {h['support']}) ---")
+        print(f"--- Hierarchical (support {h['support']}) ---")
         print(f"hP {h['hp']:.4f} | hR {h['hr']:.4f} | hF1 {h['hf1']:.4f} | Wu-Palmer {h['wup']:.4f}")
-        # EXPERIMENTAL caption-based variant (recap §11), printed for direct
-        # comparison against the object-list version above.
-        print(f"\n--- ClipMatch [caption, EXPERIMENTAL] (support {s['clipmatch_caption']['support']}) ---")
-        print(f"Top-1: {s['clipmatch_caption']['top1_accuracy']:.4f}")
-        hc = s["hierarchical_caption"]
-        print(f"--- Hierarchical [caption, EXPERIMENTAL] (support {hc['support']}) ---")
-        print(f"hP {hc['hp']:.4f} | hR {hc['hr']:.4f} | hF1 {hc['hf1']:.4f} | Wu-Palmer {hc['wup']:.4f}")
     t = s["execution_time"]
     inf_str = t["inference"] if t["inference"] is not None else "n/a"
     print(f"\nExecution time (D-HH:MM:SS): inference {inf_str} | scoring {t['scoring']} | total {t['total']}")
@@ -996,10 +944,6 @@ def _log_wandb(args, summary, run_clipmatch):
         log["ClipMatch/Top1"] = summary["clipmatch"]["top1_accuracy"]
         log["Hierarchical/hF1"] = summary["hierarchical"]["hf1"]
         log["Hierarchical/WuPalmer"] = summary["hierarchical"]["wup"]
-        # EXPERIMENTAL caption-based variant (recap §11).
-        log["ClipMatchCaption/Top1"] = summary["clipmatch_caption"]["top1_accuracy"]
-        log["HierarchicalCaption/hF1"] = summary["hierarchical_caption"]["hf1"]
-        log["HierarchicalCaption/WuPalmer"] = summary["hierarchical_caption"]["wup"]
     wandb.log(log)
     wandb.finish()
 
