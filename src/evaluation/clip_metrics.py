@@ -53,7 +53,7 @@ from __future__ import annotations
 
 import inspect
 import warnings
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 
@@ -131,7 +131,7 @@ class CLIPScorer:
         device: str = "cuda",
         batch_size: int = 64,
         trust_remote_code: bool = True,
-        torch_dtype: str = "auto",
+        torch_dtype: Optional[str] = None,
     ) -> None:
         # Imported lazily (inside the method, not at module load time) so that
         # simply IMPORTING this file never requires torch/transformers to be
@@ -149,10 +149,10 @@ class CLIPScorer:
         self.model = self._load_model(self.repo_id, trust_remote_code, torch_dtype)
         self.model.eval().to(self.device)
         # Image/text processors always emit float32 tensors regardless of the
-        # model's own dtype, so a checkpoint loaded in fp16/bf16 (e.g. via
-        # torch_dtype="auto" on EVA-CLIP-8B) would otherwise hit a dtype
-        # mismatch on the first forward pass. Recorded once so _to_device()
-        # can cast floating inputs to match.
+        # model's own dtype, so a checkpoint loaded in fp16/bf16 (only when the
+        # caller passes an explicit torch_dtype — see _load_model) would
+        # otherwise hit a dtype mismatch on the first forward pass. Recorded
+        # once so _to_device() can cast floating inputs to match.
         self._model_dtype = next(self.model.parameters()).dtype
         # The model's OWN text-embedding table size (ground truth), used to
         # catch a tokenizer/model vocabulary mismatch before it ever reaches
@@ -212,7 +212,7 @@ class CLIPScorer:
         self._embed_dim = self._encode_text_batch(["a photo of a photo"]).shape[1]
 
     @staticmethod
-    def _load_model(repo_id: str, trust_remote_code: bool, torch_dtype: str = "auto"):
+    def _load_model(repo_id: str, trust_remote_code: bool, torch_dtype: Optional[str] = None):
         """Load a checkpoint's model class, working around a real gap in
         `AutoModel.from_pretrained(..., trust_remote_code=True)`: it only
         auto-dispatches to a custom repo's model class if that repo's
@@ -234,33 +234,33 @@ class CLIPScorer:
         `"AutoModel"` key IS present — this just widens which auto_map key
         we'll accept).
 
-        `torch_dtype="auto"` (the default) loads each checkpoint in whatever
-        dtype its own config declares, rather than transformers' unconditional
-        fp32 fallback — load_in fp32 is fine for the small original CLIP, but
-        would try to allocate ~32GB for the 8B-param EVA-CLIP-8B preset.
-
-        `low_cpu_mem_usage=False` is forced on every `from_pretrained` call
-        here for a real reason, not just a default: passing `torch_dtype`
-        at all makes `transformers` default to the "fast init" path, which
-        constructs the model on the meta device (empty shapes, no storage)
-        and materializes real tensors only for what the checkpoint's
-        state_dict covers. Custom trust_remote_code checkpoints that build a
-        buffer/tensor themselves in __init__ OUTSIDE that state_dict-driven
-        path (observed with fg-clip2's positional-embedding mask) never get
-        materialized under fast init, so using it later crashes with
-        `NotImplementedError: Cannot copy out of meta tensor; no data!` — a
-        real bug this project hit, not a hypothetical. Forcing eager
-        (non-meta) init avoids it, matching what a plain from_pretrained
-        call without torch_dtype (e.g. this checkpoint's own HF model-card
-        example) gets by default. The one-time cost is loading briefly in
-        full CPU RAM before the requested dtype/device takes over.
+        `torch_dtype` is passed to `from_pretrained` ONLY when the caller
+        explicitly sets it (default None → not passed at all). This matters:
+        passing `torch_dtype` routes `transformers` through its meta-device
+        "fast init" path, which materializes real tensors only for what the
+        checkpoint's state_dict covers. A custom trust_remote_code checkpoint
+        that BUILDS a tensor itself in __init__ outside that state_dict-driven
+        path (fg-clip2's positional-embedding mask `mask1`/`mask2`) never gets
+        materialized there and stays on the meta device, so the first forward
+        crashes with `NotImplementedError: Cannot copy out of meta tensor; no
+        data!`. Loading WITHOUT torch_dtype (exactly what fg-clip2's own HF
+        model-card example does) runs normal eager init, so those buffers get
+        real data. NOTE: `low_cpu_mem_usage=False` does NOT help here — this
+        project's transformers (v5.x, pinned for vLLM) silently drops it as an
+        unknown kwarg. The trade-off: without torch_dtype a checkpoint loads
+        in its default (usually fp32) precision; for a very large preset like
+        EVA-CLIP-8B, pass torch_dtype="auto"/"float16" explicitly and accept
+        that meta-init caveat for that specific checkpoint if it applies.
         """
         from transformers import AutoConfig, AutoModel
 
+        # Only forward torch_dtype when explicitly requested — see docstring
+        # for why the default (not passing it) is what makes fg-clip2 work.
+        dtype_kwargs = {"torch_dtype": torch_dtype} if torch_dtype is not None else {}
+
         try:
             return AutoModel.from_pretrained(
-                repo_id, trust_remote_code=trust_remote_code, torch_dtype=torch_dtype,
-                low_cpu_mem_usage=False,
+                repo_id, trust_remote_code=trust_remote_code, **dtype_kwargs,
             )
         except ValueError as e:
             if "Unrecognized configuration class" not in str(e):
@@ -283,8 +283,7 @@ class CLIPScorer:
         from transformers.dynamic_module_utils import get_class_from_dynamic_module
         model_cls = get_class_from_dynamic_module(class_ref, repo_id)
         return model_cls.from_pretrained(
-            repo_id, trust_remote_code=trust_remote_code, torch_dtype=torch_dtype,
-            low_cpu_mem_usage=False,
+            repo_id, trust_remote_code=trust_remote_code, **dtype_kwargs,
         )
 
     @staticmethod
