@@ -39,8 +39,10 @@ torchvision>=0.16
 Pillow>=10.0
 
 # --- CLIP-based metrics (src/evaluation/clip_metrics.py) ---
-# F-CLIPScore, Object-CLIPScore, ClipMatch all run on open_clip's ViT-L/14.
-open_clip_torch>=2.24
+# F-CLIPScore, Object-CLIPScore, ClipMatch all run through a CLIPScorer
+# (transformers AutoModel/AutoProcessor — see clip_metrics.CLIP_PRESETS for
+# the supported checkpoints: original CLIP, EVA-CLIP, FG-CLIP2, LLM2CLIP).
+# No open_clip dependency; transformers>=4.40 above already covers this.
 
 # --- Experiment tracking ---
 wandb>=0.16

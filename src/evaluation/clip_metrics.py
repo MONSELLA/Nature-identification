@@ -23,10 +23,11 @@ CLIPScore convention (Hessel et al.): CLIPScore = w · max(cos, 0), w = 2.5 by
 default. The scale w is a constant across every term, so it does not change the
 relative ordering used for model comparison; it is exposed for reproducibility.
 
-KNOWN LIMITATION: vanilla CLIP text encoders truncate at 77 tokens (open_clip
-ViT-L/14 included). Only the F-CLIPScore SENTENCE term (the full caption) is at
-risk; short "a photo of a {object}" templates are unaffected. `CLIPScorer`
-warns when a caption exceeds the encoder's context length.
+KNOWN LIMITATION: vanilla CLIP text encoders truncate at 77 tokens (the
+original OpenAI CLIP checkpoint included — see CLIP_PRESETS). Only the
+F-CLIPScore SENTENCE term (the full caption) is at risk; short "a photo of a
+{object}" templates are unaffected. `CLIPScorer` warns when a caption exceeds
+the encoder's context length.
 
 BACKGROUND — WHAT IS CLIP, AND WHY "COSINE SIMILARITY"?
 CLIP is a neural network trained on (image, caption) pairs so that it can turn
@@ -70,64 +71,152 @@ CLIPMATCH_DATASETS = ("imagenet", "places365")
 
 
 # =============================================================================
-# CLIP model wrapper (open_clip ViT-L/14) — returns L2-normalized numpy arrays
+# CLIP model wrapper (transformers, any CLIP-family checkpoint) — returns
+# L2-normalized numpy arrays
 # =============================================================================
+# --clip_model accepts either one of these short aliases or a raw HuggingFace
+# repo id directly. These are BEST-EFFORT default checkpoints for each variant
+# — verify the exact repo id yourself before relying on results from one of
+# them; if a default here turns out wrong/moved, just pass the correct repo id
+# straight to --clip_model, no code change needed. LongCLIP is deliberately
+# NOT included: as of writing it isn't packaged as a HF trust_remote_code
+# AutoModel — using it would require cloning its own repo, which we're
+# avoiding here in favor of everything loading through `transformers` alone.
+CLIP_PRESETS = {
+    "original": "openai/clip-vit-large-patch14",
+    "eva-clip": "BAAI/EVA-CLIP-8B",
+    "fg-clip2": "qihoo360/fg-clip2-large",
+    "llm2clip": "microsoft/LLM2CLIP-Openai-L-14-336",
+}
+
+
 class CLIPScorer:
-    """Thin open_clip wrapper. Encodes images and text to L2-normalized float32
-    numpy arrays so all downstream metric math is backend-free numpy."""
+    """HuggingFace `transformers` wrapper around a CLIP-family model. Encodes
+    images and text to L2-normalized float32 numpy arrays so all downstream
+    metric math is backend-free numpy.
+
+    Loads ANY CLIP-like checkpoint via `AutoModel`/`AutoProcessor` (falling
+    back to separate `AutoTokenizer`/`AutoImageProcessor` when a checkpoint
+    has no combined processor), so the same class covers the original OpenAI
+    CLIP as well as third-party variants (EVA-CLIP, FG-CLIP2, LLM2CLIP, ...) —
+    see CLIP_PRESETS. `trust_remote_code=True` by default since several of
+    these variants ship custom modeling code on the Hub; it's a no-op for
+    checkpoints (like the original CLIP) that don't need it.
+
+    The model's own feature-extraction method is duck-typed rather than
+    hardcoded per checkpoint: `get_image_features`/`get_text_features` (the
+    standard `transformers` CLIP API) is tried first, `encode_image`/
+    `encode_text` (the convention several trust_remote_code CLIP variants
+    carried over from open_clip's API) second — so a new --clip_model swap
+    only needs a correct repo id, not new code, as long as it exposes one of
+    these two API shapes.
+    """
 
     def __init__(
         self,
-        model_name: str = "ViT-L-14",
-        pretrained: str = "openai",
+        model_name: str = "original",
         device: str = "cuda",
         batch_size: int = 64,
+        trust_remote_code: bool = True,
     ) -> None:
         # Imported lazily (inside the method, not at module load time) so that
-        # simply IMPORTING this file never requires torch/open_clip to be
+        # simply IMPORTING this file never requires torch/transformers to be
         # installed — only actually creating a CLIPScorer does. This is what
         # lets the pure-math functions further down be unit-tested without a
         # GPU or these heavy dependencies present.
         import torch
-        import open_clip
+        from transformers import AutoImageProcessor, AutoModel, AutoProcessor, AutoTokenizer
 
         self.device = device
         self.batch_size = batch_size
-        # open_clip.create_model_and_transforms loads the pretrained CLIP
-        # weights and also returns the exact image-preprocessing pipeline
-        # (resizing/cropping/normalizing) this specific model was trained
-        # with — we must reuse that preprocessing exactly, so images match
-        # what the model expects.
-        self.model, _, self.preprocess = open_clip.create_model_and_transforms(
-            model_name, pretrained=pretrained
-        )
-        # .eval() disables training-only behaviors (like dropout); .to(device)
-        # moves all model weights onto the target device (e.g. "cuda" for GPU).
+        self._torch = torch
+        self.repo_id = CLIP_PRESETS.get(model_name, model_name)
+
+        self.model = AutoModel.from_pretrained(self.repo_id, trust_remote_code=trust_remote_code)
         self.model.eval().to(device)
-        self.tokenizer = open_clip.get_tokenizer(model_name)
-        # open_clip stores the trained context length on the text tower.
-        self.context_length = getattr(self.model, "context_length", 77)
-        self._torch = torch  # stashed so other methods can use torch without re-importing
+
+        # Most CLIP-family checkpoints publish one combined AutoProcessor
+        # (tokenizer + image processor together); fall back to loading each
+        # piece separately for the few that only publish one of the two.
+        try:
+            processor = AutoProcessor.from_pretrained(self.repo_id, trust_remote_code=trust_remote_code)
+            self.tokenizer = getattr(processor, "tokenizer", processor)
+            self.image_processor = getattr(processor, "image_processor", processor)
+        except Exception:
+            self.tokenizer = AutoTokenizer.from_pretrained(self.repo_id, trust_remote_code=trust_remote_code)
+            self.image_processor = AutoImageProcessor.from_pretrained(self.repo_id, trust_remote_code=trust_remote_code)
+
+        self.context_length = getattr(self.tokenizer, "model_max_length", 77)
+        # Some tokenizers report a sentinel "no limit" value (e.g. 1e30) when
+        # they don't actually define model_max_length — falling back to 77
+        # (CLIP's original context length) keeps the truncation warning below
+        # meaningful instead of silently never firing.
+        if not isinstance(self.context_length, int) or self.context_length > 100_000:
+            self.context_length = 77
+
+        # Embedding dimensionality varies by checkpoint and isn't exposed
+        # uniformly across configs — determine it once via a throwaway encode
+        # instead of guessing a config attribute name per backend.
+        self._embed_dim = self._encode_text_batch(["a photo of a photo"]).shape[1]
+
+    def _text_features(self, inputs: dict):
+        if hasattr(self.model, "get_text_features"):
+            return self.model.get_text_features(**inputs)
+        if hasattr(self.model, "encode_text"):
+            return self.model.encode_text(inputs["input_ids"])
+        raise AttributeError(
+            f"{self.repo_id}: model exposes neither get_text_features() nor "
+            f"encode_text() — CLIPScorer doesn't know how to run text encoding "
+            f"for this checkpoint's API."
+        )
+
+    def _image_features(self, inputs: dict):
+        if hasattr(self.model, "get_image_features"):
+            return self.model.get_image_features(**inputs)
+        if hasattr(self.model, "encode_image"):
+            return self.model.encode_image(inputs["pixel_values"])
+        raise AttributeError(
+            f"{self.repo_id}: model exposes neither get_image_features() nor "
+            f"encode_image() — CLIPScorer doesn't know how to run image "
+            f"encoding for this checkpoint's API."
+        )
+
+    def _encode_text_batch(self, texts: List[str]) -> np.ndarray:
+        torch = self._torch
+        inputs = self.tokenizer(texts, padding=True, truncation=True,
+                                max_length=self.context_length, return_tensors="pt")
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        with torch.no_grad():
+            feats = self._text_features(inputs)
+            feats = torch.nn.functional.normalize(feats, p=2, dim=-1)
+        return feats.cpu().float().numpy()
+
+    def _encode_image_batch(self, images) -> np.ndarray:
+        torch = self._torch
+        inputs = self.image_processor(images=images, return_tensors="pt")
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        with torch.no_grad():
+            feats = self._image_features(inputs)
+            feats = torch.nn.functional.normalize(feats, p=2, dim=-1)
+        return feats.cpu().float().numpy()
 
     def encode_text(self, texts: List[str], warn_truncation: bool = False,
                      verbose: bool = False, desc: str = "text") -> np.ndarray:
         """Encode a list of strings → [len(texts), dim] L2-normalized float32."""
-        torch = self._torch
         if not texts:
             # No text to encode — return an empty array with the RIGHT number
             # of embedding dimensions (so callers can still safely concatenate
             # or shape-check it) rather than a completely empty/ambiguous array.
-            return np.zeros((0, self.model.text_projection.shape[1]), dtype=np.float32)
+            return np.zeros((0, self._embed_dim), dtype=np.float32)
 
         if warn_truncation:
-            # CLIP's tokenizer pads every sequence to a fixed length with
-            # zeros; counting non-zero tokens tells us the REAL sequence
-            # length. If that's at/above the model's context length, the
-            # text got cut off and the embedding won't reflect the whole
-            # caption — surface a warning so results can be interpreted
-            # correctly (see the module docstring's 77-token caveat).
+            # Tokenize WITHOUT truncation to get the real sequence length; if
+            # that's at/above the model's context length, the text got cut
+            # off and the embedding won't reflect the whole caption — surface
+            # a warning so results can be interpreted correctly (see the
+            # module docstring's 77-token caveat).
             for t in texts:
-                n_tok = int((self.tokenizer([t]) != 0).sum().item())
+                n_tok = len(self.tokenizer(t, truncation=False)["input_ids"])
                 if n_tok >= self.context_length:
                     warnings.warn(
                         f"Caption reaches/exceeds CLIP context length "
@@ -144,18 +233,7 @@ class CLIPScorer:
         # memory in one forward pass.
         for i in range(0, n_total, self.batch_size):
             batch = texts[i : i + self.batch_size]
-            tokens = self.tokenizer(batch).to(self.device)
-            # torch.no_grad(): we're only doing inference here, not training,
-            # so there's no need to track gradients — this saves memory/time.
-            with torch.no_grad():
-                feats = self.model.encode_text(tokens)
-                # Rescale every embedding vector to unit length (L2 norm = 1),
-                # so a plain dot product later equals cosine similarity (see
-                # the module docstring's CLIP background section).
-                feats = torch.nn.functional.normalize(feats, p=2, dim=-1)
-            # Move back to CPU, plain float32, and convert to a numpy array —
-            # everything downstream of this class works in numpy, not torch.
-            out.append(feats.cpu().float().numpy())
+            out.append(self._encode_text_batch(batch))
             if verbose:
                 done = min(i + self.batch_size, n_total)
                 print(f"🔎 [CLIP] {desc}: {done}/{n_total} ({done / n_total:.1%})", flush=True)
@@ -167,26 +245,23 @@ class CLIPScorer:
         0) rather than aborting the whole scoring run — one bad file must not
         waste an expensive pass over thousands of images. A warning is emitted
         per failure."""
-        import torch
         from PIL import Image
 
-        dim = getattr(self.model.visual, "output_dim", None)
         if not image_paths:
-            return np.zeros((0, dim or 0), dtype=np.float32)
+            return np.zeros((0, self._embed_dim), dtype=np.float32)
 
         out = []
         n_total = len(image_paths)
         for i in range(0, n_total, self.batch_size):
             batch_paths = image_paths[i : i + self.batch_size]
-            tensors = []
+            images = []
             failed = []  # positions (within this batch) that could not be loaded
             for j, p in enumerate(batch_paths):
                 try:
-                    # Open the file, force it to standard RGB (some images are
-                    # grayscale/CMYK/have an alpha channel — CLIP expects RGB),
-                    # then run it through this model's own preprocessing
-                    # pipeline (resize/crop/normalize) to get a model-ready tensor.
-                    tensors.append(self.preprocess(Image.open(p).convert("RGB")))
+                    # Force standard RGB (some images are grayscale/CMYK/have
+                    # an alpha channel — CLIP expects RGB); the checkpoint's
+                    # own image_processor handles resize/crop/normalize.
+                    images.append(Image.open(p).convert("RGB"))
                 except Exception as e:
                     # A single corrupt/missing file must not crash a run that
                     # might be scoring thousands of images — log a warning,
@@ -194,18 +269,12 @@ class CLIPScorer:
                     warnings.warn(f"CLIP: could not read image '{p}' ({e!r}); using a zero embedding.", stacklevel=2)
                     failed.append(j)
 
-            if tensors:
-                # torch.stack bundles the individual preprocessed image
-                # tensors into one batch tensor for a single forward pass.
-                imgs = torch.stack(tensors).to(self.device)
-                with torch.no_grad():
-                    feats = self.model.encode_image(imgs)
-                    feats = torch.nn.functional.normalize(feats, p=2, dim=-1)
-                feats = feats.cpu().float().numpy()
+            if images:
+                feats = self._encode_image_batch(images)
                 d = feats.shape[1]
             else:
                 # Every single image in this batch failed to load.
-                d = dim or 0
+                d = self._embed_dim
                 feats = np.zeros((0, d), dtype=np.float32)
 
             # Re-insert zero rows for failed positions to keep alignment with input.

@@ -9,7 +9,7 @@ End-to-end driver for the baseline BIG-5 VLM pipeline, in three stages:
                   the infer subprocess loads the VLM, writes the JSON-lines
                   artifact to --responses_file, then EXITS — which makes the OS
                   reclaim 100% of the VLM's VRAM before the score subprocess
-                  loads open_clip + the TaxonomyGraph. The VLM and CLIP never
+                  loads the CLIP model + the TaxonomyGraph. The VLM and CLIP never
                   hold GPU memory at the same time, and we don't rely on
                   in-process CUDA cleanup (vLLM/torch release it unreliably on
                   GC). 'spawn' is required for CUDA; only the picklable args
@@ -395,8 +395,9 @@ def phase_score(args):
     # This is where CLIP actually gets loaded onto the GPU — by this point in
     # `--stage all`, the VLM has already been unloaded (see main() below), so
     # CLIP has the GPU memory to itself.
-    scorer = clip_metrics.CLIPScorer(model_name=args.clip_model, pretrained=args.clip_pretrained,
-                                     device=args.device, batch_size=args.clip_batch_size)
+    scorer = clip_metrics.CLIPScorer(model_name=args.clip_model, device=args.device,
+                                     batch_size=args.clip_batch_size,
+                                     trust_remote_code=args.clip_trust_remote_code)
 
     # ---- Hybrid labels per object ----
     # Mapping + hybrid resolution now happen in Phase 1 (see
@@ -1057,9 +1058,21 @@ def parse_args():
                         "more aggressively. Default 3 (previous behavior). Stored in the "
                         "artifact header and reused by --stage score.")
 
-    # CLIP (score)
-    p.add_argument("--clip_model", type=str, default="ViT-L-14")
-    p.add_argument("--clip_pretrained", type=str, default="openai")
+    # CLIP (score) — loaded via transformers (src/evaluation/clip_metrics.py's
+    # CLIPScorer), NOT open_clip. --clip_model accepts either a short alias
+    # from clip_metrics.CLIP_PRESETS ("original", "eva-clip", "fg-clip2",
+    # "llm2clip") or any raw HuggingFace repo id directly (e.g. to override a
+    # preset's default checkpoint, or use a variant not in the preset table).
+    p.add_argument("--clip_model", type=str, default="original",
+                   help="CLIP checkpoint: a clip_metrics.CLIP_PRESETS alias "
+                        "('original', 'eva-clip', 'fg-clip2', 'llm2clip') or a "
+                        "raw HuggingFace repo id.")
+    p.add_argument("--clip_trust_remote_code", type=lambda s: s.lower() != "false", default=True,
+                   help="Passed to transformers' from_pretrained calls (default True). Several "
+                        "CLIP variants (EVA-CLIP, FG-CLIP2, LLM2CLIP) ship custom modeling code "
+                        "on the Hub that requires this; it's a no-op for checkpoints that don't "
+                        "need it (e.g. the original OpenAI CLIP). Pass --clip_trust_remote_code "
+                        "false to disable.")
     p.add_argument("--clip_batch_size", type=int, default=64)
 
     # shared

@@ -953,7 +953,7 @@ def unload_vlm(vlm: BaseVLM) -> None:
             # blocks (to speed up future allocations) rather than immediately
             # returning them to the OS/driver — empty_cache() forces that
             # memory to actually be released so another process/library
-            # (like open_clip loading afterward) can use it.
+            # (like CLIPScorer loading afterward) can use it.
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect()
     except Exception:
