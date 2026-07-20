@@ -153,6 +153,15 @@ class CLIPScorer:
         # mismatch on the first forward pass. Recorded once so _to_device()
         # can cast floating inputs to match.
         self._model_dtype = next(self.model.parameters()).dtype
+        # The model's OWN text-embedding table size (ground truth), used to
+        # catch a tokenizer/model vocabulary mismatch before it ever reaches
+        # the GPU — see _check_token_ids_in_range.
+        self._text_vocab_size = None
+        text_model = getattr(self.model, "text_model", None)
+        if text_model is not None and hasattr(text_model, "get_input_embeddings"):
+            emb = text_model.get_input_embeddings()
+            if emb is not None:
+                self._text_vocab_size = emb.num_embeddings
 
         # Most CLIP-family checkpoints publish one combined AutoProcessor
         # (tokenizer + image processor together); fall back to loading each
@@ -312,10 +321,34 @@ class CLIPScorer:
             for k, v in inputs.items()
         }
 
+    def _check_token_ids_in_range(self, input_ids) -> None:
+        """Catch a tokenizer/model vocabulary mismatch on the CPU, with a
+        readable error, before it reaches the GPU as an opaque CUDA
+        device-side assert (`vectorized_gather_kernel: index out of bounds`)
+        — which, once triggered, poisons the CUDA context so every
+        subsequent op in the same process fails too. Seen with
+        trust_remote_code checkpoints (e.g. fg-clip2) where the tokenizer
+        loaded via AutoProcessor/AutoTokenizer doesn't actually match the
+        loaded model's own text-embedding table size."""
+        if self._text_vocab_size is None:
+            return
+        max_id = int(input_ids.max())
+        if max_id >= self._text_vocab_size:
+            raise ValueError(
+                f"{self.repo_id}: tokenizer produced token id {max_id}, but "
+                f"this model's text embedding table only has "
+                f"{self._text_vocab_size} rows. The loaded tokenizer doesn't "
+                f"match the loaded model's vocabulary — likely a "
+                f"trust_remote_code loading mismatch specific to this "
+                f"checkpoint. Check its HF model card for the exact "
+                f"tokenizer/repo id it expects before retrying."
+            )
+
     def _encode_text_batch(self, texts: List[str]) -> np.ndarray:
         torch = self._torch
         inputs = self.tokenizer(texts, padding=True, truncation=True,
                                 max_length=self.context_length, return_tensors="pt")
+        self._check_token_ids_in_range(inputs["input_ids"])
         inputs = self._to_device(inputs)
         with torch.no_grad():
             feats = self._text_features(inputs)
