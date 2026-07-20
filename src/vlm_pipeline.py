@@ -435,7 +435,7 @@ def run_inference(
                   f"({len(image_paths)} images, free_form)...", flush=True)
         # Stages 1-2: caption, then structured object extraction.
         captions = caption_batch(
-            vlm, image_paths, caption_system_prompt,
+            vlm, image_paths, #caption_system_prompt,
             max_new_tokens=caption_max_new_tokens, temperature=temperature,
         )
         if verbose:
