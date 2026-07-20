@@ -93,7 +93,8 @@ CLIPMATCH_DATASETS = ("imagenet", "places365")
 #     runs the VLM (vLLM) and CLIP scoring in one env, llm2clip isn't usable
 #     without a second env just for it — not worth the operational overhead.
 CLIP_PRESETS = {
-    "clip": "openai/clip-vit-large-patch14",
+    "original": "openai/clip-vit-large-patch14",
+    "clip": "openai/clip-vit-large-patch14",  # alias kept for back-compat
     "eva-clip": "BAAI/EVA-CLIP-8B",
     "fg-clip2": "qihoo360/fg-clip2-large",
 }
