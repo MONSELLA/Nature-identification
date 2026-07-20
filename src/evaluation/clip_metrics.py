@@ -50,7 +50,7 @@ formula.
 from __future__ import annotations
 
 import warnings
-from typing import Dict, List, Optional, Tuple
+from typing import List, Tuple
 
 import numpy as np
 
@@ -128,6 +128,7 @@ class CLIPScorer:
         device: str = "cuda",
         batch_size: int = 64,
         trust_remote_code: bool = True,
+        torch_dtype: str = "auto",
     ) -> None:
         # Imported lazily (inside the method, not at module load time) so that
         # simply IMPORTING this file never requires torch/transformers to be
@@ -135,15 +136,21 @@ class CLIPScorer:
         # lets the pure-math functions further down be unit-tested without a
         # GPU or these heavy dependencies present.
         import torch
-        from transformers import AutoImageProcessor, AutoModel, AutoProcessor, AutoTokenizer
+        from transformers import AutoImageProcessor, AutoProcessor, AutoTokenizer
 
         self.device = device
         self.batch_size = batch_size
         self._torch = torch
         self.repo_id = CLIP_PRESETS.get(model_name, model_name)
 
-        self.model = self._load_model(self.repo_id, trust_remote_code)
+        self.model = self._load_model(self.repo_id, trust_remote_code, torch_dtype)
         self.model.eval().to(self.device)
+        # Image/text processors always emit float32 tensors regardless of the
+        # model's own dtype, so a checkpoint loaded in fp16/bf16 (e.g. via
+        # torch_dtype="auto" on EVA-CLIP-8B) would otherwise hit a dtype
+        # mismatch on the first forward pass. Recorded once so _to_device()
+        # can cast floating inputs to match.
+        self._model_dtype = next(self.model.parameters()).dtype
 
         # Most CLIP-family checkpoints publish one combined AutoProcessor
         # (tokenizer + image processor together); fall back to loading each
@@ -170,7 +177,7 @@ class CLIPScorer:
         self._embed_dim = self._encode_text_batch(["a photo of a photo"]).shape[1]
 
     @staticmethod
-    def _load_model(repo_id: str, trust_remote_code: bool):
+    def _load_model(repo_id: str, trust_remote_code: bool, torch_dtype: str = "auto"):
         """Load a checkpoint's model class, working around a real gap in
         `AutoModel.from_pretrained(..., trust_remote_code=True)`: it only
         auto-dispatches to a custom repo's model class if that repo's
@@ -191,11 +198,18 @@ class CLIPScorer:
         mechanism `AutoModel.from_pretrained` uses internally when the
         `"AutoModel"` key IS present — this just widens which auto_map key
         we'll accept).
+
+        `torch_dtype="auto"` (the default) loads each checkpoint in whatever
+        dtype its own config declares, rather than transformers' unconditional
+        fp32 fallback — load_in fp32 is fine for the small original CLIP, but
+        would try to allocate ~32GB for the 8B-param EVA-CLIP-8B preset.
         """
         from transformers import AutoConfig, AutoModel
 
         try:
-            return AutoModel.from_pretrained(repo_id, trust_remote_code=trust_remote_code)
+            return AutoModel.from_pretrained(
+                repo_id, trust_remote_code=trust_remote_code, torch_dtype=torch_dtype
+            )
         except ValueError as e:
             if "Unrecognized configuration class" not in str(e):
                 raise
@@ -216,7 +230,9 @@ class CLIPScorer:
         class_ref = auto_map[key]
         from transformers.dynamic_module_utils import get_class_from_dynamic_module
         model_cls = get_class_from_dynamic_module(class_ref, repo_id)
-        return model_cls.from_pretrained(repo_id, trust_remote_code=trust_remote_code)
+        return model_cls.from_pretrained(
+            repo_id, trust_remote_code=trust_remote_code, torch_dtype=torch_dtype
+        )
 
     def _unwrap_embedding(self, output, projection_attr: str):
         """`get_text_features`/`get_image_features` are meant to return the
@@ -261,11 +277,24 @@ class CLIPScorer:
             f"encoding for this checkpoint's API."
         )
 
+    def _to_device(self, inputs: dict) -> dict:
+        """Move every tensor to `self.device`, additionally casting floating
+        tensors (e.g. `pixel_values`) to the model's own dtype — processors
+        always emit float32 regardless of what dtype the model was loaded in
+        (see `torch_dtype="auto"` in `_load_model`), so a half-precision
+        checkpoint needs its inputs downcast to match or the forward pass
+        raises a dtype-mismatch error. Integer tensors (`input_ids`,
+        `attention_mask`) are left alone."""
+        return {
+            k: v.to(self.device, dtype=self._model_dtype) if v.is_floating_point() else v.to(self.device)
+            for k, v in inputs.items()
+        }
+
     def _encode_text_batch(self, texts: List[str]) -> np.ndarray:
         torch = self._torch
         inputs = self.tokenizer(texts, padding=True, truncation=True,
                                 max_length=self.context_length, return_tensors="pt")
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        inputs = self._to_device(inputs)
         with torch.no_grad():
             feats = self._text_features(inputs)
             feats = torch.nn.functional.normalize(feats, p=2, dim=-1)
@@ -274,7 +303,7 @@ class CLIPScorer:
     def _encode_image_batch(self, images) -> np.ndarray:
         torch = self._torch
         inputs = self.image_processor(images=images, return_tensors="pt")
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        inputs = self._to_device(inputs)
         with torch.no_grad():
             feats = self._image_features(inputs)
             feats = torch.nn.functional.normalize(feats, p=2, dim=-1)
