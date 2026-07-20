@@ -504,27 +504,31 @@ def load_dataset(dataset_name, taxonomy_graph, **kwargs):
 # ============================================================================
 # CANDIDATE VOCABULARY (for ClipMatch + hierarchical metrics — ImageNet/Places)
 # ============================================================================
-def get_candidate_vocab(dataset_name, **kwargs):
+def get_candidate_vocab(dataset_name, taxonomy_graph, **kwargs):
     """
-    Returns the FIXED closed-set candidate class list for the ClipMatch and
+    Returns the closed-set candidate class list for the ClipMatch and
     hierarchical (hP/hR) metrics, as a list of dicts:
-        [{"class_name": str, "synset_id": str}, ...]
+        [{"class_name": str, "synset_id": str, "gt_nature": bool, "gt_biotic": bool|None}, ...]
 
     Only ImageNet and Places365 define such a vocabulary (single-label, closed
     class set). COCO (multi-label) and BIG-5 (no closed class vocabulary) return
     None — ClipMatch/hP/hR are not run on them, per the project conventions.
 
-    Every returned candidate carries a resolvable WordNet synset, so the
+    RESTRICTED TO MAPPED CLASSES ONLY: a candidate is included only if its
+    synset resolves to a taxonomy label via get_gt_from_graph (the SAME check
+    the dataset loaders use to decide which images to load at all — see
+    load_imagenet/load_places365). An unmapped class was never annotated into
+    our taxonomy, so it must not be a choice ClipMatch can predict, and it
+    never appears as a GT class either (the loaders drop it). This also means
+    every candidate carries its own gt_nature/gt_biotic directly — the
+    ClipMatch top-1 predicted class's taxonomy position is read straight off
+    its candidate_vocab entry, no separate graph lookup needed at scoring time.
+
+    Every returned candidate also carries a resolvable WordNet synset, so the
     ClipMatch-predicted class always has a synset for the hierarchical metrics:
       - ImageNet: every folder WNID converts losslessly via wn.synset_from_pos_and_offset.
       - Places365: scene names are resolved heuristically (MIT-tagged synsets);
         names that do not resolve are dropped from the candidate set.
-
-    NOTE: unlike get_gt_from_graph's callers above, this function does NOT
-    filter by whether the class resolves to a taxonomy LABEL — ClipMatch needs
-    the full candidate class list (so the model has every possible class to
-    choose from when predicting), regardless of whether that class happens to
-    be "mapped" for nature/biotic/material purposes.
     """
     if dataset_name == "imagenet":
         from torchvision.datasets import ImageFolder
@@ -535,9 +539,13 @@ def get_candidate_vocab(dataset_name, **kwargs):
             synset_name = _wnid_to_synset(wnid)
             if synset_name is None or synset_name in seen:
                 continue
+            gt = get_gt_from_graph(synset_name, taxonomy_graph)
+            if gt is None:
+                continue
             seen.add(synset_name)
             class_name = synset_name.split('.')[0].replace('_', ' ')
-            vocab.append({"class_name": class_name, "synset_id": synset_name})
+            vocab.append({"class_name": class_name, "synset_id": synset_name,
+                          "gt_nature": gt["gt_nature"], "gt_biotic": gt["gt_biotic"]})
         return vocab
 
     if dataset_name == "places365":
@@ -551,9 +559,13 @@ def get_candidate_vocab(dataset_name, **kwargs):
             synset = _resolve_places_name_to_synset(name, taxonomy_synsets)
             if synset is None or synset in seen:
                 continue
+            gt = get_gt_from_graph(synset, taxonomy_graph)
+            if gt is None:
+                continue
             seen.add(synset)
             class_name = name.replace('/', ' ').replace('_', ' ')
-            vocab.append({"class_name": class_name, "synset_id": synset})
+            vocab.append({"class_name": class_name, "synset_id": synset,
+                          "gt_nature": gt["gt_nature"], "gt_biotic": gt["gt_biotic"]})
         return vocab
 
     # COCO (multi-label) and BIG-5 (open scene) have no closed candidate vocab.
