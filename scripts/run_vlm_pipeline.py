@@ -411,9 +411,9 @@ def phase_score(args):
     # This is where CLIP actually gets loaded onto the GPU — by this point in
     # `--stage all`, the VLM has already been unloaded (see main() below), so
     # CLIP has the GPU memory to itself.
-    scorer = clip_metrics.create_scorer(model_name=args.clip_model, device=args.device,
-                                        batch_size=args.clip_batch_size,
-                                        trust_remote_code=args.clip_trust_remote_code)
+    scorer = clip_metrics.CLIPScorer(model_name=args.clip_model, device=args.device,
+                                     batch_size=args.clip_batch_size,
+                                     trust_remote_code=args.clip_trust_remote_code)
     
     if args.verbose: print(f"{args.clip_model} loaded. Handles a context length of {scorer.context_length} tokens!\n")
 
@@ -1027,23 +1027,26 @@ def build_arg_parser():
 
     # CLIP (score) — loaded via transformers (src/evaluation/clip_metrics.py's
     # CLIPScorer), NOT open_clip. --clip_model accepts either a short alias
-    # from clip_metrics.CLIP_PRESETS ("original", "eva-clip", "fg-clip2") or
-    # any raw HuggingFace repo id directly (e.g. to override a preset's
-    # default checkpoint, or use a variant not in the preset table). llm2clip
-    # is deliberately NOT supported — its text tower needs the `llm2vec`
-    # package, which hard-pins transformers<=4.44.2 and is incompatible with
-    # vLLM's transformers>=5.5.3 in this project's single environment (see
-    # clip_metrics.CLIP_PRESETS's module comment).
+    # from clip_metrics.CLIP_PRESETS ("original", "eva-clip", "siglip2",
+    # "jina-clip-v2") or any raw HuggingFace repo id directly (e.g. to
+    # override a preset's default checkpoint, or use a variant not in the
+    # preset table). llm2clip is deliberately NOT supported — its text tower
+    # needs the `llm2vec` package, which hard-pins transformers<=4.44.2 and
+    # is incompatible with vLLM's transformers>=5.5.3 in this project's
+    # single environment (see clip_metrics.CLIP_PRESETS's module comment).
+    # FG-CLIP2 was tried and abandoned (meta-tensor crash in its
+    # trust_remote_code __init__, incompatible with this transformers
+    # version — see clip_metrics.CLIP_PRESETS's comment for the full story).
     p.add_argument("--clip_model", type=str, default="original",
                    help="CLIP checkpoint: a clip_metrics.CLIP_PRESETS alias "
-                        "('original', 'eva-clip', 'fg-clip2') or a raw "
-                        "HuggingFace repo id.")
+                        "('original', 'eva-clip', 'siglip2', 'jina-clip-v2') "
+                        "or a raw HuggingFace repo id.")
     p.add_argument("--clip_trust_remote_code", type=lambda s: s.lower() != "false", default=True,
                    help="Passed to transformers' from_pretrained calls (default True). Several "
-                        "CLIP variants (EVA-CLIP, FG-CLIP2) ship custom modeling code on the Hub "
-                        "that requires this; it's a no-op for checkpoints that don't need it "
-                        "(e.g. the original OpenAI CLIP). Pass --clip_trust_remote_code false to "
-                        "disable.")
+                        "CLIP variants (EVA-CLIP, Jina-CLIP-v2) ship custom modeling code on the "
+                        "Hub that requires this; it's a no-op for checkpoints that don't need it "
+                        "(e.g. the original OpenAI CLIP, SigLIP2). Pass --clip_trust_remote_code "
+                        "false to disable.")
     p.add_argument("--clip_batch_size", type=int, default=64)
 
     # shared

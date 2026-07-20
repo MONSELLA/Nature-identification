@@ -1,8 +1,10 @@
-BIG-5 VLM PIPELINE — DESIGN RECAP (v5)
+BIG-5 VLM PIPELINE — DESIGN RECAP (v6)
 (v4: the VLM pipeline is now IMPLEMENTED — this doc records both the original
 design rationale AND, in "IMPLEMENTED:" notes, how the shipped code actually
 does it where the two differ. v5: ClipMatch switched to the caption-based
-variant as the only implementation — see Section 8e and Section 11.)
+variant as the only implementation — see Section 8e and Section 11. v6:
+FG-CLIP2 tried and ABANDONED as a CLIP backend — see Section 11 — replaced
+in CLIP_PRESETS by SigLIP2 and Jina-CLIP-v2.)
 
 ===============================================================
 0. IMPLEMENTATION STATUS (NEW in v4)
@@ -64,7 +66,12 @@ the COCO box-IoU matching noted in Section 8), and the ablations
         a stuffed rabbit is immaterial but geometrically a "thing")
      2. Dual-branch verification — detector/segmenter confidence +
         hierarchy-based margin check via FG-CLIP2 (cosine similarity
-        across target/hypernym/sibling hyponyms on localized crops)
+        across target/hypernym/sibling hyponyms on localized crops).
+        CAVEAT (v6): FG-CLIP2 was tried for the VLM pipeline's CLIP
+        scoring and abandoned — its trust_remote_code __init__ crashes
+        with a meta-tensor error under this project's transformers
+        version (Section 11). Re-verify it loads at all before building
+        this step around it; may need a different CLIP backend here too.
      3. Taxonomy-attribute spatial aggregation — per-object
         localization maps combined into biotic/abiotic and
         material/immaterial heatmaps.
@@ -409,10 +416,14 @@ reliably well-trained per Long-CLIP's analysis. Conflicts with the
 detailed-caption strategy (Section 4) for the sentence-level term.
 Object-level terms unaffected (short templated phrases).
 Mitigation options (not yet decided):
-  - Long-context CLIP variant for the sentence-level term (FG-CLIP2
-    explicitly trains on long-caption modeling, unlike vanilla CLIP
-    — verify its exact max sequence length before relying on it;
-    alternatively Long-CLIP)
+  - Long-context CLIP variant for the sentence-level term. FG-CLIP2
+    was tried (it explicitly trains on long-caption modeling, unlike
+    vanilla CLIP) and ABANDONED — see Section 11 — its
+    trust_remote_code __init__ crashes with a meta-tensor error under
+    this project's transformers version. Jina-CLIP-v2 (now in
+    CLIP_PRESETS) handles much longer text and may be worth trying
+    for this specifically; alternatively Long-CLIP (still not
+    packaged as a plain HF AutoModel — see CLIP_PRESETS's comment).
   - Accept + document truncation as a stated limitation
   - Deliberately truncate/cap captions at a controlled length
 
@@ -634,7 +645,8 @@ Week 8 (Sep 3-10): Finish Discussion/Conclusion/Abstract,
 - Exact weighting scheme for the nature importance score's
   central-pixel emphasis (Section 1, B.4) — not yet designed
 - Which CLIP variant for F-CLIPScore's sentence-level term (vanilla
-  + accept truncation, vs Long-CLIP, vs FG-CLIP2)
+  + accept truncation, vs Long-CLIP, vs Jina-CLIP-v2 — FG-CLIP2 is
+  no longer an option, see RESOLVED IN v6 below)
 - Format-detection method to route foreground/background/scene
   decomposition vs. fallback single caption
 - Whether to extend WordNet mapping to novel VLM-extracted object
@@ -643,23 +655,37 @@ Week 8 (Sep 3-10): Finish Discussion/Conclusion/Abstract,
   pending ablation results (material/immaterial stays VLM-based
   regardless, per Section 5)
 
+RESOLVED IN v6 (decided after repeated integration failures):
+- FG-CLIP2 (qihoo360/fg-clip2-large) is ABANDONED as a CLIP backend
+  and removed from clip_metrics.CLIP_PRESETS. Its trust_remote_code
+  __init__ builds a positional-embedding mask (`mask1`/`mask2`) as a
+  plain tensor attribute rather than a registered nn.Parameter/
+  nn.Buffer. Under this project's transformers version, __init__ runs
+  inside a meta-device "fast init" context regardless of any loading
+  kwarg (torch_dtype, low_cpu_mem_usage, device_map — all tried, none
+  fixed it, including loading exactly per FG-CLIP2's own HF model-card
+  example with no extra kwargs at all), so that tensor never gets real
+  data and the first text-encoding forward pass crashes with
+  `NotImplementedError: Cannot copy out of meta tensor; no data!`. A
+  dedicated (non-generic) loading class was also tried and hit the
+  identical crash, confirming this is a genuine incompatibility between
+  FG-CLIP2's own trust_remote_code and this transformers version, not
+  something fixable from the calling side. clip_metrics.py's `walk_type`/
+  `_text_walk_type` handling (added earlier to work around a DIFFERENT,
+  separate FG-CLIP2 issue — its get_text_features() needing a
+  walk_type kwarg tied to a fixed 64/196-token sequence length) has
+  been removed along with it, since it's moot without a working load.
+  CLIP_PRESETS now offers SigLIP2 (google/siglip2-base-patch16-224,
+  native transformers, no trust_remote_code needed) and Jina-CLIP-v2
+  (jinaai/jina-clip-v2, trust_remote_code, RAW string/image input
+  convention — see clip_metrics.CLIPScorer's class docstring) instead.
+
 RESOLVED IN v5 (decided from empirical comparison):
 - ClipMatch: caption-based similarity beats the object-list variant
   (Section 8e) — object-list ClipMatch code removed from
   clip_metrics.py; the raw-caption approach is now the ONLY
   implementation, its 77-token truncation caveat accepted as a
   stated limitation.
-- FG-CLIP2's exact max sequence length (per its HF model card):
-  NOT a single model_max_length like standard CLIP — its
-  get_text_features() takes a required `walk_type` kwarg selecting
-  between two differently-sized FIXED position-embedding tables:
-  "short" = 64 tokens (its default), "long" = 196 tokens. CLIPScorer
-  detects this convention via the get_text_features() signature
-  (no repo-id check) and always requests walk_type="long"/
-  context_length=196 — using the wrong walk_type/length pairing
-  desyncs the position-embedding lookup and crashes with a CUDA
-  device-side gather-kernel assert (`vectorized_gather_kernel: index
-  out of bounds`), which is what motivated pinning this down.
 
 RESOLVED IN v4 (decided during implementation):
 - hP/hR predicted-class -> WordNet-node step: uses CLIP-ranked object

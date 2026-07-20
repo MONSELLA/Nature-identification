@@ -21,7 +21,11 @@ evaluating the models.
   accuracy/precision/recall/F1.
 - **Grounding pipeline** (geometric/embedding-based, designed but not built):
   Grounding DINO + SAM (thing/stuff routing) → FG-CLIP2 hierarchy-margin
-  verification → nature importance score.
+  verification → nature importance score. CAVEAT: FG-CLIP2 was tried for the
+  VLM pipeline's CLIP scoring and abandoned — its trust_remote_code __init__
+  crashes with a meta-tensor error under this project's transformers version
+  (see clip_metrics.CLIP_PRESETS's comment). Re-verify it loads at all before
+  building the Grounding pipeline's verification step around it.
 
 ## VLM pipeline — code layout & how to run
 - Entrypoint: `scripts/run_vlm_pipeline.py` (`--stage all|infer|score`).
@@ -78,8 +82,10 @@ evaluating the models.
   objects only. No sentence term.
 - CLIP text encoder truncates at 77 tokens — long captions risk truncating the
   sentence-level term. Check which CLIP variant is in use before assuming the
-  full caption is encoded (FG-CLIP2 / Long-CLIP handle longer text; vanilla
-  CLIP does not).
+  full caption is encoded; vanilla CLIP, SigLIP2, and EVA-CLIP all truncate
+  around this range, Jina-CLIP-v2 handles much longer text. FG-CLIP2 was
+  tried as a long-context option and abandoned — see
+  src/evaluation/clip_metrics.py's `CLIP_PRESETS` comment.
 - **ClipMatch** (ImageNet + Places only — not COCO, not BIG-5): score the
   WHOLE CAPTION's CLIP embedding against each GT candidate class; argmax =
   predicted class. SUPERSEDES the earlier object-list variant (max similarity

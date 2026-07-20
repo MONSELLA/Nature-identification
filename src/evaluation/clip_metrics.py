@@ -83,9 +83,7 @@ CLIPMATCH_DATASETS = ("imagenet", "places365")
 # them; if a default here turns out wrong/moved, just pass the correct repo id
 # straight to --clip_model, no code change needed.
 #
-# TWO variants are deliberately NOT included, both for the same reason —
-# everything here loads through plain `transformers` alone, no extra
-# environment required:
+# NOT included, and why:
 #   - LongCLIP: not packaged as a HF trust_remote_code AutoModel; using it
 #     would require cloning its own repo.
 #   - LLM2CLIP: its text tower isn't a CLIP transformer at all — it's a
@@ -95,11 +93,24 @@ CLIPMATCH_DATASETS = ("imagenet", "places365")
 #     force-downgraded transformers and broke vLLM here). Since this project
 #     runs the VLM (vLLM) and CLIP scoring in one env, llm2clip isn't usable
 #     without a second env just for it — not worth the operational overhead.
+#   - FG-CLIP2 (qihoo360/fg-clip2-large): tried and ABANDONED. Even its own
+#     HF model-card example (AutoModelForCausalLM, no torch_dtype/device_map)
+#     crashes with `NotImplementedError: Cannot copy out of meta tensor; no
+#     data!` on a custom positional-embedding mask (`mask1`/`mask2`) that its
+#     __init__ builds as a plain tensor attribute rather than a registered
+#     buffer — under this environment's transformers version, __init__ runs
+#     inside a meta-device context regardless of any loading kwarg, so that
+#     tensor never gets real data. This is a genuine incompatibility between
+#     that checkpoint's trust_remote_code and this transformers version, not
+#     something fixable from the calling side (low_cpu_mem_usage=False did
+#     not help either). See data/llm_reference/vlm_pipeline_recap.txt for
+#     the full incident history if this is ever revisited.
 CLIP_PRESETS = {
     "original": "openai/clip-vit-large-patch14",
     "clip": "openai/clip-vit-large-patch14",  # alias kept for back-compat
     "eva-clip": "BAAI/EVA-CLIP-8B",
-    "fg-clip2": "qihoo360/fg-clip2-large",
+    "siglip2": "google/siglip2-base-patch16-224",
+    "jina-clip-v2": "jinaai/jina-clip-v2",
 }
 
 
@@ -111,18 +122,25 @@ class CLIPScorer:
     Loads ANY CLIP-like checkpoint via `AutoModel`/`AutoProcessor` (falling
     back to separate `AutoTokenizer`/`AutoImageProcessor` when a checkpoint
     has no combined processor), so the same class covers the original OpenAI
-    CLIP as well as third-party variants (EVA-CLIP, FG-CLIP2, ...) — see
-    CLIP_PRESETS. `trust_remote_code=True` by default since several of these
-    variants ship custom modeling code on the Hub; it's a no-op for
-    checkpoints (like the original CLIP) that don't need it.
+    CLIP as well as third-party variants (EVA-CLIP, SigLIP2, Jina-CLIP-v2,
+    ...) — see CLIP_PRESETS. `trust_remote_code=True` by default since some
+    of these variants ship custom modeling code on the Hub; it's a no-op for
+    checkpoints (like the original CLIP, SigLIP2) that don't need it.
 
     The model's own feature-extraction method is duck-typed rather than
-    hardcoded per checkpoint: `get_image_features`/`get_text_features` (the
-    standard `transformers` CLIP API) is tried first, `encode_image`/
-    `encode_text` (the convention several trust_remote_code CLIP variants
-    carried over from open_clip's API) second — so a new --clip_model swap
-    only needs a correct repo id, not new code, as long as it exposes one of
-    these two API shapes.
+    hardcoded per checkpoint, tried in this order:
+      1. `get_image_features`/`get_text_features` taking pre-tokenized/
+         pre-processed tensor inputs (the standard `transformers` CLIP API —
+         original CLIP, EVA-CLIP, SigLIP2).
+      2. `encode_image`/`encode_text` ALSO taking tensor inputs (the
+         open_clip-style convention some trust_remote_code variants use).
+      3. `encode_image`/`encode_text` taking RAW PIL images / raw strings
+         directly instead of tensors (the convention Jina-CLIP-v2 uses,
+         detected via a `truncate_dim` parameter on that method) — this
+         bypasses our own tokenizer/image_processor entirely for that
+         checkpoint, since the model handles preprocessing itself.
+    A new --clip_model swap only needs a correct repo id, not new code, as
+    long as it exposes one of these three shapes.
     """
 
     def __init__(
@@ -131,7 +149,7 @@ class CLIPScorer:
         device: str = "cuda",
         batch_size: int = 64,
         trust_remote_code: bool = True,
-        torch_dtype: Optional[str] = None,
+        torch_dtype: Optional[str] = "auto",
     ) -> None:
         # Imported lazily (inside the method, not at module load time) so that
         # simply IMPORTING this file never requires torch/transformers to be
@@ -167,13 +185,26 @@ class CLIPScorer:
         # Most CLIP-family checkpoints publish one combined AutoProcessor
         # (tokenizer + image processor together); fall back to loading each
         # piece separately for the few that only publish one of the two.
+        # Checkpoints using the RAW-input convention (Jina-CLIP-v2 — see the
+        # class docstring) may not publish a standard tokenizer/image
+        # processor config at all, since preprocessing happens inside their
+        # own encode_text/encode_image instead — tolerate either piece
+        # failing to load rather than crashing __init__, since an unused
+        # None is harmless (only the standard tensor-input path below ever
+        # dereferences self.tokenizer/self.image_processor).
         try:
             processor = AutoProcessor.from_pretrained(self.repo_id, trust_remote_code=trust_remote_code)
             self.tokenizer = getattr(processor, "tokenizer", processor)
             self.image_processor = getattr(processor, "image_processor", processor)
         except Exception:
-            self.tokenizer = AutoTokenizer.from_pretrained(self.repo_id, trust_remote_code=trust_remote_code)
-            self.image_processor = AutoImageProcessor.from_pretrained(self.repo_id, trust_remote_code=trust_remote_code)
+            try:
+                self.tokenizer = AutoTokenizer.from_pretrained(self.repo_id, trust_remote_code=trust_remote_code)
+            except Exception:
+                self.tokenizer = None
+            try:
+                self.image_processor = AutoImageProcessor.from_pretrained(self.repo_id, trust_remote_code=trust_remote_code)
+            except Exception:
+                self.image_processor = None
 
         self.context_length = getattr(self.tokenizer, "model_max_length", 77)
         # Some tokenizers report a sentinel "no limit" value (e.g. 1e30) when
@@ -183,28 +214,24 @@ class CLIPScorer:
         if not isinstance(self.context_length, int) or self.context_length > 100_000:
             self.context_length = 77
 
-        # FG-CLIP2 (and any future checkpoint sharing its convention) doesn't
-        # expose a single model_max_length like standard CLIP — its
-        # get_text_features() takes a required `walk_type` ("short"=64
-        # tokens, "long"=196 tokens per its model card) that selects between
-        # differently-SIZED fixed position-embedding tables. Padding to any
-        # other length (e.g. our 77-token generic fallback above) desyncs the
-        # position-embedding lookup from whichever walk_type it defaults to —
-        # this is what produced the "vectorized_gather_kernel: index out of
-        # bounds" CUDA assert. Detected via the get_text_features() signature
-        # rather than a repo-id check, so it "just works" for any checkpoint
-        # using the same convention. LONG is hardcoded (never "short") since
-        # avoiding the 77-token truncation on long captions is the entire
-        # reason FG-CLIP2 is in CLIP_PRESETS (see CLAUDE.md/vlm_pipeline_recap).
-        self._text_walk_type = None
-        if hasattr(self.model, "get_text_features"):
-            try:
-                params = inspect.signature(self.model.get_text_features).parameters
-            except (TypeError, ValueError):
-                params = {}
-            if "walk_type" in params:
-                self._text_walk_type = "long"
-                self.context_length = 196
+        # Jina-CLIP-v2-style checkpoints expose encode_text/encode_image that
+        # take RAW strings/PIL images directly (not pre-tokenized tensors)
+        # and handle preprocessing internally — detected via a `truncate_dim`
+        # parameter, a marker specific to that convention (NOT present on the
+        # open_clip-style encode_text/encode_image some OTHER trust_remote_code
+        # checkpoints use, which DO take tensor inputs — see _text_features/
+        # _image_features). Only checked when get_text_features/
+        # get_image_features are absent, since those take priority regardless.
+        # self.tokenizer/self.image_processor are still loaded above (harmless
+        # if unused) but bypassed entirely at encode time for this convention.
+        self._raw_text_encode = (
+            not hasattr(self.model, "get_text_features")
+            and self._takes_raw_input(getattr(self.model, "encode_text", None))
+        )
+        self._raw_image_encode = (
+            not hasattr(self.model, "get_image_features")
+            and self._takes_raw_input(getattr(self.model, "encode_image", None))
+        )
 
         # Embedding dimensionality varies by checkpoint and isn't exposed
         # uniformly across configs — determine it once via a throwaway encode
@@ -212,7 +239,23 @@ class CLIPScorer:
         self._embed_dim = self._encode_text_batch(["a photo of a photo"]).shape[1]
 
     @staticmethod
-    def _load_model(repo_id: str, trust_remote_code: bool, torch_dtype: Optional[str] = None):
+    def _takes_raw_input(method) -> bool:
+        """True if `method` (an `encode_text`/`encode_image`-shaped callable)
+        looks like the Jina-CLIP-v2 convention — raw strings/images in,
+        handled internally — rather than the tensor-input open_clip
+        convention. `truncate_dim` is that convention's own, distinctive
+        kwarg (controls Matryoshka embedding truncation); no tensor-input
+        `encode_text`/`encode_image` variant this project has seen exposes it."""
+        if method is None:
+            return False
+        try:
+            params = inspect.signature(method).parameters
+        except (TypeError, ValueError):
+            return False
+        return "truncate_dim" in params
+
+    @staticmethod
+    def _load_model(repo_id: str, trust_remote_code: bool, torch_dtype: Optional[str] = "auto"):
         """Load a checkpoint's model class, working around a real gap in
         `AutoModel.from_pretrained(..., trust_remote_code=True)`: it only
         auto-dispatches to a custom repo's model class if that repo's
@@ -234,28 +277,23 @@ class CLIPScorer:
         `"AutoModel"` key IS present — this just widens which auto_map key
         we'll accept).
 
-        `torch_dtype` is passed to `from_pretrained` ONLY when the caller
-        explicitly sets it (default None → not passed at all). This matters:
-        passing `torch_dtype` routes `transformers` through its meta-device
-        "fast init" path, which materializes real tensors only for what the
-        checkpoint's state_dict covers. A custom trust_remote_code checkpoint
-        that BUILDS a tensor itself in __init__ outside that state_dict-driven
-        path (fg-clip2's positional-embedding mask `mask1`/`mask2`) never gets
-        materialized there and stays on the meta device, so the first forward
-        crashes with `NotImplementedError: Cannot copy out of meta tensor; no
-        data!`. Loading WITHOUT torch_dtype (exactly what fg-clip2's own HF
-        model-card example does) runs normal eager init, so those buffers get
-        real data. NOTE: `low_cpu_mem_usage=False` does NOT help here — this
-        project's transformers (v5.x, pinned for vLLM) silently drops it as an
-        unknown kwarg. The trade-off: without torch_dtype a checkpoint loads
-        in its default (usually fp32) precision; for a very large preset like
-        EVA-CLIP-8B, pass torch_dtype="auto"/"float16" explicitly and accept
-        that meta-init caveat for that specific checkpoint if it applies.
+        `torch_dtype="auto"` (the default) loads each checkpoint in whatever
+        dtype its own config declares, rather than transformers' unconditional
+        fp32 fallback — fp32 is fine for the small original CLIP, but would
+        try to allocate ~32GB for the 8B-param EVA-CLIP-8B preset. Pass
+        `torch_dtype=None` explicitly to force plain eager loading (no dtype
+        kwarg forwarded to `from_pretrained` at all) if a future checkpoint
+        turns out to need that — passing `torch_dtype` at all can route
+        `transformers` through a meta-device "fast init" path that leaves any
+        tensor a checkpoint's own __init__ builds OUTSIDE the normal
+        parameter/buffer/state_dict machinery stuck with no real data
+        (this is why FG-CLIP2 was abandoned — see CLIP_PRESETS' comment —
+        not a concern for any preset currently included here).
         """
         from transformers import AutoConfig, AutoModel
 
-        # Only forward torch_dtype when explicitly requested — see docstring
-        # for why the default (not passing it) is what makes fg-clip2 work.
+        # Only forward torch_dtype when the caller actually wants one passed
+        # (torch_dtype=None means "don't pass it at all", not "pass None").
         dtype_kwargs = {"torch_dtype": torch_dtype} if torch_dtype is not None else {}
 
         try:
@@ -324,11 +362,7 @@ class CLIPScorer:
             pooled = self._pool(self.model.text_model(**inputs))
             return self.model.text_projection(pooled)
         if hasattr(self.model, "get_text_features"):
-            # walk_type-style checkpoints (FG-CLIP2) require this kwarg — see
-            # its detection + rationale in __init__. Absent for every other
-            # checkpoint, so this is a no-op kwarg addition for them.
-            kwargs = {"walk_type": self._text_walk_type} if self._text_walk_type else {}
-            out = self.model.get_text_features(**inputs, **kwargs)
+            out = self.model.get_text_features(**inputs)
             return self._unwrap_embedding(out, "text_projection")
         if hasattr(self.model, "encode_text"):
             return self.model.encode_text(inputs["input_ids"])
@@ -372,10 +406,10 @@ class CLIPScorer:
         readable error, before it reaches the GPU as an opaque CUDA
         device-side assert (`vectorized_gather_kernel: index out of bounds`)
         — which, once triggered, poisons the CUDA context so every
-        subsequent op in the same process fails too. Seen with
-        trust_remote_code checkpoints (e.g. fg-clip2) where the tokenizer
-        loaded via AutoProcessor/AutoTokenizer doesn't actually match the
-        loaded model's own text-embedding table size."""
+        subsequent op in the same process fails too. Guards against a
+        trust_remote_code checkpoint where the tokenizer loaded via
+        AutoProcessor/AutoTokenizer doesn't actually match the loaded
+        model's own text-embedding table size."""
         if self._text_vocab_size is None:
             return
         max_id = int(input_ids.max())
@@ -392,13 +426,23 @@ class CLIPScorer:
 
     def _encode_text_batch(self, texts: List[str]) -> np.ndarray:
         torch = self._torch
-        # walk_type-style checkpoints (FG-CLIP2) tie a FIXED sequence length
-        # to their position-embedding table per walk_type, so every batch
-        # must be padded to exactly self.context_length, not just "up to
-        # it" — plain `padding=True` (pad to the batch's own longest
-        # sequence) would under-pad relative to the table the model expects.
-        padding = "max_length" if self._text_walk_type else True
-        inputs = self.tokenizer(texts, padding=padding, truncation=True,
+        if self._raw_text_encode:
+            # Jina-CLIP-v2-style: encode_text takes RAW strings directly and
+            # handles tokenization internally — bypass self.tokenizer
+            # entirely. truncate_dim=None keeps the checkpoint's full
+            # embedding dimensionality (no Matryoshka truncation).
+            with torch.no_grad():
+                feats = self.model.encode_text(texts, truncate_dim=None)
+            feats = feats if isinstance(feats, torch.Tensor) else torch.as_tensor(feats)
+            feats = torch.nn.functional.normalize(feats.to(self.device).float(), p=2, dim=-1)
+            return feats.cpu().float().numpy()
+
+        # padding="max_length" (a fixed length every batch, not just "up to
+        # the batch's own longest sequence") matches what SigLIP2's own
+        # usage docs specify for correct retrieval quality, and is a no-op
+        # difference for standard CLIP (padded positions are masked out via
+        # attention_mask regardless of padded length).
+        inputs = self.tokenizer(texts, padding="max_length", truncation=True,
                                 max_length=self.context_length, return_tensors="pt")
         self._check_token_ids_in_range(inputs["input_ids"])
         inputs = self._to_device(inputs)
@@ -409,6 +453,15 @@ class CLIPScorer:
 
     def _encode_image_batch(self, images) -> np.ndarray:
         torch = self._torch
+        if self._raw_image_encode:
+            # Jina-CLIP-v2-style: encode_image takes RAW PIL images directly
+            # (same convention as encode_text above).
+            with torch.no_grad():
+                feats = self.model.encode_image(images, truncate_dim=None)
+            feats = feats if isinstance(feats, torch.Tensor) else torch.as_tensor(feats)
+            feats = torch.nn.functional.normalize(feats.to(self.device).float(), p=2, dim=-1)
+            return feats.cpu().float().numpy()
+
         inputs = self.image_processor(images=images, return_tensors="pt")
         inputs = self._to_device(inputs)
         with torch.no_grad():
@@ -425,12 +478,14 @@ class CLIPScorer:
             # or shape-check it) rather than a completely empty/ambiguous array.
             return np.zeros((0, self._embed_dim), dtype=np.float32)
 
-        if warn_truncation:
+        if warn_truncation and self.tokenizer is not None:
             # Tokenize WITHOUT truncation to get the real sequence length; if
             # that's at/above the model's context length, the text got cut
             # off and the embedding won't reflect the whole caption — surface
             # a warning so results can be interpreted correctly (see the
-            # module docstring's 77-token caveat).
+            # module docstring's 77-token caveat). Skipped for RAW-input
+            # checkpoints (self.tokenizer is None) — they don't tokenize
+            # through us at all, so this check doesn't apply.
             for t in texts:
                 n_tok = len(self.tokenizer(t, truncation=False)["input_ids"])
                 if n_tok >= self.context_length:
@@ -509,223 +564,6 @@ class CLIPScorer:
                 done = min(i + self.batch_size, n_total)
                 print(f"🔎 [CLIP] images: {done}/{n_total} ({done / n_total:.1%})", flush=True)
         return np.concatenate(out, axis=0)
-
-
-# =============================================================================
-# FG-CLIP2 — a DEDICATED wrapper, not routed through CLIPScorer's generic
-# duck-typing
-# =============================================================================
-# FG-CLIP2 (qihoo360/fg-clip2-large) doesn't fit the standard CLIPModel shape
-# CLIPScorer targets: it's loaded via AutoModelForCausalLM (not AutoModel),
-# its image processor takes a per-image `max_num_patches` sizing argument
-# (not a fixed resize), and its get_text_features() requires a `walk_type`
-# kwarg tied to a FIXED sequence length. Trying to cover this through
-# CLIPScorer's generic paths caused repeated, hard-to-diagnose failures
-# (a text/vision embedding-dim mismatch, a tokenizer/model vocab mismatch
-# false-alarm, and a meta-tensor crash from passing torch_dtype). Rather than
-# keep patching the generic wrapper, this class is a near-literal translation
-# of FG-CLIP2's OWN HF model-card usage snippet — same calls, same argument
-# names, same values — so there is no ambiguity about whether "generic
-# handling" introduced a mismatch.
-class FGCLIP2Scorer:
-    """Minimal, model-card-literal wrapper for qihoo360/fg-clip2-large.
-    Exposes the same `encode_text`/`encode_images`/`context_length`/
-    `batch_size` surface CLIPScorer does, so scripts/run_vlm_pipeline.py can
-    use either interchangeably — see clip_metrics.create_scorer()."""
-
-    REPO_ID = "qihoo360/fg-clip2-large"
-    # Per the model card: "Long captions: max_length=196 walk_type='long'".
-    # LONG (never "short"/64) is hardcoded — avoiding vanilla CLIP's 77-token
-    # sentence-term truncation is the entire reason FG-CLIP2 is used at all
-    # (see CLAUDE.md / data/llm_reference/vlm_pipeline_recap.txt).
-    WALK_TYPE = "long"
-    MAX_LENGTH = 196
-
-    def __init__(
-        self,
-        model_name: str = REPO_ID,
-        device: str = "cuda",
-        batch_size: int = 64,
-        trust_remote_code: bool = True,
-    ) -> None:
-        import torch
-        from transformers import AutoImageProcessor, AutoModelForCausalLM, AutoTokenizer
-
-        self._torch = torch
-        self.device = device
-        self.batch_size = batch_size
-        self.repo_id = model_name or self.REPO_ID
-        self.context_length = self.MAX_LENGTH
-
-        # low_cpu_mem_usage=False: even the model card's own literal call
-        # (no torch_dtype, no device_map) still hit "Cannot copy out of meta
-        # tensor; no data!" on self.mask1 in this environment's transformers
-        # build — meaning this repo's __init__ ran under transformers'
-        # meta-device "fast init" context regardless of any dtype/device_map
-        # kwarg. mask1/mask2 are built directly in __init__ (not registered
-        # as nn.Parameter/nn.Buffer — a real buffer would at least get moved
-        # by model.to(device) below; this one only fails later, inside
-        # forward's own `self.mask1.to(...)` call, meaning nothing on the
-        # normal parameter/buffer path ever touches it). A plain attribute
-        # tensor built under a meta context has no state_dict entry to
-        # restore it, so it stays meta forever unless __init__ itself never
-        # entered that context — which is exactly what low_cpu_mem_usage=False
-        # disables (forces old-style eager construction, real tensors from
-        # the first line of __init__, no accelerate meta shell).
-        self.model = AutoModelForCausalLM.from_pretrained(
-            self.repo_id, trust_remote_code=trust_remote_code, low_cpu_mem_usage=False,
-        ).to(device)
-        self.model.eval()
-        self.tokenizer = AutoTokenizer.from_pretrained(self.repo_id)
-        self.image_processor = AutoImageProcessor.from_pretrained(self.repo_id)
-
-        # If low_cpu_mem_usage=False didn't actually stop __init__ from
-        # running under a meta context (possible if this transformers build
-        # ignores/repurposes that flag), fail HERE with the exact attribute
-        # name/shape instead of two encode calls from now inside a forward
-        # pass with an opaque NotImplementedError. mask1/mask2 aren't
-        # registered buffers, so a generic named_buffers()/named_parameters()
-        # sweep would miss them — check the specific known attribute path
-        # from the crash traceback (model.text_model.embeddings).
-        embeddings = getattr(getattr(self.model, "text_model", None), "embeddings", None)
-        if embeddings is not None:
-            meta_attrs = [
-                name for name in ("mask1", "mask2")
-                if isinstance(getattr(embeddings, name, None), torch.Tensor)
-                and getattr(embeddings, name).is_meta
-            ]
-            if meta_attrs:
-                raise RuntimeError(
-                    f"{self.repo_id}: model.text_model.embeddings.{meta_attrs} "
-                    f"loaded on the meta device with no real data even with "
-                    f"low_cpu_mem_usage=False — this transformers build isn't "
-                    f"giving this checkpoint's custom __init__ code a real, "
-                    f"non-meta construction context. This looks like a "
-                    f"genuine incompatibility between this repo's "
-                    f"trust_remote_code and this transformers version, not "
-                    f"something fixable from the calling side. Options: run "
-                    f"this scoring stage in a separate environment with an "
-                    f"older transformers version, or report this to "
-                    f"https://github.com/360CVGroup/FG-CLIP/issues."
-                )
-
-        # Embedding dimensionality, determined lazily on first real encode
-        # call rather than a throwaway one at load time — a throwaway text
-        # encode here would need a real image encode too to know both dims,
-        # and images require a per-image max_num_patches (no fixed-size
-        # placeholder to encode blind).
-        self._embed_dim = None
-
-    @staticmethod
-    def _determine_max_patches(image) -> int:
-        """Verbatim from the model card's `determine_max_value` helper —
-        picks the vision tower's patch budget from the image's own
-        resolution (16x16 patches), in discrete steps."""
-        w, h = image.size
-        max_val = (w // 16) * (h // 16)
-        if max_val > 784:
-            return 1024
-        elif max_val > 576:
-            return 784
-        elif max_val > 256:
-            return 576
-        elif max_val > 128:
-            return 256
-        else:
-            return 128
-
-    def encode_text(self, texts: List[str], warn_truncation: bool = False,
-                     verbose: bool = False, desc: str = "text") -> np.ndarray:
-        """Encode a list of strings → [len(texts), dim] L2-normalized float32.
-        `warn_truncation` is accepted for interface compatibility with
-        CLIPScorer but unused: every caption is padded/truncated to the
-        model's own fixed MAX_LENGTH regardless, per its model card."""
-        torch = self._torch
-        if not texts:
-            return np.zeros((0, self._embed_dim or 0), dtype=np.float32)
-
-        out = []
-        n_total = len(texts)
-        for i in range(0, n_total, self.batch_size):
-            batch = texts[i : i + self.batch_size]
-            # Model card: tokenizer(captions, padding="max_length",
-            # max_length=196, truncation=True, return_tensors="pt").to(device)
-            caption_input = self.tokenizer(
-                batch, padding="max_length", max_length=self.MAX_LENGTH,
-                truncation=True, return_tensors="pt",
-            ).to(self.device)
-            with torch.no_grad():
-                # Model card: model.get_text_features(**caption_input, walk_type="long")
-                text_feature = self.model.get_text_features(**caption_input, walk_type=self.WALK_TYPE)
-                text_feature = text_feature / text_feature.norm(p=2, dim=-1, keepdim=True)
-            feats = text_feature.cpu().float().numpy()
-            if self._embed_dim is None:
-                self._embed_dim = feats.shape[1]
-            out.append(feats)
-            if verbose:
-                done = min(i + self.batch_size, n_total)
-                print(f"🔎 [FG-CLIP2] {desc}: {done}/{n_total} ({done / n_total:.1%})", flush=True)
-        return np.concatenate(out, axis=0)
-
-    def encode_images(self, image_paths: List[str], verbose: bool = False) -> np.ndarray:
-        """Encode a list of image paths → [len(paths), dim] L2-normalized
-        float32. Processed ONE AT A TIME (not batched): `max_num_patches` is
-        computed per image from its own resolution (model card's
-        `determine_max_value`), so different images in the same call can
-        need different patch budgets — there is no single batch-wide value
-        to pass to the processor. An unreadable/corrupt image yields a zero
-        row rather than aborting the whole run."""
-        from PIL import Image
-        torch = self._torch
-
-        if not image_paths:
-            return np.zeros((0, self._embed_dim or 0), dtype=np.float32)
-
-        out = []
-        n_total = len(image_paths)
-        for i, p in enumerate(image_paths):
-            try:
-                # Force standard RGB — see CLIPScorer.encode_images for why.
-                image = Image.open(p).convert("RGB")
-                max_num_patches = self._determine_max_patches(image)
-                # Model card: image_processor(images=image,
-                # max_num_patches=determine_max_value(image),
-                # return_tensors="pt").to(device)
-                image_input = self.image_processor(
-                    images=image, max_num_patches=max_num_patches, return_tensors="pt",
-                ).to(self.device)
-                with torch.no_grad():
-                    # Model card: model.get_image_features(**image_input)
-                    image_feature = self.model.get_image_features(**image_input)
-                    image_feature = image_feature / image_feature.norm(p=2, dim=-1, keepdim=True)
-                feat = image_feature.cpu().float().numpy()
-            except Exception as e:
-                warnings.warn(f"FG-CLIP2: could not encode image '{p}' ({e!r}); using a zero embedding.", stacklevel=2)
-                feat = np.zeros((1, self._embed_dim or 768), dtype=np.float32)
-            if self._embed_dim is None:
-                self._embed_dim = feat.shape[1]
-            out.append(feat)
-            if verbose:
-                progress_every = max(1, min(500, n_total // 20))
-                if i % progress_every == 0 or i == n_total - 1:
-                    print(f"🔎 [FG-CLIP2] images: {i + 1}/{n_total} ({(i + 1) / n_total:.1%})", flush=True)
-        return np.concatenate(out, axis=0)
-
-
-_FG_CLIP2_NAMES = frozenset({"fg-clip2", FGCLIP2Scorer.REPO_ID})
-
-
-def create_scorer(model_name: str = "original", device: str = "cuda", batch_size: int = 64,
-                   trust_remote_code: bool = True):
-    """Factory dispatching to FGCLIP2Scorer for FG-CLIP2 (by CLIP_PRESETS
-    alias or raw repo id) and CLIPScorer for everything else — the one place
-    that needs to know FG-CLIP2 gets special treatment, so callers (e.g.
-    scripts/run_vlm_pipeline.py) don't need their own if/else."""
-    if model_name in _FG_CLIP2_NAMES:
-        return FGCLIP2Scorer(model_name=FGCLIP2Scorer.REPO_ID, device=device,
-                             batch_size=batch_size, trust_remote_code=trust_remote_code)
-    return CLIPScorer(model_name=model_name, device=device, batch_size=batch_size,
-                      trust_remote_code=trust_remote_code)
 
 
 # =============================================================================
