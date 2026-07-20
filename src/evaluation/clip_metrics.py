@@ -78,34 +78,24 @@ CLIPMATCH_DATASETS = ("imagenet", "places365")
 # repo id directly. These are BEST-EFFORT default checkpoints for each variant
 # — verify the exact repo id yourself before relying on results from one of
 # them; if a default here turns out wrong/moved, just pass the correct repo id
-# straight to --clip_model (or --clip_llm_model for llm2clip's text tower — see
-# below), no code change needed. LongCLIP is deliberately NOT included: as of
-# writing it isn't packaged as a HF trust_remote_code AutoModel — using it
-# would require cloning its own repo, which we're avoiding here in favor of
-# everything loading through `transformers` (+ llm2vec/peft for llm2clip only)
-# alone.
+# straight to --clip_model, no code change needed.
 #
-# "llm2clip" is NOT a plain string like the others — LLM2CLIP is architecturally
-# TWO separate models, not one CLIP-style text tower:
-#   - a CLIP-style VISION tower (vision_repo) exposing the usual
-#     get_image_features(pixel_values), fine for the generic path below.
-#   - a completely separate LLM (llm_repo), wrapped by the `llm2vec` package
-#     and loaded as a PEFT adapter, that does the actual TEXT encoding.
-#     vision_repo's own get_text_features() does NOT tokenize text itself —
-#     it only PROJECTS an already-computed LLM2Vec embedding into CLIP space.
-# Feeding it raw token ids the way the generic get_text_features/encode_text
-# duck-typed path does for every other preset would be wrong (crash, or a
-# silently nonsense embedding) — see CLIPScorer._init_llm2clip /
-# _encode_text_batch's llm2clip branch below.
+# TWO variants are deliberately NOT included, both for the same reason —
+# everything here loads through plain `transformers` alone, no extra
+# environment required:
+#   - LongCLIP: not packaged as a HF trust_remote_code AutoModel; using it
+#     would require cloning its own repo.
+#   - LLM2CLIP: its text tower isn't a CLIP transformer at all — it's a
+#     SEPARATE LLM, encoded via the `llm2vec` package. `llm2vec` hard-pins
+#     transformers<=4.44.2, which is incompatible with vLLM's
+#     transformers>=5.5.3 in the SAME environment (verified: installing it
+#     force-downgraded transformers and broke vLLM here). Since this project
+#     runs the VLM (vLLM) and CLIP scoring in one env, llm2clip isn't usable
+#     without a second env just for it — not worth the operational overhead.
 CLIP_PRESETS = {
     "original": "openai/clip-vit-large-patch14",
     "eva-clip": "BAAI/EVA-CLIP-8B",
     "fg-clip2": "qihoo360/fg-clip2-large",
-    "llm2clip": {
-        "kind": "llm2clip",
-        "vision_repo": "microsoft/LLM2CLIP-Openai-L-14-336",
-        "llm_repo": "microsoft/LLM2CLIP-Llama-3-8B-Instruct-CC-Finetuned",
-    },
 }
 
 
@@ -129,11 +119,6 @@ class CLIPScorer:
     carried over from open_clip's API) second — so a new --clip_model swap
     only needs a correct repo id, not new code, as long as it exposes one of
     these two API shapes.
-
-    llm2clip is the ONE exception to that duck-typed path — see
-    CLIP_PRESETS's docstring above and _init_llm2clip below; it gets its own
-    dedicated loading + text-encoding code because it genuinely isn't a
-    single CLIP-style text tower.
     """
 
     def __init__(
@@ -142,7 +127,6 @@ class CLIPScorer:
         device: str = "cuda",
         batch_size: int = 64,
         trust_remote_code: bool = True,
-        llm_model_name: Optional[str] = None,
     ) -> None:
         # Imported lazily (inside the method, not at module load time) so that
         # simply IMPORTING this file never requires torch/transformers to be
@@ -150,106 +134,39 @@ class CLIPScorer:
         # lets the pure-math functions further down be unit-tested without a
         # GPU or these heavy dependencies present.
         import torch
+        from transformers import AutoImageProcessor, AutoModel, AutoProcessor, AutoTokenizer
 
         self.device = device
         self.batch_size = batch_size
         self._torch = torch
-        self._is_llm2clip = False
+        self.repo_id = CLIP_PRESETS.get(model_name, model_name)
 
-        preset = CLIP_PRESETS.get(model_name, model_name)
-        if isinstance(preset, dict) and preset.get("kind") == "llm2clip":
-            self._init_llm2clip(preset["vision_repo"], llm_model_name or preset["llm_repo"],
-                                trust_remote_code)
-        else:
-            self._init_standard(preset, trust_remote_code)
-
-        # Embedding dimensionality varies by checkpoint and isn't exposed
-        # uniformly across configs — determine it once via a throwaway encode
-        # instead of guessing a config attribute name per backend.
-        self._embed_dim = self._encode_text_batch(["a photo of a photo"]).shape[1]
-
-    def _init_standard(self, repo_id: str, trust_remote_code: bool) -> None:
-        """Load a single CLIP-style checkpoint (everything in CLIP_PRESETS
-        except llm2clip) via AutoModel/AutoProcessor."""
-        from transformers import AutoImageProcessor, AutoModel, AutoProcessor, AutoTokenizer
-
-        self.repo_id = repo_id
-        self.model = AutoModel.from_pretrained(repo_id, trust_remote_code=trust_remote_code)
+        self.model = AutoModel.from_pretrained(self.repo_id, trust_remote_code=trust_remote_code)
         self.model.eval().to(self.device)
 
         # Most CLIP-family checkpoints publish one combined AutoProcessor
         # (tokenizer + image processor together); fall back to loading each
         # piece separately for the few that only publish one of the two.
         try:
-            processor = AutoProcessor.from_pretrained(repo_id, trust_remote_code=trust_remote_code)
+            processor = AutoProcessor.from_pretrained(self.repo_id, trust_remote_code=trust_remote_code)
             self.tokenizer = getattr(processor, "tokenizer", processor)
             self.image_processor = getattr(processor, "image_processor", processor)
         except Exception:
-            self.tokenizer = AutoTokenizer.from_pretrained(repo_id, trust_remote_code=trust_remote_code)
-            self.image_processor = AutoImageProcessor.from_pretrained(repo_id, trust_remote_code=trust_remote_code)
+            self.tokenizer = AutoTokenizer.from_pretrained(self.repo_id, trust_remote_code=trust_remote_code)
+            self.image_processor = AutoImageProcessor.from_pretrained(self.repo_id, trust_remote_code=trust_remote_code)
 
-        self._set_context_length(self.tokenizer, fallback=77)
-
-    def _init_llm2clip(self, vision_repo: str, llm_repo: str, trust_remote_code: bool) -> None:
-        """Load LLM2CLIP's two models: the CLIP-style vision tower (images,
-        and the text-embedding PROJECTION only) from `vision_repo`, and the
-        actual LLM2Vec-wrapped text ENCODER from `llm_repo`. See CLIP_PRESETS's
-        module-level comment for why these can't share the generic path."""
-        from transformers import AutoConfig, AutoImageProcessor, AutoModel, AutoProcessor, AutoTokenizer
-
-        try:
-            from llm2vec import LLM2Vec
-        except ImportError as e:
-            raise ImportError(
-                "clip_model='llm2clip' requires the `llm2vec` package — LLM2CLIP's "
-                "text tower is an LLM2Vec-wrapped LLM, not a standard CLIP text "
-                "encoder. Install it with: pip install llm2vec"
-            ) from e
-        try:
-            from peft import PeftModel
-        except ImportError as e:
-            raise ImportError(
-                "clip_model='llm2clip' requires the `peft` package — the "
-                "LLM2Vec text tower is loaded as a PEFT adapter on top of its "
-                "base LLM. Install it with: pip install peft"
-            ) from e
-
-        self._is_llm2clip = True
-        self.repo_id = f"{vision_repo} + {llm_repo}"
-
-        # Vision tower: standard CLIP-style get_image_features(pixel_values);
-        # its get_text_features() is used too, but only to PROJECT an
-        # already-computed LLM2Vec embedding (see _encode_text_batch below),
-        # never called with raw tokens.
-        self.model = AutoModel.from_pretrained(vision_repo, trust_remote_code=trust_remote_code)
-        self.model.eval().to(self.device)
-        try:
-            processor = AutoProcessor.from_pretrained(vision_repo, trust_remote_code=trust_remote_code)
-            self.image_processor = getattr(processor, "image_processor", processor)
-        except Exception:
-            self.image_processor = AutoImageProcessor.from_pretrained(vision_repo, trust_remote_code=trust_remote_code)
-
-        # Text tower: a separate base LLM, wrapped by LLM2Vec after merging its
-        # PEFT adapter — this is the ACTUAL text encoder (mean-pooled hidden
-        # states), fundamentally different from a CLIP transformer's text tower.
-        llm_tokenizer = AutoTokenizer.from_pretrained(llm_repo)
-        llm_config = AutoConfig.from_pretrained(llm_repo, trust_remote_code=trust_remote_code)
-        llm_base = AutoModel.from_pretrained(llm_repo, config=llm_config, trust_remote_code=trust_remote_code)
-        llm_base = PeftModel.from_pretrained(llm_base, llm_repo).merge_and_unload()
-        self._llm2vec = LLM2Vec(llm_base, llm_tokenizer, pooling_mode="mean",
-                                max_length=512, doc_max_length=512)
-        # Kept for encode_text's warn_truncation length check (approximates the
-        # real limit — LLM2Vec tokenizes internally with this same tokenizer).
-        self.tokenizer = llm_tokenizer
-        self._set_context_length(llm_tokenizer, fallback=512)
-
-    def _set_context_length(self, tokenizer, fallback: int) -> None:
-        self.context_length = getattr(tokenizer, "model_max_length", fallback)
+        self.context_length = getattr(self.tokenizer, "model_max_length", 77)
         # Some tokenizers report a sentinel "no limit" value (e.g. 1e30) when
-        # they don't actually define model_max_length — falling back keeps the
-        # truncation warning below meaningful instead of silently never firing.
+        # they don't actually define model_max_length — falling back to 77
+        # (CLIP's original context length) keeps the truncation warning below
+        # meaningful instead of silently never firing.
         if not isinstance(self.context_length, int) or self.context_length > 100_000:
-            self.context_length = fallback
+            self.context_length = 77
+
+        # Embedding dimensionality varies by checkpoint and isn't exposed
+        # uniformly across configs — determine it once via a throwaway encode
+        # instead of guessing a config attribute name per backend.
+        self._embed_dim = self._encode_text_batch(["a photo of a photo"]).shape[1]
 
     def _text_features(self, inputs: dict):
         if hasattr(self.model, "get_text_features"):
@@ -275,17 +192,6 @@ class CLIPScorer:
 
     def _encode_text_batch(self, texts: List[str]) -> np.ndarray:
         torch = self._torch
-        if self._is_llm2clip:
-            # LLM2CLIP: the LLM2Vec text tower does its own tokenization
-            # internally and returns a pooled embedding — model.get_text_features
-            # here PROJECTS that embedding into CLIP space, it does NOT tokenize
-            # raw text (see CLIP_PRESETS's module comment).
-            with torch.no_grad():
-                llm_embs = self._llm2vec.encode(texts, convert_to_tensor=True).to(self.device)
-                feats = self.model.get_text_features(llm_embs)
-                feats = torch.nn.functional.normalize(feats, p=2, dim=-1)
-            return feats.cpu().float().numpy()
-
         inputs = self.tokenizer(texts, padding=True, truncation=True,
                                 max_length=self.context_length, return_tensors="pt")
         inputs = {k: v.to(self.device) for k, v in inputs.items()}

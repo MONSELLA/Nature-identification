@@ -397,8 +397,7 @@ def phase_score(args):
     # CLIP has the GPU memory to itself.
     scorer = clip_metrics.CLIPScorer(model_name=args.clip_model, device=args.device,
                                      batch_size=args.clip_batch_size,
-                                     trust_remote_code=args.clip_trust_remote_code,
-                                     llm_model_name=args.clip_llm_model)
+                                     trust_remote_code=args.clip_trust_remote_code)
 
     # ---- Hybrid labels per object ----
     # Mapping + hybrid resolution now happen in Phase 1 (see
@@ -1061,26 +1060,23 @@ def parse_args():
 
     # CLIP (score) — loaded via transformers (src/evaluation/clip_metrics.py's
     # CLIPScorer), NOT open_clip. --clip_model accepts either a short alias
-    # from clip_metrics.CLIP_PRESETS ("original", "eva-clip", "fg-clip2",
-    # "llm2clip") or any raw HuggingFace repo id directly (e.g. to override a
-    # preset's default checkpoint, or use a variant not in the preset table).
+    # from clip_metrics.CLIP_PRESETS ("original", "eva-clip", "fg-clip2") or
+    # any raw HuggingFace repo id directly (e.g. to override a preset's
+    # default checkpoint, or use a variant not in the preset table). llm2clip
+    # is deliberately NOT supported — its text tower needs the `llm2vec`
+    # package, which hard-pins transformers<=4.44.2 and is incompatible with
+    # vLLM's transformers>=5.5.3 in this project's single environment (see
+    # clip_metrics.CLIP_PRESETS's module comment).
     p.add_argument("--clip_model", type=str, default="original",
                    help="CLIP checkpoint: a clip_metrics.CLIP_PRESETS alias "
-                        "('original', 'eva-clip', 'fg-clip2', 'llm2clip') or a "
-                        "raw HuggingFace repo id.")
+                        "('original', 'eva-clip', 'fg-clip2') or a raw "
+                        "HuggingFace repo id.")
     p.add_argument("--clip_trust_remote_code", type=lambda s: s.lower() != "false", default=True,
                    help="Passed to transformers' from_pretrained calls (default True). Several "
-                        "CLIP variants (EVA-CLIP, FG-CLIP2, LLM2CLIP) ship custom modeling code "
-                        "on the Hub that requires this; it's a no-op for checkpoints that don't "
-                        "need it (e.g. the original OpenAI CLIP). Pass --clip_trust_remote_code "
-                        "false to disable.")
-    p.add_argument("--clip_llm_model", type=str, default=None,
-                   help="Only used when --clip_model llm2clip: overrides the default LLM2Vec text-"
-                        "tower checkpoint (clip_metrics.CLIP_PRESETS['llm2clip']['llm_repo']). "
-                        "LLM2CLIP is two separate models (a CLIP vision tower + a wholly separate "
-                        "LLM as the text tower, via the llm2vec + peft packages — both must be "
-                        "installed) — this flag lets you swap the LLM half without touching "
-                        "--clip_model. Ignored for every other --clip_model value.")
+                        "CLIP variants (EVA-CLIP, FG-CLIP2) ship custom modeling code on the Hub "
+                        "that requires this; it's a no-op for checkpoints that don't need it "
+                        "(e.g. the original OpenAI CLIP). Pass --clip_trust_remote_code false to "
+                        "disable.")
     p.add_argument("--clip_batch_size", type=int, default=64)
 
     # shared

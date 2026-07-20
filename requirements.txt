@@ -41,14 +41,14 @@ Pillow>=10.0
 # --- CLIP-based metrics (src/evaluation/clip_metrics.py) ---
 # F-CLIPScore, Object-CLIPScore, ClipMatch all run through a CLIPScorer
 # (transformers AutoModel/AutoProcessor — see clip_metrics.CLIP_PRESETS for
-# the supported checkpoints: original CLIP, EVA-CLIP, FG-CLIP2, LLM2CLIP).
-# No open_clip dependency; transformers>=4.40 above already covers original
-# CLIP/EVA-CLIP/FG-CLIP2. --clip_model llm2clip needs two EXTRA packages
-# (uncomment if you'll use it): LLM2CLIP's text tower is a wholly separate
-# LLM wrapped by llm2vec, loaded as a peft adapter — not a standard CLIP text
-# encoder, see CLIPScorer._init_llm2clip.
-# llm2vec>=0.2
-# peft>=0.10
+# the supported checkpoints: original CLIP, EVA-CLIP, FG-CLIP2). No open_clip
+# dependency; transformers>=4.40 above already covers all three.
+# NOTE: LLM2CLIP is intentionally NOT supported — its text tower requires the
+# `llm2vec` package, which hard-pins transformers<=4.44.2. That's incompatible
+# with vLLM's transformers>=5.5.3 requirement in this project's single
+# environment (confirmed: installing llm2vec force-downgrades transformers
+# and breaks vLLM). Would need a second, separate environment to use — not
+# worth the operational overhead here.
 
 # --- Experiment tracking ---
 wandb>=0.16
