@@ -397,7 +397,8 @@ def phase_score(args):
     # CLIP has the GPU memory to itself.
     scorer = clip_metrics.CLIPScorer(model_name=args.clip_model, device=args.device,
                                      batch_size=args.clip_batch_size,
-                                     trust_remote_code=args.clip_trust_remote_code)
+                                     trust_remote_code=args.clip_trust_remote_code,
+                                     llm_model_name=args.clip_llm_model)
 
     # ---- Hybrid labels per object ----
     # Mapping + hybrid resolution now happen in Phase 1 (see
@@ -1073,6 +1074,13 @@ def parse_args():
                         "on the Hub that requires this; it's a no-op for checkpoints that don't "
                         "need it (e.g. the original OpenAI CLIP). Pass --clip_trust_remote_code "
                         "false to disable.")
+    p.add_argument("--clip_llm_model", type=str, default=None,
+                   help="Only used when --clip_model llm2clip: overrides the default LLM2Vec text-"
+                        "tower checkpoint (clip_metrics.CLIP_PRESETS['llm2clip']['llm_repo']). "
+                        "LLM2CLIP is two separate models (a CLIP vision tower + a wholly separate "
+                        "LLM as the text tower, via the llm2vec + peft packages — both must be "
+                        "installed) — this flag lets you swap the LLM half without touching "
+                        "--clip_model. Ignored for every other --clip_model value.")
     p.add_argument("--clip_batch_size", type=int, default=64)
 
     # shared
