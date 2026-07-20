@@ -141,7 +141,7 @@ class CLIPScorer:
         self._torch = torch
         self.repo_id = CLIP_PRESETS.get(model_name, model_name)
 
-        self.model = AutoModel.from_pretrained(self.repo_id, trust_remote_code=trust_remote_code)
+        self.model = self._load_model(self.repo_id, trust_remote_code)
         self.model.eval().to(self.device)
 
         # Most CLIP-family checkpoints publish one combined AutoProcessor
@@ -167,6 +167,55 @@ class CLIPScorer:
         # uniformly across configs — determine it once via a throwaway encode
         # instead of guessing a config attribute name per backend.
         self._embed_dim = self._encode_text_batch(["a photo of a photo"]).shape[1]
+
+    @staticmethod
+    def _load_model(repo_id: str, trust_remote_code: bool):
+        """Load a checkpoint's model class, working around a real gap in
+        `AutoModel.from_pretrained(..., trust_remote_code=True)`: it only
+        auto-dispatches to a custom repo's model class if that repo's
+        `config.json` declares an `"AutoModel"` key in its `auto_map` — if a
+        repo instead only declares e.g. `"AutoModelForImageTextToText"`, or
+        no key at all matching a family `AutoModel` recognizes, the plain
+        `AutoModel.from_pretrained` call raises `ValueError: Unrecognized
+        configuration class ... for this kind of AutoModel: AutoModel` even
+        though the repo's custom config/model code loaded and is perfectly
+        usable — it's a routing miss, not a real incompatibility.
+
+        Tries plain `AutoModel` first (covers the original CLIP and any
+        checkpoint that DOES declare an `"AutoModel"` auto_map entry). On
+        that specific "Unrecognized configuration class" failure, falls back
+        to reading `auto_map` off the checkpoint's own config directly and
+        dynamically loading whichever `AutoModel*`-family class IS declared
+        there, via `transformers`' own dynamic-module loader (the same
+        mechanism `AutoModel.from_pretrained` uses internally when the
+        `"AutoModel"` key IS present — this just widens which auto_map key
+        we'll accept).
+        """
+        from transformers import AutoConfig, AutoModel
+
+        try:
+            return AutoModel.from_pretrained(repo_id, trust_remote_code=trust_remote_code)
+        except ValueError as e:
+            if "Unrecognized configuration class" not in str(e):
+                raise
+
+        config = AutoConfig.from_pretrained(repo_id, trust_remote_code=trust_remote_code)
+        auto_map = getattr(config, "auto_map", None) or {}
+        model_keys = [k for k in auto_map if k.startswith("AutoModel")]
+        if not model_keys:
+            raise ValueError(
+                f"{repo_id}: AutoModel.from_pretrained couldn't find a usable model "
+                f"class, and config.auto_map has no AutoModel*-family entry either "
+                f"(auto_map keys: {list(auto_map)}). Check this checkpoint's model "
+                f"card on HuggingFace for the exact class it expects to be loaded with."
+            )
+        # Prefer a bare "AutoModel" entry if present (most general-purpose);
+        # otherwise take whichever AutoModelFor* entry is declared.
+        key = "AutoModel" if "AutoModel" in model_keys else model_keys[0]
+        class_ref = auto_map[key]
+        from transformers.dynamic_module_utils import get_class_from_dynamic_module
+        model_cls = get_class_from_dynamic_module(class_ref, repo_id)
+        return model_cls.from_pretrained(repo_id, trust_remote_code=trust_remote_code)
 
     def _text_features(self, inputs: dict):
         if hasattr(self.model, "get_text_features"):
