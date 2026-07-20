@@ -109,7 +109,8 @@ class CLIPScorer:
         self.context_length = getattr(self.model, "context_length", 77)
         self._torch = torch  # stashed so other methods can use torch without re-importing
 
-    def encode_text(self, texts: List[str], warn_truncation: bool = False) -> np.ndarray:
+    def encode_text(self, texts: List[str], warn_truncation: bool = False,
+                     verbose: bool = False, desc: str = "text") -> np.ndarray:
         """Encode a list of strings → [len(texts), dim] L2-normalized float32."""
         torch = self._torch
         if not texts:
@@ -137,10 +138,11 @@ class CLIPScorer:
                     break
 
         out = []
+        n_total = len(texts)
         # Process in chunks of `batch_size` rather than all at once, so we
         # don't try to fit an arbitrarily large number of texts into GPU
         # memory in one forward pass.
-        for i in range(0, len(texts), self.batch_size):
+        for i in range(0, n_total, self.batch_size):
             batch = texts[i : i + self.batch_size]
             tokens = self.tokenizer(batch).to(self.device)
             # torch.no_grad(): we're only doing inference here, not training,
@@ -154,9 +156,12 @@ class CLIPScorer:
             # Move back to CPU, plain float32, and convert to a numpy array —
             # everything downstream of this class works in numpy, not torch.
             out.append(feats.cpu().float().numpy())
+            if verbose:
+                done = min(i + self.batch_size, n_total)
+                print(f"🔎 [CLIP] {desc}: {done}/{n_total} ({done / n_total:.1%})", flush=True)
         return np.concatenate(out, axis=0)
 
-    def encode_images(self, image_paths: List[str]) -> np.ndarray:
+    def encode_images(self, image_paths: List[str], verbose: bool = False) -> np.ndarray:
         """Encode a list of image paths → [len(paths), dim] L2-normalized float32.
         An unreadable/corrupt image yields a zero row (all its CLIPScores become
         0) rather than aborting the whole scoring run — one bad file must not
@@ -170,7 +175,8 @@ class CLIPScorer:
             return np.zeros((0, dim or 0), dtype=np.float32)
 
         out = []
-        for i in range(0, len(image_paths), self.batch_size):
+        n_total = len(image_paths)
+        for i in range(0, n_total, self.batch_size):
             batch_paths = image_paths[i : i + self.batch_size]
             tensors = []
             failed = []  # positions (within this batch) that could not be loaded
@@ -214,6 +220,9 @@ class CLIPScorer:
                 if j not in failed:
                     batch_out[j] = next(good_iter)
             out.append(batch_out)
+            if verbose:
+                done = min(i + self.batch_size, n_total)
+                print(f"🔎 [CLIP] images: {done}/{n_total} ({done / n_total:.1%})", flush=True)
         return np.concatenate(out, axis=0)
 
 

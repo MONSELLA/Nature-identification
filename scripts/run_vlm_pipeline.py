@@ -418,8 +418,9 @@ def phase_score(args):
     # large batched GPU calls is much faster than thousands of tiny ones.
     image_paths = [r["image_path"] for r in records]
     captions = [r["caption"] for r in records]
-    image_embs = scorer.encode_images(image_paths)
-    caption_embs = scorer.encode_text(captions, warn_truncation=False)
+    image_embs = scorer.encode_images(image_paths, verbose=args.verbose)
+    caption_embs = scorer.encode_text(captions, warn_truncation=False,
+                                      verbose=args.verbose, desc="captions")
 
     # Flatten object texts with per-image offsets, encode once.
     # Every image has a DIFFERENT number of extracted objects, so we can't
@@ -439,7 +440,7 @@ def phase_score(args):
     # on `if flat_texts` — so a dataset where every image happens to extract
     # zero objects still gets f_clipscore's sentence-only term per image below
     # instead of silently skipping reference-free scoring for the whole run.
-    obj_embs_all = scorer.encode_text(flat_texts)
+    obj_embs_all = scorer.encode_text(flat_texts, verbose=args.verbose, desc="objects")
 
     candidate_embs = None
     if run_clipmatch:
@@ -451,7 +452,8 @@ def phase_score(args):
         # gt_nature/gt_biotic and the ClipMatch top-1 prediction can be read
         # straight off its candidate_vocab entry — no separate graph lookup.
         candidate_embs = scorer.encode_text(
-            [clip_metrics.OBJECT_TEMPLATE.format(c["class_name"]) for c in candidate_vocab])
+            [clip_metrics.OBJECT_TEMPLATE.format(c["class_name"]) for c in candidate_vocab],
+            verbose=args.verbose, desc="candidate_vocab")
 
     # ---- Per-image metric accumulation ----
     # These lists/counters accumulate results across every image in the
@@ -508,7 +510,16 @@ def phase_score(args):
     else:
         preds_to_store = {r["image_path"] for r in records}
 
+    # How often to print per-image progress under --verbose: every 5% of the
+    # dataset (at least every 1 image, at most every 500) rather than a fixed
+    # step, so the cadence stays sensible on both tiny (--max_samples) and
+    # full-scale runs.
+    progress_every = max(1, min(500, len(records) // 20)) if args.verbose else None
+
     for idx, rec in enumerate(records):
+        if progress_every and (idx % progress_every == 0 or idx == len(records) - 1):
+            done = idx + 1
+            print(f"🔎 [CLIP] scoring: {done}/{len(records)} images ({done / len(records):.1%})", flush=True)
         objs = rec["objects"]
         finals = rec["object_finals"]
         targets = rec.get("targets", [])
