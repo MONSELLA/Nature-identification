@@ -635,8 +635,6 @@ Week 8 (Sep 3-10): Finish Discussion/Conclusion/Abstract,
   central-pixel emphasis (Section 1, B.4) — not yet designed
 - Which CLIP variant for F-CLIPScore's sentence-level term (vanilla
   + accept truncation, vs Long-CLIP, vs FG-CLIP2)
-- Exact max sequence length of FG-CLIP2's text encoder — verify
-  before relying on it for long captions
 - Format-detection method to route foreground/background/scene
   decomposition vs. fallback single caption
 - Whether to extend WordNet mapping to novel VLM-extracted object
@@ -651,6 +649,17 @@ RESOLVED IN v5 (decided from empirical comparison):
   clip_metrics.py; the raw-caption approach is now the ONLY
   implementation, its 77-token truncation caveat accepted as a
   stated limitation.
+- FG-CLIP2's exact max sequence length (per its HF model card):
+  NOT a single model_max_length like standard CLIP — its
+  get_text_features() takes a required `walk_type` kwarg selecting
+  between two differently-sized FIXED position-embedding tables:
+  "short" = 64 tokens (its default), "long" = 196 tokens. CLIPScorer
+  detects this convention via the get_text_features() signature
+  (no repo-id check) and always requests walk_type="long"/
+  context_length=196 — using the wrong walk_type/length pairing
+  desyncs the position-embedding lookup and crashes with a CUDA
+  device-side gather-kernel assert (`vectorized_gather_kernel: index
+  out of bounds`), which is what motivated pinning this down.
 
 RESOLVED IN v4 (decided during implementation):
 - hP/hR predicted-class -> WordNet-node step: uses CLIP-ranked object

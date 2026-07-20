@@ -51,6 +51,7 @@ formula.
 
 from __future__ import annotations
 
+import inspect
 import warnings
 from typing import List, Tuple
 
@@ -182,6 +183,29 @@ class CLIPScorer:
         if not isinstance(self.context_length, int) or self.context_length > 100_000:
             self.context_length = 77
 
+        # FG-CLIP2 (and any future checkpoint sharing its convention) doesn't
+        # expose a single model_max_length like standard CLIP — its
+        # get_text_features() takes a required `walk_type` ("short"=64
+        # tokens, "long"=196 tokens per its model card) that selects between
+        # differently-SIZED fixed position-embedding tables. Padding to any
+        # other length (e.g. our 77-token generic fallback above) desyncs the
+        # position-embedding lookup from whichever walk_type it defaults to —
+        # this is what produced the "vectorized_gather_kernel: index out of
+        # bounds" CUDA assert. Detected via the get_text_features() signature
+        # rather than a repo-id check, so it "just works" for any checkpoint
+        # using the same convention. LONG is hardcoded (never "short") since
+        # avoiding the 77-token truncation on long captions is the entire
+        # reason FG-CLIP2 is in CLIP_PRESETS (see CLAUDE.md/vlm_pipeline_recap).
+        self._text_walk_type = None
+        if hasattr(self.model, "get_text_features"):
+            try:
+                params = inspect.signature(self.model.get_text_features).parameters
+            except (TypeError, ValueError):
+                params = {}
+            if "walk_type" in params:
+                self._text_walk_type = "long"
+                self.context_length = 196
+
         # Embedding dimensionality varies by checkpoint and isn't exposed
         # uniformly across configs — determine it once via a throwaway encode
         # instead of guessing a config attribute name per backend.
@@ -283,7 +307,12 @@ class CLIPScorer:
             pooled = self._pool(self.model.text_model(**inputs))
             return self.model.text_projection(pooled)
         if hasattr(self.model, "get_text_features"):
-            return self._unwrap_embedding(self.model.get_text_features(**inputs), "text_projection")
+            # walk_type-style checkpoints (FG-CLIP2) require this kwarg — see
+            # its detection + rationale in __init__. Absent for every other
+            # checkpoint, so this is a no-op kwarg addition for them.
+            kwargs = {"walk_type": self._text_walk_type} if self._text_walk_type else {}
+            out = self.model.get_text_features(**inputs, **kwargs)
+            return self._unwrap_embedding(out, "text_projection")
         if hasattr(self.model, "encode_text"):
             return self.model.encode_text(inputs["input_ids"])
         raise AttributeError(
@@ -346,7 +375,13 @@ class CLIPScorer:
 
     def _encode_text_batch(self, texts: List[str]) -> np.ndarray:
         torch = self._torch
-        inputs = self.tokenizer(texts, padding=True, truncation=True,
+        # walk_type-style checkpoints (FG-CLIP2) tie a FIXED sequence length
+        # to their position-embedding table per walk_type, so every batch
+        # must be padded to exactly self.context_length, not just "up to
+        # it" — plain `padding=True` (pad to the batch's own longest
+        # sequence) would under-pad relative to the table the model expects.
+        padding = "max_length" if self._text_walk_type else True
+        inputs = self.tokenizer(texts, padding=padding, truncation=True,
                                 max_length=self.context_length, return_tensors="pt")
         self._check_token_ids_in_range(inputs["input_ids"])
         inputs = self._to_device(inputs)
