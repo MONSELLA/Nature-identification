@@ -81,17 +81,16 @@ EXTRACTION_PROMPT = (
     "\"{caption}\"\n\n"
     "Using BOTH the image and the description, list every distinct "
     "object, element, or entity that appears in the image. Follow these rules:\n"
-    "  - Return each object as a noun or a compound noun (e.g. \"bench\", "
+    "  - Return each entity as a noun or a compound noun (e.g. \"bench\", "
     "\"golden retriever\", \"mountain\", \"hen of the woods\").\n"
-    "  - Include secondary and background elements, not just the main subject.\n"
-    "  - Include an element even when it is only PART of a larger object or is "
+    "  - Include secondary and background entities, not just the main subject.\n"
+    "  - Include an entity even when it is only PART of a larger one or is "
     "depicted on its surface (e.g. a flower printed on a dress -> list "
     "\"flower\"; a bird on a logo -> list \"bird\").\n"
-    "  - Do not repeat the same object twice. Do not invent objects that are "
+    "  - Do not repeat the same entity twice. Do not invent entities that are "
     "not supported by the image."
 )
-
-
+ 
 class ObjectExtractionResponse(BaseModel):
     """Structured schema for the extraction call: a flat list of object phrases.
 
@@ -177,7 +176,7 @@ class MaterialResponse(BaseModel):
     """
 
     reasoning: str = Field(
-        description="One concise sentence justifying the tangibility a based on the visual evidence."
+        description="One concise sentence justifying the tangibility based on the visual evidence."
     )
     tangibility: Literal["material", "immaterial"]
 
@@ -188,7 +187,7 @@ class MaterialResponse(BaseModel):
 # if a caller only cares about e.g. nature+biotic and not material.
 _AXIS_INSTRUCTIONS = {
     "nature": '"nature": either "yes" or "no" — whether this instance counts as nature under the provided definition.',
-    "life_category": '"biotic": either "biotic", "abiotic", or "none" — only answer "biotic"/"abiotic" if "nature" is "yes"; use "none" if "nature" is "no"',
+    "life_category": '"life_category": either "biotic", "abiotic", or "none" — only answer "biotic"/"abiotic" if "nature" is "yes"; use "none" if "nature" is "no"',
     "tangibility": '"tangibility": either "material", "immaterial", or "none" — only answer "material"/"immaterial" if "nature" is "yes"; use "none" if "nature" is "no"',
 }
 
@@ -300,7 +299,8 @@ FIFTH EXAMPLE OUTPUT FOR TARGET "sunset":
 # those answers are thrown away. This prompt instead STATES the already-known
 # nature/biotic verdict up front and asks for material/immaterial only, with
 # examples that match MaterialResponse's actual shape.
-def build_material_classification_prompt(class_name, biotic):
+
+#def build_material_classification_prompt(class_name, biotic):
     """
     Build the per-object prompt for the MAPPED-nature material-only labeling
     call (paired with schema=MaterialResponse).

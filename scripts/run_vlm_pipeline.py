@@ -598,84 +598,67 @@ def phase_score(args):
                 image_n_extraction_hits += 1
 
         if single_label:
-            # --- ImageNet/Places (single-label): axes from the ClipMatch TOP-1
-            # PREDICTED CLASS's own taxonomy position ---
-            # ClipMatch predicts the class from the WHOLE CAPTION's CLIP
-            # similarity to each candidate (clip_metrics.clipmatch) — an
-            # earlier variant matched each extracted object independently and
-            # took the max similarity across objects instead, but the
-            # caption-based version empirically performs better and is now
-            # the only ClipMatch implementation. candidate_vocab is restricted
-            # to MAPPED-into-the-graph classes only (see get_candidate_vocab),
-            # so ClipMatch's argmax over the candidate vocabulary can only
-            # ever land on a class our taxonomy actually annotates, and every
-            # candidate carries its own gt_nature/gt_biotic directly — no
-            # separate graph lookup needed. nature/biotic are read straight
-            # off the PREDICTED class's own taxonomy labels; material remains
-            # ALWAYS the VLM's own judgment (CLAUDE.md — never mapped), taken
-            # from whichever extracted object is most representative of the
-            # predicted class.
+            # --- ImageNet/Places (single-label) ---
             gt_syn = targets[0].get("synset_id") if targets else None
             pred_class_synset = pred_node = None
             best_obj_idx = None
+
+            # 1. ClipMatch Top-1 Class (The Anchor)
             per_cand_sim, pred_idx = clip_metrics.clipmatch(caption_embs[idx], candidate_embs)
             if pred_idx >= 0:
                 pred_vocab_entry = candidate_vocab[pred_idx]
                 pred_class_synset = pred_vocab_entry["synset_id"]
                 clipmatch_pred_similarity = float(per_cand_sim[pred_idx])
+
+                # 2. Compare Anchor embedding with ALL extracted objects' embeddings (argmax)
                 if rec_obj_embs.shape[0] > 0:
-                    # Which extracted object is most representative of the
-                    # caption-predicted class — used both to resolve a
-                    # specific WordNet NODE for hP/hR below, and as the
-                    # source object for the material axis's VLM judgment.
                     sims_to_pred = rec_obj_embs @ candidate_embs[pred_idx]
                     best_obj_idx = int(sims_to_pred.argmax())
+                    
+                    # 3. Resolve the argmax extracted object to a WordNet node for hierarchical metrics
                     pred_node = taxonomy_metrics.resolve_to_wordnet(
-                        list(sims_to_pred), pred_class_synset, objs)
+                        list(sims_to_pred), pred_class_synset, objs
+                    )
 
             t0 = targets[0]
-            # A present GT with no prediction (no objects extracted, or none
-            # scored) is PENALIZED AS WRONG — encoded as the negation of the
-            # GT — never dropped (CLAUDE.md: prediction-unmapped penalized).
+            # Pull the VLM hybrid resolved labels for the argmax extracted object
+            best_final = finals[best_obj_idx] if best_obj_idx is not None else None
+
+            # --- NATURE axis: from the argmax object's hybrid label ---
             if t0.get("gt_nature") is not None:
                 gt_n = bool(t0["gt_nature"])
-                pn = pred_vocab_entry["gt_nature"] if pred_vocab_entry else None
+                pn = best_final["final_nature"] if best_final else None
                 gt_nature_val, pred_nature_val = gt_n, bool(pn) if pn is not None else (not gt_n)
                 nat_true.append(gt_n)
                 nat_pred.append(pred_nature_val)
+
+            # --- BIOTIC axis: from the argmax object's hybrid label ---
             if t0.get("gt_biotic") is not None:
                 gt_b = bool(t0["gt_biotic"])
-                pb = pred_vocab_entry["gt_biotic"] if pred_vocab_entry else None
+                pb = best_final["final_biotic"] if best_final else None
                 gt_biotic_val, pred_biotic_val = gt_b, bool(pb) if pb is not None else (not gt_b)
                 bio_true.append(gt_b)
                 bio_pred.append(pred_biotic_val)
-            # material: ALWAYS the VLM's own prediction (CLAUDE.md — never mapped),
-            # taken from the extracted object most representative of the
-            # ClipMatch top-1 predicted class. None (no prediction, object judged
-            # non-nature, or parse failure) is penalized as wrong, never
-            # taxonomy-defaulted.
+
+            # --- MATERIAL axis: from the argmax object's hybrid label ---
             if t0.get("gt_material") is not None:
                 gt_m = bool(t0["gt_material"])
-                pm = finals[best_obj_idx]["final_material"] if best_obj_idx is not None else None
+                pm = best_final["final_material"] if best_final else None
                 gt_material_val, pred_material_val = gt_m, bool(pm) if pm is not None else (not gt_m)
                 mat_true.append(gt_m)
                 mat_pred.append(pred_material_val)
 
-            # Every image with a GT synset counts toward support; a total miss
-            # (no prediction) scores top-1=0 and hP/hR=0, not excluded.
+            # --- HIERARCHICAL & ClipMatch metrics ---
             if gt_syn:
                 clipmatch_support += 1
                 clipmatch_correct = pred_class_synset is not None and pred_class_synset == gt_syn
                 if clipmatch_correct:
                     clipmatch_top1 += 1
+                
+                # Compare GT synset vs the resolved WordNet node of the argmax object
                 hier = taxonomy_metrics.compute_hierarchical_metrics(graph, gt_syn, pred_node)
                 hp_vals.append(hier["hp"]); hr_vals.append(hier["hr"]); hf1_vals.append(hier["hf1"])
-                # Wu-Palmer similarity between the predicted object's resolved
-                # WordNet node and the GT synset — a single 0-1 "how close is
-                # the miss" number, complementary to hP/hR's ancestor-overlap
-                # view. compute_wup_similarity already returns 0.0 (not a
-                # crash) when pred_node is None, matching the project's
-                # "prediction-unmapped penalized as wrong" convention.
+                
                 wup_sim = taxonomy_metrics.compute_wup_similarity(gt_syn, pred_node)
                 wup_vals.append(wup_sim)
         else:
@@ -778,9 +761,9 @@ def phase_score(args):
                 "clipmatch_pred_class": pred_vocab_entry["class_name"] if pred_vocab_entry else None,
                 "clipmatch_pred_synset": pred_vocab_entry["synset_id"] if pred_vocab_entry else None,
                 "clipmatch_pred_similarity": clipmatch_pred_similarity,
-                "clipmatch_pred_nature": pred_vocab_entry["gt_nature"] if pred_vocab_entry else None,
-                "clipmatch_pred_biotic": pred_vocab_entry["gt_biotic"] if pred_vocab_entry else None,
-                "clipmatch_pred_material": finals[best_obj_idx]["final_material"] if best_obj_idx is not None else None,
+                "clipmatch_pred_nature": best_final["final_nature"] if best_final else None,
+                "clipmatch_pred_biotic": best_final["final_biotic"] if best_final else None,
+                "clipmatch_pred_material": best_final["final_material"] if best_final else None,
                 "clipmatch_top1_correct": clipmatch_correct,
                 "gt_synset": gt_syn,
                 "resolved_pred_synset": pred_node,
@@ -1012,8 +995,8 @@ def build_arg_parser():
     p.add_argument("--max_model_len", type=int, default=None)
     p.add_argument("--trust_remote_code", action="store_true")
     p.add_argument("--batch_size", type=int, default=16)
-    p.add_argument("--max_new_tokens_caption", type=int, default=256)
-    p.add_argument("--max_new_tokens_label", type=int, default=300)
+    p.add_argument("--max_new_tokens_caption", type=int, default=248) # 248 tokens is the maximum length that LongCLIP can handle
+    p.add_argument("--max_new_tokens_label", type=int, default=256)
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--max_hops", type=int, default=0,
                    help="Maximum WordNet hop distance allowed when mapping an EXTRACTED "
