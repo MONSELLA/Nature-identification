@@ -45,14 +45,18 @@ Pillow>=10.0
 # --- CLIP-based metrics (src/evaluation/clip_metrics.py) ---
 # F-CLIPScore, Object-CLIPScore, ClipMatch all run through a CLIPScorer
 # (transformers AutoModel/AutoProcessor — see clip_metrics.CLIP_PRESETS for
-# the supported checkpoints: original CLIP, EVA-CLIP, FG-CLIP2). No open_clip
-# dependency; transformers>=4.40 above already covers all three.
+# the supported checkpoints: original CLIP, EVA-CLIP, SigLIP2, Jina-CLIP-v2).
+# No open_clip dependency; transformers>=4.40 above already covers all four.
+# (FG-CLIP2 was tried and abandoned — meta-tensor crash in its
+# trust_remote_code __init__ under this project's transformers version; see
+# clip_metrics.CLIP_PRESETS's comment.)
 # NOTE: LLM2CLIP is intentionally NOT supported — its text tower requires the
 # `llm2vec` package, which hard-pins transformers<=4.44.2. That's incompatible
 # with vLLM's transformers>=5.5.3 requirement in this project's single
 # environment (confirmed: installing llm2vec force-downgrades transformers
 # and breaks vLLM). Would need a second, separate environment to use — not
 # worth the operational overhead here.
+einops                  # required by jina-clip-v2's trust_remote_code modeling code
 
 # --- Experiment tracking ---
 wandb>=0.16

@@ -1,0 +1,200 @@
+{
+    "imagenet": {
+        "gemma-google_gemma-4-E4B-it": {
+            "model": "gemma-google_gemma-4-E4B-it",
+            "dataset": "imagenet",
+            "parse_failure_rate": 0.00568,
+            "nature": {
+                "accuracy": 0.86614,
+                "precision": 0.7939487558346485,
+                "recall": 0.9769834710743802,
+                "f1": 0.8760073361862947,
+                "precision_neg": 0.9724543791108253,
+                "recall_neg": 0.7621705426356589,
+                "f1_neg": 0.8545663936029204,
+                "support": 50000
+            },
+            "biotic": {
+                "accuracy": 0.9588842975206612,
+                "precision": 0.9835248211575981,
+                "recall": 0.9736051502145923,
+                "f1": 0.978539846867249,
+                "precision_neg": 0.4581497797356828,
+                "recall_neg": 0.5777777777777777,
+                "f1_neg": 0.5110565110565111,
+                "support": 24200
+            },
+            "material": {
+                "accuracy": 0.9693388429752066,
+                "precision": 0.9959656871071854,
+                "recall": 0.9731535269709544,
+                "f1": 0.9844274680993955,
+                "precision_neg": 0.007668711656441718,
+                "recall_neg": 0.05,
+                "f1_neg": 0.013297872340425532,
+                "support": 24200
+            },
+            "execution_time": "0-03:10:17",
+            "evaluated_at": "2026-07-20T21:32:07.452622+00:00"
+        },
+        "dataset_class_stats": {
+            "full": {
+                "total_classes": 997,
+                "nature": 484,
+                "no_nature": 513,
+                "biotic": 466,
+                "abiotic": 18,
+                "material": 482,
+                "immaterial": 2
+            }
+        },
+        "llava-lmms-lab-encoder_LLaVA-OneVision-2-8B-Instruct": {
+            "model": "llava-lmms-lab-encoder_LLaVA-OneVision-2-8B-Instruct",
+            "dataset": "imagenet",
+            "parse_failure_rate": 0.00042,
+            "nature": {
+                "accuracy": 0.729,
+                "precision": 0.6440123323236694,
+                "recall": 0.9840082644628099,
+                "f1": 0.77850791159932,
+                "precision_neg": 0.9702856265356266,
+                "recall_neg": 0.4898062015503876,
+                "f1_neg": 0.6509890789202555,
+                "support": 50000
+            },
+            "biotic": {
+                "accuracy": 0.9636776859504133,
+                "precision": 0.9813645927261797,
+                "recall": 0.980901287553648,
+                "f1": 0.9811328854450622,
+                "precision_neg": 0.5115257958287596,
+                "recall_neg": 0.5177777777777778,
+                "f1_neg": 0.5146327995582551,
+                "support": 24200
+            },
+            "material": {
+                "accuracy": 0.9749173553719008,
+                "precision": 0.9959049267530713,
+                "recall": 0.9788381742738589,
+                "f1": 0.9872978006570825,
+                "precision_neg": 0.005847953216374269,
+                "recall_neg": 0.03,
+                "f1_neg": 0.009787928221859706,
+                "support": 24200
+            },
+            "execution_time": "0-03:48:50",
+            "evaluated_at": "2026-07-20T22:21:52.799462+00:00"
+        },
+        "mistral-mistralai_Ministral-3-8B-Instruct-2512": {
+            "model": "mistral-mistralai_Ministral-3-8B-Instruct-2512",
+            "dataset": "imagenet",
+            "parse_failure_rate": 0.01788,
+            "nature": {
+                "accuracy": 0.9239,
+                "precision": 0.8901258655648647,
+                "recall": 0.9614462809917356,
+                "f1": 0.9244124833628002,
+                "precision_neg": 0.9608985373622229,
+                "recall_neg": 0.8886821705426357,
+                "f1_neg": 0.9233805199250921,
+                "support": 50000
+            },
+            "biotic": {
+                "accuracy": 0.9500826446280992,
+                "precision": 0.9815170008718396,
+                "recall": 0.9663519313304721,
+                "f1": 0.9738754325259515,
+                "precision_neg": 0.37777777777777777,
+                "recall_neg": 0.5288888888888889,
+                "f1_neg": 0.44074074074074077,
+                "support": 24200
+            },
+            "material": {
+                "accuracy": 0.9548760330578513,
+                "precision": 0.9959903423299129,
+                "recall": 0.9585477178423236,
+                "f1": 0.976910390324354,
+                "precision_neg": 0.006958250497017893,
+                "recall_neg": 0.07,
+                "f1_neg": 0.012658227848101266,
+                "support": 24200
+            },
+            "execution_time": "0-07:10:29",
+            "evaluated_at": "2026-07-21T01:32:18.626839+00:00"
+        },
+        "qwen-Qwen_Qwen3.5-9B": {
+            "model": "qwen-Qwen_Qwen3.5-9B",
+            "dataset": "imagenet",
+            "parse_failure_rate": 0.05148,
+            "nature": {
+                "accuracy": 0.82822,
+                "precision": 0.7526297051493672,
+                "recall": 0.9609090909090909,
+                "f1": 0.8441112946258417,
+                "precision_neg": 0.9504789823587918,
+                "recall_neg": 0.7037596899224806,
+                "f1_neg": 0.8087210208672027,
+                "support": 50000
+            },
+            "biotic": {
+                "accuracy": 0.9484710743801653,
+                "precision": 0.9806041058274855,
+                "recall": 0.9655793991416309,
+                "f1": 0.9730337564604372,
+                "precision_neg": 0.3619729514717582,
+                "recall_neg": 0.5055555555555555,
+                "f1_neg": 0.42188224385720907,
+                "support": 24200
+            },
+            "material": {
+                "accuracy": 0.9514049586776859,
+                "precision": 0.9957612456747404,
+                "recall": 0.9552697095435685,
+                "f1": 0.9750952986022872,
+                "precision_neg": 0.001851851851851852,
+                "recall_neg": 0.02,
+                "f1_neg": 0.003389830508474576,
+                "support": 24200
+            },
+            "execution_time": "0-09:33:23",
+            "evaluated_at": "2026-07-21T03:55:12.951500+00:00"
+        },
+        "internvl-OpenGVLab_InternVL3_5-8B": {
+            "model": "internvl-OpenGVLab_InternVL3_5-8B",
+            "dataset": "imagenet",
+            "parse_failure_rate": 2e-05,
+            "nature": {
+                "accuracy": 0.88826,
+                "precision": 0.8232882898530587,
+                "recall": 0.9793388429752066,
+                "f1": 0.8945590427840792,
+                "precision_neg": 0.976429547918729,
+                "recall_neg": 0.8028294573643411,
+                "f1_neg": 0.8811605300661519,
+                "support": 50000
+            },
+            "biotic": {
+                "accuracy": 0.9659090909090909,
+                "precision": 0.9842288964536562,
+                "recall": 0.9803004291845494,
+                "f1": 0.9822607349431268,
+                "precision_neg": 0.5377643504531722,
+                "recall_neg": 0.5933333333333334,
+                "f1_neg": 0.5641838351822503,
+                "support": 24200
+            },
+            "material": {
+                "accuracy": 0.9754132231404958,
+                "precision": 0.9958233135046197,
+                "recall": 0.9794190871369295,
+                "f1": 0.9875530824425245,
+                "precision_neg": 0.002012072434607646,
+                "recall_neg": 0.01,
+                "f1_neg": 0.0033500837520938024,
+                "support": 24200
+            },
+            "execution_time": "0-10:58:17",
+            "evaluated_at": "2026-07-21T08:30:37.686523+00:00"
+        }
+    }
+}

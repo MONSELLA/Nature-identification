@@ -21,7 +21,11 @@ evaluating the models.
   accuracy/precision/recall/F1.
 - **Grounding pipeline** (geometric/embedding-based, designed but not built):
   Grounding DINO + SAM (thing/stuff routing) → FG-CLIP2 hierarchy-margin
-  verification → nature importance score.
+  verification → nature importance score. CAVEAT: FG-CLIP2 was tried for the
+  VLM pipeline's CLIP scoring and abandoned — its trust_remote_code __init__
+  crashes with a meta-tensor error under this project's transformers version
+  (see clip_metrics.CLIP_PRESETS's comment). Re-verify it loads at all before
+  building the Grounding pipeline's verification step around it.
 
 ## VLM pipeline — code layout & how to run
 - Entrypoint: `scripts/run_vlm_pipeline.py` (`--stage all|infer|score`).
@@ -78,14 +82,18 @@ evaluating the models.
   objects only. No sentence term.
 - CLIP text encoder truncates at 77 tokens — long captions risk truncating the
   sentence-level term. Check which CLIP variant is in use before assuming the
-  full caption is encoded (FG-CLIP2 / Long-CLIP handle longer text; vanilla
-  CLIP does not).
-- **ClipMatch** (ImageNet + Places only — not COCO, not BIG-5): score each
-  extracted object independently (`"a photo of a {object}"`), take the MAX
-  similarity across objects per GT candidate class. Do NOT run against the raw
-  caption or a concatenated object-list sentence — both were tried and
-  rejected (token limit + semantic dilution — see data/llm_reference/vlm_pipeline_recap.txt
-  for why).
+  full caption is encoded; vanilla CLIP, SigLIP2, and EVA-CLIP all truncate
+  around this range, Jina-CLIP-v2 handles much longer text. FG-CLIP2 was
+  tried as a long-context option and abandoned — see
+  src/evaluation/clip_metrics.py's `CLIP_PRESETS` comment.
+- **ClipMatch** (ImageNet + Places only — not COCO, not BIG-5): score the
+  WHOLE CAPTION's CLIP embedding against each GT candidate class; argmax =
+  predicted class. SUPERSEDES the earlier object-list variant (max similarity
+  across independently-embedded extracted objects) — the caption-based version
+  empirically performs better, so the object-list implementation has been
+  removed from the codebase (see data/llm_reference/vlm_pipeline_recap.txt for
+  the history). Known caveat carried over: long captions risk CLIP's 77-token
+  truncation — accepted given the empirical gain.
 - **hP/hR/hF1** (hierarchical precision/recall/F1): ImageNet + Places only. Map
   the ClipMatch-predicted class onto a WordNet node via the extracted-object list
   (`resolve_to_wordnet`: rank objects by CLIP sim to the predicted class,

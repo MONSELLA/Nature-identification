@@ -1,7 +1,10 @@
-BIG-5 VLM PIPELINE — DESIGN RECAP (v4)
+BIG-5 VLM PIPELINE — DESIGN RECAP (v6)
 (v4: the VLM pipeline is now IMPLEMENTED — this doc records both the original
 design rationale AND, in "IMPLEMENTED:" notes, how the shipped code actually
-does it where the two differ.)
+does it where the two differ. v5: ClipMatch switched to the caption-based
+variant as the only implementation — see Section 8e and Section 11. v6:
+FG-CLIP2 tried and ABANDONED as a CLIP backend — see Section 11 — replaced
+in CLIP_PRESETS by SigLIP2 and Jina-CLIP-v2.)
 
 ===============================================================
 0. IMPLEMENTATION STATUS (NEW in v4)
@@ -63,7 +66,12 @@ the COCO box-IoU matching noted in Section 8), and the ablations
         a stuffed rabbit is immaterial but geometrically a "thing")
      2. Dual-branch verification — detector/segmenter confidence +
         hierarchy-based margin check via FG-CLIP2 (cosine similarity
-        across target/hypernym/sibling hyponyms on localized crops)
+        across target/hypernym/sibling hyponyms on localized crops).
+        CAVEAT (v6): FG-CLIP2 was tried for the VLM pipeline's CLIP
+        scoring and abandoned — its trust_remote_code __init__ crashes
+        with a meta-tensor error under this project's transformers
+        version (Section 11). Re-verify it loads at all before building
+        this step around it; may need a different CLIP backend here too.
      3. Taxonomy-attribute spatial aggregation — per-object
         localization maps combined into biotic/abiotic and
         material/immaterial heatmaps.
@@ -408,10 +416,14 @@ reliably well-trained per Long-CLIP's analysis. Conflicts with the
 detailed-caption strategy (Section 4) for the sentence-level term.
 Object-level terms unaffected (short templated phrases).
 Mitigation options (not yet decided):
-  - Long-context CLIP variant for the sentence-level term (FG-CLIP2
-    explicitly trains on long-caption modeling, unlike vanilla CLIP
-    — verify its exact max sequence length before relying on it;
-    alternatively Long-CLIP)
+  - Long-context CLIP variant for the sentence-level term. FG-CLIP2
+    was tried (it explicitly trains on long-caption modeling, unlike
+    vanilla CLIP) and ABANDONED — see Section 11 — its
+    trust_remote_code __init__ crashes with a meta-tensor error under
+    this project's transformers version. Jina-CLIP-v2 (now in
+    CLIP_PRESETS) handles much longer text and may be worth trying
+    for this specifically; alternatively Long-CLIP (still not
+    packaged as a plain HF AutoModel — see CLIP_PRESETS's comment).
   - Accept + document truncation as a stated limitation
   - Deliberately truncate/cap captions at a controlled length
 
@@ -457,33 +469,48 @@ d) COCO/ImageNet/Places — GT-mention accuracy (EM/Contains, per
    or any WordNet-synset synonym (not just the literal label
    string) appears among extracted objects.
 
-e) ClipMatch (Ging et al.), ImageNet + Places ONLY — COCO/BIG-5
-   excluded (COCO multi-label, BIG-5 has no closed class vocabulary
-   — ClipMatch needs a fixed candidate list, so this scoping is a
-   correctness requirement, not a compromise):
-     - Run against the EXTRACTED OBJECT LIST, not the raw caption
-       and NOT a concatenated sentence template ("a photo of a X,
-       a Y, and a Z" was considered and rejected — see below).
-     - Score each extracted object independently via its own short
-       phrase ("a photo of a {object}"), take the MAX similarity
-       across all objects as the model's implicit best guess for
-       each GT candidate class.
-     - REJECTED APPROACH — raw caption: risks CLIP 77-token
-       truncation on long captions, and ClipMatch was designed/
-       validated on short single-answer VQA responses, not
-       multi-sentence scene descriptions — using the full caption
-       deviates from how the metric was built and tested.
-     - REJECTED APPROACH — concatenated object-list sentence ("a
-       photo of a X, a Y ... and a Z"): (1) still risks the 77-token
-       limit with busy scenes (8-10+ objects), worse than the
-       caption case since triggered by object count not verbosity;
-       (2) semantic dilution — one joint embedding for many objects
-       is a smeared average, diluting the signal for any single
-       target GT class, hurting matching precisely in richer scenes.
-     - Independent per-object scoring avoids both problems, stays
-       truest to ClipMatch's original single-concept design, and
-       reuses the same object-list input as Object-CLIPScore (no
-       new extraction format needed).
+e) ClipMatch (Ging et al.-inspired), ImageNet + Places ONLY —
+   COCO/BIG-5 excluded (COCO multi-label, BIG-5 has no closed class
+   vocabulary — ClipMatch needs a fixed candidate list, so this
+   scoping is a correctness requirement, not a compromise):
+     - SUPERSEDED IN v5 (see below): originally run against the
+       EXTRACTED OBJECT LIST (max similarity across independently-
+       embedded objects per candidate) with the raw-caption and
+       concatenated-object-sentence variants explicitly REJECTED for
+       token-limit + semantic-dilution reasons (kept below for
+       history). After both variants were actually implemented and
+       compared empirically, the CAPTION-based version performed
+       better — so as of v5 it is the ONLY ClipMatch implementation;
+       the object-list code has been removed from clip_metrics.py.
+     - CURRENT (v5): score the WHOLE CAPTION's CLIP embedding
+       against each candidate class directly; argmax = predicted
+       class (clip_metrics.clipmatch). The 77-token truncation risk
+       this reintroduces (see the original rejection rationale below)
+       is accepted as a stated limitation given the empirical gain.
+     - ORIGINAL (v1-v4) DESIGN, kept for history — run against the
+       EXTRACTED OBJECT LIST, not the raw caption and NOT a
+       concatenated sentence template ("a photo of a X, a Y, and a
+       Z" was considered and rejected — see below):
+         - Score each extracted object independently via its own
+           short phrase ("a photo of a {object}"), take the MAX
+           similarity across all objects as the model's implicit
+           best guess for each GT candidate class.
+         - REJECTED APPROACH — raw caption: risks CLIP 77-token
+           truncation on long captions, and ClipMatch was designed/
+           validated on short single-answer VQA responses, not
+           multi-sentence scene descriptions — using the full caption
+           deviates from how the metric was built and tested. (This
+           is the approach v5 above ended up adopting anyway, after
+           empirical comparison showed it outperforming the
+           object-list version despite this caveat.)
+         - REJECTED APPROACH — concatenated object-list sentence ("a
+           photo of a X, a Y ... and a Z"): (1) still risks the
+           77-token limit with busy scenes (8-10+ objects), worse
+           than the caption case since triggered by object count not
+           verbosity; (2) semantic dilution — one joint embedding for
+           many objects is a smeared average, diluting the signal for
+           any single target GT class, hurting matching precisely in
+           richer scenes. (Still not used — this rejection stands.)
 
 f) Hierarchical Precision / Recall (hP/hR) + Wu-Palmer, per
    Snæbjarnarson et al.'s taxonomy-aware evaluation — ImageNet +
@@ -501,8 +528,11 @@ f) Hierarchical Precision / Recall (hP/hR) + Wu-Palmer, per
      - IMPLEMENTED (taxonomy_metrics.resolve_to_wordnet): the
        predicted-class -> WordNet-node step is NOT a BGE cross-encoder
        (that was the design sketch). Instead the extracted objects are
-       ranked by their CLIP similarity to the predicted class (reusing
-       the per-object sims ClipMatch already computed), the top phrase
+       ranked by their CLIP similarity to the predicted class (each
+       extracted object's embedding dotted against the ClipMatch-
+       predicted class's own embedding — computed in run_vlm_pipeline.py
+       right after the v5 caption-based ClipMatch call, since ClipMatch
+       itself no longer touches per-object embeddings), the top phrase
        that resolves in WordNet is taken, and polysemy is broken by
        maximizing Wu-Palmer similarity to the predicted class. hP/hR
        are then the ancestral-closure overlap of GT node vs. predicted
@@ -615,9 +645,8 @@ Week 8 (Sep 3-10): Finish Discussion/Conclusion/Abstract,
 - Exact weighting scheme for the nature importance score's
   central-pixel emphasis (Section 1, B.4) — not yet designed
 - Which CLIP variant for F-CLIPScore's sentence-level term (vanilla
-  + accept truncation, vs Long-CLIP, vs FG-CLIP2)
-- Exact max sequence length of FG-CLIP2's text encoder — verify
-  before relying on it for long captions
+  + accept truncation, vs Long-CLIP, vs Jina-CLIP-v2 — FG-CLIP2 is
+  no longer an option, see RESOLVED IN v6 below)
 - Format-detection method to route foreground/background/scene
   decomposition vs. fallback single caption
 - Whether to extend WordNet mapping to novel VLM-extracted object
@@ -625,9 +654,38 @@ Week 8 (Sep 3-10): Finish Discussion/Conclusion/Abstract,
 - Final choice between same-VLM vs agnostic-LLM extraction —
   pending ablation results (material/immaterial stays VLM-based
   regardless, per Section 5)
-- Whether to also test ClipMatch/hP/hR against the raw caption for
-  comparison, despite the concerns raised, or go straight to
-  object-list-only
+
+RESOLVED IN v6 (decided after repeated integration failures):
+- FG-CLIP2 (qihoo360/fg-clip2-large) is ABANDONED as a CLIP backend
+  and removed from clip_metrics.CLIP_PRESETS. Its trust_remote_code
+  __init__ builds a positional-embedding mask (`mask1`/`mask2`) as a
+  plain tensor attribute rather than a registered nn.Parameter/
+  nn.Buffer. Under this project's transformers version, __init__ runs
+  inside a meta-device "fast init" context regardless of any loading
+  kwarg (torch_dtype, low_cpu_mem_usage, device_map — all tried, none
+  fixed it, including loading exactly per FG-CLIP2's own HF model-card
+  example with no extra kwargs at all), so that tensor never gets real
+  data and the first text-encoding forward pass crashes with
+  `NotImplementedError: Cannot copy out of meta tensor; no data!`. A
+  dedicated (non-generic) loading class was also tried and hit the
+  identical crash, confirming this is a genuine incompatibility between
+  FG-CLIP2's own trust_remote_code and this transformers version, not
+  something fixable from the calling side. clip_metrics.py's `walk_type`/
+  `_text_walk_type` handling (added earlier to work around a DIFFERENT,
+  separate FG-CLIP2 issue — its get_text_features() needing a
+  walk_type kwarg tied to a fixed 64/196-token sequence length) has
+  been removed along with it, since it's moot without a working load.
+  CLIP_PRESETS now offers SigLIP2 (google/siglip2-base-patch16-224,
+  native transformers, no trust_remote_code needed) and Jina-CLIP-v2
+  (jinaai/jina-clip-v2, trust_remote_code, RAW string/image input
+  convention — see clip_metrics.CLIPScorer's class docstring) instead.
+
+RESOLVED IN v5 (decided from empirical comparison):
+- ClipMatch: caption-based similarity beats the object-list variant
+  (Section 8e) — object-list ClipMatch code removed from
+  clip_metrics.py; the raw-caption approach is now the ONLY
+  implementation, its 77-token truncation caveat accepted as a
+  stated limitation.
 
 RESOLVED IN v4 (decided during implementation):
 - hP/hR predicted-class -> WordNet-node step: uses CLIP-ranked object
