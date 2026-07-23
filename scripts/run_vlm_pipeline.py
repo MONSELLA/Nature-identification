@@ -629,9 +629,15 @@ def phase_score(args):
                     sims_to_pred = rec_obj_embs @ candidate_embs[pred_idx]
                     best_obj_idx = int(sims_to_pred.argmax())
                     
-                    # 3. Resolve the argmax extracted object to a WordNet node for hierarchical metrics
+                    # 3. Resolve ONLY the argmax extracted object (best_obj_idx) to a
+                    #    WordNet node for hierarchical metrics — no fallback to the
+                    #    next-best object if this one fails to resolve. Passing a
+                    #    single-candidate list makes resolve_to_wordnet try exactly
+                    #    that one object and return None (a mapping failure, scored
+                    #    downstream as 0.0 / excluded — see the hierarchical vs
+                    #    hierarchical_mapped split below) if it can't be mapped.
                     pred_node = taxonomy_metrics.resolve_to_wordnet(
-                        list(sims_to_pred), pred_class_synset, objs
+                        [sims_to_pred[best_obj_idx]], pred_class_synset, [objs[best_obj_idx]]
                     )
 
             t0 = targets[0]
