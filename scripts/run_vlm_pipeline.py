@@ -481,8 +481,22 @@ def phase_score(args):
     nat_true, nat_pred = [], []
     bio_true, bio_pred, mat_true, mat_pred = [], [], [], []
     fclip_vals, objclip_vals = [], []
+    # Two parallel accumulations of the hierarchical metrics (hP/hR/hF1 + Wu-
+    # Palmer), differing ONLY in how they treat images whose ClipMatch-predicted
+    # object could NOT be resolved onto a WordNet node (resolve_to_wordnet ->
+    # pred_node is None):
+    #   * `*_vals`        — INCLUDES those failures, scored as 0.0 (the
+    #                       "prediction-unmapped penalized as wrong" convention).
+    #   * `*_vals_mapped` — EXCLUDES them entirely, so it reflects hierarchical
+    #                       quality ONLY over images where the predicted object
+    #                       actually mapped into WordNet.
+    # `n_hier_mapping_fail` counts the excluded (mapping-failure) images so the
+    # failure RATE can be reported alongside both versions.
     hp_vals, hr_vals, hf1_vals = [], [], []
     wup_vals = []
+    hp_vals_mapped, hr_vals_mapped, hf1_vals_mapped = [], [], []
+    wup_vals_mapped = []
+    n_hier_mapping_fail = 0
     n_gt_targets = n_extraction_hits = 0
     n_objects_total = n_parse_fail = n_object_records = 0
     n_map_nature = n_vlm_nature = 0
@@ -655,12 +669,26 @@ def phase_score(args):
                 if clipmatch_correct:
                     clipmatch_top1 += 1
                 
-                # Compare GT synset vs the resolved WordNet node of the argmax object
+                # Compare GT synset vs the resolved WordNet node of the argmax
+                # object. `pred_node is None` means the ClipMatch-predicted
+                # object could not be mapped onto ANY WordNet node (mapping
+                # failure) — compute_hierarchical_metrics/compute_wup_similarity
+                # both score that as 0.0, which the `*_vals` lists keep (failures
+                # counted as error). The `*_vals_mapped` lists only collect the
+                # cases where mapping SUCCEEDED (pred_node is not None), and the
+                # failures are tallied into n_hier_mapping_fail for the rate.
                 hier = taxonomy_metrics.compute_hierarchical_metrics(graph, gt_syn, pred_node)
                 hp_vals.append(hier["hp"]); hr_vals.append(hier["hr"]); hf1_vals.append(hier["hf1"])
-                
+
                 wup_sim = taxonomy_metrics.compute_wup_similarity(gt_syn, pred_node)
                 wup_vals.append(wup_sim)
+
+                if pred_node is None:
+                    n_hier_mapping_fail += 1
+                else:
+                    hp_vals_mapped.append(hier["hp"]); hr_vals_mapped.append(hier["hr"])
+                    hf1_vals_mapped.append(hier["hf1"])
+                    wup_vals_mapped.append(wup_sim)
         else:
             # --- COCO (multi-label) + BIG-5 (holistic): image-level nature OR
             #     + matched-object biotic/material ---
@@ -810,9 +838,21 @@ def phase_score(args):
             "top1_accuracy": (clipmatch_top1 / clipmatch_support) if clipmatch_support else 0.0,
             "support": clipmatch_support,
         }
+        # Two hierarchical views over the SAME images (see the accumulation
+        # comment above): "hierarchical" penalizes WordNet-mapping failures as
+        # 0.0 (support = every ClipMatch-scored image); "hierarchical_mapped"
+        # drops those failures (support = only images whose predicted object
+        # mapped into WordNet). mapping_failure_rate is the fraction of scored
+        # images where the predicted object could not be mapped at all.
         summary["hierarchical"] = {"hp": _mean(hp_vals), "hr": _mean(hr_vals),
                                    "hf1": _mean(hf1_vals), "wup": _mean(wup_vals),
-                                   "support": len(hf1_vals)}
+                                   "support": len(hf1_vals),
+                                   "mapping_failure_rate": (n_hier_mapping_fail / len(hf1_vals))
+                                                           if hf1_vals else 0.0,
+                                   "mapping_failures": n_hier_mapping_fail}
+        summary["hierarchical_mapped"] = {"hp": _mean(hp_vals_mapped), "hr": _mean(hr_vals_mapped),
+                                          "hf1": _mean(hf1_vals_mapped), "wup": _mean(wup_vals_mapped),
+                                          "support": len(hf1_vals_mapped)}
 
     # Wall-clock time this model took to finish this run, formatted "D-HH:MM:SS"
     # (SLURM-style elapsed time). inference_time_seconds comes from phase_infer's
@@ -891,8 +931,13 @@ def _print_summary(s, run_clipmatch):
         print(f"\n--- ClipMatch [caption-based] (support {s['clipmatch']['support']}) ---")
         print(f"Top-1: {s['clipmatch']['top1_accuracy']:.4f}")
         h = s["hierarchical"]
+        hm = s["hierarchical_mapped"]
         print(f"--- Hierarchical (support {h['support']}) ---")
-        print(f"hP {h['hp']:.4f} | hR {h['hr']:.4f} | hF1 {h['hf1']:.4f} | Wu-Palmer {h['wup']:.4f}")
+        print(f"[failures as error]  hP {h['hp']:.4f} | hR {h['hr']:.4f} | hF1 {h['hf1']:.4f} | Wu-Palmer {h['wup']:.4f}")
+        print(f"WordNet mapping-failure rate: {h['mapping_failure_rate']:.1%} "
+              f"({h['mapping_failures']}/{h['support']})")
+        print(f"[mapped only, support {hm['support']}]  hP {hm['hp']:.4f} | hR {hm['hr']:.4f} "
+              f"| hF1 {hm['hf1']:.4f} | Wu-Palmer {hm['wup']:.4f}")
     t = s["execution_time"]
     inf_str = t["inference"] if t["inference"] is not None else "n/a"
     print(f"\nExecution time (D-HH:MM:SS): inference {inf_str} | scoring {t['scoring']} | total {t['total']}")
@@ -927,6 +972,9 @@ def _log_wandb(args, summary, run_clipmatch):
         log["ClipMatch/Top1"] = summary["clipmatch"]["top1_accuracy"]
         log["Hierarchical/hF1"] = summary["hierarchical"]["hf1"]
         log["Hierarchical/WuPalmer"] = summary["hierarchical"]["wup"]
+        log["Hierarchical/MappingFailureRate"] = summary["hierarchical"]["mapping_failure_rate"]
+        log["Hierarchical/hF1_MappedOnly"] = summary["hierarchical_mapped"]["hf1"]
+        log["Hierarchical/WuPalmer_MappedOnly"] = summary["hierarchical_mapped"]["wup"]
     wandb.log(log)
     wandb.finish()
 
@@ -1080,21 +1128,39 @@ def parse_args():
     return args
 
 
+def _model_slug(args):
+    """Filesystem-safe slug identifying the VLM for this run, e.g.
+    'qwen2_5_vl/Qwen/Qwen3.5-0.8B' -> 'qwen2_5_vl_Qwen_Qwen3.5-0.8B'. Matches
+    the `model` string stored in the artifact header (build in phase_infer) and
+    the slug used for the predictions CSV, so all of a model's outputs share one
+    recognizable name. Returns None when the model isn't set (e.g. a standalone
+    --stage score run that relies on an explicit --responses_file)."""
+    if not args.model_family or not args.model_name:
+        return None
+    return f"{args.model_family}/{args.model_name}".replace("/", "_")
+
+
 def _resolve_responses_file(args):
     """Fill in --responses_file's default (None until now) as
-    '<results_dir>/<run_name>/vlm_responses.jsonl' — the SAME directory
-    --output_file lands in — so the intermediate artifact respects
-    --results_dir/--run_name exactly like every other output this script
-    writes, instead of always landing at a fixed cwd-relative path regardless
-    of those flags. An explicitly-passed --responses_file is left untouched.
-    Creates that directory so phase_infer can open the file for writing.
-    Mutates and returns `args`."""
+    '<results_dir>/<run_name>/vlm_responses_<model_slug>.jsonl' — the SAME
+    directory --output_file lands in — so the intermediate artifact respects
+    --results_dir/--run_name exactly like every other output this script writes,
+    instead of always landing at a fixed cwd-relative path regardless of those
+    flags. The filename is suffixed with the MODEL slug so each model's infer
+    artifact is uniquely named (the Grounding pipeline consumes these per-model
+    JSON-Lines files, and it keeps a rerun on a different VLM from overwriting a
+    previous model's artifact). Falls back to a plain 'vlm_responses.jsonl' when
+    the model isn't known (a standalone --stage score run). An explicitly-passed
+    --responses_file is left untouched. Creates that directory so phase_infer
+    can open the file for writing. Mutates and returns `args`."""
     if args.responses_file is None:
         out_dir = Path(args.results_dir)
         if args.run_name:
             out_dir = out_dir / args.run_name
         out_dir.mkdir(parents=True, exist_ok=True)
-        args.responses_file = str(out_dir / "vlm_responses.jsonl")
+        slug = _model_slug(args)
+        fname = f"vlm_responses_{slug}.jsonl" if slug else "vlm_responses.jsonl"
+        args.responses_file = str(out_dir / fname)
     return args
 
 
