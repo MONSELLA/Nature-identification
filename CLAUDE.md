@@ -101,12 +101,21 @@ evaluating the models.
   of the GT node vs. the predicted node.
 
 ## Axis scoring (nature/biotic/material accuracy) — per dataset
-- **ImageNet/Places (single-label)**: nature/biotic are read off the FORCED top-1
-  ClipMatch class's taxonomy position — no lexical extraction matching, no
-  similarity threshold (global argmax over the full candidate vocab always
-  returns a class). This means an incidental-but-correct object never counts
-  against the single GT label. material is the VLM's own label for the
-  best-matching extracted object (still VLM, never mapped). Prediction-unmapped
+- **ImageNet/Places (single-label)**: ClipMatch (whole-caption CLIP embedding
+  vs. candidate_vocab, global argmax — no lexical matching, no similarity
+  threshold) picks the top-1 predicted class, restricted to classes mapped into
+  the graph. That predicted class is then used ONLY to pick an ANCHOR among the
+  extracted objects: the object whose own CLIP embedding is most similar to the
+  predicted class's embedding (`best_obj_idx`/`best_final` in
+  `run_vlm_pipeline.py`'s single-label branch). nature/biotic/material are all
+  read off that ANCHOR OBJECT's own hybrid-resolved label
+  (`final_nature`/`final_biotic`/`final_material`) — NOT off the predicted
+  class's own stored taxonomy position. This means an incidental-but-correct
+  object never counts against the single GT label, and also means the axis
+  verdict can in principle diverge from the ClipMatch-predicted class itself
+  (e.g. if the anchor object's hybrid label came from the VLM fallback rather
+  than the mapping). material is always the VLM's own label (never mapped).
+  No anchor object (empty extraction or failed ClipMatch) → prediction-unmapped
   → penalized as wrong.
 - **COCO/BIG-5**: image-level nature = OR over extracted objects; biotic/material
   scored on the matched GT object. COCO box-IoU matching (Hungarian, IoU≥0.5) is
