@@ -81,8 +81,8 @@ EXTRACTION_PROMPT = (
     "\"{caption}\"\n\n"
     "Using BOTH the image and the description, list every distinct "
     "object, element, or entity that appears in the image. Follow these rules:\n"
-    "  - Return each entity as a noun or a compound noun (e.g. \"bench\", "
-    "\"golden retriever\", \"mountain\", \"hen of the woods\").\n"
+    "  - Return each entity as a noun or a compound noun (e.g. \"grass\", "
+    "\"golden retriever\", \"mountain\", \"sea lion\").\n"
     "  - Include secondary and background entities, not just the main subject.\n"
     "  - Include an entity even when it is only PART of a larger one or is "
     "depicted on its surface (e.g. a flower printed on a dress -> list "
@@ -176,7 +176,7 @@ class MaterialResponse(BaseModel):
     """
 
     reasoning: str = Field(
-        description="One concise sentence justifying the tangibility based on the visual evidence."
+        description="One concise sentence justifying the tangibility classification of the entity based on the visual evidence."
     )
     tangibility: Literal["material", "immaterial"]
 
@@ -236,46 +236,73 @@ Follow the interleaved reasoning structure: evaluate nature first, lock in the d
 
 FIRST EXAMPLE OUTPUT FOR TARGET "chair":
 {{
-  "nature_reasoning": "The target is a chair. The visual evidence shows it is made of wood with visible grain. Manufactured objects where the natural material of origin is visually identifiable count as nature-based artefacts, fulfilling the criteria for nature.",
+  "nature_reasoning": "The target entity is a chair. The visual evidence shows a manufactured structural object made of wood with clearly visible natural grain. While homogenous artefacts are excluded, manufactured objects where the natural material of origin remains visually identifiable by its grain or texture explicitly count as Nature-Based Artefacts, fulfilling the inclusion criteria.",
   "nature": "yes",
-  "sub_axes_reasoning": "Since nature is 'yes', I evaluate the sub-axes. Wood is a derivative of flora, making it biotic. The chair is a physical object that occupies space, making it material.",
+  "sub_axes_reasoning": "Since nature is 'yes', I evaluate the sub-axes. Wood is a processed material derived from trees, placing it under Flora & Plant Derivatives within the biotic category. Because it is a real-world physical object with mass that occupies space, it is classified as material under the Tangibility axis.",
   "life_category": "biotic",
   "tangibility": "material"
 }}
 
 SECOND EXAMPLE OUTPUT FOR TARGET "fan":
 {{
-  "nature_reasoning": "The target is a manufactured electric fan made of plastic and metal. It is a fully artificial object with no unaltered natural elements or identifiable natural textures, so it fails the criteria for nature.",
+  "nature_reasoning": "The target entity is an electric fan. The visual evidence reveals a manufactured functional object made of smooth plastic and metal. Because the original natural texture of the materials is completely unidentifiable and altered, and the object does not depict a natural entity, it falls strictly under the Homogenous Artefacts exclusion and fails the criteria for nature.",
   "nature": "no",
-  "sub_axes_reasoning": "Not applicable since the entity is not nature.",
+  "sub_axes_reasoning": "Not applicable since the entity is not classified as nature.",
   "life_category": "none",
   "tangibility": "none"
 }}
 
 THIRD EXAMPLE OUTPUT FOR TARGET "river":
 {{
-  "nature_reasoning": "The target is a flowing body of water. Hydrological components are explicitly classified as natural elements, fulfilling the criteria for nature.",
+  "nature_reasoning": "The target entity is a river. The visual evidence captures a real-world flowing body of water. Hydrological components (rivers, ponds, lakes, streams) are explicitly classified under Non-Living Natural Elements & Processes, fulfilling the inclusion criteria for nature.",
   "nature": "yes",
-  "sub_axes_reasoning": "Since nature is 'yes', I must evaluate the sub-axes. Water is a non-living hydrological component, making it abiotic. It has a physical presence in the landscape, making it material.",
+  "sub_axes_reasoning": "Since nature is 'yes', I evaluate the sub-axes. A river is a fluid flow, placing it under Hydrological Components within the abiotic category. Because the image is an unfiltered documentary depiction capturing a real-world physical environment, it is classified as material under the Tangibility axis.",
   "life_category": "abiotic",
   "tangibility": "material"
 }}
 
 FOURTH EXAMPLE OUTPUT FOR TARGET "dog":
 {{
-  "nature_reasoning": "The target is a dog. The image shows this is a stylized, cartoon depiction rather than a photograph of a real animal. Fictional or stylized depictions of non-human living entities still count as nature representations, fulfilling the criteria.",
+  "nature_reasoning": "The target entity is a dog. The visual evidence indicates this is a stylized animated cartoon depiction rather than an unfiltered documentary photograph of a real animal. Fictional, stylized, or artistic depictions explicitly referencing more-than-human living entities (fauna) count as Representations of Nature, fulfilling the inclusion criteria.",
   "nature": "yes",
-  "sub_axes_reasoning": "Since nature is 'yes', I evaluate the sub-axes. A dog is an animal (fauna), making it biotic. Because the image shows a digital or animated representation rather than a physical organism, it is immaterial.",
+  "sub_axes_reasoning": "Since nature is 'yes', I evaluate the sub-axes. A dog is a non-human vertebrate (fauna), placing its representational subject under the biotic category. Because this specific instance is a fabricated animated depiction rather than a physical real-world organism, it is classified as immaterial under the Tangibility axis.",
   "life_category": "biotic",
   "tangibility": "immaterial"
 }}
 
 FIFTH EXAMPLE OUTPUT FOR TARGET "sunset":
 {{
-  "nature_reasoning": "The target is a sunset. The visual evidence reveals this is an artistic painting of a sunset rather than a photograph of the sky. Artistic representations of astrophysical processes explicitly count as nature-relevant, fulfilling the criteria.",
+  "nature_reasoning": "The target entity is a sunset. The visual evidence shows an artistic painting on canvas depicting a sky at dusk, rather than a literal photograph of reality. Artistic depictions of astrophysical phenomena explicitly count as Representations of Nature, fulfilling the inclusion criteria.",
   "nature": "yes",
-  "sub_axes_reasoning": "Since nature is 'yes', I evaluate the sub-axes. A sunset is an astrophysical process, making it abiotic. Because this specific instance is an artistic medium (a painting) rather than the literal physical event, it is immaterial.",
+  "sub_axes_reasoning": "Since nature is 'yes', I evaluate the sub-axes. A sunset is a celestial phenomenon, placing it under Astrophysical Components within the abiotic category. Because the entity is presented through an expressive artistic medium (a painting) rather than as an unfiltered real-world physical occurrence, it is classified as immaterial under the Tangibility axis.",
   "life_category": "abiotic",
+  "tangibility": "immaterial"
+}}
+
+SIXTH EXAMPLE OUTPUT FOR TARGET "policeman":
+{{
+  "nature_reasoning": "The target entity is a policeman. The visual evidence shows a human being wearing a uniform. Under this classification taxonomy, human beings, human body parts, and groups of people fall under the explicit Exclusion Scope and are never classified as nature, regardless of their role or setting.",
+  "nature": "no",
+  "sub_axes_reasoning": "Not applicable since human beings are excluded from the nature taxonomy.",
+  "life_category": "none",
+  "tangibility": "none"
+}}
+
+SEVENTH EXAMPLE OUTPUT FOR TARGET "canyon":
+{{
+  "nature_reasoning": "The target entity is a canyon. The visual evidence shows a massive, deep valley with layered rock cliffs. Large-scale landforms and earth structures fall under Geological & Topographical Components within the Non-Living Natural Elements inclusion scope, fulfilling the criteria for nature.",
+  "nature": "yes",
+  "sub_axes_reasoning": "Since nature is 'yes', I evaluate the sub-axes. A canyon is a large-scale landform and earth structure, placing it under Geological & Topographical Components within the abiotic category. Because this is an unfiltered documentary photograph of a real-world physical landscape, it is classified as material under the Tangibility axis.",
+  "life_category": "abiotic",
+  "tangibility": "material"
+}}
+
+EIGHTH EXAMPLE OUTPUT FOR TARGET "elephant":
+{{
+  "nature_reasoning": "The target entity is an elephant figurine. The visual evidence shows a three-dimensional decorative sculpture shaped like an animal. While homogenous structural artefacts are excluded, three-dimensional figurines, sculptures, or models depicting flora and fauna explicitly count as Representations of Nature, fulfilling the inclusion criteria.",
+  "nature": "yes",
+  "sub_axes_reasoning": "Since nature is 'yes', I evaluate the sub-axes. The object represents an elephant (fauna), placing its conceptual subject under the biotic category. Although the figurine is a physical three-dimensional object, its primary purpose is representational and symbolic; therefore, under the Tangibility rules for representations, it is classified as immaterial.",
+  "life_category": "biotic",
   "tangibility": "immaterial"
 }}
 """
@@ -300,7 +327,7 @@ FIFTH EXAMPLE OUTPUT FOR TARGET "sunset":
 # nature/biotic verdict up front and asks for material/immaterial only, with
 # examples that match MaterialResponse's actual shape.
 
-#def build_material_classification_prompt(class_name, biotic):
+def build_material_classification_prompt(class_name, biotic):
     """
     Build the per-object prompt for the MAPPED-nature material-only labeling
     call (paired with schema=MaterialResponse).
@@ -316,38 +343,46 @@ FIFTH EXAMPLE OUTPUT FOR TARGET "sunset":
     Returns:
         The full prompt string ready to send to the VLM alongside the image.
     """
-    if biotic is True:
-        established = (
-            f'This "{class_name}" has ALREADY been established as NATURE, and specifically as '
-            f'BIOTIC (a living organism, or the material/immaterial result of a biotic process).'
-        )
-    elif biotic is False:
-        established = (
-            f'This "{class_name}" has ALREADY been established as NATURE, and specifically as '
-            f'ABIOTIC (a non-living natural element or process).'
-        )
-    else:
-        established = f'This "{class_name}" has ALREADY been established as NATURE.'
-
+    
     return f"""You are analyzing a specific target entity identified in the provided image.
 TARGET ENTITY TO CLASSIFY: "{class_name}"
 
-{established} Do NOT re-evaluate the nature or biotic/abiotic classification — treat both as
-settled and given.
+Your task is to classify this specific "{class_name}" instance's tangibility, based on the visual evidence in the image and the strict definitions provided. 
+First, provide a one-sentence reasoning step explaining what you see. Then, output your final tangibility classification as either "material" or "immaterial".
 
-Your ONLY remaining task is to classify this specific "{class_name}" instance's tangibility, based
-on the visual evidence in the image and the strict definitions provided. First, provide a one-sentence 
-reasoning step explaining what you see. Then, output your final classification as either "material" or "immaterial".
-
-EXAMPLE OUTPUT FOR TARGET "river" (already classified as nature, abiotic):
+EXAMPLE OUTPUT FOR TARGET "river":
 {{
-  "reasoning": "The image shows a real, physically flowing river occupying space in the landscape, not a depiction of one.",
+  "reasoning": "The image captures an unfiltered documentary view of a real-world, physically flowing river that occupies physical space in the landscape.",
   "tangibility": "material"
 }}
 
-EXAMPLE OUTPUT FOR TARGET "dog" (already classified as nature, biotic):
+EXAMPLE OUTPUT FOR TARGET "dog":
 {{
-  "reasoning": "The image shows a stylized cartoon drawing of a dog rather than a real, physically present animal.",
+  "reasoning": "The image shows a stylized animated cartoon depiction of a dog rather than a real, physically present organism.",
+  "tangibility": "immaterial"
+}}
+
+EXAMPLE OUTPUT FOR TARGET "chair":
+{{
+  "reasoning": "The image shows a real-world manufactured wooden chair with identifiable natural grain that possesses physical presence and mass.",
+  "tangibility": "material"
+}}
+
+EXAMPLE OUTPUT FOR TARGET "sunset":
+{{
+  "reasoning": "The image reveals an artistic painting on canvas depicting a sky at dusk rather than an unfiltered real-world physical occurrence.",
+  "tangibility": "immaterial"
+}}
+
+EXAMPLE OUTPUT FOR TARGET "canyon":
+{{
+  "reasoning": "The image captures an unfiltered documentary photograph of a real-world geological landform occupying physical space.",
+  "tangibility": "material"
+}}
+
+EXAMPLE OUTPUT FOR TARGET "elephant":
+{{
+  "reasoning": "The image shows that this specific instance is a three-dimensional decorative figurine whose primary purpose is representational and symbolic, rather than a living organism.",
   "tangibility": "immaterial"
 }}
 """

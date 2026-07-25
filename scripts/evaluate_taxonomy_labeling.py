@@ -64,7 +64,7 @@ def parse_args():
                         help="Dataset to load and evaluate.")
     parser.add_argument("--data_dir", type=str, help="Path to images directory (for COCO/ImageNet/Places).")
     parser.add_argument("--instances_json", type=str, default="/home/pmonserrat/datasets/coco/annotations/instances_val2017.json", help="Path to instances json (for COCO).")
-    parser.add_argument("--places_categories_txt", type=str, help="Path to categories_places365.txt (for Places).")
+    parser.add_argument("--places_categories_txt", type=str, help="Path to categories_places365.txt (for Places).", default = "/home/pmonserrat/datasets/places/categories_places365.txt")
 
     # BIG-5 Dataset Arguments
     parser.add_argument("--twitter_en_gt_csv", type=str, default=None, help="table_for_pau_twitter-en-6.csv")

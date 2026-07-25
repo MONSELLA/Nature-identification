@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>BIG-5 Prediction Viewer</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header id="topbar">
+    <div class="brand">🌿 BIG-5 Prediction Viewer</div>
+    <div class="file-picker">
+      <label for="fileSelect">CSV file</label>
+      <select id="fileSelect"><option>Loading…</option></select>
+      <button id="reloadFiles" title="Rescan for CSV files">⟳</button>
+    </div>
+    <div class="nav">
+      <button id="prevBtn" title="Previous (←)">◀</button>
+      <span id="counter">0 / 0</span>
+      <button id="nextBtn" title="Next (→)">▶</button>
+      <input id="jumpInput" type="number" min="1" placeholder="#" title="Jump to index" />
+    </div>
+  </header>
+
+  <div id="layout">
+    <aside id="sidebar">
+      <div class="sidebar-section">
+        <div class="section-title">Filters</div>
+        <input id="searchBox" type="text" placeholder="Search name / class / caption…" />
+        <div id="filterControls"></div>
+        <div class="filter-toggles" id="toggleControls"></div>
+        <button id="resetFilters" class="secondary">Reset filters</button>
+      </div>
+      <div class="sidebar-section grow">
+        <div class="section-title">
+          Results <span id="resultCount" class="muted"></span>
+        </div>
+        <ul id="resultList"></ul>
+      </div>
+    </aside>
+
+    <main id="main">
+      <div id="emptyState" class="empty">Select a CSV file to begin.</div>
+      <div id="record" class="record hidden">
+        <div class="record-left">
+          <div id="imageWrap" class="image-wrap"></div>
+          <div id="imagePath" class="image-path"></div>
+        </div>
+        <div class="record-right">
+          <div id="verdicts" class="verdicts"></div>
+          <div id="details"></div>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

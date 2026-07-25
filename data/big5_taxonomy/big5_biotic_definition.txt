@@ -1,19 +1,19 @@
-BIOTIC — living organisms, or the material/immaterial result of biotic processes,
-present in an ecosystem, interacting, adapting, and evolving. Includes:
-- Natural or semi-natural flora and derivatives (plants, wild or potted; food like
-  sugar, honey, coffee, liqueur)
-- Natural or semi-natural fauna and derivatives (wild, domesticated, or bred
-  vertebrates, molluscs, insects; derivatives like butter)
-- Natural or semi-natural fungi and other organisms (moulds, yeasts, mushrooms,
-  bacteria)
-- Natural or semi-natural ecosystems (natural reserve, urban park, vegetable garden)
+TAXONOMY REFERENCE: LIFE CATEGORY AXIS
 
-ABIOTIC — non-living elements or processes, material or immaterial, that
-characterize or occur in an ecosystem and affect the behavior/survival of organisms.
-Includes:
-- Hydrological components (river, pond, lake)
-- Atmospheric/weather/seasonal components (rain, cloud, snow, wind, temperature,
-  winter, summer) — excluding non-natural uses like "summer school"
-- Geological components (salt, petrol, oil)
-- Astrophysical components/processes (sunset, sunrise, day, night, stars, moon) —
-  excluding purely conversational uses like "good morning/night"
+CATEGORY 1: BIOTIC
+Definition: All more-than-human living organisms, ecosystems defined by living communities, and the material or immaterial results and derivatives of biological processes.
+Inclusion Scope:
+- Flora & Plant Derivatives: Wild or potted plants, flowers, trees, and plant-derived foods, drinks, or materials (e.g., sugar, coffee, liqueur, wood with visible grain).
+- Fauna & Animal Derivatives: Wild, domesticated, or bred non-human vertebrates, molluscs, and insects, as well as animal-derived products (e.g., butter, honey, meat, eggs).
+- Fungi & Microorganisms: Wild or cultivated mushrooms, moulds, yeasts, and bacteria.
+- Biological Ecosystems: Environments defined by the living communities and biological interactions within them (e.g., nature reserves, urban parks, vegetable gardens, forests).
+- Representations: Fictional, scientific, or artistic depictions of non-human living organisms or biological products (e.g., animated animals, drawings of plants).
+
+CATEGORY 2: ABIOTIC
+Definition: All non-living physical, chemical, geological, topographical, meteorological, or astrophysical elements and processes that characterize or occur within an ecosystem.
+Inclusion Scope:
+- Hydrological Components: Water bodies and fluid flows (e.g., rivers, ponds, lakes, oceans, streams).
+- Atmospheric & Weather Components: Meteorological phenomena and seasonal climatic conditions (e.g., rain, clouds, snow, wind, ambient temperature, winter snowstorms).
+- Geological & Topographical Components: Large-scale landforms, earth structures, natural mineral resources, and soil materials (e.g., mountains, canyons, cliffs, valleys, caves, dunes, rocks, sand, salt, mineral oil).
+- Astrophysical Components & Processes: Celestial bodies and phenomena (e.g., the sun, stars, moon, sunsets, sunrises, eclipses, natural day/night lighting).
+- Representations: Fictional, scientific, or artistic depictions of non-living natural elements, landforms, or phenomena (e.g., paintings of a mountain range or sunset, video-game weather effects).
