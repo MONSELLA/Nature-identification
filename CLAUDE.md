@@ -19,13 +19,16 @@ evaluating the models.
   `src/vlm_pipeline.py`): caption → object extraction → mapping → taxonomy
   labeling. Produces per-image predictions scoreable with standard
   accuracy/precision/recall/F1.
-- **Grounding pipeline** (geometric/embedding-based, designed but not built):
-  Grounding DINO + SAM (thing/stuff routing) → FG-CLIP2 hierarchy-margin
-  verification → nature importance score. CAVEAT: FG-CLIP2 was tried for the
-  VLM pipeline's CLIP scoring and abandoned — its trust_remote_code __init__
-  crashes with a meta-tensor error under this project's transformers version
-  (see clip_metrics.CLIP_PRESETS's comment). Re-verify it loads at all before
-  building the Grounding pipeline's verification step around it.
+- **Grounding pipeline** (pixel-based, IMPLEMENTED — `src/grounding_pipeline.py`,
+  `scripts/run_grounding_pipeline.py`): SAM3 semantic segmentation of every
+  nature-labeled entity → nature relevance score. Enriches the VLM pipeline's
+  own artifact in place; does NOT write a separate output file.
+  SUPERSEDED DESIGN — do not reintroduce: the thing/stuff split (Grounding DINO
+  + SAM for things, an open-vocab segmenter for stuff) and its WordNet-lexname /
+  COCO-Panoptic / LLM routing step are DROPPED. One model, SAM3, handles both
+  through a single output head. The FG-CLIP2 hierarchy-margin verification step
+  is likewise not part of the shipped pipeline (FG-CLIP2 was abandoned as a CLIP
+  backend — see clip_metrics.CLIP_PRESETS's comment).
 
 ## VLM pipeline — code layout & how to run
 - Entrypoint: `scripts/run_vlm_pipeline.py` (`--stage all|infer|score`).
@@ -72,6 +75,43 @@ evaluating the models.
   (0 = only annotator-labeled nodes; default 3). Stored in the artifact header.
 - Always track and log: WordNet-mapping-rate vs. VLM-fallback-rate, and total
   objects extracted per image (diagnostic, not just the taxonomy scores).
+
+## Grounding pipeline — code layout & hard conventions
+- Entrypoints: `scripts/run_grounding_pipeline.py` (grounding only, over an
+  existing VLM artifact) and `scripts/run_pipeline.py` (VLM infer → grounding
+  end-to-end, each stage its own OS subprocess so VRAM is fully reclaimed
+  between the VLM and SAM3 — same `subprocess.run` rationale as `--stage all`,
+  never `multiprocessing.Process`). Core module: `src/grounding_pipeline.py`.
+- ONE artifact per run: grounding reads the VLM's JSON-Lines artifact
+  (`vlm_responses_<model>.jsonl`) and adds its own fields to each image record —
+  never a parallel per-stage output file. Added: `object_groundings` (aligned
+  index-for-index with `objects`/`object_labels`/`object_finals`, each entry
+  `{object, prompt, is_nature, grounded, mask_rle, pixel_count}`),
+  plus top-level `nature_relevance_score` and `relevance_score_method`.
+- Only entities with `final_nature is True` (the HYBRID label) are grounded.
+  Everything else gets `grounded: null` = never attempted; `grounded: false` =
+  SAM3 looked and found nothing. Entities are NEVER deleted from the record —
+  the full VLM output stays auditable.
+- SAM3 (`facebook/sam3`) via plain transformers AutoModel/AutoProcessor. Read
+  `outputs.semantic_seg` (concept-level pixel coverage), NOT the instance-level
+  `pred_masks`/`pred_boxes`/`pred_logits`.
+- `semantic_seg` is RAW LOGITS (unbounded), verified in the transformers source
+  — sigmoid is required. Use `processor.post_process_semantic_segmentation(...)`,
+  which does sigmoid → resize to original size → binarize at 0.5 (SAM3's own
+  default). `--debug_semantic_range` prints the raw min/max to re-confirm.
+- SAM3 resolves ONE text prompt per forward pass (`Sam3Model.forward` shares one
+  batch dim between `pixel_values` and `input_ids`; `semantic_seg` is
+  `(batch,1,H,W)`). There is no ragged per-image prompt list. Batching is
+  therefore over flattened (image, entity) PAIRS: `--batch_size` counts images,
+  `--max_pairs_per_forward` bounds actual GPU work.
+- Masks stored as `pycocotools` RLE (`counts` decoded to str for JSON).
+- Nature relevance score is computed over the RLE-MERGED UNION of surviving
+  masks (overlapping pixels counted once), `--relevance_method`:
+  `coverage_ratio` (default; nature px / total px) or `center_weighted`
+  (Gaussian in normalized distance-from-center, `--center_sigma`, aspect-ratio
+  independent). Both in [0,1]; no grounded nature entity → 0.0.
+- Report `grounding_confirmation_rate` (grounded / nature entities). Per recap
+  §9 this is AGREEMENT WITH AN INDEPENDENT MODEL, never ground truth.
 
 ## Metrics — exact definitions, do not rename or merge
 - **F-CLIPScore** (faithful, cite Oh & Hwang exactly):
@@ -147,5 +187,9 @@ evaluating the models.
 Baseline VLM pipeline is IMPLEMENTED end-to-end (caption → extraction →
 mapping-routed labeling → hybrid resolution → metrics: F-CLIPScore,
 Object-CLIPScore, per-axis acc/P/R/F1, ClipMatch + hP/hR on ImageNet/Places).
-Next: spot-check on Qwen3.5-0.8B and hand off to Ramin for the BSC infra check;
-then the sequential ablations (recap §7) and the Grounding pipeline (weeks 2-5).
+Grounding pipeline is IMPLEMENTED end-to-end (SAM3 semantic segmentation of
+nature entities → RLE masks → nature relevance score), enriching the same
+artifact. Next: spot-check both pipelines on Qwen3.5-0.8B + a real SAM3 run
+(confirm the semantic_seg range empirically with --debug_semantic_range and
+tune --max_pairs_per_forward to the GPU), hand off to Ramin for the BSC infra
+check, then the sequential ablations (recap §7).
