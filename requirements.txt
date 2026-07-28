@@ -58,6 +58,17 @@ Pillow>=10.0
 # worth the operational overhead here.
 einops                  # required by jina-clip-v2's trust_remote_code modeling code
 
+# --- Grounding pipeline (src/grounding_pipeline.py) ---
+# SAM3 (facebook/sam3) is loaded through plain transformers AutoModel/
+# AutoProcessor — no trust_remote_code, no separate detector, no separate
+# segmentation model. It needs a transformers release that actually ships
+# `transformers.models.sam3` (confirmed present in 5.14.1); the
+# transformers>=4.40 floor above is NOT sufficient on its own, so if
+# `AutoModel.from_pretrained("facebook/sam3")` raises an unknown-model-type
+# error, upgrade transformers rather than chasing it as a config problem.
+# pycocotools (listed below for the closed-set baselines) is ALSO required here
+# for RLE mask encoding/decoding and RLE union merging.
+
 # --- Experiment tracking ---
 wandb>=0.16
 
