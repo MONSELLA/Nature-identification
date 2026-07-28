@@ -1190,12 +1190,16 @@ def _resolve_responses_file(args):
 # =============================================================================
 # Subprocess re-invocation (for --stage all)
 # =============================================================================
-def _args_to_cli(args, parser, stage):
+def _args_to_cli(args, parser, stage=None):
     """Rebuild a `sys.argv`-style flag list from a parsed args Namespace, to
     re-invoke THIS SAME SCRIPT as a genuinely separate OS process (see
     main()'s --stage all for why — a real subprocess, not
     multiprocessing.Process, to avoid nesting inside vLLM's own internal
     engine-core subprocess).
+
+    `stage` is prepended as `--stage <stage>` when given. It's optional so
+    scripts/run_pipeline.py can reuse this same reconstruction for the GROUNDING
+    stage's parser, which has no --stage flag of its own.
 
     Only emits a flag when its value differs from that action's own default
     (so the subprocess falls back to the SAME defaults for anything the user
@@ -1205,7 +1209,7 @@ def _args_to_cli(args, parser, stage):
     added/changed in build_arg_parser() without needing a parallel update
     here.
     """
-    argv = ["--stage", stage]
+    argv = ["--stage", stage] if stage is not None else []
     for action in parser._actions:
         if not action.option_strings or action.dest in ("help", "stage"):
             continue
