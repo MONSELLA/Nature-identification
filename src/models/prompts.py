@@ -48,20 +48,11 @@ from pydantic import BaseModel, Field
 #
 # This is the very FIRST thing we ask the VLM about an image: a plain, open-
 # ended description. No JSON schema, no taxonomy jargon — just "describe what
-# you see". We deliberately ask for background/setting/secondary elements
-# explicitly (not just "describe this image") because a bare prompt tends to
-# only describe the single most obvious subject and skip everything else
-# (called "salience bias"), and tends to be too short to mention secondary
-# details ("brevity bias"). This neutral caption becomes the input to Stage 2.
-"""CAPTION_PROMPT = (
-    "Describe this image in 3-4 sentences, covering the main subject, the "
-    "background, the setting, and any secondary elements present. Be "
-    "specific but concise."
-)"""
-
+# you see". The explicit "including any text" clause covers BIG-5's
+# text-heavy/meme/screenshot images, where a bare "describe this image" would
+# otherwise skip on-image text entirely. This neutral caption becomes the
+# input to Stage 2.
 CAPTION_PROMPT = "Describe this image, including any text."
-
-#CAPTION_PROMPT = "Describe this image."
 
 # =============================================================================
 # Stage 2 — Object extraction (structured)
@@ -406,7 +397,15 @@ def build_system_prompts(nature_path: str, biotic_path: str, material_path: str)
     definition file once:
 
       - caption_system         : NATURE definition only (no axis-priming, per
-                                 the recap) — used for captioning + extraction.
+                                 the recap) — used for EXTRACTION only. The
+                                 caption call itself (src/vlm_pipeline.py's
+                                 caption_batch, via run_inference) deliberately
+                                 does NOT receive this prompt, so the very
+                                 first free-form look at the image stays
+                                 completely free of nature-related context;
+                                 this string is threaded through run_inference
+                                 only to seed extraction_system_prompt's
+                                 default.
       - label_system_full      : ALL THREE axis definitions — used for
                                  UNMAPPED objects (where the VLM must decide
                                  nature/biotic/material from scratch) AND for

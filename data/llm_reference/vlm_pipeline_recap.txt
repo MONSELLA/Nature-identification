@@ -110,7 +110,16 @@ instructions, no "you are..." framing. Task instructions are
 added separately at call-time depending on stage.
 
   a) big5_nature_definition.txt (NOW v2 — GAP RESOLVED) — nature
-     vs. non-nature criteria only. Used during open captioning.
+     vs. non-nature criteria only. ORIGINALLY designed to be used
+     during open captioning (as that stage's system prompt).
+     SUPERSEDED (v7): the caption call itself now deliberately
+     receives NO system prompt at all (see Section 4/CLAUDE.md) —
+     this file is used as the EXTRACTION stage's system prompt
+     instead (the "second look"), not the caption stage's. Kept
+     here for the file's own content history; the "avoids premature
+     axis-bias in the free-form caption" rationale below was written
+     when this file WAS the caption's system prompt and is now moot
+     for that stage specifically (still relevant for extraction).
      Does NOT mention biotic/abiotic or material/immaterial by
      name (avoids premature axis-bias in the free-form caption),
      but now BROADENED so its categories implicitly cover the full
@@ -215,14 +224,23 @@ references the definition files under data/big5_taxonomy/):
   meaningfully different.
 
 - Caption prompt (baseline, NEUTRAL — no nature-priming).
-  IMPLEMENTED (verbatim, src/models/prompts.py CAPTION_PROMPT):
-  "Describe this image in 3-4 sentences, covering the main subject,
-  the background, the setting, and any secondary elements present.
-  Be specific but concise."
+  ORIGINAL DESIGN (v1-v6 of this recap): "Describe this image in 3-4
+  sentences, covering the main subject, the background, the setting,
+  and any secondary elements present. Be specific but concise."
   Reasoning: plain "describe the scene" suffers from (a) salience
   bias (only prominent subject described) and (b) brevity bias
   (short captions leave no room for secondary elements). This prompt
   addresses both without leading toward nature specifically.
+  SUPERSEDED (v7 — CLAUDE.md updated to match): the shipped baseline
+  is now the shorter "Describe this image, including any text."
+  (src/models/prompts.py CAPTION_PROMPT), a deliberate change to
+  cover BIG-5's text-heavy/meme/screenshot images (a bare "describe
+  this image" skips on-image text entirely). The salience-bias/
+  brevity-bias mitigation the original 3-4-sentence prompt provided
+  is NOT carried over by this shorter prompt — not yet re-validated
+  empirically post-switch; worth confirming via F-CLIPScore/
+  Object-CLIPScore whether that mitigation is still needed once
+  real per-model captions are in hand.
 
 - Explicit decision: do NOT add "pay special attention to nature-
   related elements" to the baseline. Reasoning: leading question →

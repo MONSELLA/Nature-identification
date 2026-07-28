@@ -5,10 +5,15 @@ Baseline BIG-5 VLM pipeline (language-based), Phase-1 inference including the
 hybrid taxonomy-label resolution (mapping now happens here, not in Phase-2).
 
 Two-pass baseline per image:
-  1. caption_batch        — open-ended, neutral caption (no nature-priming).
+  1. caption_batch        — open-ended, neutral caption (no nature-priming
+                            INSTRUCTION, and deliberately NO system prompt
+                            either — this first look at the image gets no
+                            nature-definition context at all; see
+                            run_inference).
   2. extract_objects_batch— structured object list, image re-sent (a "second
                             look"); captures part-objects (e.g. a flower on a
-                            dress).
+                            dress). This IS given the nature-definition
+                            system prompt.
   2b. map each object      — WordNet mapping FIRST (map_object_to_taxonomy), so
                             the labeling call is routed to the minimum the VLM
                             still has to answer.
@@ -434,8 +439,19 @@ def run_inference(
             print(f"[infer] batch {b + 1}/{num_batches}: caption_batch "
                   f"({len(image_paths)} images, free_form)...", flush=True)
         # Stages 1-2: caption, then structured object extraction.
+        # Deliberately NO system prompt on this first call: the caption stage
+        # is kept entirely free of nature-related context (neither an
+        # explicit "pay attention to nature" instruction NOR the passive
+        # nature-definition system prompt), so this first free-form look at
+        # the image is uninfluenced by axis framing either way. The same
+        # nature-definition prompt IS still given to extraction (the "second
+        # look", via extraction_system_prompt below) and to labeling
+        # (label_system_full/label_system_material) — only this very first
+        # caption call skips it. caption_system_prompt is accepted as a
+        # run_inference parameter solely to seed extraction_system_prompt's
+        # default (see below), not to be passed here.
         captions = caption_batch(
-            vlm, image_paths, #caption_system_prompt,
+            vlm, image_paths,
             max_new_tokens=caption_max_new_tokens, temperature=temperature,
         )
         if verbose:

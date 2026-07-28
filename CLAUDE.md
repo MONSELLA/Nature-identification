@@ -48,11 +48,20 @@ evaluating the models.
 - Baseline is TWO-PASS: open-ended caption (no schema) → separate structured
   extraction call. Never collapse into single-pass-with-schema without it being
   an explicit, labeled ablation.
-- Caption prompt (baseline, neutral, no nature-priming):
-    "Describe this image in 3-4 sentences, covering the main subject, the 
-    background, the setting, and any secondary elements present. Be specific but concise."
-  Do NOT add "pay attention to nature" to this prompt unless running the
-  nature-priming ablation explicitly.
+- Caption prompt (baseline, neutral, no nature-priming), `src/models/prompts.py`'s
+  `CAPTION_PROMPT`:
+    "Describe this image, including any text."
+  The "including any text" clause covers BIG-5's text-heavy/meme/screenshot
+  images, where a bare "describe this image" would otherwise skip on-image
+  text entirely. Do NOT add "pay attention to nature" to this prompt unless
+  running the nature-priming ablation explicitly.
+- The CAPTION CALL ITSELF gets NO system prompt (deliberate, settled): unlike
+  extraction and labeling, `caption_batch` (via `run_inference`,
+  `src/vlm_pipeline.py`) is called without the nature-definition system
+  prompt, so this first free-form look at the image is uninfluenced by ANY
+  nature-related context — neither an explicit priming instruction nor the
+  passive definition file. Extraction (the "second look") and both labeling
+  calls still receive it as normal.
 - Context files go in the `system` role, never `user`. Read once at startup,
   not per-call (keeps the string stable for vLLM prefix caching).
 - Taxonomy labeling is a HYBRID, resolved during PHASE-1 INFERENCE (mapping is

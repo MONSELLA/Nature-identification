@@ -583,6 +583,7 @@ def phase_score(args):
         # left None wherever a given dataset type has no such value.
         pred_vocab_entry = None
         best_obj_idx = None
+        best_final = None
         gt_syn = pred_class_synset = pred_node = None
         hier = {"hp": None, "hr": None, "hf1": None}
         wup_sim = None
