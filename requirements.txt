@@ -56,7 +56,6 @@ Pillow>=10.0
 # environment (confirmed: installing llm2vec force-downgrades transformers
 # and breaks vLLM). Would need a second, separate environment to use — not
 # worth the operational overhead here.
-einops                  # required by jina-clip-v2's trust_remote_code modeling code
 
 # --- Grounding pipeline (src/grounding_pipeline.py) ---
 # SAM3 (facebook/sam3) is loaded through plain transformers AutoModel/

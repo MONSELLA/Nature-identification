@@ -59,7 +59,9 @@ from pydantic import BaseModel, Field
     "specific but concise."
 )"""
 
-CAPTION_PROMPT = "What is this?"
+CAPTION_PROMPT = "Describe this image, including any text."
+
+#CAPTION_PROMPT = "Describe this image."
 
 # =============================================================================
 # Stage 2 — Object extraction (structured)

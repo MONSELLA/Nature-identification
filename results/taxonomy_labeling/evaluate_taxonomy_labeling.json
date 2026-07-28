@@ -1,41 +1,239 @@
 {
+    "places365": {
+        "gemma-google_gemma-4-E4B-it": {
+            "model": "gemma-google_gemma-4-E4B-it",
+            "dataset": "places365",
+            "parse_failure_rate": 0.01419047619047619,
+            "nature": {
+                "accuracy": 0.795,
+                "precision": 0.5439469320066335,
+                "recall": 0.9647058823529412,
+                "f1": 0.6956521739130435,
+                "precision_neg": 0.9849435382685069,
+                "recall_neg": 0.7405660377358491,
+                "f1_neg": 0.8454496499730748,
+                "support": 21000
+            },
+            "biotic": {
+                "accuracy": 0.8770588235294118,
+                "precision": 0.7758135797509039,
+                "recall": 0.9655,
+                "f1": 0.8603252394742704,
+                "precision_neg": 0.9735733435465339,
+                "recall_neg": 0.82,
+                "f1_neg": 0.8902118718263001,
+                "support": 5100
+            },
+            "material": {
+                "accuracy": 0.9386274509803921,
+                "precision": 0.9795375485983221,
+                "recall": 0.9574,
+                "f1": 0.9683422676241529,
+                "precision_neg": 0.0,
+                "recall_neg": 0.0,
+                "f1_neg": 0.0,
+                "support": 5100
+            },
+            "execution_time": "0-01:32:11",
+            "evaluated_at": "2026-07-25T11:12:38.236565+00:00"
+        },
+        "dataset_class_stats": {
+            "full": {
+                "total_classes": 210,
+                "nature": 51,
+                "no_nature": 159,
+                "biotic": 20,
+                "abiotic": 31,
+                "material": 50,
+                "immaterial": 1
+            }
+        },
+        "qwen-Qwen_Qwen3.5-9B": {
+            "model": "qwen-Qwen_Qwen3.5-9B",
+            "dataset": "places365",
+            "parse_failure_rate": 0.1000952380952381,
+            "nature": {
+                "accuracy": 0.8194285714285714,
+                "precision": 0.5866225165562914,
+                "recall": 0.8684313725490196,
+                "f1": 0.7002371541501976,
+                "precision_neg": 0.9501115241635688,
+                "recall_neg": 0.8037106918238994,
+                "f1_neg": 0.8708006814310051,
+                "support": 21000
+            },
+            "biotic": {
+                "accuracy": 0.8276470588235294,
+                "precision": 0.7378022910479423,
+                "recall": 0.8695,
+                "f1": 0.7982556805141152,
+                "precision_neg": 0.9048487057965731,
+                "recall_neg": 0.8006451612903226,
+                "f1_neg": 0.8495635803525586,
+                "support": 5100
+            },
+            "material": {
+                "accuracy": 0.86,
+                "precision": 0.9777084262148907,
+                "recall": 0.8772,
+                "f1": 0.9247311827956989,
+                "precision_neg": 0.0,
+                "recall_neg": 0.0,
+                "f1_neg": 0.0,
+                "support": 5100
+            },
+            "execution_time": "0-05:03:42",
+            "evaluated_at": "2026-07-25T14:44:09.908850+00:00"
+        },
+        "mistral-mistralai_Ministral-3-8B-Instruct-2512": {
+            "model": "mistral-mistralai_Ministral-3-8B-Instruct-2512",
+            "dataset": "places365",
+            "parse_failure_rate": 0.09238095238095238,
+            "nature": {
+                "accuracy": 0.8497619047619047,
+                "precision": 0.6902014472912185,
+                "recall": 0.6919607843137255,
+                "f1": 0.6910799960834231,
+                "precision_neg": 0.9011141184616352,
+                "recall_neg": 0.900377358490566,
+                "f1_neg": 0.9007455878189197,
+                "support": 21000
+            },
+            "biotic": {
+                "accuracy": 0.6670588235294118,
+                "precision": 0.5699721964782206,
+                "recall": 0.615,
+                "f1": 0.5916305916305916,
+                "precision_neg": 0.7382732834806254,
+                "recall_neg": 0.7006451612903226,
+                "f1_neg": 0.7189672293942403,
+                "support": 5100
+            },
+            "material": {
+                "accuracy": 0.687843137254902,
+                "precision": 0.9722838137472284,
+                "recall": 0.7016,
+                "f1": 0.8150557620817844,
+                "precision_neg": 0.0,
+                "recall_neg": 0.0,
+                "f1_neg": 0.0,
+                "support": 5100
+            },
+            "execution_time": "0-04:50:48",
+            "evaluated_at": "2026-07-25T16:03:41.595738+00:00"
+        },
+        "llava-lmms-lab-encoder_LLaVA-OneVision-2-8B-Instruct": {
+            "model": "llava-lmms-lab-encoder_LLaVA-OneVision-2-8B-Instruct",
+            "dataset": "places365",
+            "parse_failure_rate": 0.03147619047619048,
+            "nature": {
+                "accuracy": 0.6530952380952381,
+                "precision": 0.4077981264241708,
+                "recall": 0.9474509803921569,
+                "f1": 0.5701811316301847,
+                "precision_neg": 0.9707135832149492,
+                "recall_neg": 0.5586792452830188,
+                "f1_neg": 0.7091932457786116,
+                "support": 21000
+            },
+            "biotic": {
+                "accuracy": 0.8788235294117647,
+                "precision": 0.8149498632634458,
+                "recall": 0.894,
+                "f1": 0.8526466380543634,
+                "precision_neg": 0.9270474879559532,
+                "recall_neg": 0.8690322580645161,
+                "f1_neg": 0.8971028971028971,
+                "support": 5100
+            },
+            "material": {
+                "accuracy": 0.9331372549019608,
+                "precision": 0.9798146240988671,
+                "recall": 0.9514,
+                "f1": 0.9653982749873161,
+                "precision_neg": 0.00816326530612245,
+                "recall_neg": 0.02,
+                "f1_neg": 0.011594202898550725,
+                "support": 5100
+            },
+            "execution_time": "0-02:31:09",
+            "evaluated_at": "2026-07-25T18:35:01.669551+00:00"
+        },
+        "internvl-OpenGVLab_InternVL3_5-8B": {
+            "model": "internvl-OpenGVLab_InternVL3_5-8B",
+            "dataset": "places365",
+            "parse_failure_rate": 9.523809523809524e-05,
+            "nature": {
+                "accuracy": 0.8844761904761905,
+                "precision": 0.6950116686114353,
+                "recall": 0.9343137254901961,
+                "f1": 0.7970893275342924,
+                "precision_neg": 0.9763150452488688,
+                "recall_neg": 0.8684905660377359,
+                "f1_neg": 0.9192517640793503,
+                "support": 21000
+            },
+            "biotic": {
+                "accuracy": 0.8588235294117647,
+                "precision": 0.7742073693230506,
+                "recall": 0.9035,
+                "f1": 0.8338717120443009,
+                "precision_neg": 0.9302241503976862,
+                "recall_neg": 0.83,
+                "f1_neg": 0.8772587794067508,
+                "support": 5100
+            },
+            "material": {
+                "accuracy": 0.9164705882352941,
+                "precision": 0.9790532048596565,
+                "recall": 0.9348,
+                "f1": 0.956414978514426,
+                "precision_neg": 0.0,
+                "recall_neg": 0.0,
+                "f1_neg": 0.0,
+                "support": 5100
+            },
+            "execution_time": "0-04:53:17",
+            "evaluated_at": "2026-07-25T23:28:30.181403+00:00"
+        }
+    },
     "imagenet": {
         "gemma-google_gemma-4-E4B-it": {
             "model": "gemma-google_gemma-4-E4B-it",
             "dataset": "imagenet",
-            "parse_failure_rate": 0.005,
+            "parse_failure_rate": 0.00564,
             "nature": {
-                "accuracy": 0.87202,
-                "precision": 0.8015789652017755,
-                "recall": 0.9775619834710744,
-                "f1": 0.880866829259211,
-                "precision_neg": 0.9734953873187875,
-                "recall_neg": 0.7730232558139535,
-                "f1_neg": 0.8617538401711063,
+                "accuracy": 0.87722,
+                "precision": 0.8057558828508549,
+                "recall": 0.9833884297520661,
+                "f1": 0.885754163952731,
+                "precision_neg": 0.9803567065721964,
+                "recall_neg": 0.7776356589147286,
+                "f1_neg": 0.867307900140495,
                 "support": 50000
             },
             "biotic": {
-                "accuracy": 0.9584710743801653,
-                "precision": 0.9826802338168434,
-                "recall": 0.9740343347639485,
-                "f1": 0.9783381829938571,
-                "precision_neg": 0.45248868778280543,
-                "recall_neg": 0.5555555555555556,
-                "f1_neg": 0.49875311720698257,
+                "accuracy": 0.9688429752066116,
+                "precision": 0.9835706932052162,
+                "recall": 0.9840772532188842,
+                "f1": 0.983823908006522,
+                "precision_neg": 0.5822072072072072,
+                "recall_neg": 0.5744444444444444,
+                "f1_neg": 0.5782997762863534,
                 "support": 24200
             },
             "material": {
-                "accuracy": 0.9697107438016529,
-                "precision": 0.9959672284246721,
-                "recall": 0.9735269709543568,
-                "f1": 0.9846192584510145,
-                "precision_neg": 0.007776049766718507,
-                "recall_neg": 0.05,
-                "f1_neg": 0.013458950201884253,
+                "accuracy": 0.9678512396694214,
+                "precision": 0.9992293860775752,
+                "recall": 0.9684647302904564,
+                "f1": 0.9836065573770492,
+                "precision_neg": 0.09738717339667459,
+                "recall_neg": 0.82,
+                "f1_neg": 0.1740976645435244,
                 "support": 24200
             },
-            "execution_time": "0-03:09:33",
-            "evaluated_at": "2026-07-22T17:34:03.731109+00:00"
+            "execution_time": "0-03:26:18",
+            "evaluated_at": "2026-07-26T02:55:00.405831+00:00"
         },
         "dataset_class_stats": {
             "full": {
@@ -48,153 +246,153 @@
                 "immaterial": 2
             }
         },
-        "llava-lmms-lab-encoder_LLaVA-OneVision-2-8B-Instruct": {
-            "model": "llava-lmms-lab-encoder_LLaVA-OneVision-2-8B-Instruct",
+        "qwen-Qwen_Qwen3.5-9B": {
+            "model": "qwen-Qwen_Qwen3.5-9B",
             "dataset": "imagenet",
-            "parse_failure_rate": 0.0006,
+            "parse_failure_rate": 0.0496,
             "nature": {
-                "accuracy": 0.727,
-                "precision": 0.6422292924935289,
-                "recall": 0.9842561983471074,
-                "f1": 0.7772810338075969,
-                "precision_neg": 0.9704925650557621,
-                "recall_neg": 0.4856976744186047,
-                "f1_neg": 0.6473961562306262,
+                "accuracy": 0.89714,
+                "precision": 0.8473371486895345,
+                "recall": 0.9605371900826446,
+                "f1": 0.9003931594135534,
+                "precision_neg": 0.9576815704347056,
+                "recall_neg": 0.8376744186046512,
+                "f1_neg": 0.8936671697645089,
                 "support": 50000
             },
             "biotic": {
-                "accuracy": 0.9647520661157025,
-                "precision": 0.9821712419985393,
-                "recall": 0.9812017167381974,
-                "f1": 0.9816862399896945,
-                "precision_neg": 0.5254604550379198,
-                "recall_neg": 0.5388888888888889,
-                "f1_neg": 0.5320899616017554,
+                "accuracy": 0.9508264462809918,
+                "precision": 0.9808612440191388,
+                "recall": 0.9678111587982833,
+                "f1": 0.9742925037805141,
+                "precision_neg": 0.38016528925619836,
+                "recall_neg": 0.5111111111111111,
+                "f1_neg": 0.43601895734597157,
                 "support": 24200
             },
             "material": {
-                "accuracy": 0.9750413223140496,
-                "precision": 0.9958217270194986,
-                "recall": 0.9790456431535269,
-                "f1": 0.987362430430598,
-                "precision_neg": 0.001976284584980237,
-                "recall_neg": 0.01,
-                "f1_neg": 0.0033003300330033004,
+                "accuracy": 0.9489256198347108,
+                "precision": 0.9975626740947076,
+                "recall": 0.9510373443983402,
+                "f1": 0.9737445832271221,
+                "precision_neg": 0.03594771241830065,
+                "recall_neg": 0.44,
+                "f1_neg": 0.06646525679758308,
                 "support": 24200
             },
-            "execution_time": "0-03:50:17",
-            "evaluated_at": "2026-07-22T20:09:48.110841+00:00"
+            "execution_time": "0-11:52:26",
+            "evaluated_at": "2026-07-26T09:27:06.680763+00:00"
         },
         "mistral-mistralai_Ministral-3-8B-Instruct-2512": {
             "model": "mistral-mistralai_Ministral-3-8B-Instruct-2512",
             "dataset": "imagenet",
-            "parse_failure_rate": 0.01958,
+            "parse_failure_rate": 0.03486,
             "nature": {
-                "accuracy": 0.9202,
-                "precision": 0.8838119112731693,
-                "recall": 0.9615289256198347,
-                "f1": 0.9210338822039266,
-                "precision_neg": 0.9606708347414668,
-                "recall_neg": 0.8814341085271318,
-                "f1_neg": 0.9193483182406209,
+                "accuracy": 0.91612,
+                "precision": 0.8836977368622938,
+                "recall": 0.9519834710743802,
+                "f1": 0.9165705191963398,
+                "precision_neg": 0.9514417049728374,
+                "recall_neg": 0.8824806201550388,
+                "f1_neg": 0.9156645887794088,
                 "support": 50000
             },
             "biotic": {
-                "accuracy": 0.9504958677685951,
-                "precision": 0.9814411431558769,
-                "recall": 0.9668669527896996,
-                "f1": 0.9740995373373114,
-                "precision_neg": 0.38041733547351525,
-                "recall_neg": 0.5266666666666666,
-                "f1_neg": 0.44175209692451073,
+                "accuracy": 0.9415289256198347,
+                "precision": 0.9817301342725071,
+                "recall": 0.9570815450643777,
+                "f1": 0.9692491578832989,
+                "precision_neg": 0.3265993265993266,
+                "recall_neg": 0.5388888888888889,
+                "f1_neg": 0.40670859538784065,
                 "support": 24200
             },
             "material": {
-                "accuracy": 0.9545867768595041,
-                "precision": 0.9961175100297658,
-                "recall": 0.9581327800829875,
-                "f1": 0.9767559907785368,
-                "precision_neg": 0.009813542688910697,
-                "recall_neg": 0.1,
-                "f1_neg": 0.017873100983020553,
+                "accuracy": 0.9317768595041322,
+                "precision": 0.9996438904963276,
+                "recall": 0.9318257261410788,
+                "f1": 0.9645441855470848,
+                "precision_neg": 0.05302593659942363,
+                "recall_neg": 0.92,
+                "f1_neg": 0.1002724795640327,
                 "support": 24200
             },
-            "execution_time": "0-07:15:52",
-            "evaluated_at": "2026-07-22T23:19:14.442884+00:00"
+            "execution_time": "0-09:48:57",
+            "evaluated_at": "2026-07-26T12:44:09.091212+00:00"
         },
-        "qwen-Qwen_Qwen3.5-9B": {
-            "model": "qwen-Qwen_Qwen3.5-9B",
+        "llava-lmms-lab-encoder_LLaVA-OneVision-2-8B-Instruct": {
+            "model": "llava-lmms-lab-encoder_LLaVA-OneVision-2-8B-Instruct",
             "dataset": "imagenet",
-            "parse_failure_rate": 0.04774,
+            "parse_failure_rate": 0.01088,
             "nature": {
-                "accuracy": 0.83162,
-                "precision": 0.7566767509189681,
-                "recall": 0.961198347107438,
-                "f1": 0.8467628911013633,
-                "precision_neg": 0.9512435744327328,
-                "recall_neg": 0.710077519379845,
-                "f1_neg": 0.8131560842451009,
+                "accuracy": 0.78958,
+                "precision": 0.7031635229466805,
+                "recall": 0.9781818181818182,
+                "f1": 0.8181802471269334,
+                "precision_neg": 0.9676767676767677,
+                "recall_neg": 0.6126744186046512,
+                "f1_neg": 0.7503025987896048,
                 "support": 50000
             },
             "biotic": {
-                "accuracy": 0.9492561983471074,
-                "precision": 0.9815849188340025,
-                "recall": 0.9654077253218885,
-                "f1": 0.97342911545785,
-                "precision_neg": 0.37227414330218067,
-                "recall_neg": 0.5311111111111111,
-                "f1_neg": 0.43772893772893773,
+                "accuracy": 0.9628925619834711,
+                "precision": 0.984137275242047,
+                "recall": 0.9772103004291846,
+                "f1": 0.9806615556895512,
+                "precision_neg": 0.5009398496240601,
+                "recall_neg": 0.5922222222222222,
+                "f1_neg": 0.5427698574338086,
                 "support": 24200
             },
             "material": {
-                "accuracy": 0.9512809917355372,
-                "precision": 0.9957606955919885,
-                "recall": 0.9551452282157676,
-                "f1": 0.97503017980812,
-                "precision_neg": 0.0018467220683287165,
-                "recall_neg": 0.02,
-                "f1_neg": 0.0033812341504649195,
+                "accuracy": 0.9643801652892562,
+                "precision": 0.9965809043507993,
+                "recall": 0.967551867219917,
+                "f1": 0.9818518674470504,
+                "precision_neg": 0.02493765586034913,
+                "recall_neg": 0.2,
+                "f1_neg": 0.04434589800443459,
                 "support": 24200
             },
-            "execution_time": "0-09:31:48",
-            "evaluated_at": "2026-07-22T23:38:21.371348+00:00"
+            "execution_time": "0-05:06:31",
+            "evaluated_at": "2026-07-26T14:33:52.007791+00:00"
         },
         "internvl-OpenGVLab_InternVL3_5-8B": {
             "model": "internvl-OpenGVLab_InternVL3_5-8B",
             "dataset": "imagenet",
-            "parse_failure_rate": 0.0,
+            "parse_failure_rate": 0.00042,
             "nature": {
-                "accuracy": 0.88772,
-                "precision": 0.8225392197695405,
-                "recall": 0.979297520661157,
-                "f1": 0.8940994491813175,
-                "precision_neg": 0.9763545403058335,
-                "recall_neg": 0.8018217054263566,
-                "f1_neg": 0.8805226866433983,
+                "accuracy": 0.905,
+                "precision": 0.846011527787661,
+                "recall": 0.9825619834710744,
+                "f1": 0.9091882384430084,
+                "precision_neg": 0.9807253128711062,
+                "recall_neg": 0.8322480620155038,
+                "f1_neg": 0.9004067597601375,
                 "support": 50000
             },
             "biotic": {
-                "accuracy": 0.9653305785123967,
-                "precision": 0.9839272633257207,
-                "recall": 0.98,
-                "f1": 0.9819597049906466,
-                "precision_neg": 0.5307150050352467,
-                "recall_neg": 0.5855555555555556,
-                "f1_neg": 0.5567881669307977,
+                "accuracy": 0.9705785123966942,
+                "precision": 0.9845546593444311,
+                "recall": 0.9848927038626609,
+                "f1": 0.9847236525918297,
+                "precision_neg": 0.6053811659192825,
+                "recall_neg": 0.6,
+                "f1_neg": 0.6026785714285714,
                 "support": 24200
             },
             "material": {
-                "accuracy": 0.9754132231404958,
-                "precision": 0.9958651533690561,
-                "recall": 0.9793775933609958,
-                "f1": 0.9875525616618899,
-                "precision_neg": 0.004008016032064128,
-                "recall_neg": 0.02,
-                "f1_neg": 0.00667779632721202,
+                "accuracy": 0.974504132231405,
+                "precision": 0.9993620550333858,
+                "recall": 0.9750207468879668,
+                "f1": 0.98704135425199,
+                "precision_neg": 0.12372634643377002,
+                "recall_neg": 0.85,
+                "f1_neg": 0.21601016518424396,
                 "support": 24200
             },
-            "execution_time": "0-10:55:50",
-            "evaluated_at": "2026-07-23T04:37:18.022145+00:00"
+            "execution_time": "0-12:22:01",
+            "evaluated_at": "2026-07-27T01:06:22.225756+00:00"
         }
     }
 }
