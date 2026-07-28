@@ -792,6 +792,21 @@ def phase_score(args):
         # branch above). None on single-label datasets, where there's only
         # ever one target and it's covered by the clipmatch_* columns.
         gt_targets_json = json.dumps({"targets": targets, "target_matches": target_matches})
+        # Grounding-pipeline results, present only when src/grounding_pipeline.py
+        # has enriched this artifact (see run_pipeline.py / run_grounding_pipeline.py)
+        # — None/blank on a VLM-only artifact, so scoring one still works fine.
+        # mask_rle is deliberately DROPPED here (too bulky for a CSV cell, and
+        # not useful in tabular form); it stays in the .jsonl artifact. This is
+        # the grounding VERDICT per object — was it confirmed, how many pixels —
+        # not the raw masks, which is what makes this "the actual SAM3
+        # prediction" belong in the results CSV rather than only the raw
+        # artifact.
+        object_groundings = rec.get("object_groundings")
+        groundings_json = json.dumps([
+            {"object": g["object"], "prompt": g["prompt"], "is_nature": g["is_nature"],
+             "grounded": g["grounded"], "pixel_count": g["pixel_count"]}
+            for g in object_groundings
+        ]) if object_groundings is not None else None
         flat_rows.append({
             "image_path": rec["image_path"],
             "dataset": dataset,
@@ -803,6 +818,9 @@ def phase_score(args):
             "clipscore": image_clipscore,
             "f_clipscore": image_fclip,
             "object_clipscore": image_objclip,
+            "object_groundings": groundings_json,
+            "nature_relevance_score_coverage_ratio": rec.get("nature_relevance_score_coverage_ratio"),
+            "nature_relevance_score_center_weighted": rec.get("nature_relevance_score_center_weighted"),
             "wordnet_mapping_rate_image": (image_n_map_nature / (image_n_map_nature + image_n_vlm_nature))
                                            if (image_n_map_nature + image_n_vlm_nature) else None,
             "parse_failure_count_image": image_n_parse_fail,

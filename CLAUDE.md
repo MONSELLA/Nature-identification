@@ -106,10 +106,16 @@ evaluating the models.
   `--max_pairs_per_forward` bounds actual GPU work.
 - Masks stored as `pycocotools` RLE (`counts` decoded to str for JSON).
 - Nature relevance score is computed over the RLE-MERGED UNION of surviving
-  masks (overlapping pixels counted once), `--relevance_method`:
-  `coverage_ratio` (default; nature px / total px) or `center_weighted`
-  (Gaussian in normalized distance-from-center, `--center_sigma`, aspect-ratio
-  independent). Both in [0,1]; no grounded nature entity → 0.0.
+  masks (overlapping pixels counted once). BOTH methods are always computed
+  and stored, never a choice between them:
+  `nature_relevance_score_coverage_ratio` (nature px / total px) and
+  `nature_relevance_score_center_weighted` (Gaussian in normalized
+  distance-from-center, `--center_sigma`, aspect-ratio independent). Both in
+  [0,1]; no grounded nature entity → 0.0 under both. Overlap between two
+  DIFFERENT entities' masks (e.g. "tree" and "leaves" covering the same
+  pixels) is resolved by the union itself — a pixel counts as nature if ANY
+  grounded entity covers it, never a confidence-based per-pixel winner; each
+  entity's own mask stays intact and unclipped in `object_groundings`.
 - Report `grounding_confirmation_rate` (grounded / nature entities). Per recap
   §9 this is AGREEMENT WITH AN INDEPENDENT MODEL, never ground truth.
 

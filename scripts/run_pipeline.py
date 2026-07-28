@@ -102,8 +102,8 @@ def build_arg_parser():
                    help="Override the grounding stage's --device.")
     p.add_argument("--skip_vlm", action="store_true",
                    help="Skip the VLM inference stage and ground an artifact that already "
-                        "exists (e.g. re-run grounding with a different "
-                        "--relevance_method without paying for inference again).")
+                        "exists (e.g. re-run grounding with a different --mask_threshold or "
+                        "--center_sigma without paying for inference again).")
     p.add_argument("--skip_grounding", action="store_true",
                    help="Run only the VLM inference stage. Equivalent to calling "
                         "run_vlm_pipeline.py --stage infer directly; provided so a script "

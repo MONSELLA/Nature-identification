@@ -21,15 +21,20 @@ would have to be re-joined later.
 
 Fields added per image record (see src/grounding_pipeline.py's module docstring
 for the full shape):
-    "object_groundings"       — aligned index-for-index with "objects", one
-                                entry per extracted entity, carrying
-                                {grounded, mask_rle, pixel_count, ...}.
+    "object_groundings"                        — aligned index-for-index with
+                                "objects", one entry per extracted entity,
+                                carrying {grounded, mask_rle, pixel_count, ...}.
                                 Entities SAM3 could not confirm are MARKED
                                 (`grounded: false`), never deleted, so the full
                                 VLM output stays auditable.
-    "nature_relevance_score"  — float in [0, 1] over the UNION of the surviving
-                                nature masks (overlapping pixels counted once).
-    "relevance_score_method"  — "coverage_ratio" | "center_weighted".
+    "nature_relevance_score_coverage_ratio"     — float in [0, 1], nature px /
+                                total px, over the UNION of surviving nature
+                                masks (overlapping pixels counted once).
+    "nature_relevance_score_center_weighted"    — float in [0, 1], same union
+                                mask but pixels near the image center count
+                                more (Gaussian falloff, --center_sigma).
+                                BOTH scores are always computed and stored —
+                                not a selectable either/or.
 
 Only entities whose HYBRID resolved label is nature (`final_nature is True`) are
 grounded — everything else gets `grounded: null` ("never attempted"), which is
@@ -66,7 +71,6 @@ logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 from src.grounding_pipeline import (
     DEFAULT_CENTER_SIGMA,
     DEFAULT_MASK_THRESHOLD,
-    RELEVANCE_METHODS,
     SAM3_MODEL_ID,
     SAM3Grounder,
     grounding_diagnostics,
@@ -99,8 +103,7 @@ def phase_ground(args):
         sys.exit(1)
     out_path = _resolve_output_path(args, in_path)
 
-    print(f"🚀 [grounding] {in_path} -> {out_path} "
-          f"(model='{args.sam3_model}', method='{args.relevance_method}')")
+    print(f"🚀 [grounding] {in_path} -> {out_path} (model='{args.sam3_model}')")
     phase_t0 = time.time()
 
     header, footer_holder, records = stream_artifact(in_path)
@@ -115,14 +118,15 @@ def phase_ground(args):
 
     # Record the grounding configuration in the artifact header, next to the
     # VLM's own run metadata, so an enriched artifact is self-describing — you
-    # can tell which SAM3 checkpoint/threshold/scoring method produced these
-    # masks without having to find the command line that made them.
+    # can tell which SAM3 checkpoint/threshold produced these masks without
+    # having to find the command line that made them. Both relevance-score
+    # methods are always computed (see src/grounding_pipeline.py), so
+    # center_sigma is always relevant, not gated on a method choice.
     header = dict(header)
     header["grounding"] = {
         "sam3_model": args.sam3_model,
         "mask_threshold": args.mask_threshold,
-        "relevance_method": args.relevance_method,
-        "center_sigma": args.center_sigma if args.relevance_method == "center_weighted" else None,
+        "center_sigma": args.center_sigma,
         "source_artifact": str(in_path),
     }
 
@@ -139,7 +143,6 @@ def phase_ground(args):
             grounder, records,
             batch_size=args.batch_size,
             max_pairs_per_forward=args.max_pairs_per_forward,
-            relevance_method=args.relevance_method,
             center_sigma=args.center_sigma,
             n_total=args.max_samples,
             verbose=args.verbose,
@@ -182,7 +185,7 @@ def _print_summary(args, header, d, elapsed, out_path):
           f"{str(header.get('dataset', '?')).upper()}  ({d['n_images']} images)")
     print("=" * 60)
     print(f"SAM3: {args.sam3_model} | mask threshold {args.mask_threshold} "
-          f"| relevance '{args.relevance_method}'")
+          f"| relevance: coverage_ratio + center_weighted (sigma {args.center_sigma})")
     print(f"Entities: {d['objects_total']} total | {d['nature_entities']} nature "
           f"({d['nature_entities_per_image']:.2f}/image)")
     # The headline diagnostic: how often an independent segmenter could actually
@@ -287,17 +290,17 @@ def build_arg_parser():
                         "forward passes, to re-confirm on real data that the map is "
                         "unbounded logits rather than an already-normalized probability map.")
 
-    # Relevance score
-    p.add_argument("--relevance_method", choices=list(RELEVANCE_METHODS), default="coverage_ratio",
-                   help="'coverage_ratio' (default): nature pixels / total pixels. "
-                        "'center_weighted': weight each pixel by a Gaussian in its distance "
-                        "from the image center before summing. Both are computed over the "
-                        "UNION of the surviving nature masks and land in [0, 1].")
+    # Relevance score — BOTH methods are always computed and stored (not a
+    # choice between them): "nature_relevance_score_coverage_ratio" (nature
+    # pixels / total pixels) and "nature_relevance_score_center_weighted"
+    # (same union mask, but weighted by a Gaussian in distance from the image
+    # center). Both land in [0, 1] and are computed over the UNION of the
+    # surviving nature masks.
     p.add_argument("--center_sigma", type=float, default=DEFAULT_CENTER_SIGMA,
                    help="Width of the center_weighted Gaussian, in units where the image "
                         "center is 0 and each edge midpoint is 1 (aspect-ratio "
-                        f"independent). Default {DEFAULT_CENTER_SIGMA}. No effect under "
-                        "--relevance_method coverage_ratio.")
+                        f"independent). Default {DEFAULT_CENTER_SIGMA}. Only affects "
+                        "nature_relevance_score_center_weighted.")
 
     # shared
     p.add_argument("--max_samples", type=int, default=None,
