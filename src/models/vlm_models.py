@@ -191,7 +191,7 @@ def _patch_transformers_config_registration() -> None:
     encoder), the SAME registration collides and `CONFIG_MAPPING.register`
     raises `ValueError: 'aimv2' is already used by a Transformers config,
     pick another name.` — which happens at vLLM's own import time, so it's
-    not something --clip_model/--model_family choices, or any `transformers`/
+    not something --clipscore_model/--model_family choices, or any `transformers`/
     `vllm` version PIN, can dodge: it depends on which side (vLLM's shim vs.
     transformers' own native support) landed the "aimv2" name first, which
     isn't expressed as a version constraint pip can resolve around.
