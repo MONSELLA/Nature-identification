@@ -172,10 +172,23 @@ evaluating the models.
   than the mapping). material is always the VLM's own label (never mapped).
   No anchor object (empty extraction or failed ClipMatch) → prediction-unmapped
   → penalized as wrong.
-- **COCO/BIG-5**: image-level nature = OR over extracted objects; biotic/material
-  scored on the matched GT object. COCO box-IoU matching (Hungarian, IoU≥0.5) is
-  FUTURE WORK gated on the Grounding pipeline — for now COCO uses the same
-  lexical GT matching as BIG-5.
+- **BIG-5 (holistic, one GT label per image)**: nature = OR over extracted
+  objects, same as always. biotic/material use a DIRECTION-AWARE "at least one
+  matching entity" rule instead of matching a specific object (there is no
+  named object to match — BIG-5's GT is one label for the whole scene):
+  whichever value the GT actually is, correctness means the model output at
+  least one nature-positive entity carrying THAT specific label
+  (`has_biotic`/`has_abiotic` for biotic, symmetrically for material). An
+  image can contain BOTH a biotic and an abiotic entity at once (e.g. a dog
+  next to a rock) and still score correctly against a GT of just one of
+  them — this deliberately looks at GT to pick which existence check
+  (`has_biotic` vs `has_abiotic`) applies, unlike the nature axis, where "no
+  nature entity output at all" is sufficient for a no-nature GT (there's no
+  meaningful "found an explicit non-nature entity" signal to require there).
+- **COCO**: image-level nature = OR over extracted objects; biotic/material
+  scored on the matched GT object via lexical matching (`find_matching_object`).
+  Evaluated separately via the Grounding pipeline going forward — box-IoU
+  matching (Hungarian, IoU≥0.5) remains FUTURE WORK gated on that pipeline.
 - **Extraction-hit rate** (exact-match: was the GT object mentioned) is a
   REPORTING-ONLY diagnostic; it no longer gates or feeds the axis scores.
 

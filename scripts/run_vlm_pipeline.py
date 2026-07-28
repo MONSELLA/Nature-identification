@@ -719,17 +719,68 @@ def phase_score(args):
                     hp_vals_mapped.append(hier["hp"]); hr_vals_mapped.append(hier["hr"])
                     hf1_vals_mapped.append(hier["hf1"])
                     wup_vals_mapped.append(wup_sim)
+        elif dataset == "big5":
+            # --- BIG-5 (holistic image-level annotation) ---
+            # GT here is ONE label per axis for the WHOLE scene (see
+            # src.loaders.dataset_loader.load_big5 — a single "scene" target,
+            # not a named object to find lexically), so unlike COCO there is
+            # no specific object to match against. nature is scored the same
+            # image-level OR as always (image_pred_nature: True iff ANY
+            # extracted entity is nature). biotic/material use a
+            # DIRECTION-AWARE "at least one matching entity" rule instead:
+            # whichever value the GT actually is (biotic or abiotic; material
+            # or immaterial), correctness means the model output at least one
+            # nature-positive entity carrying THAT specific label — an image
+            # can contain both a biotic and an abiotic entity at once (e.g. a
+            # dog next to a rock) and still be scored correctly against a
+            # GT of just "biotic", since only the GT's own direction needs a
+            # hit. This deliberately looks at GT to decide which existence
+            # check to apply (has_biotic vs has_abiotic), rather than a single
+            # fixed-positive-class OR — confirmed as the intended semantics,
+            # not a mistake, unlike the nature axis, where "no nature
+            # entity output at all" is sufficient for a no-nature GT (there is
+            # no equivalent meaningful "found an explicit non-nature entity"
+            # signal to require there).
+            g_nat = image_gt_nature(targets)
+            if g_nat is not None:
+                image_gt_nature_val = bool(g_nat)
+                image_pred_nature_val = bool(image_pred_nature(finals))
+                nat_true.append(image_gt_nature_val)
+                nat_pred.append(image_pred_nature_val)
+
+            nature_entities = [fin for fin in finals if fin["final_nature"] is True]
+            has_biotic = any(fin["final_biotic"] is True for fin in nature_entities)
+            has_abiotic = any(fin["final_biotic"] is False for fin in nature_entities)
+            has_material = any(fin["final_material"] is True for fin in nature_entities)
+            has_immaterial = any(fin["final_material"] is False for fin in nature_entities)
+
+            t0 = targets[0] if targets else {}
+            target_matches = [{"class_name": t0.get("class_name")}]
+            if t0.get("gt_biotic") is not None:
+                gt_b = bool(t0["gt_biotic"])
+                pred_b = has_biotic if gt_b else (not has_abiotic)
+                bio_true.append(gt_b)
+                bio_pred.append(pred_b)
+                target_matches[0].update({"gt_biotic": gt_b, "pred_biotic": pred_b,
+                                          "has_biotic_entity": has_biotic, "has_abiotic_entity": has_abiotic})
+            if t0.get("gt_material") is not None:
+                gt_m = bool(t0["gt_material"])
+                pred_m = has_material if gt_m else (not has_immaterial)
+                mat_true.append(gt_m)
+                mat_pred.append(pred_m)
+                target_matches[0].update({"gt_material": gt_m, "pred_material": pred_m,
+                                          "has_material_entity": has_material, "has_immaterial_entity": has_immaterial})
         else:
-            # --- COCO (multi-label) + BIG-5 (holistic): image-level nature OR
-            #     + matched-object biotic/material ---
-            # TODO(grounding-pipeline, recap §6.4): for COCO, replace this
-            # lexical find_matching_object matching with Hungarian box-IoU
-            # assignment (IoU>=0.5) once Grounding DINO 1.5 provides predicted
-            # boxes — matched GT boxes score bio/material/nature as usual;
-            # unmatched GT boxes are penalized as wrong; unmatched PREDICTED
-            # boxes are excluded, NOT penalized (COCO's 80 classes are a curated
-            # subset, so an extra real object is not a hallucination). Not
-            # implementable until the Grounding pipeline exists.
+            # --- COCO (multi-label): image-level nature OR + matched-object
+            #     biotic/material, via lexical GT matching (find_matching_object) ---
+            # TODO(grounding-pipeline, recap §6.4): replace this lexical
+            # matching with Hungarian box-IoU assignment (IoU>=0.5) once
+            # Grounding DINO 1.5 provides predicted boxes — matched GT boxes
+            # score bio/material/nature as usual; unmatched GT boxes are
+            # penalized as wrong; unmatched PREDICTED boxes are excluded, NOT
+            # penalized (COCO's 80 classes are a curated subset, so an extra
+            # real object is not a hallucination). Not implementable until the
+            # Grounding pipeline exists.
             g_nat = image_gt_nature(targets)
             if g_nat is not None:
                 image_gt_nature_val = bool(g_nat)
@@ -879,9 +930,15 @@ def phase_score(args):
                               "(which is restricted to classes mapped into the graph — see "
                               "get_candidate_vocab); material is ALWAYS the VLM's own judgment "
                               "(never mapped), taken from the extracted object most representative "
-                              "of that predicted class. coco/big5: image-level nature (OR) + "
-                              "matched-object biotic/material (coco box-IoU is future work, "
-                              "recap §6.4)."),
+                              "of that predicted class. big5 (holistic, one GT label per image): "
+                              "nature is the same image-level OR as always; biotic/material are "
+                              "scored as 'did the model output at least one nature-positive entity "
+                              "matching the GT's own direction' (has_biotic when GT=biotic, "
+                              "has_abiotic when GT=abiotic, symmetrically for material) — an image "
+                              "can contain both a biotic AND an abiotic entity and still score "
+                              "correctly against a GT of just one of them. coco: image-level nature "
+                              "(OR) + matched-object biotic/material via lexical GT matching (box-IoU "
+                              "is future work, recap §6.4)."),
         "material_caveat": ("Material GT for imagenet/coco/places is the heuristic "
                             "gt_material=True default (real photos); only BIG-5 has genuine "
                             "material GT. Predicted material is always the VLM's judgment "
