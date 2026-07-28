@@ -5,7 +5,7 @@ run_grounding_pipeline.py
 Driver for the GROUNDING stage only (SAM3 segmentation -> nature relevance
 score). It reads the JSON-Lines artifact the VLM pipeline wrote
 (`run_vlm_pipeline.py --stage infer`, default
-`<results_dir>/<run_name>/vlm_responses_<model>.jsonl`) and ENRICHES each image
+`<results_dir>/<run_name>/artifacts/vlm_responses_<model>.jsonl`) and ENRICHES each image
 record with its own fields, so ONE artifact ends up holding everything for a
 given image — caption, entities, taxonomy labels, masks, relevance score —
 rather than the grounding stage writing a second, separate output file that
@@ -74,6 +74,12 @@ from src.grounding_pipeline import (
     stream_artifact,
 )
 from src.utils import format_duration
+
+# Must match run_vlm_pipeline.ARTIFACTS_SUBDIR exactly — duplicated here
+# (rather than imported) so this script stays independently runnable without
+# pulling in run_vlm_pipeline.py's heavier VLM-serving imports (vLLM, etc.)
+# just to ground an existing artifact.
+ARTIFACTS_SUBDIR = "artifacts"
 
 
 # =============================================================================
@@ -222,10 +228,9 @@ def build_arg_parser():
     p.add_argument("--responses_file", type=str, default=None,
                    help="VLM-pipeline artifact to read and enrich (written by "
                         "run_vlm_pipeline.py --stage infer). Default: the same path that "
-                        "script would have used, i.e. "
-                        "'<results_dir>/<run_name>/vlm_responses_<model_slug>.jsonl', "
-                        "which requires --model_family/--model_name so the slug can be "
-                        "rebuilt.")
+                        "script would have used, i.e. '<results_dir>/<run_name>/"
+                        f"{ARTIFACTS_SUBDIR}/vlm_responses_<model_slug>.jsonl', which requires "
+                        "--model_family/--model_name so the slug can be rebuilt.")
     p.add_argument("--grounded_file", type=str, default=None,
                    help="Where to write the ENRICHED artifact. Default: "
                         "'grounded_<input stem>.jsonl' next to --responses_file. Ignored "
@@ -320,15 +325,15 @@ def parse_args():
 def _resolve_responses_file(args):
     """Fill in --responses_file's default by rebuilding exactly the path
     run_vlm_pipeline.py's _resolve_responses_file would have written to for the
-    same --results_dir/--run_name/model, so the two scripts agree on where the
-    artifact lives without the path having to be passed by hand. Mutates and
-    returns `args`."""
+    same --results_dir/--run_name/model (including the ARTIFACTS_SUBDIR
+    grouping), so the two scripts agree on where the artifact lives without
+    the path having to be passed by hand. Mutates and returns `args`."""
     if args.responses_file is None:
         out_dir = Path(args.results_dir)
         if args.run_name:
             out_dir = out_dir / args.run_name
         slug = f"{args.model_family}/{args.model_name}".replace("/", "_")
-        args.responses_file = str(out_dir / f"vlm_responses_{slug}.jsonl")
+        args.responses_file = str(out_dir / ARTIFACTS_SUBDIR / f"vlm_responses_{slug}.jsonl")
     return args
 
 
