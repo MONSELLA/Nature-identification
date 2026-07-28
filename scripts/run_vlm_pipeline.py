@@ -57,10 +57,10 @@ Metrics (per CLAUDE.md scoping):
         nature) + matched-object biotic/material (COCO box-IoU matching is
         future work, gated on the Grounding pipeline — §6.4).
   - CLIPScore + F-CLIPScore + Object-CLIPScore : ALL datasets (reference-free),
-    scored with --clip_model.
+    scored with --clipscore_model.
   - ClipMatch + hP/hR/hF1                : ImageNet + Places ONLY (fixed vocab,
     restricted to classes mapped into the graph), scored with
-    --clipmatch_clip_model (independently selectable from --clip_model;
+    --clipmatch_clip_model (independently selectable from --clipscore_model;
     defaults to the same checkpoint).
   - Diagnostics: extraction-hit rate (exact-match, reporting-only — no longer
     gates axis scores), WordNet-mapping vs VLM-fallback rate, objects/image,
@@ -413,26 +413,26 @@ def phase_score(args):
     # This is where CLIP actually gets loaded onto the GPU — by this point in
     # `--stage all`, the VLM has already been unloaded (see main() below), so
     # CLIP has the GPU memory to itself.
-    scorer = clip_metrics.CLIPScorer(model_name=args.clip_model, device=args.device,
+    scorer = clip_metrics.CLIPScorer(model_name=args.clipscore_model, device=args.device,
                                      batch_size=args.clip_batch_size,
-                                     trust_remote_code=args.clip_trust_remote_code)
+                                     trust_remote_code=args.clipscore_trust_remote_code)
 
-    if args.verbose: print(f"{args.clip_model} loaded. Handles a context length of {scorer.context_length} tokens!\n")
+    if args.verbose: print(f"{args.clipscore_model} loaded. Handles a context length of {scorer.context_length} tokens!\n")
 
     # ClipMatch + hP/hR (ImageNet/Places only) can use a DIFFERENT CLIP
     # checkpoint from the reference-free metrics (CLIPScore/F-CLIPScore/
     # Object-CLIPScore) — the two jobs have different requirements (matching
     # a whole caption against a fixed candidate vocabulary vs. reference-free
-    # image-text plausibility). Default is the SAME checkpoint as --clip_model;
+    # image-text plausibility). Default is the SAME checkpoint as --clipscore_model;
     # only load a second model if the resolved (model, trust_remote_code) pair
     # actually differs, to avoid holding two copies of the same weights.
-    clipmatch_model_name = args.clipmatch_clip_model or args.clip_model
+    clipmatch_model_name = args.clipmatch_clip_model or args.clipscore_model
     clipmatch_trust_remote_code = (args.clipmatch_clip_trust_remote_code
                                     if args.clipmatch_clip_trust_remote_code is not None
-                                    else args.clip_trust_remote_code)
+                                    else args.clipscore_trust_remote_code)
     cm_scorer = scorer
-    if run_clipmatch and (clipmatch_model_name != args.clip_model
-                          or clipmatch_trust_remote_code != args.clip_trust_remote_code):
+    if run_clipmatch and (clipmatch_model_name != args.clipscore_model
+                          or clipmatch_trust_remote_code != args.clipscore_trust_remote_code):
         cm_scorer = clip_metrics.CLIPScorer(model_name=clipmatch_model_name, device=args.device,
                                             batch_size=args.clip_batch_size,
                                             trust_remote_code=clipmatch_trust_remote_code)
@@ -833,7 +833,7 @@ def phase_score(args):
             "object_clipscore": _mean(objclip_vals),
         },
         "clip_models": {
-            "reference_free": args.clip_model,
+            "reference_free": args.clipscore_model,
             "clipmatch": clipmatch_model_name if run_clipmatch else None,
         },
         "nature": _binary_metrics(nat_true, nat_pred),
@@ -1072,7 +1072,7 @@ def build_arg_parser():
                         "artifact header and reused by --stage score.")
 
     # CLIP (score) — loaded via transformers (src/evaluation/clip_metrics.py's
-    # CLIPScorer), NOT open_clip. --clip_model accepts either a short alias
+    # CLIPScorer), NOT open_clip. --clipscore_model accepts either a short alias
     # from clip_metrics.CLIP_PRESETS ("original", "eva-clip", "siglip2",
     # "jina-clip-v2") or any raw HuggingFace repo id directly (e.g. to
     # override a preset's default checkpoint, or use a variant not in the
@@ -1083,33 +1083,33 @@ def build_arg_parser():
     # FG-CLIP2 was tried and abandoned (meta-tensor crash in its
     # trust_remote_code __init__, incompatible with this transformers
     # version — see clip_metrics.CLIP_PRESETS's comment for the full story).
-    p.add_argument("--clip_model", type=str, default="original",
+    p.add_argument("--clipscore_model", type=str, default="original",
                    help="CLIP checkpoint used for the REFERENCE-FREE metrics (CLIPScore, "
                         "F-CLIPScore, Object-CLIPScore — all datasets): a "
                         "clip_metrics.CLIP_PRESETS alias ('original', 'eva-clip', 'siglip2', "
                         "'jina-clip-v2') or a raw HuggingFace repo id. Also the default for "
                         "--clipmatch_clip_model when that isn't set separately.")
-    p.add_argument("--clip_trust_remote_code", type=lambda s: s.lower() != "false", default=True,
-                   help="Passed to transformers' from_pretrained calls for --clip_model "
+    p.add_argument("--clipscore_trust_remote_code", type=lambda s: s.lower() != "false", default=True,
+                   help="Passed to transformers' from_pretrained calls for --clipscore_model "
                         "(default True). Several CLIP variants (EVA-CLIP, Jina-CLIP-v2) ship "
                         "custom modeling code on the Hub that requires this; it's a no-op for "
                         "checkpoints that don't need it (e.g. the original OpenAI CLIP, "
-                        "SigLIP2). Pass --clip_trust_remote_code false to disable.")
+                        "SigLIP2). Pass --clipscore_trust_remote_code false to disable.")
     p.add_argument("--clip_batch_size", type=int, default=64)
     p.add_argument("--clipmatch_clip_model", type=str, default=None,
                    help="CLIP checkpoint used for ClipMatch + hP/hR/hF1 (ImageNet + Places "
-                        "only) — kept independently selectable from --clip_model since the two "
+                        "only) — kept independently selectable from --clipscore_model since the two "
                         "jobs have different needs (ClipMatch matches a whole caption against a "
                         "fixed candidate vocabulary; F-CLIPScore/Object-CLIPScore/CLIPScore are "
                         "reference-free plausibility scores). Default: same value as "
-                        "--clip_model. When it resolves to the SAME checkpoint + "
-                        "--clip_trust_remote_code setting as --clip_model, the already-loaded "
+                        "--clipscore_model. When it resolves to the SAME checkpoint + "
+                        "--clipscore_trust_remote_code setting as --clipscore_model, the already-loaded "
                         "scorer is reused instead of loading a second model.")
     p.add_argument("--clipmatch_clip_trust_remote_code", type=lambda s: s.lower() != "false", default=None,
                    help="Passed to transformers' from_pretrained calls for "
-                        "--clipmatch_clip_model (default: same as --clip_trust_remote_code). "
+                        "--clipmatch_clip_model (default: same as --clipscore_trust_remote_code). "
                         "Pass --clipmatch_clip_trust_remote_code false/true to override "
-                        "independently of --clip_trust_remote_code.")
+                        "independently of --clipscore_trust_remote_code.")
 
     # shared
     p.add_argument("--output_file", type=str, default="vlm_pipeline_results.json",
