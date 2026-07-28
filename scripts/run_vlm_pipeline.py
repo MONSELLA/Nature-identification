@@ -116,14 +116,16 @@ from src.vlm_pipeline import run_inference, resolve_hybrid_label, _normalize_obj
 from src.evaluation import clip_metrics
 from src.utils import update_results_store, update_dataset_class_stats, compute_class_stats, format_duration
 
-# Per-model outputs (the inference .jsonl artifact + the predictions .csv) are
-# grouped together in this subfolder of <results_dir>/<run_name>, so a run_name
-# folder full of models stays readable at a glance: the shared results JSON
-# sits directly in the folder, and every model's own raw files sit one level
-# down instead of interleaving with it. scripts/run_grounding_pipeline.py
-# mirrors this constant (it reconstructs the same artifact path independently)
-# — keep the two in sync if this ever changes.
-ARTIFACTS_SUBDIR = "artifacts"
+# Per-model outputs are split by FILE TYPE into these two subfolders of
+# <results_dir>/<run_name>, so a run_name folder full of models stays
+# readable at a glance: the shared results JSON sits directly in the folder,
+# every model's raw inference artifact sits in RESPONSES_SUBDIR, and every
+# model's per-image predictions CSV sits in PREDICTIONS_SUBDIR.
+# scripts/run_grounding_pipeline.py mirrors RESPONSES_SUBDIR (it reconstructs
+# the same artifact path independently) — keep the two in sync if this ever
+# changes.
+RESPONSES_SUBDIR = "responses"
+PREDICTIONS_SUBDIR = "predictions"
 
 
 # =============================================================================
@@ -319,6 +321,10 @@ def phase_infer(args):
         "record_type": "header",
         "dataset": args.dataset,
         "model": f"{args.model_family}/{args.model_name}",
+        # Kept separately from "model" (the family/name identifier used for
+        # results-store keys and the CSV's own "model" column) so Phase 2 can
+        # build filenames from JUST the model name — see _model_slug.
+        "model_name": args.model_name,
         "candidate_vocab": candidate_vocab,
         "max_hops": args.max_hops,
     }
@@ -907,9 +913,10 @@ def phase_score(args):
     # further nests it into a per-ablation-configuration subfolder, so results
     # from different pipeline configurations never land in the same place and
     # stay easy to tell apart later. The shared results JSON (--output_file)
-    # sits directly in that folder; per-model raw outputs (the predictions CSV
-    # here, the .jsonl artifact from _resolve_responses_file) are grouped one
-    # level down in ARTIFACTS_SUBDIR instead.
+    # sits directly in that folder; per-model raw outputs are split by file
+    # type one level down — the predictions CSV here goes in
+    # PREDICTIONS_SUBDIR, the .jsonl artifact from _resolve_responses_file
+    # goes in RESPONSES_SUBDIR.
     out_dir = Path(args.results_dir)
     if args.run_name:
         out_dir = out_dir / args.run_name
@@ -929,13 +936,16 @@ def phase_score(args):
         # Include dataset + model in the filename — otherwise every model run
         # writes to the same "<stem>_predictions.csv" and each rerun (e.g. a
         # different VLM on the same dataset) silently overwrites the previous
-        # model's predictions. Grouped into ARTIFACTS_SUBDIR alongside that
-        # model's .jsonl artifact (see _resolve_responses_file), not next to
-        # the shared results JSON.
-        artifacts_dir = out_dir / ARTIFACTS_SUBDIR
-        artifacts_dir.mkdir(parents=True, exist_ok=True)
-        model_slug = header.get("model", "unknown_model").replace("/", "_")
-        csv_path = artifacts_dir / f"{out_path.stem}_{dataset}_{model_slug}_predictions.csv"
+        # model's predictions. Grouped into PREDICTIONS_SUBDIR (separate from
+        # RESPONSES_SUBDIR, where that model's .jsonl artifact lives — see
+        # _resolve_responses_file), not next to the shared results JSON.
+        # model_slug uses ONLY the model NAME (see _model_slug's rationale),
+        # falling back to the full family/name "model" string for older
+        # artifacts written before the header carried "model_name" separately.
+        predictions_dir = out_dir / PREDICTIONS_SUBDIR
+        predictions_dir.mkdir(parents=True, exist_ok=True)
+        model_slug = (header.get("model_name") or header.get("model", "unknown_model")).replace("/", "_")
+        csv_path = predictions_dir / f"{out_path.stem}_{dataset}_{model_slug}_predictions.csv"
         with open(csv_path, "w", newline="") as f:
             w = csv.DictWriter(f, fieldnames=list(flat_rows[0].keys()))
             w.writeheader(); w.writerows(flat_rows)
@@ -1039,12 +1049,14 @@ def build_arg_parser():
     p.add_argument("--responses_file", type=str, default=None,
                    help="Intermediate artifact: written by infer, read by score. Default: "
                         f"'vlm_responses_<model_slug>.jsonl' inside --results_dir/--run_name/"
-                        f"{ARTIFACTS_SUBDIR} (grouped there together with the predictions CSV; "
-                        "--output_file's shared results JSON stays directly in --results_dir/"
-                        "--run_name). Pass an explicit path to override (e.g. to write it "
-                        "somewhere else, or to point --stage score at a specific prior "
-                        "artifact). ALWAYS retained on disk (never deleted, under any --stage) — "
-                        "it carries every raw VLM response plus the resolved per-object labels, "
+                        f"{RESPONSES_SUBDIR} (all models' .jsonl artifacts grouped together "
+                        f"there; predictions CSVs go in --results_dir/--run_name/"
+                        f"{PREDICTIONS_SUBDIR} instead; --output_file's shared results JSON "
+                        "stays directly in --results_dir/--run_name). Pass an explicit path to "
+                        "override (e.g. to write it somewhere else, or to point --stage score "
+                        "at a specific prior artifact). ALWAYS retained on disk (never deleted, "
+                        "under any --stage) — it carries every raw VLM response plus the "
+                        "resolved per-object labels, "
                         "which the Grounding pipeline needs downstream, so this artifact is a "
                         "first-class output, not just an internal handoff.")
 
@@ -1132,9 +1144,9 @@ def build_arg_parser():
                    help="Shared results store JSON, keyed by dataset then model name (updated "
                         "in place — a rerun of the same model overwrites its own entry; other "
                         "models' entries are untouched). Lands directly in --results_dir/"
-                        f"--run_name — NOT inside {ARTIFACTS_SUBDIR}, since it's a single shared "
-                        "file every model in that folder reports into, unlike the per-model "
-                        "artifacts.")
+                        f"--run_name — NOT inside {RESPONSES_SUBDIR}/{PREDICTIONS_SUBDIR}, since "
+                        "it's a single shared file every model in that folder reports into, "
+                        "unlike the per-model artifacts.")
     p.add_argument("--results_dir", type=str, default="results",
                    help="Base directory all results are written under. Created if it doesn't "
                         "exist.")
@@ -1143,10 +1155,10 @@ def build_arg_parser():
                         "e.g. --run_name vlm_pipeline/imagenet), useful for keeping results from "
                         "different pipeline configurations (ablations) in separate, clearly "
                         "labeled folders. Layout inside it: --output_file's shared results JSON "
-                        f"directly in this folder; every model's own raw outputs — the "
-                        "--responses_file .jsonl artifact and its _predictions.csv — grouped "
-                        f"together one level down, in a '{ARTIFACTS_SUBDIR}' subfolder. Created "
-                        "if it doesn't exist. Default: write directly into --results_dir.")
+                        f"directly in this folder; every model's --responses_file .jsonl "
+                        f"artifact in a '{RESPONSES_SUBDIR}' subfolder; every model's "
+                        f"_predictions.csv in a '{PREDICTIONS_SUBDIR}' subfolder. Created if it "
+                        "doesn't exist. Default: write directly into --results_dir.")
     p.add_argument("--max_samples", type=int, default=None)
     p.add_argument("--verbose", action="store_true")
     p.add_argument("--wandb", action="store_true")
@@ -1175,40 +1187,45 @@ def parse_args():
 
 def _model_slug(args):
     """Filesystem-safe slug identifying the VLM for this run, e.g.
-    'qwen2_5_vl/Qwen/Qwen3.5-0.8B' -> 'qwen2_5_vl_Qwen_Qwen3.5-0.8B'. Matches
-    the `model` string stored in the artifact header (build in phase_infer) and
-    the slug used for the predictions CSV, so all of a model's outputs share one
-    recognizable name. Returns None when the model isn't set (e.g. a standalone
+    --model_name 'Qwen/Qwen3.5-0.8B' -> 'Qwen_Qwen3.5-0.8B'. Deliberately built
+    from ONLY --model_name, NOT --model_family: model_name already carries the
+    org/model identity, so folding model_family in too just repeats that
+    identity a second time under a different name (e.g. the old
+    'qwen2_5_vl_Qwen_Qwen3.5-0.8B'). The full family/name pair remains the
+    canonical model identifier everywhere else (the header's own "model"
+    field, results-store keys, the CSV's "model" column) — this slug is
+    filename-only. Returns None when the model isn't set (e.g. a standalone
     --stage score run that relies on an explicit --responses_file)."""
-    if not args.model_family or not args.model_name:
+    if not args.model_name:
         return None
-    return f"{args.model_family}/{args.model_name}".replace("/", "_")
+    return args.model_name.replace("/", "_")
 
 
 def _resolve_responses_file(args):
     """Fill in --responses_file's default (None until now) as
-    '<results_dir>/<run_name>/ARTIFACTS_SUBDIR/vlm_responses_<model_slug>.jsonl'
-    — grouped into ARTIFACTS_SUBDIR alongside the predictions CSV (see
-    phase_score), one level below where --output_file's shared results JSON
-    lands, so a --run_name folder with several models stays easy to scan: the
-    one shared results JSON directly inside it, every model's own raw files
-    inside ARTIFACTS_SUBDIR. The filename is suffixed with the MODEL slug so
-    each model's infer artifact is uniquely named (the Grounding pipeline
-    consumes these per-model JSON-Lines files, and it keeps a rerun on a
-    different VLM from overwriting a previous model's artifact). Falls back to
-    a plain 'vlm_responses.jsonl' when the model isn't known (a standalone
-    --stage score run). An explicitly-passed --responses_file is left
-    untouched. Creates that directory so phase_infer can open the file for
-    writing. Mutates and returns `args`."""
+    '<results_dir>/<run_name>/RESPONSES_SUBDIR/vlm_responses_<model_slug>.jsonl'
+    — grouped into RESPONSES_SUBDIR (separate from PREDICTIONS_SUBDIR, where
+    phase_score writes the predictions CSV), so a --run_name folder with
+    several models stays easy to scan: the shared results JSON directly
+    inside it, every model's raw .jsonl artifacts together in one subfolder,
+    every model's predictions CSVs together in another. The filename is
+    suffixed with the MODEL slug (see _model_slug) so each model's infer
+    artifact is uniquely named (the Grounding pipeline consumes these
+    per-model JSON-Lines files, and it keeps a rerun on a different VLM from
+    overwriting a previous model's artifact). Falls back to a plain
+    'vlm_responses.jsonl' when the model isn't known (a standalone --stage
+    score run). An explicitly-passed --responses_file is left untouched.
+    Creates that directory so phase_infer can open the file for writing.
+    Mutates and returns `args`."""
     if args.responses_file is None:
         out_dir = Path(args.results_dir)
         if args.run_name:
             out_dir = out_dir / args.run_name
-        artifacts_dir = out_dir / ARTIFACTS_SUBDIR
-        artifacts_dir.mkdir(parents=True, exist_ok=True)
+        responses_dir = out_dir / RESPONSES_SUBDIR
+        responses_dir.mkdir(parents=True, exist_ok=True)
         slug = _model_slug(args)
         fname = f"vlm_responses_{slug}.jsonl" if slug else "vlm_responses.jsonl"
-        args.responses_file = str(artifacts_dir / fname)
+        args.responses_file = str(responses_dir / fname)
     return args
 
 

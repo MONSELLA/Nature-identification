@@ -5,7 +5,7 @@ run_grounding_pipeline.py
 Driver for the GROUNDING stage only (SAM3 segmentation -> nature relevance
 score). It reads the JSON-Lines artifact the VLM pipeline wrote
 (`run_vlm_pipeline.py --stage infer`, default
-`<results_dir>/<run_name>/artifacts/vlm_responses_<model>.jsonl`) and ENRICHES each image
+`<results_dir>/<run_name>/responses/vlm_responses_<model>.jsonl`) and ENRICHES each image
 record with its own fields, so ONE artifact ends up holding everything for a
 given image — caption, entities, taxonomy labels, masks, relevance score —
 rather than the grounding stage writing a second, separate output file that
@@ -75,11 +75,11 @@ from src.grounding_pipeline import (
 )
 from src.utils import format_duration
 
-# Must match run_vlm_pipeline.ARTIFACTS_SUBDIR exactly — duplicated here
+# Must match run_vlm_pipeline.RESPONSES_SUBDIR exactly — duplicated here
 # (rather than imported) so this script stays independently runnable without
 # pulling in run_vlm_pipeline.py's heavier VLM-serving imports (vLLM, etc.)
 # just to ground an existing artifact.
-ARTIFACTS_SUBDIR = "artifacts"
+RESPONSES_SUBDIR = "responses"
 
 
 # =============================================================================
@@ -229,8 +229,8 @@ def build_arg_parser():
                    help="VLM-pipeline artifact to read and enrich (written by "
                         "run_vlm_pipeline.py --stage infer). Default: the same path that "
                         "script would have used, i.e. '<results_dir>/<run_name>/"
-                        f"{ARTIFACTS_SUBDIR}/vlm_responses_<model_slug>.jsonl', which requires "
-                        "--model_family/--model_name so the slug can be rebuilt.")
+                        f"{RESPONSES_SUBDIR}/vlm_responses_<model_slug>.jsonl', which requires "
+                        "--model_name so the slug can be rebuilt.")
     p.add_argument("--grounded_file", type=str, default=None,
                    help="Where to write the ENRICHED artifact. Default: "
                         "'grounded_<input stem>.jsonl' next to --responses_file. Ignored "
@@ -244,11 +244,14 @@ def build_arg_parser():
 
     # Identify the input artifact the same way run_vlm_pipeline.py names it.
     p.add_argument("--model_family", type=str, default=None,
-                   help="Only used to reconstruct the default --responses_file name "
-                        "(which is suffixed with the VLM's slug so each model's artifact "
-                        "is distinct). Unnecessary if --responses_file is given.")
+                   help="NOT used to build the default --responses_file name (that's "
+                        "--model_name alone, matching run_vlm_pipeline.py's _model_slug). "
+                        "Accepted here only so the same flags used for the VLM run can be "
+                        "passed straight through without editing.")
     p.add_argument("--model_name", type=str, default=None,
-                   help="See --model_family.")
+                   help="Used to reconstruct the default --responses_file name (suffixed with "
+                        "this model's slug so each model's artifact is distinct). Unnecessary "
+                        "if --responses_file is given.")
     p.add_argument("--results_dir", type=str, default="results",
                    help="Base directory the VLM artifact lives under (matches "
                         "run_vlm_pipeline.py's flag of the same name).")
@@ -314,26 +317,26 @@ def build_arg_parser():
 def parse_args():
     p = build_arg_parser()
     args = p.parse_args()
-    if args.responses_file is None and not (args.model_family and args.model_name):
+    if args.responses_file is None and not args.model_name:
         # argparse can't express "required unless another flag is set", so this
         # raises the same kind of clean CLI error it would have.
-        p.error("--responses_file is required unless --model_family and --model_name are "
-                "given (they're what the default artifact filename is built from).")
+        p.error("--responses_file is required unless --model_name is given (it's what the "
+                "default artifact filename is built from).")
     return args
 
 
 def _resolve_responses_file(args):
     """Fill in --responses_file's default by rebuilding exactly the path
     run_vlm_pipeline.py's _resolve_responses_file would have written to for the
-    same --results_dir/--run_name/model (including the ARTIFACTS_SUBDIR
+    same --results_dir/--run_name/model (including the RESPONSES_SUBDIR
     grouping), so the two scripts agree on where the artifact lives without
     the path having to be passed by hand. Mutates and returns `args`."""
     if args.responses_file is None:
         out_dir = Path(args.results_dir)
         if args.run_name:
             out_dir = out_dir / args.run_name
-        slug = f"{args.model_family}/{args.model_name}".replace("/", "_")
-        args.responses_file = str(out_dir / ARTIFACTS_SUBDIR / f"vlm_responses_{slug}.jsonl")
+        slug = args.model_name.replace("/", "_")
+        args.responses_file = str(out_dir / RESPONSES_SUBDIR / f"vlm_responses_{slug}.jsonl")
     return args
 
 
