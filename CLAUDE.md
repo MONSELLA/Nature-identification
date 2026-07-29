@@ -101,6 +101,14 @@ evaluating the models.
   Everything else gets `grounded: null` = never attempted; `grounded: false` =
   SAM3 looked and found nothing. Entities are NEVER deleted from the record —
   the full VLM output stays auditable.
+- `run_vlm_pipeline.py --stage score`'s predictions CSV mirrors the grounding
+  fields for qualitative review WITHOUT needing the raw `.jsonl` open
+  alongside it: `object_groundings` (per-object JSON, now including
+  `mask_rle`), `grounding_ungrounded_objects` (nature entities SAM3 attempted
+  but whose mask never crossed `--mask_threshold` — `grounded: false`, not
+  `null`), and `grounding_confirmation_rate_image`. The run summary/console/
+  W&B also report a dataset-wide `confirmation_rate` (recap §9: agreement
+  with SAM3, an INDEPENDENT model, never ground truth).
 - SAM3 (`facebook/sam3`) via plain transformers AutoModel/AutoProcessor. Read
   `outputs.semantic_seg` (concept-level pixel coverage), NOT the instance-level
   `pred_masks`/`pred_boxes`/`pred_logits`.

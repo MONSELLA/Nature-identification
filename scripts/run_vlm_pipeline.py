@@ -589,6 +589,16 @@ def phase_score(args):
     n_gt_targets = n_extraction_hits = 0
     n_objects_total = n_parse_fail = n_object_records = 0
     n_map_nature = n_vlm_nature = 0
+    # Grounding diagnostics (see src/grounding_pipeline.py): only meaningful
+    # when this artifact was actually enriched by the Grounding pipeline
+    # (run_grounding = header carries a "grounding" key, added by
+    # run_grounding_pipeline.py's phase_ground). "attempted" = nature entities
+    # SAM3 was asked about (grounded is True or False, never None); "confirmed"
+    # = SAM3 found nature pixels for it; the rest were attempted but SAM3's
+    # confidence never crossed --mask_threshold (recap §9's "agreement with an
+    # independent model", never a ground-truth signal).
+    run_grounding = bool(header.get("grounding"))
+    n_grounding_attempted = n_grounding_confirmed = 0
     clipmatch_top1 = 0
     clipmatch_support = 0
     clipmatch_caption_top1 = 0
@@ -932,18 +942,35 @@ def phase_score(args):
         # Grounding-pipeline results, present only when src/grounding_pipeline.py
         # has enriched this artifact (see run_pipeline.py / run_grounding_pipeline.py)
         # — None/blank on a VLM-only artifact, so scoring one still works fine.
-        # mask_rle is deliberately DROPPED here (too bulky for a CSV cell, and
-        # not useful in tabular form); it stays in the .jsonl artifact. This is
-        # the grounding VERDICT per object — was it confirmed, how many pixels —
-        # not the raw masks, which is what makes this "the actual SAM3
-        # prediction" belong in the results CSV rather than only the raw
-        # artifact.
+        # mask_rle IS included here (pycocotools RLE — a small JSON dict, not
+        # the decoded pixel array) so the predictions CSV is self-sufficient
+        # for qualitative review (decode_rle in grounding_pipeline.py turns it
+        # back into a boolean mask for overlay plotting) without needing the
+        # raw .jsonl artifact open alongside it.
         object_groundings = rec.get("object_groundings")
         groundings_json = json.dumps([
             {"object": g["object"], "prompt": g["prompt"], "is_nature": g["is_nature"],
-             "grounded": g["grounded"], "pixel_count": g["pixel_count"]}
+             "grounded": g["grounded"], "pixel_count": g["pixel_count"], "mask_rle": g["mask_rle"]}
             for g in object_groundings
         ]) if object_groundings is not None else None
+        # Nature entities SAM3 actually ATTEMPTED (is_nature True implies an
+        # attempt was made — see _nature_object_indices) but whose predicted
+        # mask never crossed --mask_threshold: `grounded is False` distinguishes
+        # this from `grounded is None` (never attempted at all, not nature).
+        # Surfaced per image for qualitative review (which specific objects the
+        # VLM claimed but SAM3 couldn't confirm in pixels) and accumulated below
+        # into a run-level rate (recap §9: agreement with an independent model,
+        # never ground truth — a low confirmation rate flags VLM hallucination
+        # OR an under-sensitive --mask_threshold, not "ground truth says wrong").
+        ungrounded_objects = ([g["object"] for g in object_groundings
+                               if g["is_nature"] and g["grounded"] is False]
+                              if object_groundings is not None else None)
+        image_n_attempted = image_n_confirmed = None
+        if object_groundings is not None:
+            image_n_attempted = sum(1 for g in object_groundings if g["is_nature"])
+            image_n_confirmed = sum(1 for g in object_groundings if g["grounded"] is True)
+            n_grounding_attempted += image_n_attempted
+            n_grounding_confirmed += image_n_confirmed
         flat_rows.append({
             "image_path": rec["image_path"],
             "dataset": dataset,
@@ -958,6 +985,11 @@ def phase_score(args):
             "object_groundings": groundings_json,
             "nature_relevance_score_coverage_ratio": rec.get("nature_relevance_score_coverage_ratio"),
             "nature_relevance_score_center_weighted": rec.get("nature_relevance_score_center_weighted"),
+            "grounding_ungrounded_objects": json.dumps(ungrounded_objects) if ungrounded_objects is not None else None,
+            "grounding_nature_entities_attempted_image": image_n_attempted,
+            "grounding_confirmed_image": image_n_confirmed,
+            "grounding_confirmation_rate_image": (image_n_confirmed / image_n_attempted)
+                                                  if image_n_attempted else None,
             "wordnet_mapping_rate_image": (image_n_map_nature / (image_n_map_nature + image_n_vlm_nature))
                                            if (image_n_map_nature + image_n_vlm_nature) else None,
             "parse_failure_count_image": image_n_parse_fail,
@@ -1049,6 +1081,19 @@ def phase_score(args):
                             "(never mapped), so on imagenet/places it is scored against that "
                             "heuristic GT default — BIG-5 is the only genuine material benchmark."),
     }
+    if run_grounding:
+        # recap §9: this is agreement with an INDEPENDENT model (SAM3), never
+        # ground truth — a low confirmation_rate flags either VLM hallucination
+        # (claimed an entity SAM3 can't find in pixels) or an under-sensitive
+        # --mask_threshold, not "the model was wrong" in a GT sense.
+        summary["grounding"] = {
+            "nature_entities_attempted": n_grounding_attempted,
+            "confirmed": n_grounding_confirmed,
+            "confirmation_rate": (n_grounding_confirmed / n_grounding_attempted)
+                                  if n_grounding_attempted else 0.0,
+            "sam3_model": header["grounding"].get("sam3_model"),
+            "mask_threshold": header["grounding"].get("mask_threshold"),
+        }
     if run_clipmatch:
         summary["clipmatch"] = {
             "top1_accuracy": (clipmatch_top1 / clipmatch_support) if clipmatch_support else 0.0,
@@ -1175,6 +1220,12 @@ def _print_summary(s, run_clipmatch):
         print(f"Acc {m['accuracy']:.4f}")
         print(f"  {axis.split('_')[0]:<12} (pos) P {m['precision']:.4f} | R {m['recall']:.4f} | F1 {m['f1']:.4f}")
         print(f"  {neg_labels[axis]:<12} (neg) P {m['precision_neg']:.4f} | R {m['recall_neg']:.4f} | F1 {m['f1_neg']:.4f}")
+    g = s.get("grounding")
+    if g is not None:
+        print(f"\n--- Grounding [{g['sam3_model']}, threshold {g['mask_threshold']}] "
+              f"(nature entities attempted {g['nature_entities_attempted']}) ---")
+        print(f"Confirmation rate: {g['confirmation_rate']:.1%} "
+              f"({g['confirmed']}/{g['nature_entities_attempted']}) — agreement with SAM3, not ground truth")
     if run_clipmatch:
         primary_label = "summary-caption" if s["clip_models"]["clipmatch_primary_source"] == "summary_caption" else "caption-based"
         cm = s["clipmatch"]
@@ -1240,6 +1291,10 @@ def _log_wandb(args, summary, run_clipmatch):
         log["Hierarchical/MappingFailureRate"] = summary["hierarchical"]["mapping_failure_rate"]
         log["Hierarchical/hF1_MappedOnly"] = summary["hierarchical_mapped"]["hf1"]
         log["Hierarchical/WuPalmer_MappedOnly"] = summary["hierarchical_mapped"]["wup"]
+    if summary.get("grounding") is not None:
+        log["Grounding/ConfirmationRate"] = summary["grounding"]["confirmation_rate"]
+        log["Grounding/NatureEntitiesAttempted"] = summary["grounding"]["nature_entities_attempted"]
+        log["Grounding/Confirmed"] = summary["grounding"]["confirmed"]
     wandb.log(log)
     wandb.finish()
 
