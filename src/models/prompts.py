@@ -69,13 +69,16 @@ CAPTION_PROMPT = "Describe this image, including any text."
 # run_vlm_pipeline.py's --no_summarize_clipmatch_caption to opt out). Still
 # NOT part of the baseline two-pass pipeline itself — only feeds ClipMatch.
 #
-# "main subject OR SETTING" is deliberate, not just "main subject": ImageNet's
-# candidate classes are object-centric (a discrete figure-in-a-scene, e.g.
-# "golden retriever"), but Places365's classes ARE the scene itself
-# ("airport terminal", "kitchen") — there's no separate "subject" apart from
-# the setting to describe. A subject-only phrasing risks the summary fixating
-# on an incidental foreground object instead of the scene ClipMatch actually
-# needs to match against Places' candidate vocabulary. One shared prompt
+# ALWAYS asks for BOTH the subject and the setting (not "subject OR setting"
+# — that phrasing handed the model an unconstrained, arbitrary choice with no
+# criterion for which to pick, risking inconsistent behavior across images).
+# ImageNet's candidate classes are object-centric (a discrete figure-in-a-
+# scene, e.g. "golden retriever"); Places365's ARE the scene itself ("airport
+# terminal", "kitchen"). Asking for the subject alone risks the summary
+# fixating on an incidental foreground object (e.g. "a man walking") on a
+# Places image where the SETTING is what ClipMatch actually needs to match
+# (e.g. "restaurant") — asking for both means the setting still gets
+# mentioned even when a person/object is also in frame. One shared prompt
 # across both datasets, not forked per-dataset — simpler to defend
 # methodologically, and not yet validated as a net win vs the original
 # subject-only wording (worth re-checking ClipMatch top-1 on Places
@@ -84,8 +87,9 @@ SUMMARY_CAPTION_PROMPT = (
     "Here is a detailed description of this image:\n\n"
     "\"{caption}\"\n\n"
     "Using both the image and this description, write a short summary "
-    "(at most 50 words) capturing only the main subject or setting, and its "
-    "most important surrounding context."
+    "(at most 50 words) capturing both the main subject (if there is one) "
+    "and the setting or scene, along with the most important surrounding "
+    "context."
 )
 
 # =============================================================================
