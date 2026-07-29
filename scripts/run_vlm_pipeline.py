@@ -1460,7 +1460,7 @@ def build_arg_parser():
                         "behavior (e.g. to reproduce old results, or skip the extra VLM call). "
                         "The raw-caption ClipMatch is still reported alongside as "
                         "summary['clipmatch_caption'] whenever the summary is primary.")
-    p.add_argument("--summary_max_new_tokens", type=int, default=64,
+    p.add_argument("--summary_max_new_tokens", type=int, default=77,
                    help="Max new tokens for the summary-caption VLM call (default 64 — generous "
                         "headroom over the ~20-word target so it isn't itself cut off "
                         "mid-sentence). No effect if --no_summarize_clipmatch_caption is passed.")
