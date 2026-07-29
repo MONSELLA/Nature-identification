@@ -243,6 +243,25 @@ class CLIPScorer:
                 print(f"🔎 [CLIP] {desc}: {done}/{n_total} ({done / n_total:.1%})", flush=True)
         return np.concatenate(out, axis=0)
 
+    def count_tokens(self, texts: List[str]) -> List[int]:
+        """Untruncated token count per text under this model's OWN tokenizer —
+        used for a truncation-rate diagnostic (e.g. run_vlm_pipeline.py's
+        summary-caption ClipMatch ablation), independent of `context_length`.
+
+        Native-HF only: a plain HF tokenizer call with truncation=False gives
+        the real length directly. Long-CLIP's tokenizer is a bespoke function
+        (`longclip.tokenize`) that always returns a fixed `context_length`-wide
+        padded tensor regardless of truncate=True/False, so it can't report an
+        untruncated count the same way — raise rather than silently return a
+        misleading number.
+        """
+        if not self._is_native_hf:
+            raise NotImplementedError(
+                "count_tokens needs a native-HF tokenizer (Long-CLIP's tokenize() always "
+                "pads/truncates to a fixed context_length and can't report a raw token count)."
+            )
+        return [len(self.tokenizer(t, truncation=False)["input_ids"]) for t in texts]
+
     def encode_images(self, image_paths: List[str], verbose: bool = False) -> np.ndarray:
         from PIL import Image
 
