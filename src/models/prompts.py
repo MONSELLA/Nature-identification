@@ -55,6 +55,26 @@ from pydantic import BaseModel, Field
 CAPTION_PROMPT = "Describe this image, including any text."
 
 # =============================================================================
+# Stage 1b — ClipMatch summary caption (ABLATION ONLY, ImageNet/Places)
+# =============================================================================
+# ClipMatch's own CLIP checkpoint is typically a short-context model (vanilla
+# CLIP, 77 tokens), which silently truncates the baseline caption above (run
+# through LongCLIP, ~248 tokens). Rather than truncate blindly at the
+# tokenizer, this asks the VLM itself to compress its OWN caption into a short
+# (<=~20-word) summary, grounded in BOTH the image and that caption — so the
+# model decides what to keep instead of a mid-sentence cutoff. Only used to
+# feed ClipMatch as a comparison against the caption-based variant (see
+# src/vlm_pipeline.summarize_caption_batch, run_vlm_pipeline.py's
+# --summarize_clipmatch_caption); NOT part of the baseline two-pass pipeline.
+SUMMARY_CAPTION_PROMPT = (
+    "Here is a detailed description of this image:\n\n"
+    "\"{caption}\"\n\n"
+    "Using both the image and this description, write ONE short summary "
+    "sentence (at most 20 words) capturing only the main subject and its "
+    "most important surrounding context."
+)
+
+# =============================================================================
 # Stage 2 — Object extraction (structured)
 # =============================================================================
 # The image is re-sent on this call (recap §5a "second look"): the model gets

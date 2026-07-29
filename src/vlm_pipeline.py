@@ -62,6 +62,7 @@ from typing import Any, Dict, List, Optional
 from src.models.prompts import (
     CAPTION_PROMPT,
     EXTRACTION_PROMPT,
+    SUMMARY_CAPTION_PROMPT,
     MaterialResponse,
     ObjectExtractionResponse,
     TaxonomyResponse,
@@ -190,6 +191,35 @@ def caption_batch(
     # Guard against a non-string response (e.g. None on total generation
     # failure) by substituting an empty string, so callers never have to
     # special-case a missing caption.
+    return [(o if isinstance(o, str) else "") for o in outs]
+
+
+# =============================================================================
+# Stage 1b — ClipMatch summary caption (ABLATION ONLY — see prompts.py)
+# =============================================================================
+def summarize_caption_batch(
+    vlm,
+    image_paths: List[str],
+    captions: List[str],
+    system_prompt: Optional[str] = None,
+    max_new_tokens: int = 64,
+    temperature: float = 0.0,
+) -> List[str]:
+    """ClipMatch-only ablation: compress each image's own baseline caption into
+    a short (<=~20-word) summary, grounded in BOTH the image and that caption
+    (re-sent as context, same "second look" idea as extract_objects_batch) —
+    real re-summarization instead of blindly truncating at the CLIP tokenizer.
+    No system prompt by default, matching caption_batch's own neutrality
+    rationale (this call only compresses content the neutral caption already
+    produced, so there's nothing to keep unbiased beyond that).
+    """
+    prompts = [SUMMARY_CAPTION_PROMPT.format(caption=c) for c in captions]
+    outs = vlm.generate_batch_safe(
+        prompts, image_paths,
+        label="summarize_caption_batch", item_labels=image_paths,
+        system_prompt=system_prompt, max_new_tokens=max_new_tokens,
+        temperature=temperature, output_mode="free_form",
+    )
     return [(o if isinstance(o, str) else "") for o in outs]
 
 
@@ -376,6 +406,8 @@ def run_inference(
     label_max_new_tokens: int = 300,
     temperature: float = 0.0,
     verbose: bool = False,
+    summarize_for_clipmatch: bool = False,
+    summary_max_new_tokens: int = 64,
 ):
     """
     Run caption -> extraction -> (mapping + labeling) over every image and yield
@@ -391,7 +423,18 @@ def run_inference(
           "objects": [str, ...],
           "object_labels": [ {reasoning,nature,biotic,material,parse_failed,vlm_called}, ... ],
           "object_finals": [ resolve_hybrid_label(...) dicts, ... ],
+          "clipmatch_summary_caption": str | None,  # only when summarize_for_clipmatch
         }
+
+    `summarize_for_clipmatch` (ABLATION ONLY — see prompts.SUMMARY_CAPTION_PROMPT)
+    adds one extra VLM call per batch: a short (<=~20-word) re-summarization of
+    this image's own caption, grounded in the image, meant to feed ClipMatch
+    instead of the full ~248-token caption (which a short-context ClipMatch CLIP
+    would otherwise truncate). Only meaningful for ImageNet/Places (the only
+    ClipMatch datasets — see clip_metrics.CLIPMATCH_DATASETS); the caller is
+    responsible for not setting this on COCO/BIG-5 runs. Records carry
+    `clipmatch_summary_caption: None` when the flag is off, so the key's
+    presence/absence never has to be special-cased downstream.
 
     `object_labels[k]` and `object_finals[k]` both align with `objects[k]`.
     `object_finals` are the fully resolved hybrid labels (WordNet + VLM), so
@@ -462,6 +505,21 @@ def run_inference(
             max_new_tokens=caption_max_new_tokens, temperature=temperature,
         )
 
+        # ABLATION ONLY (ImageNet/Places): compress this image's own caption
+        # into a short ClipMatch-friendly summary. summary_captions[i] is None
+        # for every image when the flag is off, so the zip below always has a
+        # value to assign, whether or not this ran.
+        if summarize_for_clipmatch:
+            if verbose:
+                print(f"[infer] batch {b + 1}/{num_batches}: summarize_caption_batch "
+                      f"(free_form, ClipMatch ablation)...", flush=True)
+            summary_captions = summarize_caption_batch(
+                vlm, image_paths, captions,
+                max_new_tokens=summary_max_new_tokens, temperature=temperature,
+            )
+        else:
+            summary_captions = [None] * len(image_paths)
+
         # Map every extracted object to the taxonomy FIRST (cheap dict/graph
         # lookup) so Stage-3 labeling can route each object to the minimal VLM
         # call it actually needs (or none). Computed once here and reused for
@@ -492,8 +550,8 @@ def run_inference(
         # GT `targets`), caption, extracted objects, per-object mappings, and
         # per-object raw labels, all aligned by position. Resolve the final
         # hybrid label per object (reusing the precomputed mapping) and yield.
-        for inst, cap, objs, maps, labels in zip(
-            chunk, captions, objects_per_image, mappings_per_image, labels_per_image
+        for inst, cap, objs, maps, labels, summ in zip(
+            chunk, captions, objects_per_image, mappings_per_image, labels_per_image, summary_captions
         ):
             finals = [
                 resolve_hybrid_label(obj, lab, tax_graph, mapping=mp)
@@ -506,6 +564,7 @@ def run_inference(
                 "objects": objs,
                 "object_labels": labels,
                 "object_finals": finals,
+                "clipmatch_summary_caption": summ,
             }
 
         if verbose:

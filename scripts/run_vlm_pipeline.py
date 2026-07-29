@@ -300,6 +300,15 @@ def phase_infer(args):
     caption_system, label_system_full, label_system_material = build_system_prompts(
         args.nature_definition_path, args.biotic_definition_path, args.material_definition_path)
 
+    # ClipMatch summary-caption ablation only makes sense where ClipMatch itself
+    # runs (ImageNet/Places — see clip_metrics.CLIPMATCH_DATASETS); silently
+    # ignore the flag elsewhere rather than spending an extra VLM call per
+    # image on COCO/BIG-5, where nothing would ever read the result.
+    summarize_for_clipmatch = args.summarize_clipmatch_caption and args.dataset in clip_metrics.CLIPMATCH_DATASETS
+    if args.summarize_clipmatch_caption and not summarize_for_clipmatch:
+        print(f"[infer] --summarize_clipmatch_caption ignored: '{args.dataset}' is not a "
+              f"ClipMatch dataset ({clip_metrics.CLIPMATCH_DATASETS}).")
+
     # Every registered family is vLLM-served (see src/models/vlm_models.py's
     # MODEL_REGISTRY) — the HuggingFace-served BLIP family was removed.
     vlm_kwargs = {"dtype": args.dtype, "gpu_memory_utilization": args.gpu_memory_utilization,
@@ -323,6 +332,7 @@ def phase_infer(args):
         "model_name": args.model_name,
         "candidate_vocab": candidate_vocab,
         "max_hops": args.max_hops,
+        "summarize_clipmatch_caption": summarize_for_clipmatch,
     }
 
     out_path = Path(args.responses_file)
@@ -346,6 +356,8 @@ def phase_infer(args):
             caption_max_new_tokens=args.max_new_tokens_caption,
             label_max_new_tokens=args.max_new_tokens_label,
             temperature=args.temperature, verbose=args.verbose,
+            summarize_for_clipmatch=summarize_for_clipmatch,
+            summary_max_new_tokens=args.summary_max_new_tokens,
         ):
             rec["record_type"] = "image"
             f.write(json.dumps(rec) + "\n")
@@ -502,6 +514,9 @@ def phase_score(args):
     # When cm_scorer IS scorer (default), reuse the embeddings already
     # computed above instead of re-encoding the same text twice.
     candidate_embs = None
+    run_summary_clipmatch = False
+    summary_texts = summary_embs_cm = None
+    n_summary_truncated = None
     if run_clipmatch:
         caption_embs_cm = caption_embs if cm_scorer is scorer else cm_scorer.encode_text(
             captions, warn_truncation=False, verbose=args.verbose, desc="captions (clipmatch)")
@@ -517,6 +532,25 @@ def phase_score(args):
         candidate_embs = cm_scorer.encode_text(
             [clip_metrics.OBJECT_TEMPLATE.format(c["class_name"]) for c in candidate_vocab],
             verbose=args.verbose, desc="candidate_vocab")
+
+        # Summary-caption ClipMatch (ABLATION, SECONDARY — see
+        # --summarize_clipmatch_caption / src.vlm_pipeline.summarize_caption_batch):
+        # each image's own short VLM-written summary of its baseline caption,
+        # meant to dodge cm_scorer's 77-token truncation without resorting to
+        # blind truncation. Only present when the artifact was produced with
+        # --summarize_clipmatch_caption; falls back to the full caption for any
+        # individual record where the summary is missing/empty (e.g. an older
+        # partial artifact) so this never silently drops an image from scoring.
+        run_summary_clipmatch = bool(header.get("summarize_clipmatch_caption"))
+        if run_summary_clipmatch:
+            summary_texts = [r.get("clipmatch_summary_caption") or r["caption"] for r in records]
+            summary_embs_cm = cm_scorer.encode_text(
+                summary_texts, verbose=args.verbose, desc="summary captions (clipmatch)")
+            try:
+                summary_token_counts = cm_scorer.count_tokens(summary_texts)
+                n_summary_truncated = sum(1 for n in summary_token_counts if n >= cm_scorer.context_length)
+            except NotImplementedError:
+                pass
 
     # ---- Per-image metric accumulation ----
     # These lists/counters accumulate results across every image in the
@@ -546,6 +580,8 @@ def phase_score(args):
     n_map_nature = n_vlm_nature = 0
     clipmatch_top1 = 0
     clipmatch_support = 0
+    clipmatch_summary_top1 = 0
+    clipmatch_summary_support = 0
     flat_rows = []  # one row per stored IMAGE for the output CSV (see below)
 
     # How often to print per-image progress under --verbose: every 5% of the
@@ -585,6 +621,9 @@ def phase_score(args):
         wup_sim = None
         clipmatch_correct = None
         clipmatch_pred_similarity = None
+        summary_pred_vocab_entry = None
+        clipmatch_summary_correct = None
+        clipmatch_summary_pred_similarity = None
         gt_nature_val = pred_nature_val = None
         gt_biotic_val = pred_biotic_val = None
         gt_material_val = pred_material_val = None
@@ -715,6 +754,23 @@ def phase_score(args):
                     hp_vals_mapped.append(hier["hp"]); hr_vals_mapped.append(hier["hr"])
                     hf1_vals_mapped.append(hier["hf1"])
                     wup_vals_mapped.append(wup_sim)
+
+                # --- Summary-caption ClipMatch (ABLATION, SECONDARY) ---
+                # Same candidate_embs/gt_syn, matched against the VLM's own
+                # short re-summarization of this image's caption instead of the
+                # full caption — purely a reported comparison point (does NOT
+                # feed nature/biotic/material scoring or hP/hR, same as the
+                # caption-based prediction above).
+                if run_summary_clipmatch:
+                    per_cand_sim_summary, pred_idx_summary = clip_metrics.clipmatch(
+                        summary_embs_cm[idx], candidate_embs)
+                    if pred_idx_summary >= 0:
+                        summary_pred_vocab_entry = candidate_vocab[pred_idx_summary]
+                        clipmatch_summary_pred_similarity = float(per_cand_sim_summary[pred_idx_summary])
+                        clipmatch_summary_support += 1
+                        clipmatch_summary_correct = summary_pred_vocab_entry["synset_id"] == gt_syn
+                        if clipmatch_summary_correct:
+                            clipmatch_summary_top1 += 1
         elif dataset == "big5":
             # --- BIG-5 (holistic image-level annotation) ---
             # GT here is ONE label per axis for the WHOLE scene (see
@@ -905,6 +961,13 @@ def phase_score(args):
             "clipmatch_pred_biotic": best_final["final_biotic"] if best_final else None,
             "clipmatch_pred_material": best_final["final_material"] if best_final else None,
             "clipmatch_top1_correct": clipmatch_correct,
+            # ClipMatch (summary-caption variant) — SECONDARY/ablation, does
+            # not drive scoring; see --summarize_clipmatch_caption.
+            "clipmatch_summary_pred_class": summary_pred_vocab_entry["class_name"] if summary_pred_vocab_entry else None,
+            "clipmatch_summary_pred_synset": summary_pred_vocab_entry["synset_id"] if summary_pred_vocab_entry else None,
+            "clipmatch_summary_pred_similarity": clipmatch_summary_pred_similarity,
+            "clipmatch_summary_top1_correct": clipmatch_summary_correct,
+            "clipmatch_summary_caption": summary_texts[idx] if summary_texts is not None else None,
             "gt_synset": gt_syn,
             "resolved_pred_synset": pred_node,
             "hierarchical_precision": hier["hp"], "hierarchical_recall": hier["hr"],
@@ -961,6 +1024,22 @@ def phase_score(args):
             "top1_accuracy": (clipmatch_top1 / clipmatch_support) if clipmatch_support else 0.0,
             "support": clipmatch_support,
         }
+        # Summary-caption ClipMatch (ABLATION, SECONDARY — see
+        # --summarize_clipmatch_caption). None when the artifact wasn't
+        # produced with that flag, so callers can tell "not run" apart from
+        # "run and scored 0".
+        if run_summary_clipmatch:
+            summary["clipmatch_summary"] = {
+                "top1_accuracy": (clipmatch_summary_top1 / clipmatch_summary_support)
+                                  if clipmatch_summary_support else 0.0,
+                "support": clipmatch_summary_support,
+                "truncation_rate": (n_summary_truncated / n_images)
+                                    if (n_summary_truncated is not None and n_images) else None,
+                "truncated_count": n_summary_truncated,
+                "context_length": cm_scorer.context_length,
+            }
+        else:
+            summary["clipmatch_summary"] = None
         # Two hierarchical views over the SAME images (see the accumulation
         # comment above): "hierarchical" penalizes WordNet-mapping failures as
         # 0.0 (support = every ClipMatch-scored image); "hierarchical_mapped"
@@ -1064,6 +1143,12 @@ def _print_summary(s, run_clipmatch):
     if run_clipmatch:
         print(f"\n--- ClipMatch [caption-based] (support {s['clipmatch']['support']}) ---")
         print(f"Top-1: {s['clipmatch']['top1_accuracy']:.4f}")
+        cs = s.get("clipmatch_summary")
+        if cs is not None:
+            trunc_str = f"{cs['truncation_rate']:.1%}" if cs["truncation_rate"] is not None else "n/a"
+            print(f"\n--- ClipMatch [summary-caption, ablation] (support {cs['support']}) ---")
+            print(f"Top-1: {cs['top1_accuracy']:.4f} | Truncation rate (>= {cs['context_length']} tok): "
+                  f"{trunc_str} ({cs['truncated_count'] if cs['truncated_count'] is not None else 'n/a'}/{s['n_images']})")
         h = s["hierarchical"]
         hm = s["hierarchical_mapped"]
         print(f"--- Hierarchical (support {h['support']}) ---")
@@ -1105,6 +1190,10 @@ def _log_wandb(args, summary, run_clipmatch):
     }
     if run_clipmatch:
         log["ClipMatch/Top1"] = summary["clipmatch"]["top1_accuracy"]
+        if summary.get("clipmatch_summary") is not None:
+            log["ClipMatch_Summary/Top1"] = summary["clipmatch_summary"]["top1_accuracy"]
+            if summary["clipmatch_summary"]["truncation_rate"] is not None:
+                log["ClipMatch_Summary/TruncationRate"] = summary["clipmatch_summary"]["truncation_rate"]
         log["Hierarchical/hF1"] = summary["hierarchical"]["hf1"]
         log["Hierarchical/WuPalmer"] = summary["hierarchical"]["wup"]
         log["Hierarchical/MappingFailureRate"] = summary["hierarchical"]["mapping_failure_rate"]
@@ -1183,6 +1272,18 @@ def build_arg_parser():
     p.add_argument("--max_new_tokens_caption", type=int, default=248) # 248 tokens is the maximum length that LongCLIP can handle
     p.add_argument("--max_new_tokens_label", type=int, default=248)
     p.add_argument("--temperature", type=float, default=0.0)
+    p.add_argument("--summarize_clipmatch_caption", action="store_true",
+                   help="ABLATION (ImageNet/Places only, ignored elsewhere): during --stage "
+                        "infer, ask the VLM for an extra short (<=~20-word) summary of its own "
+                        "caption, grounded in the image, specifically to feed ClipMatch instead "
+                        "of the full ~248-token caption a short-context ClipMatch CLIP would "
+                        "otherwise truncate. Real re-summarization, not blind truncation. "
+                        "Reported alongside the caption-based ClipMatch as "
+                        "summary['clipmatch_summary'] — does not replace it.")
+    p.add_argument("--summary_max_new_tokens", type=int, default=64,
+                   help="Max new tokens for the --summarize_clipmatch_caption call (default 64 "
+                        "— generous headroom over the ~20-word target so it isn't itself cut "
+                        "off mid-sentence).")
     p.add_argument("--max_hops", type=int, default=0,
                    help="Maximum WordNet hop distance allowed when mapping an EXTRACTED "
                         "object onto the labeled taxonomy (map_object_to_taxonomy -> "
