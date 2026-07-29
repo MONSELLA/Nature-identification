@@ -745,6 +745,21 @@ def phase_score(args):
                         [sims_to_pred[best_obj_idx]], pred_class_synset, [objs[best_obj_idx]]
                     )
 
+            # --- Raw-caption ClipMatch (SECONDARY comparison) ---
+            # Computed unconditionally alongside the primary prediction above
+            # (NOT gated on gt_syn) so the CSV's comparison columns are
+            # populated whenever ClipMatch itself ran, exactly mirroring the
+            # primary block's own structure — only its ACCURACY accumulation
+            # below is gated on actually having a GT synset to compare
+            # against. Does not feed nature/biotic/material scoring or hP/hR
+            # either way.
+            if run_summary_clipmatch:
+                per_cand_sim_caption, pred_idx_caption = clip_metrics.clipmatch(
+                    caption_embs_cm[idx], candidate_embs)
+                if pred_idx_caption >= 0:
+                    caption_pred_vocab_entry = candidate_vocab[pred_idx_caption]
+                    clipmatch_caption_pred_similarity = float(per_cand_sim_caption[pred_idx_caption])
+
             t0 = targets[0]
             # Pull the VLM hybrid resolved labels for the argmax extracted object
             best_final = finals[best_obj_idx] if best_obj_idx is not None else None
@@ -801,21 +816,13 @@ def phase_score(args):
                     hf1_vals_mapped.append(hier["hf1"])
                     wup_vals_mapped.append(wup_sim)
 
-                # --- Raw-caption ClipMatch (SECONDARY comparison) ---
-                # Only computed when the summary caption is PRIMARY (above) —
-                # kept purely as a reported comparison point against the
-                # metric that's actually driving scoring now, does NOT feed
-                # nature/biotic/material scoring or hP/hR either way.
-                if run_summary_clipmatch:
-                    per_cand_sim_caption, pred_idx_caption = clip_metrics.clipmatch(
-                        caption_embs_cm[idx], candidate_embs)
-                    if pred_idx_caption >= 0:
-                        caption_pred_vocab_entry = candidate_vocab[pred_idx_caption]
-                        clipmatch_caption_pred_similarity = float(per_cand_sim_caption[pred_idx_caption])
-                        clipmatch_caption_support += 1
-                        clipmatch_caption_correct = caption_pred_vocab_entry["synset_id"] == gt_syn
-                        if clipmatch_caption_correct:
-                            clipmatch_caption_top1 += 1
+                # Raw-caption ClipMatch accuracy accumulation (prediction
+                # itself was already computed above, unconditionally).
+                if run_summary_clipmatch and caption_pred_vocab_entry is not None:
+                    clipmatch_caption_support += 1
+                    clipmatch_caption_correct = caption_pred_vocab_entry["synset_id"] == gt_syn
+                    if clipmatch_caption_correct:
+                        clipmatch_caption_top1 += 1
         elif dataset == "big5":
             # --- BIG-5 (holistic image-level annotation) ---
             # GT here is ONE label per axis for the WHOLE scene (see
