@@ -68,11 +68,23 @@ CAPTION_PROMPT = "Describe this image, including any text."
 # ImageNet/Places (see src/vlm_pipeline.summarize_caption_batch,
 # run_vlm_pipeline.py's --no_summarize_clipmatch_caption to opt out). Still
 # NOT part of the baseline two-pass pipeline itself — only feeds ClipMatch.
+#
+# "main subject OR SETTING" is deliberate, not just "main subject": ImageNet's
+# candidate classes are object-centric (a discrete figure-in-a-scene, e.g.
+# "golden retriever"), but Places365's classes ARE the scene itself
+# ("airport terminal", "kitchen") — there's no separate "subject" apart from
+# the setting to describe. A subject-only phrasing risks the summary fixating
+# on an incidental foreground object instead of the scene ClipMatch actually
+# needs to match against Places' candidate vocabulary. One shared prompt
+# across both datasets, not forked per-dataset — simpler to defend
+# methodologically, and not yet validated as a net win vs the original
+# subject-only wording (worth re-checking ClipMatch top-1 on Places
+# specifically after this change, since that's the dataset it targets).
 SUMMARY_CAPTION_PROMPT = (
     "Here is a detailed description of this image:\n\n"
     "\"{caption}\"\n\n"
     "Using both the image and this description, write a short summary "
-    "(at most 50 words) capturing only the main subject and its "
+    "(at most 50 words) capturing only the main subject or setting, and its "
     "most important surrounding context."
 )
 
