@@ -4,7 +4,11 @@ design rationale AND, in "IMPLEMENTED:" notes, how the shipped code actually
 does it where the two differ. v5: ClipMatch switched to the caption-based
 variant as the only implementation — see Section 8e and Section 11. v6:
 FG-CLIP2 tried and ABANDONED as a CLIP backend — see Section 11 — replaced
-in CLIP_PRESETS by SigLIP2 and Jina-CLIP-v2.)
+in CLIP_PRESETS by SigLIP2 and Jina-CLIP-v2. The object-list ClipMatch
+variant was briefly reintroduced as a diagnostic and re-removed the same
+day — CONFIRMED AGAIN worse than caption-based (0.28 vs 0.34 top-1 on the
+spot-check run); see Section 8e/11, this is the SECOND time this exact
+result has held.)
 
 ===============================================================
 0. IMPLEMENTATION STATUS (NEW in v4)
@@ -704,6 +708,15 @@ RESOLVED IN v5 (decided from empirical comparison):
   clip_metrics.py; the raw-caption approach is now the ONLY
   implementation, its 77-token truncation caveat accepted as a
   stated limitation.
+- RE-CONFIRMED (2026-07, same day): re-implemented the object-list
+  variant a second time as a diagnostic (`clip_metrics.object_list_sentence`,
+  "a photo in which appear a {}, a {}, ... and a {}" with per-object
+  `inflect`-driven determiners) specifically to re-test whether it
+  would beat caption-based ClipMatch now that captions run ~248
+  tokens. Measured 0.28 top-1 vs. 0.34 for caption-based on the
+  spot-check run — still worse. Code removed again; not worth
+  re-testing a third time without a different underlying change (e.g.
+  a different sentence template or CLIP backend), per Pau's call.
 
 RESOLVED IN v4 (decided during implementation):
 - hP/hR predicted-class -> WordNet-node step: uses CLIP-ranked object
