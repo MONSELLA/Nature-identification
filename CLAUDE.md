@@ -185,6 +185,14 @@ evaluating the models.
   (`has_biotic` vs `has_abiotic`) applies, unlike the nature axis, where "no
   nature entity output at all" is sufficient for a no-nature GT (there's no
   meaningful "found an explicit non-nature entity" signal to require there).
+  GT ITSELF can also be BOTH directions at once: the majority-vote GT CSVs
+  (`src.loaders.dataset_loader.load_big5`) carry coder-disagreement cells
+  like "material; immaterial" — per Pau, that image genuinely counts as BOTH
+  labels, not excluded, so `gt_biotic`/`gt_material` are LISTS (`[True]`,
+  `[False]`, or `[True, False]` for disagreement), and EVERY element
+  contributes its own separate GT instance scored against the same extracted
+  entities — a disagreement image can add two rows (one per direction) to
+  that axis's accuracy/precision/recall table instead of one.
 - **COCO**: image-level nature = OR over extracted objects; biotic/material
   scored on the matched GT object via lexical matching (`find_matching_object`).
   Evaluated separately via the Grounding pipeline going forward — box-IoU

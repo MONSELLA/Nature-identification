@@ -750,21 +750,36 @@ def phase_score(args):
             has_material = any(fin["final_material"] is True for fin in nature_entities)
             has_immaterial = any(fin["final_material"] is False for fin in nature_entities)
 
+            # gt_biotic/gt_material are LISTS (src.loaders.dataset_loader.load_big5),
+            # not a plain bool|None: usually one element, but BOTH [True, False]
+            # when the human coders genuinely disagreed (e.g. "material;
+            # immaterial") — per Pau, that image counts as GENUINELY BOTH labels
+            # at once, not "neither"/excluded, so EVERY element contributes its
+            # own separate GT instance against these SAME extracted entities
+            # (one image can therefore add up to two rows to bio_true/bio_pred).
             t0 = targets[0] if targets else {}
             target_matches = [{"class_name": t0.get("class_name")}]
-            if t0.get("gt_biotic") is not None:
-                gt_b = bool(t0["gt_biotic"])
-                pred_b = has_biotic if gt_b else (not has_abiotic)
-                bio_true.append(gt_b)
-                bio_pred.append(pred_b)
-                target_matches[0].update({"gt_biotic": gt_b, "pred_biotic": pred_b,
+            gt_biotic_vals = t0.get("gt_biotic")
+            if gt_biotic_vals is not None:
+                pred_biotic_vals = []
+                for gt_b in gt_biotic_vals:
+                    gt_b = bool(gt_b)
+                    pred_b = has_biotic if gt_b else (not has_abiotic)
+                    bio_true.append(gt_b)
+                    bio_pred.append(pred_b)
+                    pred_biotic_vals.append(pred_b)
+                target_matches[0].update({"gt_biotic": gt_biotic_vals, "pred_biotic": pred_biotic_vals,
                                           "has_biotic_entity": has_biotic, "has_abiotic_entity": has_abiotic})
-            if t0.get("gt_material") is not None:
-                gt_m = bool(t0["gt_material"])
-                pred_m = has_material if gt_m else (not has_immaterial)
-                mat_true.append(gt_m)
-                mat_pred.append(pred_m)
-                target_matches[0].update({"gt_material": gt_m, "pred_material": pred_m,
+            gt_material_vals = t0.get("gt_material")
+            if gt_material_vals is not None:
+                pred_material_vals = []
+                for gt_m in gt_material_vals:
+                    gt_m = bool(gt_m)
+                    pred_m = has_material if gt_m else (not has_immaterial)
+                    mat_true.append(gt_m)
+                    mat_pred.append(pred_m)
+                    pred_material_vals.append(pred_m)
+                target_matches[0].update({"gt_material": gt_material_vals, "pred_material": pred_material_vals,
                                           "has_material_entity": has_material, "has_immaterial_entity": has_immaterial})
         else:
             # --- COCO (multi-label): image-level nature OR + matched-object

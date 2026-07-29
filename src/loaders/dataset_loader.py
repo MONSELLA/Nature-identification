@@ -423,15 +423,34 @@ def load_big5(en_gt, es_gt, images_dir):
     # Small helper functions to turn the raw CSV cell text ("Yes"/"No",
     # "Material"/"Immaterial", "Biotic"/"Abiotic") into 1/0/None. Kept as
     # local closures since they're only used within this one function.
-    # NOTE: the majority-vote GT can also carry DISAGREEMENT cells (coders
-    # split), e.g. "material; immaterial" or "biotic; abiotic" — those don't
-    # match any of the single-word checks below, so they fall through to
-    # None ("not applicable") exactly like a genuinely blank/"-" cell. This
-    # is a deliberate simplification, not an oversight: revisit if disagreement
-    # rows should be scored differently instead of excluded from that axis.
     def map_yn(val): return 1 if str(val).strip().lower() == 'yes' else (0 if str(val).strip().lower() == 'no' else None)
-    def map_mat(val): return 1 if str(val).strip().lower() == 'material' else (0 if str(val).strip().lower() == 'immaterial' else None)
-    def map_bio(val): return 1 if str(val).strip().lower() == 'biotic' else (0 if str(val).strip().lower() == 'abiotic' else None)
+
+    # map_mat/map_bio return a LIST of every value present in the cell, not a
+    # single 1/0/None — the majority-vote GT can carry DISAGREEMENT cells
+    # (coders split), e.g. "material; immaterial" or "biotic; abiotic". Per
+    # Pau: that image genuinely counts as BOTH labels at once, not "neither"/
+    # excluded — so "material; immaterial" -> [1, 0] (both), a clean
+    # "material" -> [1], a clean "immaterial" -> [0], and a blank/"-"/
+    # unrecognized cell -> [] (not applicable, same as before). The caller
+    # (run_inference/scoring) is expected to treat each element of the list as
+    # its OWN ground-truth instance of that axis for this same image — e.g. a
+    # [1, 0] material result contributes one "this image is material" check
+    # AND one separate "this image is immaterial" check, both scored against
+    # the SAME extracted entities.
+    def _split_values(val):
+        return [p.strip().lower() for p in str(val).split(";") if p.strip()]
+    def map_mat(val):
+        parts = _split_values(val)
+        out = []
+        if "material" in parts: out.append(1)
+        if "immaterial" in parts: out.append(0)
+        return out
+    def map_bio(val):
+        parts = _split_values(val)
+        out = []
+        if "biotic" in parts: out.append(1)
+        if "abiotic" in parts: out.append(0)
+        return out
 
     results = []
 
@@ -463,16 +482,16 @@ def load_big5(en_gt, es_gt, images_dir):
                 nat = map_yn(row.get(f'nature_visual_{idx}'))
                 if nat is None: continue
 
-                mat = map_mat(row.get(f'nep_materiality_visual_{idx}'))
-                bio = map_bio(row.get(f'nep_biological_visual_{idx}'))
-                if nat == 0 and (mat is not None or bio is not None):
+                mat_vals = map_mat(row.get(f'nep_materiality_visual_{idx}'))
+                bio_vals = map_bio(row.get(f'nep_biological_visual_{idx}'))
+                if nat == 0 and (mat_vals or bio_vals):
                     # Safety net: if a human annotator somehow marked this
                     # media as NOT nature but still filled in a biotic/material
                     # value (a data-entry inconsistency), force both back to
                     # "not applicable" rather than trusting the contradictory
                     # values — matches the same rule enforced elsewhere in the
                     # pipeline (no biotic/material label when nature is False).
-                    mat, bio = None, None
+                    mat_vals, bio_vals = [], []
 
                 matches = glob.glob(os.path.join(images_dir, f"{platform_id}_{idx}.*"))
                 if not matches:
@@ -485,8 +504,15 @@ def load_big5(en_gt, es_gt, images_dir):
                         "class_name": "scene", # BIG-5 annotations apply to the entire scene
                         "synset_id": None,      # holistic scene label — no WordNet synset
                         "gt_nature": nat == 1,
-                        "gt_biotic": bio == 1 if bio is not None else None,
-                        "gt_material": mat == 1 if mat is not None else None
+                        # LISTS, not plain bool|None — each element is bool(v == 1)
+                        # for v in {mat,bio}_vals. Usually one element ([True] or
+                        # [False]); [] when not applicable; BOTH [True, False]
+                        # when coders disagreed (see map_mat/map_bio above) — the
+                        # BIG-5-specific scoring branch in run_vlm_pipeline.py
+                        # scores every element as its own GT instance against the
+                        # same extracted entities, not just the first one.
+                        "gt_biotic": [v == 1 for v in bio_vals] or None,
+                        "gt_material": [v == 1 for v in mat_vals] or None,
                     }]
                 })
     return results
