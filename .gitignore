@@ -14,3 +14,6 @@ visualization_app/
 
 # Python chache
 __pycache__/
+
+# Secrets (e.g. HF_TOKEN)
+.env
