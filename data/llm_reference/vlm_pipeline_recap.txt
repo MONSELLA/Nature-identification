@@ -1,4 +1,4 @@
-BIG-5 VLM PIPELINE — DESIGN RECAP (v8)
+BIG-5 VLM PIPELINE — DESIGN RECAP (v9)
 (v4: the VLM pipeline is now IMPLEMENTED — this doc records both the original
 design rationale AND, in "IMPLEMENTED:" notes, how the shipped code actually
 does it where the two differ. v5: ClipMatch switched to the caption-based
@@ -16,7 +16,10 @@ the raw caption itself) on ImageNet/Places — measured 0.41 vs 0.34 top-1,
 — see Section 8e/11. v8: SigLIP2 actually added to CLIP_PRESETS (native
 transformers, no trust_remote_code); OBJECT_TEMPLATE's "a photo of a {}"
 now goes through an inflect-checked determiner everywhere it's filled in
-— see Section 11.)
+— see Section 11. v9: SigLIP2 measured WORSE than MetaCLIP for ClipMatch —
+added two LAION OpenCLIP-in-CLIPModel-format checkpoints ("laion_h14",
+"laion_bigg") as the hassle-free EVA-CLIP-tier option instead — see
+Section 11.)
 
 ===============================================================
 0. IMPLEMENTATION STATUS (NEW in v4)
@@ -711,6 +714,27 @@ RESOLVED IN v6 (decided after repeated integration failures):
   clip_metrics.CLIPScorer's class docstring) were PROPOSED as
   replacements here, but neither was actually added to CLIP_PRESETS at
   the time — see RESOLVED IN v8 below for what's actually wired in.
+
+RESOLVED IN v9 (decided from empirical comparison, per Pau):
+- SigLIP2 (v8) measured WORSE than MetaCLIP for ClipMatch on a
+  spot-check comparison — not the drop-in upgrade its native-HF/
+  no-trust_remote_code convenience suggested. Kept in CLIP_PRESETS
+  (still useful for other reference-free metrics/comparisons) but no
+  longer the go-to "safe" option for ClipMatch specifically.
+- EVA-CLIP itself needs open_clip or a trust_remote_code wrapper —
+  the exact dependency risk this project has twice already hit (FG-
+  CLIP2, and the general "custom modeling code can crash under this
+  transformers version" lesson). Added the hassle-free equivalent
+  instead: two LAION OpenCLIP checkpoints that were converted to the
+  SAME "original" CLIPModel/CLIPProcessor classes (plain transformers,
+  no trust_remote_code, byte-identical code path to "original" — only
+  the repo id differs, so CLIPScorer needed zero new code):
+    "laion_h14"  -> laion/CLIP-ViT-H-14-laion2B-s32B-b79K   (~78% zero-shot IN1k)
+    "laion_bigg" -> laion/CLIP-ViT-bigG-14-laion2B-39B-b160k (~80% zero-shot IN1k,
+                    EVA-CLIP-tier scale, slower/bigger)
+  Both trained on LAION-2B (much larger/broader than OpenAI's original
+  CLIP training data), landing in the same performance tier as EVA-
+  CLIP's stronger variants without EVA-CLIP's loading risk.
 
 RESOLVED IN v8:
 - SigLIP2 (google/siglip2-base-patch16-224) actually added to

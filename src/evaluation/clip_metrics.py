@@ -51,6 +51,16 @@ CLIP_PRESETS = {
     # get_text_features/get_image_features branch, which already returns a
     # plain Tensor — no special-casing needed here.
     "siglip2": "google/siglip2-base-patch16-224",
+    # EVA-CLIP itself needs open_clip or a trust_remote_code wrapper — exactly
+    # the dependency risk this project avoids (see FG-CLIP2 above). These two
+    # LAION checkpoints are the hassle-free equivalent: they're OpenCLIP
+    # weights converted to the SAME "original" CLIPModel/CLIPProcessor classes
+    # (plain transformers, no trust_remote_code, identical code path to
+    # "original" — literally just a different repo id), but trained on
+    # LAION-2B (much larger/broader data than OpenAI's original CLIP), landing
+    # in the same performance tier as EVA-CLIP's stronger variants.
+    "laion_h14": "laion/CLIP-ViT-H-14-laion2B-s32B-b79K",       # ~78% zero-shot IN1k, faster
+    "laion_bigg": "laion/CLIP-ViT-bigG-14-laion2B-39B-b160k",   # ~80% zero-shot IN1k, EVA-CLIP-tier, slower/bigger
     "longclip": "longclip",  # Routed directly to local GitHub clone
 }
 
