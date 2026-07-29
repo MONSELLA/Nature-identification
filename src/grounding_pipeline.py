@@ -67,8 +67,11 @@ Stage 1 — SAM3 GROUNDING
 
 Stage 2 — NATURE RELEVANCE SCORE
   Union of every surviving nature mask (RLE-merged, so pixels shared by two
-  entities are counted once), scored by one of:
-    * coverage_ratio  (default) — nature pixels / total pixels, in [0, 1].
+  entities are counted once), scored by BOTH methods at once (not a
+  selectable either/or — cheap to compute together off the same union mask,
+  and storing both lets downstream analysis/evaluation compare them without
+  re-running grounding):
+    * coverage_ratio  — nature pixels / total pixels, in [0, 1].
     * center_weighted — each pixel weighted by a Gaussian in its distance from
       the image center before summing, normalized by the total weight so the
       result stays in [0, 1]. Rationale: centrally-placed content is more likely
@@ -77,12 +80,12 @@ Stage 2 — NATURE RELEVANCE SCORE
 Storage convention: this pipeline does NOT write its own separate output file.
 It reads the VLM pipeline's JSON-Lines artifact and ENRICHES each image record
 in place with its own fields, so one artifact holds everything — entities,
-labels, masks and the relevance score — after both stages have run. Per image
+labels, masks and the relevance scores — after both stages have run. Per image
 record it adds:
 
     "object_groundings": [ per-object dict aligned with record["objects"] ],
-    "nature_relevance_score": float,
-    "relevance_score_method": "coverage_ratio" | "center_weighted",
+    "nature_relevance_score_coverage_ratio": float,
+    "nature_relevance_score_center_weighted": float,
 
 `object_groundings[k]` aligns index-for-index with `objects[k]` /
 `object_labels[k]` / `object_finals[k]`, exactly like the VLM pipeline's own
@@ -124,7 +127,9 @@ DEFAULT_MASK_THRESHOLD = 0.5
 # HuggingFace repo for the single model this whole stage runs on.
 SAM3_MODEL_ID = "facebook/sam3"
 
-# Relevance-score methods selectable from the CLI (see nature_relevance_score).
+# The two relevance-score methods, both ALWAYS computed together (see
+# nature_relevance_scores) — this tuple just names the dict keys/CSV suffixes
+# they land under, it's no longer a CLI "choose one" selector.
 RELEVANCE_METHODS = ("coverage_ratio", "center_weighted")
 
 # Default width of the center_weighted Gaussian, in units where the image center
@@ -290,26 +295,28 @@ def center_weighted_score(mask: np.ndarray, sigma: float = DEFAULT_CENTER_SIGMA)
     return float(weights[mask].sum() / total)
 
 
-def nature_relevance_score(
+def nature_relevance_scores(
     rles: Sequence[Dict[str, Any]],
     height: int,
     width: int,
-    method: str = "coverage_ratio",
     center_sigma: float = DEFAULT_CENTER_SIGMA,
-) -> float:
-    """Nature relevance for one image, from its surviving entities' RLE masks.
+) -> Dict[str, float]:
+    """Nature relevance for one image, from its surviving entities' RLE masks,
+    under BOTH scoring methods at once — {"coverage_ratio": ..., "center_weighted": ...}.
+    Both are computed off the SAME union mask (one extra O(H*W) reduction is
+    negligible next to the union/RLE-merge cost), so there's no reason to make
+    a caller choose only one and re-run grounding to get the other.
 
-    An image with no grounded nature entity scores 0.0 — a genuine "no nature
-    found here" verdict, not a missing value.
+    An image with no grounded nature entity scores 0.0 under both — a genuine
+    "no nature found here" verdict, not a missing value.
     """
-    if method not in RELEVANCE_METHODS:
-        raise ValueError(f"Unknown relevance method {method!r}; expected one of {RELEVANCE_METHODS}.")
     if not rles:
-        return 0.0
+        return {"coverage_ratio": 0.0, "center_weighted": 0.0}
     merged = union_mask(rles, height, width)
-    if method == "coverage_ratio":
-        return coverage_ratio_score(merged)
-    return center_weighted_score(merged, sigma=center_sigma)
+    return {
+        "coverage_ratio": coverage_ratio_score(merged),
+        "center_weighted": center_weighted_score(merged, sigma=center_sigma),
+    }
 
 
 # =============================================================================
@@ -440,15 +447,15 @@ def ground_records(
     records: Iterable[Dict[str, Any]],
     batch_size: int = 8,
     max_pairs_per_forward: int = 16,
-    relevance_method: str = "coverage_ratio",
     center_sigma: float = DEFAULT_CENTER_SIGMA,
     n_total: Optional[int] = None,
     verbose: bool = False,
 ) -> Iterator[Dict[str, Any]]:
     """
     Ground every nature entity of every record and yield the SAME record dicts,
-    enriched with `object_groundings`, `nature_relevance_score` and
-    `relevance_score_method` (see the module docstring for the exact shape).
+    enriched with `object_groundings`, `nature_relevance_score_coverage_ratio`
+    and `nature_relevance_score_center_weighted` (see the module docstring for
+    the exact shape) — BOTH scores are always computed, never just one.
 
     Records are consumed and yielded in order, `batch_size` IMAGES at a time, so
     this composes with `stream_artifact` for constant memory over a large run.
@@ -458,8 +465,8 @@ def ground_records(
     actual GPU work, since a busy image can carry many nature entities.
 
     An image that fails to LOAD is still yielded, with every entity marked
-    `grounded: false` and a relevance score of 0.0, so one unreadable file never
-    aborts a long run and the failure stays visible in the artifact.
+    `grounded: false` and both relevance scores 0.0, so one unreadable file
+    never aborts a long run and the failure stays visible in the artifact.
     """
     batch: List[Dict[str, Any]] = []
     progress = BatchProgress(
@@ -472,8 +479,7 @@ def ground_records(
     n_done = 0
 
     def _flush(chunk: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        return _ground_batch(grounder, chunk, max_pairs_per_forward,
-                             relevance_method, center_sigma, verbose)
+        return _ground_batch(grounder, chunk, max_pairs_per_forward, center_sigma, verbose)
 
     for rec in records:
         batch.append(rec)
@@ -501,7 +507,6 @@ def _ground_batch(
     grounder: SAM3Grounder,
     batch: List[Dict[str, Any]],
     max_pairs_per_forward: int,
-    relevance_method: str,
     center_sigma: float,
     verbose: bool,
 ) -> List[Dict[str, Any]]:
@@ -573,17 +578,17 @@ def _ground_batch(
             g["mask_rle"] = encode_rle(mask)
             g["pixel_count"] = int(mask.sum())
 
-    # 4. Per-image relevance score over the UNION of surviving masks.
+    # 4. Per-image relevance scores (BOTH methods) over the UNION of surviving masks.
     for ri, rec in enumerate(batch):
         rles = [g["mask_rle"] for g in rec["object_groundings"]
                 if g["grounded"] and g["mask_rle"] is not None]
         size = sizes[ri]
         if size is None:
-            rec["nature_relevance_score"] = 0.0
+            scores = {"coverage_ratio": 0.0, "center_weighted": 0.0}
         else:
-            rec["nature_relevance_score"] = nature_relevance_score(
-                rles, size[0], size[1], method=relevance_method, center_sigma=center_sigma)
-        rec["relevance_score_method"] = relevance_method
+            scores = nature_relevance_scores(rles, size[0], size[1], center_sigma=center_sigma)
+        rec["nature_relevance_score_coverage_ratio"] = scores["coverage_ratio"]
+        rec["nature_relevance_score_center_weighted"] = scores["center_weighted"]
 
     # Release the decoded images promptly rather than waiting on GC — a batch of
     # full-resolution PIL images is not small.

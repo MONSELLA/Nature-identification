@@ -1,0 +1,14 @@
+{
+  "port": 8070,
+  "host": "127.0.0.1",
+  "dataset_roots": {
+    "imagenet": "/home/pau/Documentos/Universidad/Master/TFM/ImageNet/extracted_data",
+    "places": "/home/pau/Documentos/Universidad/Master/TFM/Places/val_formatted",
+    "big5": "/home/pau/Documentos/Universidad/Master/TFM/BIG_5_Dataset",
+    "coco": ""
+  },
+  "csv_search_dirs": [
+    "../results",
+    "/home/pau/Documentos/Universidad/Master/TFM/code/results"
+  ]
+}

@@ -12,15 +12,23 @@ openpyxl>=3.1          # engine pandas needs to read the .xlsx taxonomy workbook
 scikit-learn>=1.3      # accuracy/precision/recall/F1, average_precision_score
 networkx>=3.0          # the WordNet taxonomy DAG (src/loaders/excel_loader.py)
 nltk>=3.8               # WordNet corpus access (synsets, hypernyms, wup_similarity)
-tqdm>=4.65
+tqdm>=4.65              # progress bars in baseline/*.py specifically (the active VLM/Grounding
+                        # pipeline uses its own src.utils.BatchProgress instead, no tqdm import there)
 
 # --- Structured VLM output (src/models/prompts.py, src/models/vlm_models.py) ---
 pydantic>=2.0          # v2 API required (model_json_schema / model_fields)
 
 # --- VLM inference backends (src/models/vlm_models.py) ---
-# vLLM-served families (qwen/mistral/llava/gemma): needs SamplingParams,
-# GuidedDecodingParams, and vllm.distributed.parallel_state's
+# Every registered model family (qwen/mistral/llava/internvl/gemma) is served
+# through vLLM — needs SamplingParams, StructuredOutputsParams
+# (vllm.sampling_params — this is the CURRENT vLLM API name; older vLLM
+# releases called this GuidedDecodingParams, but that name is gone from the
+# code now, so don't go looking for it), and vllm.distributed.parallel_state's
 # destroy_model_parallel/destroy_distributed_environment.
+# (The HuggingFace-served BLIP/BLIP-2/InstructBLIP/BLIP-3 family and its
+# `outlines`-based structured-decoding path were REMOVED — this project only
+# evaluates vLLM-served models. Don't re-add `outlines` here unless that
+# backend comes back; nothing else in this codebase imports it.)
 #
 # IMPORTANT — DO NOT re-add an `outlines<1.0.0` upper pin here, and DO NOT
 # pin transformers/torch/xformers/outlines to specific versions of your own.
@@ -31,22 +39,48 @@ pydantic>=2.0          # v2 API required (model_json_schema / model_fields)
 # 'rope_type' key"). vLLM pins its OWN coherent torch/xformers/transformers/
 # outlines set — let it win. Give it only a recent FLOOR and stay out of the way.
 vllm>=0.10.0
-transformers>=4.40
+# 5.14.1 floor (higher than vLLM's OWN floor) because the Grounding pipeline's
+# SAM3 support (transformers.models.sam3) only exists from 5.14.1 on —
+# confirmed present there. If AutoModel.from_pretrained("facebook/sam3")
+# raises an unknown-model-type error, this floor is why: upgrade transformers,
+# don't chase it as a config problem.
+# CHECKED FOR CONFLICT WITH vLLM (this is exactly the kind of pairing that
+# broke things before — see the outlines<1.0.0 story above): vLLM's own
+# latest PyPI release (0.26.0, checked 2026-07) declares `transformers>=5.5.3`
+# with NO upper bound, so pip can freely pick any transformers >=5.14.1 to
+# satisfy both constraints at once — no conflict today. This has NOT always
+# been true of every vLLM release (older ones have pinned transformers<5 at
+# times), so if a future vLLM release reintroduces an upper cap below 5.14.1,
+# `pip install -r requirements.txt` will fail loudly (not silently downgrade)
+# rather than installing something broken — if that happens, the fix is to
+# bump `vllm>=` to a release whose own transformers ceiling clears 5.14.1,
+# not to lower this floor (that just reintroduces the SAM3 breakage).
+transformers>=5.14.1
 torch>=2.1
 torchvision>=0.16
 Pillow>=10.0
-# HuggingFace-served families (blip/blip2/instructblip/blip3) ONLY: their
-# structured decoding used outlines.integrations.transformers.JSONPrefixAllowedTokens,
-# which outlines 1.0 removed. vLLM now pulls outlines>=1.0, so if you actually
-# run a BLIP-family model, that specific code path in vlm_models.py needs
-# updating to the outlines 1.0 API — a separate task, and NOT something to
-# "fix" by pinning outlines back down (that re-breaks vLLM as described above).
 
 # --- CLIP-based metrics (src/evaluation/clip_metrics.py) ---
-# F-CLIPScore, Object-CLIPScore, ClipMatch all run through a CLIPScorer
-# (transformers AutoModel/AutoProcessor — see clip_metrics.CLIP_PRESETS for
-# the supported checkpoints: original CLIP, EVA-CLIP, SigLIP2, Jina-CLIP-v2).
-# No open_clip dependency; transformers>=4.40 above already covers all four.
+# F-CLIPScore, Object-CLIPScore, ClipMatch all run through a CLIPScorer.
+# clip_metrics.CLIP_PRESETS currently offers FOUR checkpoints — keep this
+# list in sync with that dict if it changes, this has drifted before:
+#   "original" (openai/clip-vit-large-patch14), "metaclip"
+#   (facebook/metaclip-h14-fullcc2.5b), "altclip" (BAAI/AltCLIP) — all three
+#   native transformers AutoModel/AutoProcessor, covered by transformers
+#   above, no extra packages — PLUS "longclip", which is different enough to
+#   need its own dependencies below.
+sentencepiece>=0.1.99  # AltCLIP's text tower is XLM-RoBERTa-based; its
+                       # tokenizer needs sentencepiece, which transformers
+                       # does NOT pull in as a hard dependency on its own.
+# longclip (CLIP_PRESETS["longclip"]) is NOT a transformers checkpoint at
+# all — clip_metrics.py routes it to a LOCAL CLONE of the Long-CLIP GitHub
+# repo (LONG_CLIP_REPO_PATH, currently "/home/pmonserrat/Long-CLIP") plus its
+# own checkpoint file (checkpoints/longclip-L.pt), neither of which pip can
+# install — same category as the "NOT on PyPI" baseline/ deps at the bottom
+# of this file. Only these two extra PACKAGES are needed once that repo is
+# cloned and the checkpoint downloaded:
+ftfy>=6.1
+regex>=2023.0
 # (FG-CLIP2 was tried and abandoned — meta-tensor crash in its
 # trust_remote_code __init__ under this project's transformers version; see
 # clip_metrics.CLIP_PRESETS's comment.)
@@ -56,16 +90,13 @@ Pillow>=10.0
 # environment (confirmed: installing llm2vec force-downgrades transformers
 # and breaks vLLM). Would need a second, separate environment to use — not
 # worth the operational overhead here.
-einops                  # required by jina-clip-v2's trust_remote_code modeling code
 
 # --- Grounding pipeline (src/grounding_pipeline.py) ---
 # SAM3 (facebook/sam3) is loaded through plain transformers AutoModel/
 # AutoProcessor — no trust_remote_code, no separate detector, no separate
-# segmentation model. It needs a transformers release that actually ships
-# `transformers.models.sam3` (confirmed present in 5.14.1); the
-# transformers>=4.40 floor above is NOT sufficient on its own, so if
-# `AutoModel.from_pretrained("facebook/sam3")` raises an unknown-model-type
-# error, upgrade transformers rather than chasing it as a config problem.
+# segmentation model. Needs `transformers.models.sam3`, which is why the
+# transformers floor above is 5.14.1, not some older version — see that
+# entry's comment.
 # pycocotools (listed below for the closed-set baselines) is ALSO required here
 # for RLE mask encoding/decoding and RLE union merging.
 

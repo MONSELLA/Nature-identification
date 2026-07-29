@@ -5,7 +5,7 @@ run_grounding_pipeline.py
 Driver for the GROUNDING stage only (SAM3 segmentation -> nature relevance
 score). It reads the JSON-Lines artifact the VLM pipeline wrote
 (`run_vlm_pipeline.py --stage infer`, default
-`<results_dir>/<run_name>/vlm_responses_<model>.jsonl`) and ENRICHES each image
+`<results_dir>/<run_name>/responses/vlm_responses_<model>.jsonl`) and ENRICHES each image
 record with its own fields, so ONE artifact ends up holding everything for a
 given image — caption, entities, taxonomy labels, masks, relevance score —
 rather than the grounding stage writing a second, separate output file that
@@ -21,15 +21,20 @@ would have to be re-joined later.
 
 Fields added per image record (see src/grounding_pipeline.py's module docstring
 for the full shape):
-    "object_groundings"       — aligned index-for-index with "objects", one
-                                entry per extracted entity, carrying
-                                {grounded, mask_rle, pixel_count, ...}.
+    "object_groundings"                        — aligned index-for-index with
+                                "objects", one entry per extracted entity,
+                                carrying {grounded, mask_rle, pixel_count, ...}.
                                 Entities SAM3 could not confirm are MARKED
                                 (`grounded: false`), never deleted, so the full
                                 VLM output stays auditable.
-    "nature_relevance_score"  — float in [0, 1] over the UNION of the surviving
-                                nature masks (overlapping pixels counted once).
-    "relevance_score_method"  — "coverage_ratio" | "center_weighted".
+    "nature_relevance_score_coverage_ratio"     — float in [0, 1], nature px /
+                                total px, over the UNION of surviving nature
+                                masks (overlapping pixels counted once).
+    "nature_relevance_score_center_weighted"    — float in [0, 1], same union
+                                mask but pixels near the image center count
+                                more (Gaussian falloff, --center_sigma).
+                                BOTH scores are always computed and stored —
+                                not a selectable either/or.
 
 Only entities whose HYBRID resolved label is nature (`final_nature is True`) are
 grounded — everything else gets `grounded: null` ("never attempted"), which is
@@ -66,7 +71,6 @@ logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 from src.grounding_pipeline import (
     DEFAULT_CENTER_SIGMA,
     DEFAULT_MASK_THRESHOLD,
-    RELEVANCE_METHODS,
     SAM3_MODEL_ID,
     SAM3Grounder,
     grounding_diagnostics,
@@ -74,6 +78,12 @@ from src.grounding_pipeline import (
     stream_artifact,
 )
 from src.utils import format_duration
+
+# Must match run_vlm_pipeline.RESPONSES_SUBDIR exactly — duplicated here
+# (rather than imported) so this script stays independently runnable without
+# pulling in run_vlm_pipeline.py's heavier VLM-serving imports (vLLM, etc.)
+# just to ground an existing artifact.
+RESPONSES_SUBDIR = "responses"
 
 
 # =============================================================================
@@ -93,8 +103,7 @@ def phase_ground(args):
         sys.exit(1)
     out_path = _resolve_output_path(args, in_path)
 
-    print(f"🚀 [grounding] {in_path} -> {out_path} "
-          f"(model='{args.sam3_model}', method='{args.relevance_method}')")
+    print(f"🚀 [grounding] {in_path} -> {out_path} (model='{args.sam3_model}')")
     phase_t0 = time.time()
 
     header, footer_holder, records = stream_artifact(in_path)
@@ -109,14 +118,15 @@ def phase_ground(args):
 
     # Record the grounding configuration in the artifact header, next to the
     # VLM's own run metadata, so an enriched artifact is self-describing — you
-    # can tell which SAM3 checkpoint/threshold/scoring method produced these
-    # masks without having to find the command line that made them.
+    # can tell which SAM3 checkpoint/threshold produced these masks without
+    # having to find the command line that made them. Both relevance-score
+    # methods are always computed (see src/grounding_pipeline.py), so
+    # center_sigma is always relevant, not gated on a method choice.
     header = dict(header)
     header["grounding"] = {
         "sam3_model": args.sam3_model,
         "mask_threshold": args.mask_threshold,
-        "relevance_method": args.relevance_method,
-        "center_sigma": args.center_sigma if args.relevance_method == "center_weighted" else None,
+        "center_sigma": args.center_sigma,
         "source_artifact": str(in_path),
     }
 
@@ -133,7 +143,6 @@ def phase_ground(args):
             grounder, records,
             batch_size=args.batch_size,
             max_pairs_per_forward=args.max_pairs_per_forward,
-            relevance_method=args.relevance_method,
             center_sigma=args.center_sigma,
             n_total=args.max_samples,
             verbose=args.verbose,
@@ -176,7 +185,7 @@ def _print_summary(args, header, d, elapsed, out_path):
           f"{str(header.get('dataset', '?')).upper()}  ({d['n_images']} images)")
     print("=" * 60)
     print(f"SAM3: {args.sam3_model} | mask threshold {args.mask_threshold} "
-          f"| relevance '{args.relevance_method}'")
+          f"| relevance: coverage_ratio + center_weighted (sigma {args.center_sigma})")
     print(f"Entities: {d['objects_total']} total | {d['nature_entities']} nature "
           f"({d['nature_entities_per_image']:.2f}/image)")
     # The headline diagnostic: how often an independent segmenter could actually
@@ -222,10 +231,9 @@ def build_arg_parser():
     p.add_argument("--responses_file", type=str, default=None,
                    help="VLM-pipeline artifact to read and enrich (written by "
                         "run_vlm_pipeline.py --stage infer). Default: the same path that "
-                        "script would have used, i.e. "
-                        "'<results_dir>/<run_name>/vlm_responses_<model_slug>.jsonl', "
-                        "which requires --model_family/--model_name so the slug can be "
-                        "rebuilt.")
+                        "script would have used, i.e. '<results_dir>/<run_name>/"
+                        f"{RESPONSES_SUBDIR}/vlm_responses_<model_slug>.jsonl', which requires "
+                        "--model_name so the slug can be rebuilt.")
     p.add_argument("--grounded_file", type=str, default=None,
                    help="Where to write the ENRICHED artifact. Default: "
                         "'grounded_<input stem>.jsonl' next to --responses_file. Ignored "
@@ -239,11 +247,14 @@ def build_arg_parser():
 
     # Identify the input artifact the same way run_vlm_pipeline.py names it.
     p.add_argument("--model_family", type=str, default=None,
-                   help="Only used to reconstruct the default --responses_file name "
-                        "(which is suffixed with the VLM's slug so each model's artifact "
-                        "is distinct). Unnecessary if --responses_file is given.")
+                   help="NOT used to build the default --responses_file name (that's "
+                        "--model_name alone, matching run_vlm_pipeline.py's _model_slug). "
+                        "Accepted here only so the same flags used for the VLM run can be "
+                        "passed straight through without editing.")
     p.add_argument("--model_name", type=str, default=None,
-                   help="See --model_family.")
+                   help="Used to reconstruct the default --responses_file name (suffixed with "
+                        "this model's slug so each model's artifact is distinct). Unnecessary "
+                        "if --responses_file is given.")
     p.add_argument("--results_dir", type=str, default="results",
                    help="Base directory the VLM artifact lives under (matches "
                         "run_vlm_pipeline.py's flag of the same name).")
@@ -279,17 +290,17 @@ def build_arg_parser():
                         "forward passes, to re-confirm on real data that the map is "
                         "unbounded logits rather than an already-normalized probability map.")
 
-    # Relevance score
-    p.add_argument("--relevance_method", choices=list(RELEVANCE_METHODS), default="coverage_ratio",
-                   help="'coverage_ratio' (default): nature pixels / total pixels. "
-                        "'center_weighted': weight each pixel by a Gaussian in its distance "
-                        "from the image center before summing. Both are computed over the "
-                        "UNION of the surviving nature masks and land in [0, 1].")
+    # Relevance score — BOTH methods are always computed and stored (not a
+    # choice between them): "nature_relevance_score_coverage_ratio" (nature
+    # pixels / total pixels) and "nature_relevance_score_center_weighted"
+    # (same union mask, but weighted by a Gaussian in distance from the image
+    # center). Both land in [0, 1] and are computed over the UNION of the
+    # surviving nature masks.
     p.add_argument("--center_sigma", type=float, default=DEFAULT_CENTER_SIGMA,
                    help="Width of the center_weighted Gaussian, in units where the image "
                         "center is 0 and each edge midpoint is 1 (aspect-ratio "
-                        f"independent). Default {DEFAULT_CENTER_SIGMA}. No effect under "
-                        "--relevance_method coverage_ratio.")
+                        f"independent). Default {DEFAULT_CENTER_SIGMA}. Only affects "
+                        "nature_relevance_score_center_weighted.")
 
     # shared
     p.add_argument("--max_samples", type=int, default=None,
@@ -309,26 +320,26 @@ def build_arg_parser():
 def parse_args():
     p = build_arg_parser()
     args = p.parse_args()
-    if args.responses_file is None and not (args.model_family and args.model_name):
+    if args.responses_file is None and not args.model_name:
         # argparse can't express "required unless another flag is set", so this
         # raises the same kind of clean CLI error it would have.
-        p.error("--responses_file is required unless --model_family and --model_name are "
-                "given (they're what the default artifact filename is built from).")
+        p.error("--responses_file is required unless --model_name is given (it's what the "
+                "default artifact filename is built from).")
     return args
 
 
 def _resolve_responses_file(args):
     """Fill in --responses_file's default by rebuilding exactly the path
     run_vlm_pipeline.py's _resolve_responses_file would have written to for the
-    same --results_dir/--run_name/model, so the two scripts agree on where the
-    artifact lives without the path having to be passed by hand. Mutates and
-    returns `args`."""
+    same --results_dir/--run_name/model (including the RESPONSES_SUBDIR
+    grouping), so the two scripts agree on where the artifact lives without
+    the path having to be passed by hand. Mutates and returns `args`."""
     if args.responses_file is None:
         out_dir = Path(args.results_dir)
         if args.run_name:
             out_dir = out_dir / args.run_name
-        slug = f"{args.model_family}/{args.model_name}".replace("/", "_")
-        args.responses_file = str(out_dir / f"vlm_responses_{slug}.jsonl")
+        slug = args.model_name.replace("/", "_")
+        args.responses_file = str(out_dir / RESPONSES_SUBDIR / f"vlm_responses_{slug}.jsonl")
     return args
 
 

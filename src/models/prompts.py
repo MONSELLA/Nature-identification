@@ -48,18 +48,11 @@ from pydantic import BaseModel, Field
 #
 # This is the very FIRST thing we ask the VLM about an image: a plain, open-
 # ended description. No JSON schema, no taxonomy jargon — just "describe what
-# you see". We deliberately ask for background/setting/secondary elements
-# explicitly (not just "describe this image") because a bare prompt tends to
-# only describe the single most obvious subject and skip everything else
-# (called "salience bias"), and tends to be too short to mention secondary
-# details ("brevity bias"). This neutral caption becomes the input to Stage 2.
-"""CAPTION_PROMPT = (
-    "Describe this image in 3-4 sentences, covering the main subject, the "
-    "background, the setting, and any secondary elements present. Be "
-    "specific but concise."
-)"""
-
-CAPTION_PROMPT = "What is this?"
+# you see". The explicit "including any text" clause covers BIG-5's
+# text-heavy/meme/screenshot images, where a bare "describe this image" would
+# otherwise skip on-image text entirely. This neutral caption becomes the
+# input to Stage 2.
+CAPTION_PROMPT = "Describe this image, including any text."
 
 # =============================================================================
 # Stage 2 — Object extraction (structured)
@@ -234,7 +227,7 @@ Based on the visual evidence in the image and the strict definitions provided, c
 Follow the interleaved reasoning structure: evaluate nature first, lock in the decision, and only then evaluate the sub-axes according to these rules:
 {field_lines}
 
-FIRST EXAMPLE OUTPUT FOR TARGET "chair":
+EXAMPLE OUTPUT FOR TARGET "chair":
 {{
   "nature_reasoning": "The target entity is a chair. The visual evidence shows a manufactured structural object made of wood with clearly visible natural grain. While homogenous artefacts are excluded, manufactured objects where the natural material of origin remains visually identifiable by its grain or texture explicitly count as Nature-Based Artefacts, fulfilling the inclusion criteria.",
   "nature": "yes",
@@ -243,7 +236,7 @@ FIRST EXAMPLE OUTPUT FOR TARGET "chair":
   "tangibility": "material"
 }}
 
-SECOND EXAMPLE OUTPUT FOR TARGET "fan":
+EXAMPLE OUTPUT FOR TARGET "fan":
 {{
   "nature_reasoning": "The target entity is an electric fan. The visual evidence reveals a manufactured functional object made of smooth plastic and metal. Because the original natural texture of the materials is completely unidentifiable and altered, and the object does not depict a natural entity, it falls strictly under the Homogenous Artefacts exclusion and fails the criteria for nature.",
   "nature": "no",
@@ -252,7 +245,7 @@ SECOND EXAMPLE OUTPUT FOR TARGET "fan":
   "tangibility": "none"
 }}
 
-THIRD EXAMPLE OUTPUT FOR TARGET "river":
+EXAMPLE OUTPUT FOR TARGET "river":
 {{
   "nature_reasoning": "The target entity is a river. The visual evidence captures a real-world flowing body of water. Hydrological components (rivers, ponds, lakes, streams) are explicitly classified under Non-Living Natural Elements & Processes, fulfilling the inclusion criteria for nature.",
   "nature": "yes",
@@ -261,7 +254,7 @@ THIRD EXAMPLE OUTPUT FOR TARGET "river":
   "tangibility": "material"
 }}
 
-FOURTH EXAMPLE OUTPUT FOR TARGET "dog":
+EXAMPLE OUTPUT FOR TARGET "dog":
 {{
   "nature_reasoning": "The target entity is a dog. The visual evidence indicates this is a stylized animated cartoon depiction rather than an unfiltered documentary photograph of a real animal. Fictional, stylized, or artistic depictions explicitly referencing more-than-human living entities (fauna) count as Representations of Nature, fulfilling the inclusion criteria.",
   "nature": "yes",
@@ -270,7 +263,7 @@ FOURTH EXAMPLE OUTPUT FOR TARGET "dog":
   "tangibility": "immaterial"
 }}
 
-FIFTH EXAMPLE OUTPUT FOR TARGET "sunset":
+EXAMPLE OUTPUT FOR TARGET "sunset":
 {{
   "nature_reasoning": "The target entity is a sunset. The visual evidence shows an artistic painting on canvas depicting a sky at dusk, rather than a literal photograph of reality. Artistic depictions of astrophysical phenomena explicitly count as Representations of Nature, fulfilling the inclusion criteria.",
   "nature": "yes",
@@ -404,7 +397,15 @@ def build_system_prompts(nature_path: str, biotic_path: str, material_path: str)
     definition file once:
 
       - caption_system         : NATURE definition only (no axis-priming, per
-                                 the recap) — used for captioning + extraction.
+                                 the recap) — used for EXTRACTION only. The
+                                 caption call itself (src/vlm_pipeline.py's
+                                 caption_batch, via run_inference) deliberately
+                                 does NOT receive this prompt, so the very
+                                 first free-form look at the image stays
+                                 completely free of nature-related context;
+                                 this string is threaded through run_inference
+                                 only to seed extraction_system_prompt's
+                                 default.
       - label_system_full      : ALL THREE axis definitions — used for
                                  UNMAPPED objects (where the VLM must decide
                                  nature/biotic/material from scratch) AND for

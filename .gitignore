@@ -4,6 +4,7 @@ notebooks/
 temporal.ipynb
 labeling_app/
 .claude
+visualization_app/
 
 #IDE
 .vscode/

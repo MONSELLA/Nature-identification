@@ -50,7 +50,8 @@ class CLIPScorer:
         device: str = "cuda",
         batch_size: int = 64,
         torch_dtype: Optional[str] = "auto",
-        **kwargs  
+        trust_remote_code: bool = False,
+        **kwargs
     ) -> None:
         import torch
         self.device = device
@@ -102,7 +103,7 @@ class CLIPScorer:
             self._is_native_hf = True
             dtype_kwargs = {"torch_dtype": torch_dtype} if torch_dtype is not None else {}
 
-            self.model = AutoModel.from_pretrained(self.repo_id, trust_remote_code=False, **dtype_kwargs)
+            self.model = AutoModel.from_pretrained(self.repo_id, trust_remote_code=trust_remote_code, **dtype_kwargs)
             self.model.eval().to(self.device)
             self._model_dtype = next(self.model.parameters()).dtype
 
@@ -114,12 +115,12 @@ class CLIPScorer:
                     self._text_vocab_size = emb.num_embeddings
 
             try:
-                processor = AutoProcessor.from_pretrained(self.repo_id, trust_remote_code=False)
+                processor = AutoProcessor.from_pretrained(self.repo_id, trust_remote_code=trust_remote_code)
                 self.tokenizer = getattr(processor, "tokenizer", processor)
                 self.image_processor = getattr(processor, "image_processor", processor)
             except Exception:
-                self.tokenizer = AutoTokenizer.from_pretrained(self.repo_id, trust_remote_code=False)
-                self.image_processor = AutoImageProcessor.from_pretrained(self.repo_id, trust_remote_code=False)
+                self.tokenizer = AutoTokenizer.from_pretrained(self.repo_id, trust_remote_code=trust_remote_code)
+                self.image_processor = AutoImageProcessor.from_pretrained(self.repo_id, trust_remote_code=trust_remote_code)
 
             config = getattr(self.model, "config", None)
             text_config = getattr(config, "text_config", config)
@@ -298,10 +299,19 @@ def object_clipscore(
     if object_embs.shape[0] == 0: return 0.0
     return float(np.mean(clip_score(_cos(image_emb, object_embs), w)))
 
+def clipscore(
+    image_emb: np.ndarray, caption_emb: np.ndarray, w: float = DEFAULT_CLIPSCORE_SCALE,
+) -> float:
+    """Plain CLIPScore(caption): the standard reference-free image-caption
+    score (Hessel et al.), no object terms at all. This is the S_term that
+    F-CLIPScore also folds in, exposed here as its own metric so it can be
+    reported alongside (and compared against) F-CLIPScore/Object-CLIPScore."""
+    return float(clip_score(_cos(image_emb, caption_emb[None, :]), w)[0])
+
 def f_clipscore(
     image_emb: np.ndarray, caption_emb: np.ndarray, object_embs: np.ndarray, w: float = DEFAULT_CLIPSCORE_SCALE,
 ) -> float:
-    s_term = float(clip_score(_cos(image_emb, caption_emb[None, :]), w)[0])
+    s_term = clipscore(image_emb, caption_emb, w)
     obj_terms = clip_score(_cos(image_emb, object_embs), w)
     return (s_term + float(np.sum(obj_terms))) / (object_embs.shape[0] + 1)
 

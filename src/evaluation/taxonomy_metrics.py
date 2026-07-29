@@ -73,6 +73,20 @@ def compute_wup_similarity(
     `wn.synset(...).wup_similarity(...)` is NLTK's built-in implementation —
     we're just wrapping it with error-handling so a bad/unknown synset string
     never crashes the caller, it just scores as "not similar at all" (0.0).
+
+    KNOWN NLTK QUIRK (confirmed empirically, not a bug in this wrapper): a
+    synset compared against ITSELF is not always exactly 1.0. NLTK's
+    wup_similarity relies on `min_depth()`, which is not internally
+    consistent across the two call sides when a synset has MULTIPLE distinct
+    hypernym paths of different lengths (multiple inheritance — common in
+    WordNet). Example: `wn.synset("dog.n.01").wup_similarity(wn.synset("dog.n.01"))`
+    returns ~0.929, not 1.0, because "dog.n.01" has both a 9-edge path (via
+    domestic_animal) and a 14-edge path (via canine/carnivore/mammal) up to
+    entity.n.01. This is expected, well-known NLTK behavior for
+    multiply-inheriting synsets, not a project bug — don't "fix" a
+    less-than-1.0 self-similarity you see in results without checking for
+    this first. hP/hR/hF1 (compute_hierarchical_metrics, below) are unaffected
+    since they're plain ancestral-closure set overlap, not this NLTK formula.
     """
     if perfect_match:
         return 1.0

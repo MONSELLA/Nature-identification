@@ -48,11 +48,20 @@ evaluating the models.
 - Baseline is TWO-PASS: open-ended caption (no schema) → separate structured
   extraction call. Never collapse into single-pass-with-schema without it being
   an explicit, labeled ablation.
-- Caption prompt (baseline, neutral, no nature-priming):
-    "Describe this image in 3-4 sentences, covering the main subject, the 
-    background, the setting, and any secondary elements present. Be specific but concise."
-  Do NOT add "pay attention to nature" to this prompt unless running the
-  nature-priming ablation explicitly.
+- Caption prompt (baseline, neutral, no nature-priming), `src/models/prompts.py`'s
+  `CAPTION_PROMPT`:
+    "Describe this image, including any text."
+  The "including any text" clause covers BIG-5's text-heavy/meme/screenshot
+  images, where a bare "describe this image" would otherwise skip on-image
+  text entirely. Do NOT add "pay attention to nature" to this prompt unless
+  running the nature-priming ablation explicitly.
+- The CAPTION CALL ITSELF gets NO system prompt (deliberate, settled): unlike
+  extraction and labeling, `caption_batch` (via `run_inference`,
+  `src/vlm_pipeline.py`) is called without the nature-definition system
+  prompt, so this first free-form look at the image is uninfluenced by ANY
+  nature-related context — neither an explicit priming instruction nor the
+  passive definition file. Extraction (the "second look") and both labeling
+  calls still receive it as normal.
 - Context files go in the `system` role, never `user`. Read once at startup,
   not per-call (keeps the string stable for vLLM prefix caching).
 - Taxonomy labeling is a HYBRID, resolved during PHASE-1 INFERENCE (mapping is
@@ -106,10 +115,16 @@ evaluating the models.
   `--max_pairs_per_forward` bounds actual GPU work.
 - Masks stored as `pycocotools` RLE (`counts` decoded to str for JSON).
 - Nature relevance score is computed over the RLE-MERGED UNION of surviving
-  masks (overlapping pixels counted once), `--relevance_method`:
-  `coverage_ratio` (default; nature px / total px) or `center_weighted`
-  (Gaussian in normalized distance-from-center, `--center_sigma`, aspect-ratio
-  independent). Both in [0,1]; no grounded nature entity → 0.0.
+  masks (overlapping pixels counted once). BOTH methods are always computed
+  and stored, never a choice between them:
+  `nature_relevance_score_coverage_ratio` (nature px / total px) and
+  `nature_relevance_score_center_weighted` (Gaussian in normalized
+  distance-from-center, `--center_sigma`, aspect-ratio independent). Both in
+  [0,1]; no grounded nature entity → 0.0 under both. Overlap between two
+  DIFFERENT entities' masks (e.g. "tree" and "leaves" covering the same
+  pixels) is resolved by the union itself — a pixel counts as nature if ANY
+  grounded entity covers it, never a confidence-based per-pixel winner; each
+  entity's own mask stays intact and unclipped in `object_groundings`.
 - Report `grounding_confirmation_rate` (grounded / nature entities). Per recap
   §9 this is AGREEMENT WITH AN INDEPENDENT MODEL, never ground truth.
 
@@ -157,10 +172,31 @@ evaluating the models.
   than the mapping). material is always the VLM's own label (never mapped).
   No anchor object (empty extraction or failed ClipMatch) → prediction-unmapped
   → penalized as wrong.
-- **COCO/BIG-5**: image-level nature = OR over extracted objects; biotic/material
-  scored on the matched GT object. COCO box-IoU matching (Hungarian, IoU≥0.5) is
-  FUTURE WORK gated on the Grounding pipeline — for now COCO uses the same
-  lexical GT matching as BIG-5.
+- **BIG-5 (holistic, one GT label per image)**: nature = OR over extracted
+  objects, same as always. biotic/material use a DIRECTION-AWARE "at least one
+  matching entity" rule instead of matching a specific object (there is no
+  named object to match — BIG-5's GT is one label for the whole scene):
+  whichever value the GT actually is, correctness means the model output at
+  least one nature-positive entity carrying THAT specific label
+  (`has_biotic`/`has_abiotic` for biotic, symmetrically for material). An
+  image can contain BOTH a biotic and an abiotic entity at once (e.g. a dog
+  next to a rock) and still score correctly against a GT of just one of
+  them — this deliberately looks at GT to pick which existence check
+  (`has_biotic` vs `has_abiotic`) applies, unlike the nature axis, where "no
+  nature entity output at all" is sufficient for a no-nature GT (there's no
+  meaningful "found an explicit non-nature entity" signal to require there).
+  GT ITSELF can also be BOTH directions at once: the majority-vote GT CSVs
+  (`src.loaders.dataset_loader.load_big5`) carry coder-disagreement cells
+  like "material; immaterial" — per Pau, that image genuinely counts as BOTH
+  labels, not excluded, so `gt_biotic`/`gt_material` are LISTS (`[True]`,
+  `[False]`, or `[True, False]` for disagreement), and EVERY element
+  contributes its own separate GT instance scored against the same extracted
+  entities — a disagreement image can add two rows (one per direction) to
+  that axis's accuracy/precision/recall table instead of one.
+- **COCO**: image-level nature = OR over extracted objects; biotic/material
+  scored on the matched GT object via lexical matching (`find_matching_object`).
+  Evaluated separately via the Grounding pipeline going forward — box-IoU
+  matching (Hungarian, IoU≥0.5) remains FUTURE WORK gated on that pipeline.
 - **Extraction-hit rate** (exact-match: was the GT object mentioned) is a
   REPORTING-ONLY diagnostic; it no longer gates or feeds the axis scores.
 

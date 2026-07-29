@@ -29,10 +29,10 @@ End-to-end driver for the baseline BIG-5 VLM pipeline, in three stages:
                   such nesting — it's the same relationship `--stage infer`
                   run by hand has to vLLM's own child process. Args cross the
                   boundary as reconstructed CLI flags (see _args_to_cli),
-                  not a pickled Namespace. --responses_file is PURELY that
-                  internal handoff in this mode, so it is deleted once
-                  scoring finishes successfully (pass --keep_responses_file
-                  to retain it).
+                  not a pickled Namespace. --responses_file is ALWAYS
+                  retained on disk (never deleted, under any --stage) — it
+                  carries every raw VLM response plus the resolved per-object
+                  labels, needed downstream by the Grounding pipeline.
 
   --stage infer : run ONLY the inference half (VLM -> --responses_file) and
                   exit. Useful to run inference on one machine/job and defer
@@ -56,9 +56,12 @@ Metrics (per CLAUDE.md scoping):
       * COCO/BIG-5: image-level nature (nature=1 if ANY extracted object is
         nature) + matched-object biotic/material (COCO box-IoU matching is
         future work, gated on the Grounding pipeline — §6.4).
-  - F-CLIPScore + Object-CLIPScore       : ALL datasets (reference-free).
+  - CLIPScore + F-CLIPScore + Object-CLIPScore : ALL datasets (reference-free),
+    scored with --clipscore_model.
   - ClipMatch + hP/hR/hF1                : ImageNet + Places ONLY (fixed vocab,
-    restricted to classes mapped into the graph).
+    restricted to classes mapped into the graph), scored with
+    --clipmatch_model (independently selectable from --clipscore_model;
+    defaults to the same checkpoint).
   - Diagnostics: extraction-hit rate (exact-match, reporting-only — no longer
     gates axis scores), WordNet-mapping vs VLM-fallback rate, objects/image,
     parse-failure rate.
@@ -91,7 +94,6 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")   # avoids the fork/par
 
 import argparse
 import csv
-import itertools
 import json
 import logging
 import random
@@ -109,10 +111,21 @@ from src.evaluation import taxonomy_metrics
 from src.loaders.excel_loader import TaxonomyGraph
 from src.loaders.dataset_loader import load_dataset, get_candidate_vocab
 from src.models.prompts import build_system_prompts
-from src.models.vlm_models import MODEL_REGISTRY, VLLM_FAMILIES, create_vlm
+from src.models.vlm_models import MODEL_REGISTRY, create_vlm
 from src.vlm_pipeline import run_inference, resolve_hybrid_label, _normalize_object
 from src.evaluation import clip_metrics
 from src.utils import update_results_store, update_dataset_class_stats, compute_class_stats, format_duration
+
+# Per-model outputs are split by FILE TYPE into these two subfolders of
+# <results_dir>/<run_name>, so a run_name folder full of models stays
+# readable at a glance: the shared results JSON sits directly in the folder,
+# every model's raw inference artifact sits in RESPONSES_SUBDIR, and every
+# model's per-image predictions CSV sits in PREDICTIONS_SUBDIR.
+# scripts/run_grounding_pipeline.py mirrors RESPONSES_SUBDIR (it reconstructs
+# the same artifact path independently) — keep the two in sync if this ever
+# changes.
+RESPONSES_SUBDIR = "responses"
+PREDICTIONS_SUBDIR = "predictions"
 
 
 # =============================================================================
@@ -263,8 +276,7 @@ def phase_infer(args):
         data_dir=args.data_dir, instances_json=args.instances_json,
         places_categories_txt=args.places_categories_txt, excel_path=args.excel_path,
         en_gt=args.twitter_en_gt_csv, es_gt=args.twitter_es_gt_csv,
-        en_media=args.twitter_en_media_csv, es_media=args.twitter_es_media_csv,
-        cache_dir=args.images_cache_dir,
+        images_dir=args.big5_images_dir,
     )
     if not dataset:
         print("No dataset instances loaded — exiting."); sys.exit(1)
@@ -288,15 +300,12 @@ def phase_infer(args):
     caption_system, label_system_full, label_system_material = build_system_prompts(
         args.nature_definition_path, args.biotic_definition_path, args.material_definition_path)
 
-    # Different VLM backends need different constructor keyword arguments —
-    # see src/models/vlm_models.py for the classes behind each family name.
-    if args.model_family in VLLM_FAMILIES:
-        vlm_kwargs = {"dtype": args.dtype, "gpu_memory_utilization": args.gpu_memory_utilization,
-                      "trust_remote_code": args.trust_remote_code}
-        if args.max_model_len is not None:
-            vlm_kwargs["max_model_len"] = args.max_model_len
-    else:
-        vlm_kwargs = {"device": args.device, "dtype": args.dtype}
+    # Every registered family is vLLM-served (see src/models/vlm_models.py's
+    # MODEL_REGISTRY) — the HuggingFace-served BLIP family was removed.
+    vlm_kwargs = {"dtype": args.dtype, "gpu_memory_utilization": args.gpu_memory_utilization,
+                  "trust_remote_code": args.trust_remote_code}
+    if args.max_model_len is not None:
+        vlm_kwargs["max_model_len"] = args.max_model_len
     vlm = create_vlm(args.model_family, args.model_name, **vlm_kwargs)
 
     # The very first line written to the output file is a special "header"
@@ -308,6 +317,10 @@ def phase_infer(args):
         "record_type": "header",
         "dataset": args.dataset,
         "model": f"{args.model_family}/{args.model_name}",
+        # Kept separately from "model" (the family/name identifier used for
+        # results-store keys and the CSV's own "model" column) so Phase 2 can
+        # build filenames from JUST the model name — see _model_slug.
+        "model_name": args.model_name,
         "candidate_vocab": candidate_vocab,
         "max_hops": args.max_hops,
     }
@@ -411,11 +424,32 @@ def phase_score(args):
     # This is where CLIP actually gets loaded onto the GPU — by this point in
     # `--stage all`, the VLM has already been unloaded (see main() below), so
     # CLIP has the GPU memory to itself.
-    scorer = clip_metrics.CLIPScorer(model_name=args.clip_model, device=args.device,
+    scorer = clip_metrics.CLIPScorer(model_name=args.clipscore_model, device=args.device,
                                      batch_size=args.clip_batch_size,
-                                     trust_remote_code=args.clip_trust_remote_code)
-    
-    if args.verbose: print(f"{args.clip_model} loaded. Handles a context length of {scorer.context_length} tokens!\n")
+                                     trust_remote_code=args.clipscore_trust_remote_code)
+
+    if args.verbose: print(f"{args.clipscore_model} loaded. Handles a context length of {scorer.context_length} tokens!\n")
+
+    # ClipMatch + hP/hR (ImageNet/Places only) can use a DIFFERENT CLIP
+    # checkpoint from the reference-free metrics (CLIPScore/F-CLIPScore/
+    # Object-CLIPScore) — the two jobs have different requirements (matching
+    # a whole caption against a fixed candidate vocabulary vs. reference-free
+    # image-text plausibility). Default is the SAME checkpoint as --clipscore_model;
+    # only load a second model if the resolved (model, trust_remote_code) pair
+    # actually differs, to avoid holding two copies of the same weights.
+    clipmatch_model_name = args.clipmatch_model or args.clipscore_model
+    clipmatch_trust_remote_code = (args.clipmatch_clip_trust_remote_code
+                                    if args.clipmatch_clip_trust_remote_code is not None
+                                    else args.clipscore_trust_remote_code)
+    cm_scorer = scorer
+    if run_clipmatch and (clipmatch_model_name != args.clipscore_model
+                          or clipmatch_trust_remote_code != args.clipscore_trust_remote_code):
+        cm_scorer = clip_metrics.CLIPScorer(model_name=clipmatch_model_name, device=args.device,
+                                            batch_size=args.clip_batch_size,
+                                            trust_remote_code=clipmatch_trust_remote_code)
+        if args.verbose:
+            print(f"{clipmatch_model_name} (ClipMatch) loaded. Handles a context length of "
+                  f"{cm_scorer.context_length} tokens!\n")
 
     # ---- Hybrid labels per object ----
     # Mapping + hybrid resolution now happen in Phase 1 (see
@@ -461,8 +495,18 @@ def phase_score(args):
     # instead of silently skipping reference-free scoring for the whole run.
     obj_embs_all = scorer.encode_text(flat_texts, verbose=args.verbose, desc="objects")
 
+    # ClipMatch/hP-hR embeddings — SEPARATE from the ones above whenever
+    # cm_scorer is a different model (must stay in one consistent embedding
+    # space: the candidate vocab, the caption, and the anchor-object
+    # similarity search all need to come from the SAME CLIP checkpoint).
+    # When cm_scorer IS scorer (default), reuse the embeddings already
+    # computed above instead of re-encoding the same text twice.
     candidate_embs = None
     if run_clipmatch:
+        caption_embs_cm = caption_embs if cm_scorer is scorer else cm_scorer.encode_text(
+            captions, warn_truncation=False, verbose=args.verbose, desc="captions (clipmatch)")
+        obj_embs_all_cm = obj_embs_all if cm_scorer is scorer else cm_scorer.encode_text(
+            flat_texts, verbose=args.verbose, desc="objects (clipmatch)")
         # Also encode the FIXED candidate-class vocabulary just once (rather
         # than per image) — every image's ClipMatch score is computed against
         # this same set of candidate-class embeddings. candidate_vocab is
@@ -470,7 +514,7 @@ def phase_score(args):
         # get_candidate_vocab), so every candidate here carries its own
         # gt_nature/gt_biotic and the ClipMatch top-1 prediction can be read
         # straight off its candidate_vocab entry — no separate graph lookup.
-        candidate_embs = scorer.encode_text(
+        candidate_embs = cm_scorer.encode_text(
             [clip_metrics.OBJECT_TEMPLATE.format(c["class_name"]) for c in candidate_vocab],
             verbose=args.verbose, desc="candidate_vocab")
 
@@ -480,7 +524,7 @@ def phase_score(args):
     # scores, etc.) after the loop below finishes.
     nat_true, nat_pred = [], []
     bio_true, bio_pred, mat_true, mat_pred = [], [], [], []
-    fclip_vals, objclip_vals = [], []
+    fclip_vals, objclip_vals, clipscore_vals = [], [], []
     # Two parallel accumulations of the hierarchical metrics (hP/hR/hF1 + Wu-
     # Palmer), differing ONLY in how they treat images whose ClipMatch-predicted
     # object could NOT be resolved onto a WordNet node (resolve_to_wordnet ->
@@ -504,40 +548,6 @@ def phase_score(args):
     clipmatch_support = 0
     flat_rows = []  # one row per stored IMAGE for the output CSV (see below)
 
-    # Which images get a row written to the CSV. Fixed at --num_preds_to_store
-    # images, chosen deterministically (not on inference order, which can vary
-    # run to run) so the SAME set of images is stored for every model/dataset
-    # run, keeping the CSVs directly comparable across models. Selection is
-    # ROUND-ROBIN across GT class names (each class's own images sorted by
-    # image_path) rather than a plain sort-by-image_path over the whole pool:
-    # image_path is typically "<data_dir>/<class_folder>/<file>", so a plain
-    # sort would cluster all picks into the first class or two alphabetically
-    # instead of sampling across classes. Images with no GT target (shouldn't
-    # normally happen — loaders only keep mapped targets) fall into a single
-    # "" bucket so they're never silently dropped from the round-robin.
-    if args.num_preds_to_store is not None:
-        paths_by_class = {}
-        for r in records:
-            targets = r.get("targets", [])
-            class_name = targets[0]["class_name"] if targets else ""
-            paths_by_class.setdefault(class_name, []).append(r["image_path"])
-        for paths in paths_by_class.values():
-            paths.sort()
-        class_queues = [paths_by_class[c] for c in sorted(paths_by_class)]
-
-        chosen_paths = []
-        for round_paths in itertools.zip_longest(*class_queues):
-            for path in round_paths:
-                if path is not None:
-                    chosen_paths.append(path)
-                if len(chosen_paths) >= args.num_preds_to_store:
-                    break
-            if len(chosen_paths) >= args.num_preds_to_store:
-                break
-        preds_to_store = set(chosen_paths)
-    else:
-        preds_to_store = {r["image_path"] for r in records}
-
     # How often to print per-image progress under --verbose: every 5% of the
     # dataset (at least every 1 image, at most every 500) rather than a fixed
     # step, so the cadence stays sensible on both tiny (--max_samples) and
@@ -555,15 +565,21 @@ def phase_score(args):
         # flat array we built above, using the offsets we remembered.
         obj_slice = slice(offsets[idx], offsets[idx + 1])
         rec_obj_embs = obj_embs_all[obj_slice]
+        # Same slice, but from cm_scorer's embedding space (identical to
+        # rec_obj_embs whenever cm_scorer is scorer) — used for the ClipMatch
+        # anchor-object search below, which must stay in ONE consistent space
+        # with candidate_embs/caption_embs_cm.
+        rec_obj_embs_cm = obj_embs_all_cm[obj_slice] if run_clipmatch else None
 
         # Reset every loop iteration (not just inside `if single_label:`) so a
         # COCO/BIG-5 image never accidentally inherits a stale value left over
         # from a PRECEDING single-label image (Python has no block scoping).
-        # These are ALL the per-image values a --num_preds_to_store CSV row
-        # can carry; populated below depending on single_label vs COCO/BIG-5,
+        # These are ALL the per-image values a predictions-CSV row can carry;
+        # populated below depending on single_label vs COCO/BIG-5,
         # left None wherever a given dataset type has no such value.
         pred_vocab_entry = None
         best_obj_idx = None
+        best_final = None
         gt_syn = pred_class_synset = pred_node = None
         hier = {"hp": None, "hr": None, "hf1": None}
         wup_sim = None
@@ -591,8 +607,10 @@ def phase_score(args):
                 image_n_vlm_nature += 1
 
         # --- reference-free CLIP metrics (all datasets) ---
+        image_clipscore = clip_metrics.clipscore(image_embs[idx], caption_embs[idx])
         image_fclip = clip_metrics.f_clipscore(image_embs[idx], caption_embs[idx], rec_obj_embs)
         image_objclip = clip_metrics.object_clipscore(image_embs[idx], rec_obj_embs)
+        clipscore_vals.append(image_clipscore)
         fclip_vals.append(image_fclip)
         objclip_vals.append(image_objclip)
 
@@ -617,16 +635,18 @@ def phase_score(args):
             pred_class_synset = pred_node = None
             best_obj_idx = None
 
-            # 1. ClipMatch Top-1 Class (The Anchor)
-            per_cand_sim, pred_idx = clip_metrics.clipmatch(caption_embs[idx], candidate_embs)
+            # 1. ClipMatch Top-1 Class (The Anchor) — uses cm_scorer's embedding space
+            per_cand_sim, pred_idx = clip_metrics.clipmatch(caption_embs_cm[idx], candidate_embs)
             if pred_idx >= 0:
                 pred_vocab_entry = candidate_vocab[pred_idx]
                 pred_class_synset = pred_vocab_entry["synset_id"]
                 clipmatch_pred_similarity = float(per_cand_sim[pred_idx])
 
-                # 2. Compare Anchor embedding with ALL extracted objects' embeddings (argmax)
-                if rec_obj_embs.shape[0] > 0:
-                    sims_to_pred = rec_obj_embs @ candidate_embs[pred_idx]
+                # 2. Compare Anchor embedding with ALL extracted objects' embeddings
+                #    (argmax) — must use rec_obj_embs_cm (SAME embedding space as
+                #    candidate_embs), not rec_obj_embs (the reference-free scorer's space).
+                if rec_obj_embs_cm.shape[0] > 0:
+                    sims_to_pred = rec_obj_embs_cm @ candidate_embs[pred_idx]
                     best_obj_idx = int(sims_to_pred.argmax())
                     
                     # 3. Resolve ONLY the argmax extracted object (best_obj_idx) to a
@@ -695,17 +715,83 @@ def phase_score(args):
                     hp_vals_mapped.append(hier["hp"]); hr_vals_mapped.append(hier["hr"])
                     hf1_vals_mapped.append(hier["hf1"])
                     wup_vals_mapped.append(wup_sim)
+        elif dataset == "big5":
+            # --- BIG-5 (holistic image-level annotation) ---
+            # GT here is ONE label per axis for the WHOLE scene (see
+            # src.loaders.dataset_loader.load_big5 — a single "scene" target,
+            # not a named object to find lexically), so unlike COCO there is
+            # no specific object to match against. nature is scored the same
+            # image-level OR as always (image_pred_nature: True iff ANY
+            # extracted entity is nature). biotic/material use a
+            # DIRECTION-AWARE "at least one matching entity" rule instead:
+            # whichever value the GT actually is (biotic or abiotic; material
+            # or immaterial), correctness means the model output at least one
+            # nature-positive entity carrying THAT specific label — an image
+            # can contain both a biotic and an abiotic entity at once (e.g. a
+            # dog next to a rock) and still be scored correctly against a
+            # GT of just "biotic", since only the GT's own direction needs a
+            # hit. This deliberately looks at GT to decide which existence
+            # check to apply (has_biotic vs has_abiotic), rather than a single
+            # fixed-positive-class OR — confirmed as the intended semantics,
+            # not a mistake, unlike the nature axis, where "no nature
+            # entity output at all" is sufficient for a no-nature GT (there is
+            # no equivalent meaningful "found an explicit non-nature entity"
+            # signal to require there).
+            g_nat = image_gt_nature(targets)
+            if g_nat is not None:
+                image_gt_nature_val = bool(g_nat)
+                image_pred_nature_val = bool(image_pred_nature(finals))
+                nat_true.append(image_gt_nature_val)
+                nat_pred.append(image_pred_nature_val)
+
+            nature_entities = [fin for fin in finals if fin["final_nature"] is True]
+            has_biotic = any(fin["final_biotic"] is True for fin in nature_entities)
+            has_abiotic = any(fin["final_biotic"] is False for fin in nature_entities)
+            has_material = any(fin["final_material"] is True for fin in nature_entities)
+            has_immaterial = any(fin["final_material"] is False for fin in nature_entities)
+
+            # gt_biotic/gt_material are LISTS (src.loaders.dataset_loader.load_big5),
+            # not a plain bool|None: usually one element, but BOTH [True, False]
+            # when the human coders genuinely disagreed (e.g. "material;
+            # immaterial") — per Pau, that image counts as GENUINELY BOTH labels
+            # at once, not "neither"/excluded, so EVERY element contributes its
+            # own separate GT instance against these SAME extracted entities
+            # (one image can therefore add up to two rows to bio_true/bio_pred).
+            t0 = targets[0] if targets else {}
+            target_matches = [{"class_name": t0.get("class_name")}]
+            gt_biotic_vals = t0.get("gt_biotic")
+            if gt_biotic_vals is not None:
+                pred_biotic_vals = []
+                for gt_b in gt_biotic_vals:
+                    gt_b = bool(gt_b)
+                    pred_b = has_biotic if gt_b else (not has_abiotic)
+                    bio_true.append(gt_b)
+                    bio_pred.append(pred_b)
+                    pred_biotic_vals.append(pred_b)
+                target_matches[0].update({"gt_biotic": gt_biotic_vals, "pred_biotic": pred_biotic_vals,
+                                          "has_biotic_entity": has_biotic, "has_abiotic_entity": has_abiotic})
+            gt_material_vals = t0.get("gt_material")
+            if gt_material_vals is not None:
+                pred_material_vals = []
+                for gt_m in gt_material_vals:
+                    gt_m = bool(gt_m)
+                    pred_m = has_material if gt_m else (not has_immaterial)
+                    mat_true.append(gt_m)
+                    mat_pred.append(pred_m)
+                    pred_material_vals.append(pred_m)
+                target_matches[0].update({"gt_material": gt_material_vals, "pred_material": pred_material_vals,
+                                          "has_material_entity": has_material, "has_immaterial_entity": has_immaterial})
         else:
-            # --- COCO (multi-label) + BIG-5 (holistic): image-level nature OR
-            #     + matched-object biotic/material ---
-            # TODO(grounding-pipeline, recap §6.4): for COCO, replace this
-            # lexical find_matching_object matching with Hungarian box-IoU
-            # assignment (IoU>=0.5) once Grounding DINO 1.5 provides predicted
-            # boxes — matched GT boxes score bio/material/nature as usual;
-            # unmatched GT boxes are penalized as wrong; unmatched PREDICTED
-            # boxes are excluded, NOT penalized (COCO's 80 classes are a curated
-            # subset, so an extra real object is not a hallucination). Not
-            # implementable until the Grounding pipeline exists.
+            # --- COCO (multi-label): image-level nature OR + matched-object
+            #     biotic/material, via lexical GT matching (find_matching_object) ---
+            # TODO(grounding-pipeline, recap §6.4): replace this lexical
+            # matching with Hungarian box-IoU assignment (IoU>=0.5) once
+            # Grounding DINO 1.5 provides predicted boxes — matched GT boxes
+            # score bio/material/nature as usual; unmatched GT boxes are
+            # penalized as wrong; unmatched PREDICTED boxes are excluded, NOT
+            # penalized (COCO's 80 classes are a curated subset, so an extra
+            # real object is not a hallucination). Not implementable until the
+            # Grounding pipeline exists.
             g_nat = image_gt_nature(targets)
             if g_nat is not None:
                 image_gt_nature_val = bool(g_nat)
@@ -750,61 +836,81 @@ def phase_score(args):
         # the ClipMatch top-1 predicted object and its classification.
         # "objects" and "gt_targets" are JSON-encoded since a CSV cell can't
         # hold a nested list directly — json.loads() them back when reading.
-        if rec["image_path"] in preds_to_store:
-            objects_json = json.dumps([
-                {
-                    "text": obj,
-                    "mapped": fin["mapped"], "mapped_synset": fin["mapped_synset"],
-                    "nature": fin["final_nature"], "biotic": fin["final_biotic"],
-                    "material": fin["final_material"],
-                    "nature_source": fin["nature_source"], "biotic_source": fin["biotic_source"],
-                    "parse_failed": lab.get("parse_failed"),
-                }
-                for obj, lab, fin in zip(objs, rec["object_labels"], finals)
-            ])
-            # "gt_targets" carries the raw target dicts, PLUS (multi-label
-            # datasets only) "target_matches" — which object matched each
-            # target and what it scored on biotic/material (see the coco/big5
-            # branch above). None on single-label datasets, where there's only
-            # ever one target and it's covered by the clipmatch_* columns.
-            gt_targets_json = json.dumps({"targets": targets, "target_matches": target_matches})
-            flat_rows.append({
-                "image_path": rec["image_path"],
-                "dataset": dataset,
-                "model": header.get("model"),
-                "caption": rec["caption"],
-                "objects": objects_json,
-                "gt_targets": gt_targets_json,
-                "n_objects": len(objs),
-                "f_clipscore": image_fclip,
-                "object_clipscore": image_objclip,
-                "wordnet_mapping_rate_image": (image_n_map_nature / (image_n_map_nature + image_n_vlm_nature))
-                                               if (image_n_map_nature + image_n_vlm_nature) else None,
-                "parse_failure_count_image": image_n_parse_fail,
-                "extraction_hit_rate_image": (image_n_extraction_hits / image_n_gt_targets)
-                                              if image_n_gt_targets else None,
-                # image-level nature (COCO/BIG-5 only; single-label's nature
-                # verdict is the clipmatch_pred_nature column below instead)
-                "image_gt_nature": image_gt_nature_val,
-                "image_pred_nature": image_pred_nature_val,
-                # single-label (ImageNet/Places) axis verdicts
-                "gt_nature": gt_nature_val, "pred_nature": pred_nature_val,
-                "gt_biotic": gt_biotic_val, "pred_biotic": pred_biotic_val,
-                "gt_material": gt_material_val, "pred_material": pred_material_val,
-                # ClipMatch (caption-based) — the metric actually used for scoring
-                "clipmatch_pred_class": pred_vocab_entry["class_name"] if pred_vocab_entry else None,
-                "clipmatch_pred_synset": pred_vocab_entry["synset_id"] if pred_vocab_entry else None,
-                "clipmatch_pred_similarity": clipmatch_pred_similarity,
-                "clipmatch_pred_nature": best_final["final_nature"] if best_final else None,
-                "clipmatch_pred_biotic": best_final["final_biotic"] if best_final else None,
-                "clipmatch_pred_material": best_final["final_material"] if best_final else None,
-                "clipmatch_top1_correct": clipmatch_correct,
-                "gt_synset": gt_syn,
-                "resolved_pred_synset": pred_node,
-                "hierarchical_precision": hier["hp"], "hierarchical_recall": hier["hr"],
-                "hierarchical_f1": hier["hf1"],
-                "wup_similarity": wup_sim,
-            })
+        # Every image gets a row (no subsampling) — the full per-image record
+        # is a first-class output the Grounding pipeline consumes downstream.
+        objects_json = json.dumps([
+            {
+                "text": obj,
+                "mapped": fin["mapped"], "mapped_synset": fin["mapped_synset"],
+                "nature": fin["final_nature"], "biotic": fin["final_biotic"],
+                "material": fin["final_material"],
+                "nature_source": fin["nature_source"], "biotic_source": fin["biotic_source"],
+                "parse_failed": lab.get("parse_failed"),
+            }
+            for obj, lab, fin in zip(objs, rec["object_labels"], finals)
+        ])
+        # "gt_targets" carries the raw target dicts, PLUS (multi-label
+        # datasets only) "target_matches" — which object matched each
+        # target and what it scored on biotic/material (see the coco/big5
+        # branch above). None on single-label datasets, where there's only
+        # ever one target and it's covered by the clipmatch_* columns.
+        gt_targets_json = json.dumps({"targets": targets, "target_matches": target_matches})
+        # Grounding-pipeline results, present only when src/grounding_pipeline.py
+        # has enriched this artifact (see run_pipeline.py / run_grounding_pipeline.py)
+        # — None/blank on a VLM-only artifact, so scoring one still works fine.
+        # mask_rle is deliberately DROPPED here (too bulky for a CSV cell, and
+        # not useful in tabular form); it stays in the .jsonl artifact. This is
+        # the grounding VERDICT per object — was it confirmed, how many pixels —
+        # not the raw masks, which is what makes this "the actual SAM3
+        # prediction" belong in the results CSV rather than only the raw
+        # artifact.
+        object_groundings = rec.get("object_groundings")
+        groundings_json = json.dumps([
+            {"object": g["object"], "prompt": g["prompt"], "is_nature": g["is_nature"],
+             "grounded": g["grounded"], "pixel_count": g["pixel_count"]}
+            for g in object_groundings
+        ]) if object_groundings is not None else None
+        flat_rows.append({
+            "image_path": rec["image_path"],
+            "dataset": dataset,
+            "model": header.get("model"),
+            "caption": rec["caption"],
+            "objects": objects_json,
+            "gt_targets": gt_targets_json,
+            "n_objects": len(objs),
+            "clipscore": image_clipscore,
+            "f_clipscore": image_fclip,
+            "object_clipscore": image_objclip,
+            "object_groundings": groundings_json,
+            "nature_relevance_score_coverage_ratio": rec.get("nature_relevance_score_coverage_ratio"),
+            "nature_relevance_score_center_weighted": rec.get("nature_relevance_score_center_weighted"),
+            "wordnet_mapping_rate_image": (image_n_map_nature / (image_n_map_nature + image_n_vlm_nature))
+                                           if (image_n_map_nature + image_n_vlm_nature) else None,
+            "parse_failure_count_image": image_n_parse_fail,
+            "extraction_hit_rate_image": (image_n_extraction_hits / image_n_gt_targets)
+                                          if image_n_gt_targets else None,
+            # image-level nature (COCO/BIG-5 only; single-label's nature
+            # verdict is the clipmatch_pred_nature column below instead)
+            "image_gt_nature": image_gt_nature_val,
+            "image_pred_nature": image_pred_nature_val,
+            # single-label (ImageNet/Places) axis verdicts
+            "gt_nature": gt_nature_val, "pred_nature": pred_nature_val,
+            "gt_biotic": gt_biotic_val, "pred_biotic": pred_biotic_val,
+            "gt_material": gt_material_val, "pred_material": pred_material_val,
+            # ClipMatch (caption-based) — the metric actually used for scoring
+            "clipmatch_pred_class": pred_vocab_entry["class_name"] if pred_vocab_entry else None,
+            "clipmatch_pred_synset": pred_vocab_entry["synset_id"] if pred_vocab_entry else None,
+            "clipmatch_pred_similarity": clipmatch_pred_similarity,
+            "clipmatch_pred_nature": best_final["final_nature"] if best_final else None,
+            "clipmatch_pred_biotic": best_final["final_biotic"] if best_final else None,
+            "clipmatch_pred_material": best_final["final_material"] if best_final else None,
+            "clipmatch_top1_correct": clipmatch_correct,
+            "gt_synset": gt_syn,
+            "resolved_pred_synset": pred_node,
+            "hierarchical_precision": hier["hp"], "hierarchical_recall": hier["hr"],
+            "hierarchical_f1": hier["hf1"],
+            "wup_similarity": wup_sim,
+        })
 
     # ---- Assemble summary ----
     n_images = len(records)
@@ -818,8 +924,13 @@ def phase_score(args):
             "vlm_fallback_rate": (n_vlm_nature / n_object_records) if n_object_records else 0.0,
         },
         "reference_free": {
+            "clipscore": _mean(clipscore_vals),
             "f_clipscore": _mean(fclip_vals),
             "object_clipscore": _mean(objclip_vals),
+        },
+        "clip_models": {
+            "reference_free": args.clipscore_model,
+            "clipmatch": clipmatch_model_name if run_clipmatch else None,
         },
         "nature": _binary_metrics(nat_true, nat_pred),
         "biotic_matched": _binary_metrics(bio_true, bio_pred),
@@ -830,9 +941,15 @@ def phase_score(args):
                               "(which is restricted to classes mapped into the graph — see "
                               "get_candidate_vocab); material is ALWAYS the VLM's own judgment "
                               "(never mapped), taken from the extracted object most representative "
-                              "of that predicted class. coco/big5: image-level nature (OR) + "
-                              "matched-object biotic/material (coco box-IoU is future work, "
-                              "recap §6.4)."),
+                              "of that predicted class. big5 (holistic, one GT label per image): "
+                              "nature is the same image-level OR as always; biotic/material are "
+                              "scored as 'did the model output at least one nature-positive entity "
+                              "matching the GT's own direction' (has_biotic when GT=biotic, "
+                              "has_abiotic when GT=abiotic, symmetrically for material) — an image "
+                              "can contain both a biotic AND an abiotic entity and still score "
+                              "correctly against a GT of just one of them. coco: image-level nature "
+                              "(OR) + matched-object biotic/material via lexical GT matching (box-IoU "
+                              "is future work, recap §6.4)."),
         "material_caveat": ("Material GT for imagenet/coco/places is the heuristic "
                             "gt_material=True default (real photos); only BIG-5 has genuine "
                             "material GT. Predicted material is always the VLM's judgment "
@@ -882,7 +999,11 @@ def phase_score(args):
     # Everything lands under --results_dir ("results/" by default); --run_name
     # further nests it into a per-ablation-configuration subfolder, so results
     # from different pipeline configurations never land in the same place and
-    # stay easy to tell apart later.
+    # stay easy to tell apart later. The shared results JSON (--output_file)
+    # sits directly in that folder; per-model raw outputs are split by file
+    # type one level down — the predictions CSV here goes in
+    # PREDICTIONS_SUBDIR, the .jsonl artifact from _resolve_responses_file
+    # goes in RESPONSES_SUBDIR.
     out_dir = Path(args.results_dir)
     if args.run_name:
         out_dir = out_dir / args.run_name
@@ -902,14 +1023,20 @@ def phase_score(args):
         # Include dataset + model in the filename — otherwise every model run
         # writes to the same "<stem>_predictions.csv" and each rerun (e.g. a
         # different VLM on the same dataset) silently overwrites the previous
-        # model's predictions.
-        model_slug = header.get("model", "unknown_model").replace("/", "_")
-        csv_path = out_path.with_name(f"{out_path.stem}_{dataset}_{model_slug}_predictions.csv")
+        # model's predictions. Grouped into PREDICTIONS_SUBDIR (separate from
+        # RESPONSES_SUBDIR, where that model's .jsonl artifact lives — see
+        # _resolve_responses_file), not next to the shared results JSON.
+        # model_slug uses ONLY the model NAME (see _model_slug's rationale),
+        # falling back to the full family/name "model" string for older
+        # artifacts written before the header carried "model_name" separately.
+        predictions_dir = out_dir / PREDICTIONS_SUBDIR
+        predictions_dir.mkdir(parents=True, exist_ok=True)
+        model_slug = (header.get("model_name") or header.get("model", "unknown_model")).replace("/", "_")
+        csv_path = predictions_dir / f"{out_path.stem}_{dataset}_{model_slug}_predictions.csv"
         with open(csv_path, "w", newline="") as f:
             w = csv.DictWriter(f, fieldnames=list(flat_rows[0].keys()))
             w.writeheader(); w.writerows(flat_rows)
-        print(f"💾 [score] wrote {out_path} and {csv_path} "
-              f"({len(preds_to_store)} images stored)")
+        print(f"💾 [score] wrote {out_path} and {csv_path} ({len(flat_rows)} images stored)")
 
     if args.wandb:
         _log_wandb(args, summary, run_clipmatch)
@@ -924,7 +1051,8 @@ def _print_summary(s, run_clipmatch):
     print(f"Objects/image: {d['objects_per_image']:.2f} | Parse-fail: {d['parse_failure_rate']:.1%} "
           f"| Extraction-hit: {d['extraction_hit_rate']:.1%}")
     print(f"WordNet-mapping: {d['wordnet_mapping_rate']:.1%} | VLM-fallback: {d['vlm_fallback_rate']:.1%}")
-    print(f"F-CLIPScore: {s['reference_free']['f_clipscore']:.4f} | "
+    print(f"CLIPScore: {s['reference_free']['clipscore']:.4f} | "
+          f"F-CLIPScore: {s['reference_free']['f_clipscore']:.4f} | "
           f"Object-CLIPScore: {s['reference_free']['object_clipscore']:.4f}")
     neg_labels = {"nature": "no_nature", "biotic_matched": "abiotic", "material_matched": "immaterial"}
     for axis in ("nature", "biotic_matched", "material_matched"):
@@ -967,6 +1095,7 @@ def _log_wandb(args, summary, run_clipmatch):
         "ObjectsPerImage": summary["diagnostics"]["objects_per_image"],
         "ExtractionHitRate": summary["diagnostics"]["extraction_hit_rate"],
         "WordNetMappingRate": summary["diagnostics"]["wordnet_mapping_rate"],
+        "CLIPScore": summary["reference_free"]["clipscore"],
         "F-CLIPScore": summary["reference_free"]["f_clipscore"],
         "Object-CLIPScore": summary["reference_free"]["object_clipscore"],
         "Nature/F1": summary["nature"]["f1"], "Nature/Accuracy": summary["nature"]["accuracy"],
@@ -1006,22 +1135,17 @@ def build_arg_parser():
     p.add_argument("--dataset", choices=["coco", "imagenet", "places365", "big5"], required=True)
     p.add_argument("--responses_file", type=str, default=None,
                    help="Intermediate artifact: written by infer, read by score. Default: "
-                        "'vlm_responses.jsonl' inside --results_dir/--run_name (the SAME "
-                        "folder --output_file lands in), so a run's artifact and its results "
-                        "JSON/CSV are always co-located and both respect --results_dir/"
-                        "--run_name. Pass an explicit path to override (e.g. to write it "
-                        "somewhere else, or to point --stage score at a specific prior "
-                        "artifact). Under --stage all this file is PURELY an internal handoff "
-                        "between the infer and score subprocesses, so it is deleted once "
-                        "scoring finishes successfully — see --keep_responses_file to retain "
-                        "it. --stage infer/score never delete it (infer's whole point is to "
-                        "persist it for a later --stage score; score's whole point is to "
-                        "reread an existing artifact, possibly after a metrics-code change).")
-    p.add_argument("--keep_responses_file", action="store_true",
-                   help="Under --stage all, keep --responses_file on disk after scoring "
-                        "finishes instead of deleting it (e.g. to inspect the raw VLM outputs, "
-                        "or to re-run --stage score later without re-running inference). "
-                        "Ignored for --stage infer/score, which never delete the file regardless.")
+                        f"'vlm_responses_<model_slug>.jsonl' inside --results_dir/--run_name/"
+                        f"{RESPONSES_SUBDIR} (all models' .jsonl artifacts grouped together "
+                        f"there; predictions CSVs go in --results_dir/--run_name/"
+                        f"{PREDICTIONS_SUBDIR} instead; --output_file's shared results JSON "
+                        "stays directly in --results_dir/--run_name). Pass an explicit path to "
+                        "override (e.g. to write it somewhere else, or to point --stage score "
+                        "at a specific prior artifact). ALWAYS retained on disk (never deleted, "
+                        "under any --stage) — it carries every raw VLM response plus the "
+                        "resolved per-object labels, "
+                        "which the Grounding pipeline needs downstream, so this artifact is a "
+                        "first-class output, not just an internal handoff.")
 
     # taxonomy / context
     p.add_argument("--excel_path", type=str, default="../data/big5_taxonomy/flat_wordnet_tree_fixed.xlsx")
@@ -1034,11 +1158,18 @@ def build_arg_parser():
     p.add_argument("--data_dir", type=str)
     p.add_argument("--instances_json", type=str)
     p.add_argument("--places_categories_txt", type=str)
-    p.add_argument("--twitter_en_gt_csv", type=str, default=None)
-    p.add_argument("--twitter_es_gt_csv", type=str, default=None)
-    p.add_argument("--twitter_en_media_csv", type=str, default=None)
-    p.add_argument("--twitter_es_media_csv", type=str, default=None)
-    p.add_argument("--images_cache_dir", type=str, default="./big_5_cache")
+    p.add_argument("--twitter_en_gt_csv", type=str, default=None,
+                   help="BIG-5 English majority-vote GT CSV (platform_id, n_images, "
+                        "nature_visual_<idx>/nep_materiality_visual_<idx>/"
+                        "nep_biological_visual_<idx> per up-to-4 images).")
+    p.add_argument("--twitter_es_gt_csv", type=str, default=None,
+                   help="BIG-5 Spanish majority-vote GT CSV, same schema as "
+                        "--twitter_en_gt_csv.")
+    p.add_argument("--big5_images_dir", type=str, default="./big_5_images",
+                   help="Local folder (shared by both languages) already containing every "
+                        "BIG-5 image, named '<platform_id>_<idx>.<ext>'. Images are located "
+                        "by globbing for that stem (the extension isn't fixed — jpg/jpeg/png "
+                        "all appear) rather than downloaded — there is no remote fetch step.")
 
     # VLM (infer)
     p.add_argument("--model_family", type=str, choices=sorted(MODEL_REGISTRY))
@@ -1050,7 +1181,7 @@ def build_arg_parser():
     p.add_argument("--trust_remote_code", action="store_true")
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--max_new_tokens_caption", type=int, default=248) # 248 tokens is the maximum length that LongCLIP can handle
-    p.add_argument("--max_new_tokens_label", type=int, default=256)
+    p.add_argument("--max_new_tokens_label", type=int, default=248)
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--max_hops", type=int, default=0,
                    help="Maximum WordNet hop distance allowed when mapping an EXTRACTED "
@@ -1063,7 +1194,7 @@ def build_arg_parser():
                         "artifact header and reused by --stage score.")
 
     # CLIP (score) — loaded via transformers (src/evaluation/clip_metrics.py's
-    # CLIPScorer), NOT open_clip. --clip_model accepts either a short alias
+    # CLIPScorer), NOT open_clip. --clipscore_model accepts either a short alias
     # from clip_metrics.CLIP_PRESETS ("original", "eva-clip", "siglip2",
     # "jina-clip-v2") or any raw HuggingFace repo id directly (e.g. to
     # override a preset's default checkpoint, or use a variant not in the
@@ -1074,41 +1205,55 @@ def build_arg_parser():
     # FG-CLIP2 was tried and abandoned (meta-tensor crash in its
     # trust_remote_code __init__, incompatible with this transformers
     # version — see clip_metrics.CLIP_PRESETS's comment for the full story).
-    p.add_argument("--clip_model", type=str, default="original",
-                   help="CLIP checkpoint: a clip_metrics.CLIP_PRESETS alias "
-                        "('original', 'eva-clip', 'siglip2', 'jina-clip-v2') "
-                        "or a raw HuggingFace repo id.")
-    p.add_argument("--clip_trust_remote_code", type=lambda s: s.lower() != "false", default=True,
-                   help="Passed to transformers' from_pretrained calls (default True). Several "
-                        "CLIP variants (EVA-CLIP, Jina-CLIP-v2) ship custom modeling code on the "
-                        "Hub that requires this; it's a no-op for checkpoints that don't need it "
-                        "(e.g. the original OpenAI CLIP, SigLIP2). Pass --clip_trust_remote_code "
-                        "false to disable.")
+    p.add_argument("--clipscore_model", type=str, default="original",
+                   help="CLIP checkpoint used for the REFERENCE-FREE metrics (CLIPScore, "
+                        "F-CLIPScore, Object-CLIPScore — all datasets): a "
+                        "clip_metrics.CLIP_PRESETS alias ('original', 'eva-clip', 'siglip2', "
+                        "'jina-clip-v2') or a raw HuggingFace repo id. Also the default for "
+                        "--clipmatch_model when that isn't set separately.")
+    p.add_argument("--clipscore_trust_remote_code", type=lambda s: s.lower() != "false", default=True,
+                   help="Passed to transformers' from_pretrained calls for --clipscore_model "
+                        "(default True). Several CLIP variants (EVA-CLIP, Jina-CLIP-v2) ship "
+                        "custom modeling code on the Hub that requires this; it's a no-op for "
+                        "checkpoints that don't need it (e.g. the original OpenAI CLIP, "
+                        "SigLIP2). Pass --clipscore_trust_remote_code false to disable.")
     p.add_argument("--clip_batch_size", type=int, default=64)
+    p.add_argument("--clipmatch_model", type=str, default=None,
+                   help="CLIP checkpoint used for ClipMatch + hP/hR/hF1 (ImageNet + Places "
+                        "only) — kept independently selectable from --clipscore_model since the two "
+                        "jobs have different needs (ClipMatch matches a whole caption against a "
+                        "fixed candidate vocabulary; F-CLIPScore/Object-CLIPScore/CLIPScore are "
+                        "reference-free plausibility scores). Default: same value as "
+                        "--clipscore_model. When it resolves to the SAME checkpoint + "
+                        "--clipscore_trust_remote_code setting as --clipscore_model, the already-loaded "
+                        "scorer is reused instead of loading a second model.")
+    p.add_argument("--clipmatch_clip_trust_remote_code", type=lambda s: s.lower() != "false", default=None,
+                   help="Passed to transformers' from_pretrained calls for "
+                        "--clipmatch_model (default: same as --clipscore_trust_remote_code). "
+                        "Pass --clipmatch_clip_trust_remote_code false/true to override "
+                        "independently of --clipscore_trust_remote_code.")
 
     # shared
     p.add_argument("--output_file", type=str, default="vlm_pipeline_results.json",
-                   help="Results store JSON, keyed by dataset then model name (updated in place — "
-                        "a rerun of the same model overwrites its entry).")
+                   help="Shared results store JSON, keyed by dataset then model name (updated "
+                        "in place — a rerun of the same model overwrites its own entry; other "
+                        "models' entries are untouched). Lands directly in --results_dir/"
+                        f"--run_name — NOT inside {RESPONSES_SUBDIR}/{PREDICTIONS_SUBDIR}, since "
+                        "it's a single shared file every model in that folder reports into, "
+                        "unlike the per-model artifacts.")
     p.add_argument("--results_dir", type=str, default="results",
-                   help="Base directory all results (JSON store + predictions CSV) are written "
-                        "under. Created if it doesn't exist.")
+                   help="Base directory all results are written under. Created if it doesn't "
+                        "exist.")
     p.add_argument("--run_name", type=str, default=None,
-                   help="Optional subfolder of --results_dir to write --output_file (and its "
-                        "_predictions.csv) into, e.g. --run_name ablation_single_pass -> "
-                        "results/ablation_single_pass/. Useful for keeping results from "
+                   help="Optional subfolder of --results_dir (may itself be a multi-level path, "
+                        "e.g. --run_name vlm_pipeline/imagenet), useful for keeping results from "
                         "different pipeline configurations (ablations) in separate, clearly "
-                        "labeled folders. Created if it doesn't exist. Default: write directly "
-                        "into --results_dir.")
+                        "labeled folders. Layout inside it: --output_file's shared results JSON "
+                        f"directly in this folder; every model's --responses_file .jsonl "
+                        f"artifact in a '{RESPONSES_SUBDIR}' subfolder; every model's "
+                        f"_predictions.csv in a '{PREDICTIONS_SUBDIR}' subfolder. Created if it "
+                        "doesn't exist. Default: write directly into --results_dir.")
     p.add_argument("--max_samples", type=int, default=None)
-    p.add_argument("--num_preds_to_store", type=int, default=None,
-                   help="Number of images whose predictions (one row per image — caption, "
-                        "extracted objects, ClipMatch top-1 prediction) get written to the "
-                        "_predictions.csv file. Images are chosen deterministically, round-robin "
-                        "across GT class names (each class's images sorted by image_path), so "
-                        "the SAME fixed set of images is stored across different models/runs on "
-                        "the same dataset, keeping CSVs comparable. Default: store all scored "
-                        "images.")
     p.add_argument("--verbose", action="store_true")
     p.add_argument("--wandb", action="store_true")
     p.add_argument("--wandb_run_id", type=str, default=None, help=argparse.SUPPRESS)
@@ -1136,37 +1281,45 @@ def parse_args():
 
 def _model_slug(args):
     """Filesystem-safe slug identifying the VLM for this run, e.g.
-    'qwen2_5_vl/Qwen/Qwen3.5-0.8B' -> 'qwen2_5_vl_Qwen_Qwen3.5-0.8B'. Matches
-    the `model` string stored in the artifact header (build in phase_infer) and
-    the slug used for the predictions CSV, so all of a model's outputs share one
-    recognizable name. Returns None when the model isn't set (e.g. a standalone
+    --model_name 'Qwen/Qwen3.5-0.8B' -> 'Qwen_Qwen3.5-0.8B'. Deliberately built
+    from ONLY --model_name, NOT --model_family: model_name already carries the
+    org/model identity, so folding model_family in too just repeats that
+    identity a second time under a different name (e.g. the old
+    'qwen2_5_vl_Qwen_Qwen3.5-0.8B'). The full family/name pair remains the
+    canonical model identifier everywhere else (the header's own "model"
+    field, results-store keys, the CSV's "model" column) — this slug is
+    filename-only. Returns None when the model isn't set (e.g. a standalone
     --stage score run that relies on an explicit --responses_file)."""
-    if not args.model_family or not args.model_name:
+    if not args.model_name:
         return None
-    return f"{args.model_family}/{args.model_name}".replace("/", "_")
+    return args.model_name.replace("/", "_")
 
 
 def _resolve_responses_file(args):
     """Fill in --responses_file's default (None until now) as
-    '<results_dir>/<run_name>/vlm_responses_<model_slug>.jsonl' — the SAME
-    directory --output_file lands in — so the intermediate artifact respects
-    --results_dir/--run_name exactly like every other output this script writes,
-    instead of always landing at a fixed cwd-relative path regardless of those
-    flags. The filename is suffixed with the MODEL slug so each model's infer
-    artifact is uniquely named (the Grounding pipeline consumes these per-model
-    JSON-Lines files, and it keeps a rerun on a different VLM from overwriting a
-    previous model's artifact). Falls back to a plain 'vlm_responses.jsonl' when
-    the model isn't known (a standalone --stage score run). An explicitly-passed
-    --responses_file is left untouched. Creates that directory so phase_infer
-    can open the file for writing. Mutates and returns `args`."""
+    '<results_dir>/<run_name>/RESPONSES_SUBDIR/vlm_responses_<model_slug>.jsonl'
+    — grouped into RESPONSES_SUBDIR (separate from PREDICTIONS_SUBDIR, where
+    phase_score writes the predictions CSV), so a --run_name folder with
+    several models stays easy to scan: the shared results JSON directly
+    inside it, every model's raw .jsonl artifacts together in one subfolder,
+    every model's predictions CSVs together in another. The filename is
+    suffixed with the MODEL slug (see _model_slug) so each model's infer
+    artifact is uniquely named (the Grounding pipeline consumes these
+    per-model JSON-Lines files, and it keeps a rerun on a different VLM from
+    overwriting a previous model's artifact). Falls back to a plain
+    'vlm_responses.jsonl' when the model isn't known (a standalone --stage
+    score run). An explicitly-passed --responses_file is left untouched.
+    Creates that directory so phase_infer can open the file for writing.
+    Mutates and returns `args`."""
     if args.responses_file is None:
         out_dir = Path(args.results_dir)
         if args.run_name:
             out_dir = out_dir / args.run_name
-        out_dir.mkdir(parents=True, exist_ok=True)
+        responses_dir = out_dir / RESPONSES_SUBDIR
+        responses_dir.mkdir(parents=True, exist_ok=True)
         slug = _model_slug(args)
         fname = f"vlm_responses_{slug}.jsonl" if slug else "vlm_responses.jsonl"
-        args.responses_file = str(out_dir / fname)
+        args.responses_file = str(responses_dir / fname)
     return args
 
 
@@ -1249,21 +1402,11 @@ def main():
     _run_stage_subprocess(args, parser, "infer")
     _run_stage_subprocess(args, parser, "score")
 
-    # --stage all's --responses_file is purely the internal handoff between
-    # the two subprocesses above — scoring just finished reading it, so
-    # nothing downstream needs it anymore. Delete it by default (opt out with
-    # --keep_responses_file) so a run doesn't silently leave a
-    # potentially-large JSON-Lines artifact behind that the user never
-    # explicitly asked to keep. --stage infer/score never reach this code
-    # path at all, so a standalone infer run (or a later standalone re-score)
-    # is never affected.
-    if not args.keep_responses_file:
-        try:
-            Path(args.responses_file).unlink()
-            print(f"🗑️  [all] removed intermediate {args.responses_file} "
-                  f"(pass --keep_responses_file to retain it)")
-        except FileNotFoundError:
-            pass
+    # --responses_file is ALWAYS retained (never deleted here, under any
+    # --stage) — it carries every raw VLM response plus the resolved
+    # per-object labels, which the Grounding pipeline consumes downstream, so
+    # it's a first-class output of this run, not a disposable handoff.
+    print(f"💾 [all] retained inference artifact at {args.responses_file}")
 
 
 if __name__ == "__main__":
