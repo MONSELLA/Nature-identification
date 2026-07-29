@@ -9,9 +9,23 @@ CLIP-based metrics for the BIG-5 VLM pipeline:
   - Object-CLIPScore (OURS, F-CLIPScore-INSPIRED — never call this "F-CLIPScore"):
         mean of CLIPScore("a photo of a {object}") over extracted objects only,
         no sentence term.
-  - ClipMatch        (Ging et al.-INSPIRED, caption-based; ImageNet + Places
-    only): score the WHOLE CAPTION's CLIP embedding against each GT candidate
-    class; argmax over candidates = predicted class.
+  - ClipMatch        (Ging et al.-INSPIRED; ImageNet + Places only): score a
+    text embedding against each GT candidate class; argmax over candidates =
+    predicted class. TWO variants, both computed (see run_vlm_pipeline.py):
+      * caption-based (PRIMARY — drives nature/biotic/material scoring on
+        single-label datasets): the WHOLE CAPTION's embedding.
+      * object-list (SECONDARY, diagnostic only — reintroduced per Pau,
+        2026-07, after having been removed in v5 of the design recap for
+        losing to the caption-based version empirically): one sentence built
+        from ALL extracted objects via `object_list_sentence`, e.g. "a photo
+        in which appear a dog, a tree, and an apple". Re-added specifically
+        to re-compare against the caption-based variant now that captions run
+        ~248 tokens (LongCLIP's context) while ClipMatch's own CLIP checkpoint
+        is typically vanilla CLIP (77-token context) — the object list is
+        usually much shorter than the caption, so it truncates less often.
+        Tracked alongside a token-truncation-rate diagnostic (see
+        CLIPScorer.count_tokens) since a busy image's object list can still
+        exceed 77 tokens.
 
 Design: the CLIP model wrapper (`CLIPScorer`) is kept separate from the metric
 math (pure NumPy on L2-normalized embeddings). This lets the aggregation logic
@@ -26,6 +40,7 @@ from typing import List, Optional, Tuple
 import numpy as np
 
 OBJECT_TEMPLATE = "a photo of a {}"
+OBJECT_LIST_PREFIX = "a photo in which appear "
 DEFAULT_CLIPSCORE_SCALE = 2.5
 CLIPMATCH_DATASETS = ("imagenet", "places365")
 LONG_CLIP_REPO_PATH = "/home/pmonserrat/Long-CLIP"
@@ -243,6 +258,26 @@ class CLIPScorer:
                 print(f"🔎 [CLIP] {desc}: {done}/{n_total} ({done / n_total:.1%})", flush=True)
         return np.concatenate(out, axis=0)
 
+    def count_tokens(self, texts: List[str]) -> List[int]:
+        """Untruncated token count per text under this model's OWN tokenizer —
+        used to measure whether encode_text's internal truncation is actually
+        discarding content (e.g. the object-list ClipMatch truncation-rate
+        diagnostic in run_vlm_pipeline.py), independent of `context_length`.
+
+        Native-HF only: a plain HF tokenizer call with truncation=False gives
+        the real length directly. Long-CLIP's tokenizer is a bespoke function
+        (`longclip.tokenize`) that always returns a fixed `context_length`-wide
+        padded tensor regardless of truncate=True/False, so it can't report an
+        untruncated count the same way — raise rather than silently return a
+        misleading number.
+        """
+        if not self._is_native_hf:
+            raise NotImplementedError(
+                "count_tokens needs a native-HF tokenizer (Long-CLIP's tokenize() always "
+                "pads/truncates to a fixed context_length and can't report a raw token count)."
+            )
+        return [len(self.tokenizer(t, truncation=False)["input_ids"]) for t in texts]
+
     def encode_images(self, image_paths: List[str], verbose: bool = False) -> np.ndarray:
         from PIL import Image
 
@@ -326,3 +361,49 @@ def clipmatch(
 
 def object_texts(objects: List[str]) -> List[str]:
     return [OBJECT_TEMPLATE.format(o) for o in objects]
+
+
+_INFLECT_ENGINE = None
+
+
+def _inflect_engine():
+    """Lazy singleton — only the object-list ClipMatch variant needs this, so
+    don't pay the import cost when it isn't used."""
+    global _INFLECT_ENGINE
+    if _INFLECT_ENGINE is None:
+        import inflect
+        _INFLECT_ENGINE = inflect.engine()
+    return _INFLECT_ENGINE
+
+
+def _noun_phrase(obj: str) -> str:
+    """Prefix one extracted-object phrase with the grammatically correct
+    determiner: "a"/"an" for a singular noun phrase (`inflect` picks the right
+    one off the phrase's actual pronunciation-relevant spelling, e.g. "an
+    hour" vs "a house"), no article at all if the phrase is already plural
+    (e.g. "trees", "birds") — `inflect.singular_noun()` returns the singular
+    form (truthy) when it detects a plural, else False.
+    """
+    obj = obj.strip()
+    if not obj:
+        return obj
+    engine = _inflect_engine()
+    if engine.singular_noun(obj):
+        return obj
+    return engine.a(obj)
+
+
+def object_list_sentence(objects: List[str]) -> str:
+    """Concatenate every extracted object into ONE sentence for the
+    object-list ClipMatch variant: "a photo in which appear a {}, a {}, ...
+    and a {}" — each object gets its own determiner via `_noun_phrase` rather
+    than one hardcoded "a" in front of every object regardless of its
+    grammar. Falls back to a bare "a photo" when there are no objects, so
+    encoding never receives an empty string.
+    """
+    phrases = [p for p in (_noun_phrase(o) for o in objects) if p]
+    if not phrases:
+        return "a photo"
+    if len(phrases) == 1:
+        return f"{OBJECT_LIST_PREFIX}{phrases[0]}"
+    return f"{OBJECT_LIST_PREFIX}{', '.join(phrases[:-1])}, and {phrases[-1]}"

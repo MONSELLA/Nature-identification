@@ -81,6 +81,10 @@ sentencepiece>=0.1.99  # AltCLIP's text tower is XLM-RoBERTa-based; its
 # cloned and the checkpoint downloaded:
 ftfy>=6.1
 regex>=2023.0
+# inflect: grammatically correct "a"/"an"/no-article determiners for the
+# object-list ClipMatch sentence variant (clip_metrics.object_list_sentence).
+# Pure-Python, no heavy deps of its own.
+inflect>=7.0
 # (FG-CLIP2 was tried and abandoned — meta-tensor crash in its
 # trust_remote_code __init__ under this project's transformers version; see
 # clip_metrics.CLIP_PRESETS's comment.)

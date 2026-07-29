@@ -1,10 +1,12 @@
-BIG-5 VLM PIPELINE — DESIGN RECAP (v6)
+BIG-5 VLM PIPELINE — DESIGN RECAP (v7)
 (v4: the VLM pipeline is now IMPLEMENTED — this doc records both the original
 design rationale AND, in "IMPLEMENTED:" notes, how the shipped code actually
 does it where the two differ. v5: ClipMatch switched to the caption-based
 variant as the only implementation — see Section 8e and Section 11. v6:
 FG-CLIP2 tried and ABANDONED as a CLIP backend — see Section 11 — replaced
-in CLIP_PRESETS by SigLIP2 and Jina-CLIP-v2.)
+in CLIP_PRESETS by SigLIP2 and Jina-CLIP-v2. v7: the object-list ClipMatch
+variant v5 removed is REINTRODUCED as a SECONDARY/diagnostic metric, run
+alongside (not instead of) the caption-based one — see Section 8e.)
 
 ===============================================================
 0. IMPLEMENTATION STATUS (NEW in v4)
@@ -672,6 +674,42 @@ Week 8 (Sep 3-10): Finish Discussion/Conclusion/Abstract,
 - Final choice between same-VLM vs agnostic-LLM extraction —
   pending ablation results (material/immaterial stays VLM-based
   regardless, per Section 5)
+
+RESOLVED IN v7 (decided per Pau's request, 2026-07):
+- The object-list ClipMatch variant v5 removed is REINTRODUCED in
+  clip_metrics.py (`object_list_sentence`) — but as a SECONDARY,
+  diagnostic-only metric computed ALONGSIDE the caption-based
+  (primary) ClipMatch, not as a replacement. Motivation: with real
+  captions now running ~248 tokens (LongCLIP's context) while
+  ClipMatch itself typically runs on a shorter-context CLIP
+  checkpoint (vanilla CLIP, 77 tokens), the object-list sentence is
+  usually much shorter than the caption and truncates less often —
+  worth re-measuring against the caption-based version's already-
+  settled v5 win, not assuming that win still holds at this caption
+  length.
+- Template: "a photo in which appear a {}, a {}, ... and a {}",
+  NOT the earlier "a photo of a X, a Y ... and a Z" phrasing from
+  v1-v4 (kept below for history) — same underlying idea, different
+  wording. Each object gets its OWN determiner via the `inflect`
+  library ("a"/"an" for a singular noun phrase, decided by the
+  phrase's actual spelling/pronunciation rather than a naive
+  vowel-letter check — e.g. "an hour", "a university" — no article
+  at all when `inflect.singular_noun()` detects the phrase is
+  already plural, e.g. "trees"), rather than one hardcoded "a"
+  in front of every object regardless of its grammar.
+- A token-truncation-RATE diagnostic ships alongside it
+  (`CLIPScorer.count_tokens`, `summary["clipmatch_objlist"]
+  ["truncation_rate"]`): the fraction of images whose object-list
+  sentence alone reaches/exceeds the ClipMatch CLIP's context
+  length. Native-HF CLIP checkpoints only — Long-CLIP's tokenizer
+  always pads/truncates to a fixed context length and can't report
+  an untruncated count, but Long-CLIP is not expected as the
+  ClipMatch backend in practice anyway (ClipMatch wants a
+  retrieval-tuned CLIP, not the long-context one).
+- Does NOT feed nature/biotic/material scoring or hP/hR — those
+  stay on the caption-based ClipMatch's argmax object, unchanged
+  from v5/v6. Reported purely for comparison in the results CSV
+  (`clipmatch_objlist_*` columns) and the run summary.
 
 RESOLVED IN v6 (decided after repeated integration failures):
 - FG-CLIP2 (qihoo360/fg-clip2-large) is ABANDONED as a CLIP backend
