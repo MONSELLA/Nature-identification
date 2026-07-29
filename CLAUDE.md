@@ -142,9 +142,7 @@ evaluating the models.
   S = caption sentence, n_i = extracted objects.
 - **Object-CLIPScore** (ours, F-CLIPScore-INSPIRED — never call this
   "F-CLIPScore"): mean of `CLIPScore("a photo of a {object}")` over extracted
-  objects only. No sentence term. The determiner ("a"/"an"/none for plurals)
-  is grammar-checked via `inflect` (`clip_metrics.object_template_text`), not
-  a hardcoded "a" — same helper used for ClipMatch's candidate_vocab text.
+  objects only. No sentence term.
 - CLIP text encoder truncates at 77 tokens — long captions risk truncating the
   sentence-level term. Check which CLIP variant is in use before assuming the
   full caption is encoded; vanilla CLIP, SigLIP2, and EVA-CLIP all truncate

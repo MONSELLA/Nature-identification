@@ -1,4 +1,4 @@
-BIG-5 VLM PIPELINE — DESIGN RECAP (v9)
+BIG-5 VLM PIPELINE — DESIGN RECAP (v10)
 (v4: the VLM pipeline is now IMPLEMENTED — this doc records both the original
 design rationale AND, in "IMPLEMENTED:" notes, how the shipped code actually
 does it where the two differ. v5: ClipMatch switched to the caption-based
@@ -19,7 +19,10 @@ now goes through an inflect-checked determiner everywhere it's filled in
 — see Section 11. v9: SigLIP2 measured WORSE than MetaCLIP for ClipMatch —
 added two LAION OpenCLIP-in-CLIPModel-format checkpoints ("laion_h14",
 "laion_bigg") as the hassle-free EVA-CLIP-tier option instead — see
-Section 11.)
+Section 11. v10: the v8 inflect-checked OBJECT_TEMPLATE determiner was
+REVERTED per Pau — suspected (not confirmed in isolation) of contributing
+to a ClipMatch drop observed after switching to MetaCLIP; OBJECT_TEMPLATE
+is back to a hardcoded "a" — see Section 11.)
 
 ===============================================================
 0. IMPLEMENTATION STATUS (NEW in v4)
@@ -714,6 +717,18 @@ RESOLVED IN v6 (decided after repeated integration failures):
   clip_metrics.CLIPScorer's class docstring) were PROPOSED as
   replacements here, but neither was actually added to CLIP_PRESETS at
   the time — see RESOLVED IN v8 below for what's actually wired in.
+
+RESOLVED IN v10 (reverted per Pau):
+- The v8 inflect-checked OBJECT_TEMPLATE determiner (object_template_text)
+  was REMOVED — Pau observed a ClipMatch drop after switching to MetaCLIP
+  and suspected this change as a contributing factor. NOTE: this was not
+  isolated/confirmed as the actual cause (the MetaCLIP switch itself is a
+  confounding variable in that same comparison), but reverted anyway per
+  Pau's call. OBJECT_TEMPLATE ("a photo of a {}") is back to a hardcoded
+  "a" for both Object-CLIPScore's per-object text and ClipMatch's
+  candidate_vocab class-name text; `inflect` dependency removed from
+  requirements.txt. If revisited, isolate this change from any concurrent
+  CLIP-backend swap before attributing a score change to it.
 
 RESOLVED IN v9 (decided from empirical comparison, per Pau):
 - SigLIP2 (v8) measured WORSE than MetaCLIP for ClipMatch on a

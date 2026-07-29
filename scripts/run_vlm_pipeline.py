@@ -554,7 +554,7 @@ def phase_score(args):
         # gt_nature/gt_biotic and the ClipMatch top-1 prediction can be read
         # straight off its candidate_vocab entry — no separate graph lookup.
         candidate_embs = cm_scorer.encode_text(
-            [clip_metrics.object_template_text(c["class_name"]) for c in candidate_vocab],
+            [clip_metrics.OBJECT_TEMPLATE.format(c["class_name"]) for c in candidate_vocab],
             verbose=args.verbose, desc="candidate_vocab")
 
         # Summary-caption ClipMatch — PRIMARY when the artifact has one (see

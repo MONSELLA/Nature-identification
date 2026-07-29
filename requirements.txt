@@ -75,11 +75,6 @@ Pillow>=10.0
 sentencepiece>=0.1.99  # AltCLIP's text tower is XLM-RoBERTa-based; its
                        # tokenizer needs sentencepiece, which transformers
                        # does NOT pull in as a hard dependency on its own.
-# inflect: grammatically correct "a"/"an"/no-article determiners wherever
-# OBJECT_TEMPLATE ("a photo of a {}") is filled in with a real object phrase
-# (clip_metrics.object_template_text — Object-CLIPScore's per-object text and
-# ClipMatch's candidate_vocab class-name text). Pure-Python, no heavy deps.
-inflect>=7.0
 # longclip (CLIP_PRESETS["longclip"]) is NOT a transformers checkpoint at
 # all — clip_metrics.py routes it to a LOCAL CLONE of the Long-CLIP GitHub
 # repo (LONG_CLIP_REPO_PATH, currently "/home/pmonserrat/Long-CLIP") plus its
