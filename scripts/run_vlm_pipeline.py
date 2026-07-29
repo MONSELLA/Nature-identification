@@ -60,7 +60,7 @@ Metrics (per CLAUDE.md scoping):
     scored with --clipscore_model.
   - ClipMatch + hP/hR/hF1                : ImageNet + Places ONLY (fixed vocab,
     restricted to classes mapped into the graph), scored with
-    --clipmatch_clip_model (independently selectable from --clipscore_model;
+    --clipmatch_model (independently selectable from --clipscore_model;
     defaults to the same checkpoint).
   - Diagnostics: extraction-hit rate (exact-match, reporting-only — no longer
     gates axis scores), WordNet-mapping vs VLM-fallback rate, objects/image,
@@ -437,7 +437,7 @@ def phase_score(args):
     # image-text plausibility). Default is the SAME checkpoint as --clipscore_model;
     # only load a second model if the resolved (model, trust_remote_code) pair
     # actually differs, to avoid holding two copies of the same weights.
-    clipmatch_model_name = args.clipmatch_clip_model or args.clipscore_model
+    clipmatch_model_name = args.clipmatch_model or args.clipscore_model
     clipmatch_trust_remote_code = (args.clipmatch_clip_trust_remote_code
                                     if args.clipmatch_clip_trust_remote_code is not None
                                     else args.clipscore_trust_remote_code)
@@ -1181,7 +1181,7 @@ def build_arg_parser():
     p.add_argument("--trust_remote_code", action="store_true")
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--max_new_tokens_caption", type=int, default=248) # 248 tokens is the maximum length that LongCLIP can handle
-    p.add_argument("--max_new_tokens_label", type=int, default=256)
+    p.add_argument("--max_new_tokens_label", type=int, default=248)
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--max_hops", type=int, default=0,
                    help="Maximum WordNet hop distance allowed when mapping an EXTRACTED "
@@ -1210,7 +1210,7 @@ def build_arg_parser():
                         "F-CLIPScore, Object-CLIPScore — all datasets): a "
                         "clip_metrics.CLIP_PRESETS alias ('original', 'eva-clip', 'siglip2', "
                         "'jina-clip-v2') or a raw HuggingFace repo id. Also the default for "
-                        "--clipmatch_clip_model when that isn't set separately.")
+                        "--clipmatch_model when that isn't set separately.")
     p.add_argument("--clipscore_trust_remote_code", type=lambda s: s.lower() != "false", default=True,
                    help="Passed to transformers' from_pretrained calls for --clipscore_model "
                         "(default True). Several CLIP variants (EVA-CLIP, Jina-CLIP-v2) ship "
@@ -1218,7 +1218,7 @@ def build_arg_parser():
                         "checkpoints that don't need it (e.g. the original OpenAI CLIP, "
                         "SigLIP2). Pass --clipscore_trust_remote_code false to disable.")
     p.add_argument("--clip_batch_size", type=int, default=64)
-    p.add_argument("--clipmatch_clip_model", type=str, default=None,
+    p.add_argument("--clipmatch_model", type=str, default=None,
                    help="CLIP checkpoint used for ClipMatch + hP/hR/hF1 (ImageNet + Places "
                         "only) — kept independently selectable from --clipscore_model since the two "
                         "jobs have different needs (ClipMatch matches a whole caption against a "
@@ -1229,7 +1229,7 @@ def build_arg_parser():
                         "scorer is reused instead of loading a second model.")
     p.add_argument("--clipmatch_clip_trust_remote_code", type=lambda s: s.lower() != "false", default=None,
                    help="Passed to transformers' from_pretrained calls for "
-                        "--clipmatch_clip_model (default: same as --clipscore_trust_remote_code). "
+                        "--clipmatch_model (default: same as --clipscore_trust_remote_code). "
                         "Pass --clipmatch_clip_trust_remote_code false/true to override "
                         "independently of --clipscore_trust_remote_code.")
 
