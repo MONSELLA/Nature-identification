@@ -1417,7 +1417,7 @@ def build_arg_parser():
                         "custom modeling code on the Hub that requires this; it's a no-op for "
                         "checkpoints that don't need it (e.g. the original OpenAI CLIP, "
                         "SigLIP2). Pass --clipscore_trust_remote_code false to disable.")
-    p.add_argument("--clip_batch_size", type=int, default=64)
+    p.add_argument("--clip_batch_size", type=int, default=77)
     p.add_argument("--clipmatch_model", type=str, default=None,
                    help="CLIP checkpoint used for ClipMatch + hP/hR/hF1 (ImageNet + Places "
                         "only) — kept independently selectable from --clipscore_model since the two "
