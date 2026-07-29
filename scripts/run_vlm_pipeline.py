@@ -517,6 +517,8 @@ def phase_score(args):
     run_summary_clipmatch = False
     summary_texts = summary_embs_cm = None
     n_summary_truncated = None
+    summary_token_mean = None
+    summary_token_counts = None
     primary_embs_cm = None
     if run_clipmatch:
         caption_embs_cm = caption_embs if cm_scorer is scorer else cm_scorer.encode_text(
@@ -553,6 +555,7 @@ def phase_score(args):
             try:
                 summary_token_counts = cm_scorer.count_tokens(summary_texts)
                 n_summary_truncated = sum(1 for n in summary_token_counts if n >= cm_scorer.context_length)
+                summary_token_mean = sum(summary_token_counts) / len(summary_token_counts)
             except NotImplementedError:
                 pass
         # Whichever embedding space drives scoring THIS run — summary caption
@@ -980,6 +983,7 @@ def phase_score(args):
             "clipmatch_pred_material": best_final["final_material"] if best_final else None,
             "clipmatch_top1_correct": clipmatch_correct,
             "clipmatch_summary_caption": summary_texts[idx] if summary_texts is not None else None,
+            "clipmatch_summary_caption_token_length": summary_token_counts[idx] if summary_token_counts is not None else None,
             # ClipMatch (raw-caption variant) — SECONDARY comparison, only
             # populated when the summary caption is primary; does not drive
             # scoring either way.
@@ -1058,6 +1062,7 @@ def phase_score(args):
                                 else None,
             "truncated_count": n_summary_truncated if run_summary_clipmatch else None,
             "context_length": cm_scorer.context_length,
+            "mean_token_length": summary_token_mean if run_summary_clipmatch else None,
         }
         # Raw-caption ClipMatch (SECONDARY comparison) — only computed/
         # meaningful when the summary caption is primary above; None
@@ -1174,8 +1179,10 @@ def _print_summary(s, run_clipmatch):
         primary_label = "summary-caption" if s["clip_models"]["clipmatch_primary_source"] == "summary_caption" else "caption-based"
         cm = s["clipmatch"]
         trunc_str = f"{cm['truncation_rate']:.1%}" if cm["truncation_rate"] is not None else "n/a"
+        mean_tok_str = f"{cm['mean_token_length']:.1f}" if cm["mean_token_length"] is not None else "n/a"
         print(f"\n--- ClipMatch [{primary_label}, PRIMARY] (support {cm['support']}) ---")
-        print(f"Top-1: {cm['top1_accuracy']:.4f} | Truncation rate (>= {cm['context_length']} tok): "
+        print(f"Top-1: {cm['top1_accuracy']:.4f} | Mean token length: {mean_tok_str} "
+              f"| Truncation rate (>= {cm['context_length']} tok): "
               f"{trunc_str} ({cm['truncated_count'] if cm['truncated_count'] is not None else 'n/a'}/{s['n_images']})")
         cc = s.get("clipmatch_caption")
         if cc is not None:
@@ -1224,6 +1231,8 @@ def _log_wandb(args, summary, run_clipmatch):
         log["ClipMatch/Top1"] = summary["clipmatch"]["top1_accuracy"]
         if summary["clipmatch"]["truncation_rate"] is not None:
             log["ClipMatch/TruncationRate"] = summary["clipmatch"]["truncation_rate"]
+        if summary["clipmatch"]["mean_token_length"] is not None:
+            log["ClipMatch/MeanTokenLength"] = summary["clipmatch"]["mean_token_length"]
         if summary.get("clipmatch_caption") is not None:
             log["ClipMatch_RawCaption/Top1"] = summary["clipmatch_caption"]["top1_accuracy"]
         log["Hierarchical/hF1"] = summary["hierarchical"]["hf1"]
