@@ -44,16 +44,6 @@ import networkx as nx
 from nltk.corpus import wordnet as wn
 
 
-# Optional hand-curated synonyms for senses WordNet lemmatizes awkwardly.
-# Mirrors the reference file's `custom_synonyms`; extend as needed.
-# Example: WordNet's literal synsets for "boy"/"girl"/etc. don't map cleanly
-# onto "person.n.01" the way we'd want for this project, so we hardcode the
-# mapping here instead of relying on WordNet's own synonym lookup for these.
-CUSTOM_SYNONYMS = {
-    "person.n.01": ["boy", "girl", "man", "woman", "kid", "child", "guy", "lady"],
-}
-
-
 # =============================================================================
 # Wu-Palmer similarity
 # =============================================================================
@@ -272,11 +262,6 @@ def resolve_to_wordnet(
     best_score, top_candidate = max(zip(candidate_scores, candidate_strings), key=lambda p: p[0])
     if best_score <= threshold:
         return None
-
-    # Custom synonym expansion: if this string is a known alias of the
-    # predicted class, accept the predicted class directly.
-    if pred_synset_id in CUSTOM_SYNONYMS and top_candidate.strip().lower() in CUSTOM_SYNONYMS[pred_synset_id]:
-        return pred_synset_id
 
     synsets = _synsets_for_phrase(top_candidate)
     if synsets:
