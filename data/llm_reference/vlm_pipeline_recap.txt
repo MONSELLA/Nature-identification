@@ -1,4 +1,4 @@
-BIG-5 VLM PIPELINE — DESIGN RECAP (v11)
+BIG-5 VLM PIPELINE — DESIGN RECAP (v12)
 (v4: the VLM pipeline is now IMPLEMENTED — this doc records both the original
 design rationale AND, in "IMPLEMENTED:" notes, how the shipped code actually
 does it where the two differ. v5: ClipMatch switched to the caption-based
@@ -25,7 +25,10 @@ to a ClipMatch drop observed after switching to MetaCLIP; OBJECT_TEMPLATE
 is back to a hardcoded "a" — see Section 11. v11: added an OPT-IN ClipMatch
 candidate-text variant (--use_wordnet_definitions_clipmatch) that swaps the
 plain OBJECT_TEMPLATE phrase for a WordNet lemma(s)+gloss prose per
-candidate class — untested hypothesis, not a default — see Section 8e/11.)
+candidate class — untested hypothesis, not a default — see Section 8e/11.
+v12: that variant MEASURED — no meaningful difference vs the plain
+OBJECT_TEMPLATE phrase on ClipMatch top-1; kept as an available, non-default
+flag rather than removed, per Pau — see Section 11.)
 
 ===============================================================
 0. IMPLEMENTATION STATUS (NEW in v4)
@@ -730,20 +733,33 @@ RESOLVED IN v6 (decided after repeated integration failures):
   replacements here, but neither was actually added to CLIP_PRESETS at
   the time — see RESOLVED IN v8 below for what's actually wired in.
 
-PROPOSED IN v11 (added, NOT YET VALIDATED — per Pau's request):
-- ClipMatch candidate-vocab text now has an independent, opt-in
-  variant: `clip_metrics.wordnet_definition_text(synset_id)` builds
-  "A {primary lemma}, also known as {other lemmas}. It is defined as:
-  {WordNet gloss}." per GT candidate class, instead of the plain
-  OBJECT_TEMPLATE phrase. `clip_metrics.candidate_vocab_texts(...,
-  use_wordnet_definitions=...)` picks between the two; wired to
-  run_vlm_pipeline.py's `--use_wordnet_definitions_clipmatch`
-  (--stage score only — the choice doesn't affect --stage infer at
-  all). Hypothesis: a VLM's own image descriptions are often
-  definitional/explanatory in style, so a richer, more descriptive
-  candidate-side text may align better in CLIP's embedding space than
-  a bare templated noun phrase — UNTESTED, not a default. Every
-  candidate's synset_id is guaranteed to resolve via `wn.synset()`
+RESOLVED IN v12 (measured, per Pau):
+- The v11 WordNet-definition ClipMatch candidate text
+  (`clip_metrics.wordnet_definition_text`, `--use_wordnet_definitions_clipmatch`)
+  was run and compared against the plain OBJECT_TEMPLATE phrase — NO
+  MEANINGFUL DIFFERENCE in ClipMatch top-1 between the two. The
+  "richer candidate-side semantic content aligns better against a
+  VLM's own descriptive summary" hypothesis (v11) is NOT supported by
+  this result. Kept in the codebase as a non-default, opt-in flag
+  (cheap to keep, not proven harmful either, and may behave
+  differently on a larger sample or a different CLIP backend) rather
+  than removed outright — unlike the inflect-determiner change (v10),
+  which was reverted because it was suspected of actively hurting the
+  score. If revisited, a larger sample than the earlier spot-check
+  runs would be needed to rule out this being a real-but-small effect
+  hidden by run-to-run noise (see the earlier non-determinism
+  discussion) rather than a genuine null result.
+
+v11 PROPOSAL (for reference — see RESOLVED IN v12 above for the outcome):
+- ClipMatch candidate-vocab text got an independent, opt-in variant:
+  `clip_metrics.wordnet_definition_text(synset_id)` builds "A {primary
+  lemma}, also known as {other lemmas}. It is defined as: {WordNet
+  gloss}." per GT candidate class, instead of the plain OBJECT_TEMPLATE
+  phrase. `clip_metrics.candidate_vocab_texts(..., use_wordnet_definitions=...)`
+  picks between the two; wired to run_vlm_pipeline.py's
+  `--use_wordnet_definitions_clipmatch` (--stage score only — the
+  choice doesn't affect --stage infer at all). Every candidate's
+  synset_id is guaranteed to resolve via `wn.synset()`
   (get_candidate_vocab's own docstring), so no mapping-fallback logic
   is needed here the way it is for object-side WordNet lookups
   (resolve_to_wordnet). Needs `inflect`, but ONLY for this path — the
