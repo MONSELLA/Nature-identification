@@ -249,6 +249,21 @@ def _mean(vals):
     return float(sum(vals) / len(vals)) if vals else 0.0
 
 
+def _clip_token_stats(scorer, texts):
+    """Per-text CLIP-tokenizer token counts, mean length, and truncated count
+    (>= scorer.context_length) for a list of texts under `scorer`'s own
+    tokenizer. Returns (None, None, None) when the scorer can't count tokens
+    (Long-CLIP's tokenizer always pads/truncates to a fixed length — see
+    CLIPScorer.count_tokens)."""
+    try:
+        counts = scorer.count_tokens(texts)
+    except NotImplementedError:
+        return None, None, None
+    mean = sum(counts) / len(counts) if counts else 0.0
+    truncated = sum(1 for n in counts if n >= scorer.context_length)
+    return counts, mean, truncated
+
+
 # =============================================================================
 # PHASE 1 — inference
 # =============================================================================
@@ -519,10 +534,16 @@ def phase_score(args):
     n_summary_truncated = None
     summary_token_mean = None
     summary_token_counts = None
+    caption_token_counts = caption_token_mean = n_caption_truncated = None
     primary_embs_cm = None
     if run_clipmatch:
         caption_embs_cm = caption_embs if cm_scorer is scorer else cm_scorer.encode_text(
             captions, warn_truncation=False, verbose=args.verbose, desc="captions (clipmatch)")
+        # Raw-caption token stats under cm_scorer's OWN tokenizer — always
+        # tracked (not gated on run_summary_clipmatch) so the raw caption's
+        # truncation is visible whether it's driving scoring (no summary
+        # available) or just reported as the secondary comparison.
+        caption_token_counts, caption_token_mean, n_caption_truncated = _clip_token_stats(cm_scorer, captions)
         obj_embs_all_cm = obj_embs_all if cm_scorer is scorer else cm_scorer.encode_text(
             flat_texts, verbose=args.verbose, desc="objects (clipmatch)")
         # Also encode the FIXED candidate-class vocabulary just once (rather
@@ -552,12 +573,8 @@ def phase_score(args):
             summary_texts = [r.get("clipmatch_summary_caption") or r["caption"] for r in records]
             summary_embs_cm = cm_scorer.encode_text(
                 summary_texts, verbose=args.verbose, desc="summary captions (clipmatch)")
-            try:
-                summary_token_counts = cm_scorer.count_tokens(summary_texts)
-                n_summary_truncated = sum(1 for n in summary_token_counts if n >= cm_scorer.context_length)
-                summary_token_mean = sum(summary_token_counts) / len(summary_token_counts)
-            except NotImplementedError:
-                pass
+            summary_token_counts, summary_token_mean, n_summary_truncated = _clip_token_stats(
+                cm_scorer, summary_texts)
         # Whichever embedding space drives scoring THIS run — summary caption
         # when the artifact has one, else the full caption (old artifacts /
         # --no_summarize_clipmatch_caption). Computed once here, not per-image.
@@ -1023,6 +1040,7 @@ def phase_score(args):
             "clipmatch_caption_pred_synset": caption_pred_vocab_entry["synset_id"] if caption_pred_vocab_entry else None,
             "clipmatch_caption_pred_similarity": clipmatch_caption_pred_similarity,
             "clipmatch_caption_top1_correct": clipmatch_caption_correct,
+            "clipmatch_caption_token_length": caption_token_counts[idx] if caption_token_counts is not None else None,
             "gt_synset": gt_syn,
             "resolved_pred_synset": pred_node,
             "hierarchical_precision": hier["hp"], "hierarchical_recall": hier["hr"],
@@ -1095,28 +1113,37 @@ def phase_score(args):
             "mask_threshold": header["grounding"].get("mask_threshold"),
         }
     if run_clipmatch:
+        # Token stats for whichever text is PRIMARY this run: the summary
+        # caption when the artifact has one, else the raw caption itself
+        # (both are always tracked via _clip_token_stats above, so this is
+        # just picking the one that's actually driving scoring).
+        primary_truncated = n_summary_truncated if run_summary_clipmatch else n_caption_truncated
+        primary_mean_tokens = summary_token_mean if run_summary_clipmatch else caption_token_mean
         summary["clipmatch"] = {
             "top1_accuracy": (clipmatch_top1 / clipmatch_support) if clipmatch_support else 0.0,
             "support": clipmatch_support,
-            # Truncation rate of whichever text is PRIMARY this run — only
-            # tracked when that's the summary caption (see clip_models above);
-            # None when primary fell back to the full caption (no per-token
-            # tracking kept for that path).
-            "truncation_rate": (n_summary_truncated / n_images)
-                                if (run_summary_clipmatch and n_summary_truncated is not None and n_images)
-                                else None,
-            "truncated_count": n_summary_truncated if run_summary_clipmatch else None,
+            "truncation_rate": (primary_truncated / n_images)
+                                if (primary_truncated is not None and n_images) else None,
+            "truncated_count": primary_truncated,
             "context_length": cm_scorer.context_length,
-            "mean_token_length": summary_token_mean if run_summary_clipmatch else None,
+            "mean_token_length": primary_mean_tokens,
         }
         # Raw-caption ClipMatch (SECONDARY comparison) — only computed/
         # meaningful when the summary caption is primary above; None
         # otherwise, so callers can tell "not run" apart from "run and scored 0".
+        # Its OWN token stats are reported here too (caption_token_mean/
+        # n_caption_truncated), even though the raw caption isn't primary in
+        # this branch — that's the whole point of the comparison.
         if run_summary_clipmatch:
             summary["clipmatch_caption"] = {
                 "top1_accuracy": (clipmatch_caption_top1 / clipmatch_caption_support)
                                   if clipmatch_caption_support else 0.0,
                 "support": clipmatch_caption_support,
+                "truncation_rate": (n_caption_truncated / n_images)
+                                    if (n_caption_truncated is not None and n_images) else None,
+                "truncated_count": n_caption_truncated,
+                "context_length": cm_scorer.context_length,
+                "mean_token_length": caption_token_mean,
             }
         else:
             summary["clipmatch_caption"] = None
@@ -1237,8 +1264,12 @@ def _print_summary(s, run_clipmatch):
               f"{trunc_str} ({cm['truncated_count'] if cm['truncated_count'] is not None else 'n/a'}/{s['n_images']})")
         cc = s.get("clipmatch_caption")
         if cc is not None:
+            cc_trunc_str = f"{cc['truncation_rate']:.1%}" if cc["truncation_rate"] is not None else "n/a"
+            cc_mean_tok_str = f"{cc['mean_token_length']:.1f}" if cc["mean_token_length"] is not None else "n/a"
             print(f"\n--- ClipMatch [raw-caption, secondary comparison] (support {cc['support']}) ---")
-            print(f"Top-1: {cc['top1_accuracy']:.4f}")
+            print(f"Top-1: {cc['top1_accuracy']:.4f} | Mean token length: {cc_mean_tok_str} "
+                  f"| Truncation rate (>= {cc['context_length']} tok): "
+                  f"{cc_trunc_str} ({cc['truncated_count'] if cc['truncated_count'] is not None else 'n/a'}/{s['n_images']})")
         h = s["hierarchical"]
         hm = s["hierarchical_mapped"]
         print(f"--- Hierarchical (support {h['support']}) ---")
@@ -1286,6 +1317,10 @@ def _log_wandb(args, summary, run_clipmatch):
             log["ClipMatch/MeanTokenLength"] = summary["clipmatch"]["mean_token_length"]
         if summary.get("clipmatch_caption") is not None:
             log["ClipMatch_RawCaption/Top1"] = summary["clipmatch_caption"]["top1_accuracy"]
+            if summary["clipmatch_caption"]["truncation_rate"] is not None:
+                log["ClipMatch_RawCaption/TruncationRate"] = summary["clipmatch_caption"]["truncation_rate"]
+            if summary["clipmatch_caption"]["mean_token_length"] is not None:
+                log["ClipMatch_RawCaption/MeanTokenLength"] = summary["clipmatch_caption"]["mean_token_length"]
         log["Hierarchical/hF1"] = summary["hierarchical"]["hf1"]
         log["Hierarchical/WuPalmer"] = summary["hierarchical"]["wup"]
         log["Hierarchical/MappingFailureRate"] = summary["hierarchical"]["mapping_failure_rate"]
