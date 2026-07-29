@@ -62,16 +62,22 @@ Pillow>=10.0
 
 # --- CLIP-based metrics (src/evaluation/clip_metrics.py) ---
 # F-CLIPScore, Object-CLIPScore, ClipMatch all run through a CLIPScorer.
-# clip_metrics.CLIP_PRESETS currently offers FOUR checkpoints — keep this
+# clip_metrics.CLIP_PRESETS currently offers FIVE checkpoints — keep this
 # list in sync with that dict if it changes, this has drifted before:
 #   "original" (openai/clip-vit-large-patch14), "metaclip"
-#   (facebook/metaclip-h14-fullcc2.5b), "altclip" (BAAI/AltCLIP) — all three
-#   native transformers AutoModel/AutoProcessor, covered by transformers
+#   (facebook/metaclip-h14-fullcc2.5b), "altclip" (BAAI/AltCLIP), "siglip2"
+#   (google/siglip2-base-patch16-224) — all four native transformers
+#   AutoModel/AutoProcessor, NO trust_remote_code, covered by transformers
 #   above, no extra packages — PLUS "longclip", which is different enough to
 #   need its own dependencies below.
 sentencepiece>=0.1.99  # AltCLIP's text tower is XLM-RoBERTa-based; its
                        # tokenizer needs sentencepiece, which transformers
                        # does NOT pull in as a hard dependency on its own.
+# inflect: grammatically correct "a"/"an"/no-article determiners wherever
+# OBJECT_TEMPLATE ("a photo of a {}") is filled in with a real object phrase
+# (clip_metrics.object_template_text — Object-CLIPScore's per-object text and
+# ClipMatch's candidate_vocab class-name text). Pure-Python, no heavy deps.
+inflect>=7.0
 # longclip (CLIP_PRESETS["longclip"]) is NOT a transformers checkpoint at
 # all — clip_metrics.py routes it to a LOCAL CLONE of the Long-CLIP GitHub
 # repo (LONG_CLIP_REPO_PATH, currently "/home/pmonserrat/Long-CLIP") plus its

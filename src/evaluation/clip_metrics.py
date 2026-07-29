@@ -8,7 +8,9 @@ CLIP-based metrics for the BIG-5 VLM pipeline:
     S = caption sentence, n_i = extracted objects.
   - Object-CLIPScore (OURS, F-CLIPScore-INSPIRED — never call this "F-CLIPScore"):
         mean of CLIPScore("a photo of a {object}") over extracted objects only,
-        no sentence term.
+        no sentence term. The determiner ("a"/"an"/none for plurals) is
+        grammar-checked via `inflect` (see object_template_text), not a
+        hardcoded "a" regardless of the object phrase.
   - ClipMatch        (Ging et al.-INSPIRED, caption-based; ImageNet + Places
     only): score the WHOLE CAPTION's CLIP embedding against each GT candidate
     class; argmax over candidates = predicted class.
@@ -37,6 +39,18 @@ CLIP_PRESETS = {
     "original": "openai/clip-vit-large-patch14",
     "metaclip": "facebook/metaclip-h14-fullcc2.5b",
     "altclip": "BAAI/AltCLIP",
+    # SigLIP2: native transformers AutoModel/AutoProcessor, NO trust_remote_code
+    # — unlike FG-CLIP2 (tried and abandoned as a CLIP backend: its
+    # trust_remote_code __init__ crashed with a meta-tensor error under this
+    # project's transformers version; see data/llm_reference/vlm_pipeline_recap.txt
+    # §11 for the full history), SigLIP2's whole forward path is plain library
+    # code, so there's no custom-model-class __init__ to crash. SiglipModel has
+    # no separate text_projection/visual_projection submodule (the pooled
+    # output from text_model/vision_model IS already the projected embedding),
+    # so CLIPScorer._text_features/_image_features fall through to their
+    # get_text_features/get_image_features branch, which already returns a
+    # plain Tensor — no special-casing needed here.
+    "siglip2": "google/siglip2-base-patch16-224",
     "longclip": "longclip",  # Routed directly to local GitHub clone
 }
 
@@ -343,5 +357,40 @@ def clipmatch(
     per_candidate_sim = candidate_embs @ caption_emb
     return per_candidate_sim, int(np.argmax(per_candidate_sim))
 
+_INFLECT_ENGINE = None
+
+
+def _inflect_engine():
+    """Lazy singleton — only object_template_text needs this, so don't pay the
+    import cost for callers that never template an object phrase."""
+    global _INFLECT_ENGINE
+    if _INFLECT_ENGINE is None:
+        import inflect
+        _INFLECT_ENGINE = inflect.engine()
+    return _INFLECT_ENGINE
+
+
+def object_template_text(obj: str) -> str:
+    """OBJECT_TEMPLATE ("a photo of a {}") with a grammatically correct
+    determiner instead of a hardcoded "a" regardless of the object's own
+    grammar: "a"/"an" for a singular noun phrase (`inflect` picks the right
+    one off the phrase's actual spelling, e.g. "an hour" vs "a house"), no
+    article at all when the phrase is already plural (`inflect.singular_noun()`
+    returns the singular form — truthy — when it detects a plural, e.g.
+    "trees" -> "a photo of trees", not "a photo of a trees").
+
+    Every caller of OBJECT_TEMPLATE (Object-CLIPScore's per-object text,
+    ClipMatch's candidate_vocab class-name text) should go through this
+    function rather than `OBJECT_TEMPLATE.format(obj)` directly.
+    """
+    obj = obj.strip()
+    if not obj:
+        return OBJECT_TEMPLATE.format(obj)
+    engine = _inflect_engine()
+    if engine.singular_noun(obj):
+        return f"a photo of {obj}"
+    return f"a photo of {engine.a(obj)}"
+
+
 def object_texts(objects: List[str]) -> List[str]:
-    return [OBJECT_TEMPLATE.format(o) for o in objects]
+    return [object_template_text(o) for o in objects]

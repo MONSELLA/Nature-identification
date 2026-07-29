@@ -1,17 +1,22 @@
-BIG-5 VLM PIPELINE — DESIGN RECAP (v7)
+BIG-5 VLM PIPELINE — DESIGN RECAP (v8)
 (v4: the VLM pipeline is now IMPLEMENTED — this doc records both the original
 design rationale AND, in "IMPLEMENTED:" notes, how the shipped code actually
 does it where the two differ. v5: ClipMatch switched to the caption-based
 variant as the only implementation — see Section 8e and Section 11. v6:
-FG-CLIP2 tried and ABANDONED as a CLIP backend — see Section 11 — replaced
-in CLIP_PRESETS by SigLIP2 and Jina-CLIP-v2. The object-list ClipMatch
-variant was briefly reintroduced as a diagnostic and re-removed the same
-day — CONFIRMED AGAIN worse than caption-based (0.28 vs 0.34 top-1 on the
-spot-check run); see Section 8e/11, this is the SECOND time this exact
-result has held. v7: ClipMatch's PRIMARY text is now a VLM-written SUMMARY
-of the caption (not the raw caption itself) on ImageNet/Places — measured
-0.41 vs 0.34 top-1, ~0% truncation vs. the raw caption's frequent silent
-CLIP-tokenizer cutoff — see Section 8e/11.)
+FG-CLIP2 tried and ABANDONED as a CLIP backend — see Section 11 — SigLIP2
+and Jina-CLIP-v2 proposed as replacements at the time, but NOT actually
+wired into CLIP_PRESETS until v8 (SigLIP2 only — see below); v6 itself
+overclaimed this. The object-list ClipMatch variant was briefly
+reintroduced as a diagnostic and re-removed the same day — CONFIRMED AGAIN
+worse than caption-based (0.28 vs 0.34 top-1 on the spot-check run); see
+Section 8e/11, this is the SECOND time this exact result has held. v7:
+ClipMatch's PRIMARY text is now a VLM-written SUMMARY of the caption (not
+the raw caption itself) on ImageNet/Places — measured 0.41 vs 0.34 top-1,
+~0% truncation vs. the raw caption's frequent silent CLIP-tokenizer cutoff
+— see Section 8e/11. v8: SigLIP2 actually added to CLIP_PRESETS (native
+transformers, no trust_remote_code); OBJECT_TEMPLATE's "a photo of a {}"
+now goes through an inflect-checked determiner everywhere it's filled in
+— see Section 11.)
 
 ===============================================================
 0. IMPLEMENTATION STATUS (NEW in v4)
@@ -700,10 +705,34 @@ RESOLVED IN v6 (decided after repeated integration failures):
   separate FG-CLIP2 issue — its get_text_features() needing a
   walk_type kwarg tied to a fixed 64/196-token sequence length) has
   been removed along with it, since it's moot without a working load.
-  CLIP_PRESETS now offers SigLIP2 (google/siglip2-base-patch16-224,
-  native transformers, no trust_remote_code needed) and Jina-CLIP-v2
-  (jinaai/jina-clip-v2, trust_remote_code, RAW string/image input
-  convention — see clip_metrics.CLIPScorer's class docstring) instead.
+  SigLIP2 (google/siglip2-base-patch16-224, native transformers, no
+  trust_remote_code needed) and Jina-CLIP-v2 (jinaai/jina-clip-v2,
+  trust_remote_code, RAW string/image input convention — see
+  clip_metrics.CLIPScorer's class docstring) were PROPOSED as
+  replacements here, but neither was actually added to CLIP_PRESETS at
+  the time — see RESOLVED IN v8 below for what's actually wired in.
+
+RESOLVED IN v8:
+- SigLIP2 (google/siglip2-base-patch16-224) actually added to
+  clip_metrics.CLIP_PRESETS as "siglip2" — native transformers
+  AutoModel/AutoProcessor, NO trust_remote_code, so there's no
+  custom-model-class __init__ that can hit FG-CLIP2's meta-tensor crash.
+  SiglipModel has no separate text_projection/visual_projection
+  submodule (its text_model/vision_model pooled output IS already the
+  projected embedding), so CLIPScorer._text_features/_image_features
+  fall through to the get_text_features/get_image_features branch,
+  which already handles a plain-Tensor return — no SigLIP-specific
+  code needed in CLIPScorer itself. Jina-CLIP-v2 was NOT added (still
+  requires trust_remote_code, which this change specifically avoided).
+- OBJECT_TEMPLATE ("a photo of a {}") is now filled in via
+  `clip_metrics.object_template_text`, which picks the grammatically
+  correct determiner via `inflect` instead of hardcoding "a" — "a"/"an"
+  for a singular noun phrase (by actual spelling, e.g. "an hour", "a
+  university"), no article at all for an already-plural phrase (e.g.
+  "trees" -> "a photo of trees"). Applies everywhere OBJECT_TEMPLATE is
+  used: Object-CLIPScore's per-object text (`object_texts`) and
+  ClipMatch's candidate_vocab class-name text
+  (run_vlm_pipeline.py's candidate_embs encoding call).
 
 RESOLVED IN v7 (decided from empirical comparison, same day as the
 object-list re-confirmation below):
