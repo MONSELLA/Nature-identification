@@ -1,4 +1,4 @@
-BIG-5 VLM PIPELINE — DESIGN RECAP (v6)
+BIG-5 VLM PIPELINE — DESIGN RECAP (v7)
 (v4: the VLM pipeline is now IMPLEMENTED — this doc records both the original
 design rationale AND, in "IMPLEMENTED:" notes, how the shipped code actually
 does it where the two differ. v5: ClipMatch switched to the caption-based
@@ -8,7 +8,10 @@ in CLIP_PRESETS by SigLIP2 and Jina-CLIP-v2. The object-list ClipMatch
 variant was briefly reintroduced as a diagnostic and re-removed the same
 day — CONFIRMED AGAIN worse than caption-based (0.28 vs 0.34 top-1 on the
 spot-check run); see Section 8e/11, this is the SECOND time this exact
-result has held.)
+result has held. v7: ClipMatch's PRIMARY text is now a VLM-written SUMMARY
+of the caption (not the raw caption itself) on ImageNet/Places — measured
+0.41 vs 0.34 top-1, ~0% truncation vs. the raw caption's frequent silent
+CLIP-tokenizer cutoff — see Section 8e/11.)
 
 ===============================================================
 0. IMPLEMENTATION STATUS (NEW in v4)
@@ -701,6 +704,28 @@ RESOLVED IN v6 (decided after repeated integration failures):
   native transformers, no trust_remote_code needed) and Jina-CLIP-v2
   (jinaai/jina-clip-v2, trust_remote_code, RAW string/image input
   convention — see clip_metrics.CLIPScorer's class docstring) instead.
+
+RESOLVED IN v7 (decided from empirical comparison, same day as the
+object-list re-confirmation below):
+- The RAW caption, even scoring better than the object-list variant
+  (v5), still suffers CLIP-tokenizer truncation on a short-context
+  ClipMatch CLIP (captions run ~248 tokens, vanilla CLIP truncates at
+  77). Rather than accept that as a stated limitation (v5's original
+  call), asked the VLM itself (image + its own caption as context) for
+  a short (<=~20-word) SUMMARY caption
+  (`src.vlm_pipeline.summarize_caption_batch`,
+  `prompts.SUMMARY_CAPTION_PROMPT`) and scored ClipMatch against THAT
+  instead. Measured 0.41 top-1 vs. 0.34 for the raw caption, with ~0%
+  truncation (vs. the raw caption's frequent silent cutoff) — a real
+  re-summarization beats both blind truncation of a long caption AND
+  the object-list variant. This is now the PRIMARY/default text
+  ClipMatch scores against on ImageNet/Places
+  (`run_vlm_pipeline.py`'s `--no_summarize_clipmatch_caption` opts back
+  into the raw caption, kept as a reported SECONDARY comparison,
+  `summary["clipmatch_caption"]`, whenever the summary is primary).
+  Costs one extra VLM call per image on ImageNet/Places only — never
+  triggered on COCO/BIG-5, which don't run ClipMatch at all, so this
+  doesn't touch the final 2M-image BIG-5 production inference run.
 
 RESOLVED IN v5 (decided from empirical comparison):
 - ClipMatch: caption-based similarity beats the object-list variant

@@ -141,14 +141,23 @@ evaluating the models.
   around this range, Jina-CLIP-v2 handles much longer text. FG-CLIP2 was
   tried as a long-context option and abandoned — see
   src/evaluation/clip_metrics.py's `CLIP_PRESETS` comment.
-- **ClipMatch** (ImageNet + Places only — not COCO, not BIG-5): score the
-  WHOLE CAPTION's CLIP embedding against each GT candidate class; argmax =
-  predicted class. SUPERSEDES the earlier object-list variant (max similarity
-  across independently-embedded extracted objects) — the caption-based version
-  empirically performs better, so the object-list implementation has been
-  removed from the codebase (see data/llm_reference/vlm_pipeline_recap.txt for
-  the history). Known caveat carried over: long captions risk CLIP's 77-token
-  truncation — accepted given the empirical gain.
+- **ClipMatch** (ImageNet + Places only — not COCO, not BIG-5): score a text
+  embedding against each GT candidate class; argmax = predicted class.
+  SUPERSEDES the earlier object-list variant (max similarity across
+  independently-embedded extracted objects) — tried TWICE (v5 and again in
+  2026-07) and beaten both times by scoring a caption-derived text instead;
+  removed from the codebase both times (see
+  data/llm_reference/vlm_pipeline_recap.txt for the history).
+  PRIMARY text (DEFAULT on ImageNet/Places): the VLM's own short (<=~20-word)
+  SUMMARY of its baseline caption, grounded in the image
+  (`src.vlm_pipeline.summarize_caption_batch`,
+  `prompts.SUMMARY_CAPTION_PROMPT`) — measured 0.41 vs. 0.34 top-1 against the
+  raw caption on the spot-check run, with ~0% CLIP-tokenizer truncation vs.
+  the raw caption's frequent silent cutoff. A real re-summarization is more
+  defensible than letting CLIP truncate arbitrary content from the ~248-token
+  caption. `--stage infer`'s `--no_summarize_clipmatch_caption` opts back into
+  scoring the raw caption instead (kept as a SECONDARY reported comparison,
+  `summary["clipmatch_caption"]`, whenever the summary is primary).
 - **hP/hR/hF1** (hierarchical precision/recall/F1): ImageNet + Places only. Map
   the ClipMatch-predicted class onto a WordNet node via the extracted-object list
   (`resolve_to_wordnet`: rank objects by CLIP sim to the predicted class,
@@ -156,10 +165,12 @@ evaluating the models.
   of the GT node vs. the predicted node.
 
 ## Axis scoring (nature/biotic/material accuracy) — per dataset
-- **ImageNet/Places (single-label)**: ClipMatch (whole-caption CLIP embedding
-  vs. candidate_vocab, global argmax — no lexical matching, no similarity
-  threshold) picks the top-1 predicted class, restricted to classes mapped into
-  the graph. That predicted class is then used ONLY to pick an ANCHOR among the
+- **ImageNet/Places (single-label)**: ClipMatch (PRIMARY text's CLIP embedding
+  — the VLM's summary caption by default, raw caption if
+  `--no_summarize_clipmatch_caption` — vs. candidate_vocab, global argmax — no
+  lexical matching, no similarity threshold) picks the top-1 predicted class,
+  restricted to classes mapped into the graph. That predicted class is then
+  used ONLY to pick an ANCHOR among the
   extracted objects: the object whose own CLIP embedding is most similar to the
   predicted class's embedding (`best_obj_idx`/`best_final` in
   `run_vlm_pipeline.py`'s single-label branch). nature/biotic/material are all

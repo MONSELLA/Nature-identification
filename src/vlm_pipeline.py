@@ -195,7 +195,8 @@ def caption_batch(
 
 
 # =============================================================================
-# Stage 1b — ClipMatch summary caption (ABLATION ONLY — see prompts.py)
+# Stage 1b — ClipMatch summary caption (default text ClipMatch scores against
+# on ImageNet/Places — see prompts.py)
 # =============================================================================
 def summarize_caption_batch(
     vlm,
@@ -205,13 +206,16 @@ def summarize_caption_batch(
     max_new_tokens: int = 64,
     temperature: float = 0.0,
 ) -> List[str]:
-    """ClipMatch-only ablation: compress each image's own baseline caption into
-    a short (<=~20-word) summary, grounded in BOTH the image and that caption
-    (re-sent as context, same "second look" idea as extract_objects_batch) —
-    real re-summarization instead of blindly truncating at the CLIP tokenizer.
-    No system prompt by default, matching caption_batch's own neutrality
-    rationale (this call only compresses content the neutral caption already
-    produced, so there's nothing to keep unbiased beyond that).
+    """ClipMatch-only (ImageNet/Places): compress each image's own baseline
+    caption into a short (<=~20-word) summary, grounded in BOTH the image and
+    that caption (re-sent as context, same "second look" idea as
+    extract_objects_batch) — real re-summarization instead of blindly
+    truncating at the CLIP tokenizer. Measured 0.41 vs. 0.34 top-1 against the
+    raw caption, so this is now the PRIMARY text ClipMatch scores against
+    (run_vlm_pipeline.py's --no_summarize_clipmatch_caption opts back into the
+    raw caption). No system prompt by default, matching caption_batch's own
+    neutrality rationale (this call only compresses content the neutral
+    caption already produced, so there's nothing to keep unbiased beyond that).
     """
     prompts = [SUMMARY_CAPTION_PROMPT.format(caption=c) for c in captions]
     outs = vlm.generate_batch_safe(
@@ -426,11 +430,12 @@ def run_inference(
           "clipmatch_summary_caption": str | None,  # only when summarize_for_clipmatch
         }
 
-    `summarize_for_clipmatch` (ABLATION ONLY — see prompts.SUMMARY_CAPTION_PROMPT)
-    adds one extra VLM call per batch: a short (<=~20-word) re-summarization of
-    this image's own caption, grounded in the image, meant to feed ClipMatch
-    instead of the full ~248-token caption (which a short-context ClipMatch CLIP
-    would otherwise truncate). Only meaningful for ImageNet/Places (the only
+    `summarize_for_clipmatch` (see prompts.SUMMARY_CAPTION_PROMPT) adds one
+    extra VLM call per batch: a short (<=~20-word) re-summarization of this
+    image's own caption, grounded in the image, which then becomes the PRIMARY
+    text ClipMatch scores against (measured 0.41 vs. 0.34 top-1 against the
+    full ~248-token caption, which a short-context ClipMatch CLIP would
+    otherwise truncate). Only meaningful for ImageNet/Places (the only
     ClipMatch datasets — see clip_metrics.CLIPMATCH_DATASETS); the caller is
     responsible for not setting this on COCO/BIG-5 runs. Records carry
     `clipmatch_summary_caption: None` when the flag is off, so the key's
@@ -505,14 +510,14 @@ def run_inference(
             max_new_tokens=caption_max_new_tokens, temperature=temperature,
         )
 
-        # ABLATION ONLY (ImageNet/Places): compress this image's own caption
-        # into a short ClipMatch-friendly summary. summary_captions[i] is None
-        # for every image when the flag is off, so the zip below always has a
+        # ImageNet/Places DEFAULT: compress this image's own caption into a
+        # short ClipMatch-friendly summary. summary_captions[i] is None for
+        # every image when the flag is off, so the zip below always has a
         # value to assign, whether or not this ran.
         if summarize_for_clipmatch:
             if verbose:
                 print(f"[infer] batch {b + 1}/{num_batches}: summarize_caption_batch "
-                      f"(free_form, ClipMatch ablation)...", flush=True)
+                      f"(free_form, ClipMatch primary text)...", flush=True)
             summary_captions = summarize_caption_batch(
                 vlm, image_paths, captions,
                 max_new_tokens=summary_max_new_tokens, temperature=temperature,
