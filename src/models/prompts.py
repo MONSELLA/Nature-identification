@@ -72,7 +72,7 @@ SUMMARY_CAPTION_PROMPT = (
     "Here is a detailed description of this image:\n\n"
     "\"{caption}\"\n\n"
     "Using both the image and this description, write a short summary "
-    "(at most 25 words) capturing only the main subject and its "
+    "(at most 50 words) capturing only the main subject and its "
     "most important surrounding context."
 )
 
