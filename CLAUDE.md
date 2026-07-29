@@ -170,11 +170,12 @@ evaluating the models.
   SEPARATE, independent choice: `--stage score`'s `--use_wordnet_definitions_clipmatch`
   swaps the default `OBJECT_TEMPLATE` phrase ("a photo of a golden retriever")
   for a richer WordNet lemma(s)+gloss prose per class
-  (`clip_metrics.wordnet_definition_text`) — untested hypothesis (not yet
-  validated as a win) that more semantic content on the candidate side aligns
-  better against a VLM's own descriptive summary. Needs `inflect` (only for
-  this path — the OBJECT_TEMPLATE default does not use it, see the recap's v10
-  entry on why). Recorded in `summary["clip_models"]["clipmatch_candidate_text"]`
+  (`clip_metrics.wordnet_definition_text`) — MEASURED (v12): no meaningful
+  ClipMatch top-1 difference vs. the plain template, so the "richer candidate
+  text aligns better" hypothesis is not supported; kept as a non-default flag
+  rather than removed. Needs `inflect` (only for this path — the OBJECT_TEMPLATE
+  default does not use it, see the recap's v10 entry on why). Recorded in
+  `summary["clip_models"]["clipmatch_candidate_text"]`
   and `summary["clipmatch_candidates"]` (token-length/truncation diagnostic).
 - **hP/hR/hF1** (hierarchical precision/recall/F1): ImageNet + Places only. Map
   the ClipMatch-predicted class onto a WordNet node via the extracted-object list
