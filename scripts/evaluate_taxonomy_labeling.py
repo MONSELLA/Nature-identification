@@ -35,7 +35,7 @@ import time
 import wandb
 
 from src.loaders.excel_loader import TaxonomyGraph
-from src.models.vlm_models import MODEL_REGISTRY, VLLM_FAMILIES, create_vlm
+from src.models.vlm_models import MODEL_REGISTRY, create_vlm
 from src.loaders.dataset_loader import load_dataset
 from src.utils import update_results_store, update_dataset_class_stats, compute_class_stats, format_duration, BatchProgress
 # TaxonomyResponse + build_classification_prompt + build_system_prompts live in
@@ -276,17 +276,12 @@ def main():
     if args.verbose:
         print(f"[INFO] Creating VLM: family='{args.model_family}', model='{args.model_name}'...")
 
-    # Different VLM backends need different constructor arguments: vLLM-served
-    # models take vLLM-specific settings like GPU memory
-    # fraction and max sequence length, while the HuggingFace-served BLIP
-    # family just needs a device string.
-    if args.model_family in VLLM_FAMILIES:
-        vlm_kwargs = {
-            "dtype": args.dtype, "gpu_memory_utilization": args.gpu_memory_utilization, "trust_remote_code": args.trust_remote_code
-        }
-        if args.max_model_len is not None: vlm_kwargs["max_model_len"] = args.max_model_len
-    else:
-        vlm_kwargs = {"device": args.device, "dtype": args.dtype}
+    # Every registered family is vLLM-served (see src/models/vlm_models.py's
+    # MODEL_REGISTRY) — the HuggingFace-served BLIP family was removed.
+    vlm_kwargs = {
+        "dtype": args.dtype, "gpu_memory_utilization": args.gpu_memory_utilization, "trust_remote_code": args.trust_remote_code
+    }
+    if args.max_model_len is not None: vlm_kwargs["max_model_len"] = args.max_model_len
 
     vlm = create_vlm(args.model_family, args.model_name, **vlm_kwargs)
 

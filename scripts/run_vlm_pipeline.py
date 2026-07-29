@@ -111,7 +111,7 @@ from src.evaluation import taxonomy_metrics
 from src.loaders.excel_loader import TaxonomyGraph
 from src.loaders.dataset_loader import load_dataset, get_candidate_vocab
 from src.models.prompts import build_system_prompts
-from src.models.vlm_models import MODEL_REGISTRY, VLLM_FAMILIES, create_vlm
+from src.models.vlm_models import MODEL_REGISTRY, create_vlm
 from src.vlm_pipeline import run_inference, resolve_hybrid_label, _normalize_object
 from src.evaluation import clip_metrics
 from src.utils import update_results_store, update_dataset_class_stats, compute_class_stats, format_duration
@@ -301,15 +301,12 @@ def phase_infer(args):
     caption_system, label_system_full, label_system_material = build_system_prompts(
         args.nature_definition_path, args.biotic_definition_path, args.material_definition_path)
 
-    # Different VLM backends need different constructor keyword arguments —
-    # see src/models/vlm_models.py for the classes behind each family name.
-    if args.model_family in VLLM_FAMILIES:
-        vlm_kwargs = {"dtype": args.dtype, "gpu_memory_utilization": args.gpu_memory_utilization,
-                      "trust_remote_code": args.trust_remote_code}
-        if args.max_model_len is not None:
-            vlm_kwargs["max_model_len"] = args.max_model_len
-    else:
-        vlm_kwargs = {"device": args.device, "dtype": args.dtype}
+    # Every registered family is vLLM-served (see src/models/vlm_models.py's
+    # MODEL_REGISTRY) — the HuggingFace-served BLIP family was removed.
+    vlm_kwargs = {"dtype": args.dtype, "gpu_memory_utilization": args.gpu_memory_utilization,
+                  "trust_remote_code": args.trust_remote_code}
+    if args.max_model_len is not None:
+        vlm_kwargs["max_model_len"] = args.max_model_len
     vlm = create_vlm(args.model_family, args.model_name, **vlm_kwargs)
 
     # The very first line written to the output file is a special "header"
