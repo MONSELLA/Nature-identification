@@ -1,4 +1,4 @@
-BIG-5 VLM PIPELINE — DESIGN RECAP (v12)
+BIG-5 VLM PIPELINE — DESIGN RECAP (v13)
 (v4: the VLM pipeline is now IMPLEMENTED — this doc records both the original
 design rationale AND, in "IMPLEMENTED:" notes, how the shipped code actually
 does it where the two differ. v5: ClipMatch switched to the caption-based
@@ -28,7 +28,14 @@ plain OBJECT_TEMPLATE phrase for a WordNet lemma(s)+gloss prose per
 candidate class — untested hypothesis, not a default — see Section 8e/11.
 v12: that variant MEASURED — no meaningful difference vs the plain
 OBJECT_TEMPLATE phrase on ClipMatch top-1; kept as an available, non-default
-flag rather than removed, per Pau — see Section 11.)
+flag rather than removed, per Pau — see Section 11. v13: EXTRACTION_PROMPT
+now explicitly asks for the overall setting/scene/environment as its own
+extractable entity (not just discrete objects) — same scene-centric gap the
+v?? SUMMARY_CAPTION_PROMPT fix addressed, but for the object-extraction
+stage, needed since this one prompt is shared across ImageNet/COCO
+(object-centric) AND Places365 (scene-centric candidate classes) AND BIG-5
+(whose taxonomy lists "Ecosystems & Environments" as first-class nature) —
+see Section 5.)
 
 ===============================================================
 0. IMPLEMENTATION STATUS (NEW in v4)
@@ -307,6 +314,32 @@ of what wins here — it requires image access (see Section 6). So
 even if (b) wins for extraction/object-naming, material/immaterial
 classification specifically must stay VLM-based. Not a fully open
 50/50 comparison for that one axis.
+
+v13 UPDATE: EXTRACTION_PROMPT now explicitly instructs the model to
+list the overall SETTING/SCENE/ENVIRONMENT as its own entity when
+it's a meaningful part of what the image depicts, not just discrete
+objects within it (e.g. an empty office interior -> also list
+"office", not only "desk"/"chair"). Motivation: this one prompt is
+shared across ALL FOUR datasets (ImageNet, COCO, Places365, BIG-5),
+but the original wording and its examples ("grass", "golden
+retriever", "mountain", "sea lion") were entirely object-centric —
+fine for ImageNet/COCO, but Places365's candidate classes ARE scenes
+("kitchen", "airport terminal"), and without a matching extracted
+phrase, ClipMatch's anchor-object selection and hP/hR's WordNet
+resolution have nothing scene-level to grab onto (same gap
+SUMMARY_CAPTION_PROMPT had before its "subject or setting" fix —
+Section 8e). Also directly serves BIG-5: its own nature taxonomy
+(data/big5_taxonomy/big5_nature_definition.txt) lists "Ecosystems &
+Environments" (forests, parks, nature reserves) as a first-class
+INCLUSION category, not just the flora/fauna within them, so
+extraction should be able to surface "forest"/"park" as entities in
+their own right. Scoped with "when it is a meaningful part of what
+the image depicts" specifically to avoid trivially tacking a generic
+"room"/"outdoors" entity onto every single image regardless of
+relevance. NOT YET VALIDATED empirically (unlike the summary-caption
+fix, which was later confirmed to change ClipMatch behavior on
+Places) — worth checking extraction-hit rate and the hP/hR mapping-
+failure rate on Places before/after this change.
 
 ===============================================================
 6. VLM PIPELINE — TAXONOMY LABELING STRATEGY

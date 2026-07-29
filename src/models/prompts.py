@@ -107,21 +107,46 @@ SUMMARY_CAPTION_PROMPT = (
 # list of individual objects/elements. This list is what gets fed into Stage 3
 # (one taxonomy-labeling call per object) and into the CLIP-based metrics
 # (each object becomes its own "a photo of a {object}" text embedding).
+#
+# EXPLICIT SETTING/SCENE RULE (added — must hold across ImageNet, COCO,
+# Places365, and BIG-5 Twitter/Weibo, since this prompt is shared across all
+# of them): the original wording only asked for discrete OBJECTS, with every
+# example a physical thing ("grass", "golden retriever", "mountain", "sea
+# lion"). That's fine for ImageNet/COCO, but Places365's candidate classes ARE
+# scenes/settings ("kitchen", "airport terminal") — if extraction never
+# surfaces the scene itself as its own entity (only the discrete objects
+# inside it, e.g. "stove", "cabinet"), there's no extracted phrase for
+# ClipMatch's anchor-selection or hP/hR's WordNet resolution to match against
+# the scene-level GT class (same failure mode the summary-caption prompt had
+# before its "subject or setting" fix — see SUMMARY_CAPTION_PROMPT above).
+# BIG-5's own nature taxonomy also explicitly lists "Ecosystems &
+# Environments" (forests, parks, nature reserves) as a first-class INCLUSION
+# category, not just the flora/fauna within them — so this also directly
+# serves BIG-5, not only Places. Scoped with "when it is a meaningful part of
+# what the image depicts" so it doesn't trivially tack a generic "room"/
+# "outdoors" entity onto every single image regardless of relevance.
 EXTRACTION_PROMPT = (
     "Below is a general description of the image:\n\n"
     "\"{caption}\"\n\n"
     "Using BOTH the image and the description, list every distinct "
-    "object, element, or entity that appears in the image. Follow these rules:\n"
+    "object, element, or entity that appears in the image, INCLUDING the "
+    "overall setting, scene, or environment itself when it is a meaningful "
+    "part of what the image depicts (e.g. a kitchen interior, a forest, a "
+    "beach) — not just the discrete objects within it. Follow these rules:\n"
     "  - Return each entity as a noun or a compound noun (e.g. \"grass\", "
-    "\"golden retriever\", \"mountain\", \"sea lion\").\n"
+    "\"golden retriever\", \"mountain\", \"sea lion\", \"kitchen\", "
+    "\"forest\").\n"
     "  - Include secondary and background entities, not just the main subject.\n"
+    "  - If the image is primarily about a place or environment rather than a "
+    "specific object within it, include that place/environment as its own "
+    "entity (e.g. an empty office interior -> list \"office\").\n"
     "  - Include an entity even when it is only PART of a larger one or is "
     "depicted on its surface (e.g. a flower printed on a dress -> list "
     "\"flower\"; a bird on a logo -> list \"bird\").\n"
     "  - Do not repeat the same entity twice. Do not invent entities that are "
     "not supported by the image."
 )
- 
+
 class ObjectExtractionResponse(BaseModel):
     """Structured schema for the extraction call: a flat list of object phrases.
 
@@ -139,8 +164,10 @@ class ObjectExtractionResponse(BaseModel):
     objects: List[str] = Field(
         description=(
             "The distinct physical objects, elements, or entities present in the "
-            "image, each as a noun or a compound noun. Include part-objects and "
-            "background elements."
+            "image, each as a noun or a compound noun. Include part-objects, "
+            "background elements, and the overall setting/scene/environment "
+            "itself when it is a meaningful part of what the image depicts "
+            "(e.g. 'kitchen', 'forest', 'beach')."
         )
     )
 
