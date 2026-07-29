@@ -1,4 +1,4 @@
-BIG-5 VLM PIPELINE — DESIGN RECAP (v10)
+BIG-5 VLM PIPELINE — DESIGN RECAP (v11)
 (v4: the VLM pipeline is now IMPLEMENTED — this doc records both the original
 design rationale AND, in "IMPLEMENTED:" notes, how the shipped code actually
 does it where the two differ. v5: ClipMatch switched to the caption-based
@@ -22,7 +22,10 @@ added two LAION OpenCLIP-in-CLIPModel-format checkpoints ("laion_h14",
 Section 11. v10: the v8 inflect-checked OBJECT_TEMPLATE determiner was
 REVERTED per Pau — suspected (not confirmed in isolation) of contributing
 to a ClipMatch drop observed after switching to MetaCLIP; OBJECT_TEMPLATE
-is back to a hardcoded "a" — see Section 11.)
+is back to a hardcoded "a" — see Section 11. v11: added an OPT-IN ClipMatch
+candidate-text variant (--use_wordnet_definitions_clipmatch) that swaps the
+plain OBJECT_TEMPLATE phrase for a WordNet lemma(s)+gloss prose per
+candidate class — untested hypothesis, not a default — see Section 8e/11.)
 
 ===============================================================
 0. IMPLEMENTATION STATUS (NEW in v4)
@@ -547,6 +550,15 @@ e) ClipMatch (Ging et al.-inspired), ImageNet + Places ONLY —
            many objects is a smeared average, diluting the signal for
            any single target GT class, hurting matching precisely in
            richer scenes. (Still not used — this rejection stands.)
+     - CANDIDATE-SIDE text (v11, OPT-IN, separate from all of the
+       above — those are all about the IMAGE-description side):
+       `--use_wordnet_definitions_clipmatch` swaps each GT candidate
+       class's plain OBJECT_TEMPLATE phrase ("a photo of a golden
+       retriever") for its WordNet lemma(s) + gloss in natural prose
+       (clip_metrics.wordnet_definition_text — "A golden retriever,
+       also known as ... . It is defined as: <definition>."). NOT the
+       default; not yet empirically validated either way. See
+       RESOLVED/PROPOSED IN v11, Section 11.
 
 f) Hierarchical Precision / Recall (hP/hR) + Wu-Palmer, per
    Snæbjarnarson et al.'s taxonomy-aware evaluation — ImageNet +
@@ -717,6 +729,29 @@ RESOLVED IN v6 (decided after repeated integration failures):
   clip_metrics.CLIPScorer's class docstring) were PROPOSED as
   replacements here, but neither was actually added to CLIP_PRESETS at
   the time — see RESOLVED IN v8 below for what's actually wired in.
+
+PROPOSED IN v11 (added, NOT YET VALIDATED — per Pau's request):
+- ClipMatch candidate-vocab text now has an independent, opt-in
+  variant: `clip_metrics.wordnet_definition_text(synset_id)` builds
+  "A {primary lemma}, also known as {other lemmas}. It is defined as:
+  {WordNet gloss}." per GT candidate class, instead of the plain
+  OBJECT_TEMPLATE phrase. `clip_metrics.candidate_vocab_texts(...,
+  use_wordnet_definitions=...)` picks between the two; wired to
+  run_vlm_pipeline.py's `--use_wordnet_definitions_clipmatch`
+  (--stage score only — the choice doesn't affect --stage infer at
+  all). Hypothesis: a VLM's own image descriptions are often
+  definitional/explanatory in style, so a richer, more descriptive
+  candidate-side text may align better in CLIP's embedding space than
+  a bare templated noun phrase — UNTESTED, not a default. Every
+  candidate's synset_id is guaranteed to resolve via `wn.synset()`
+  (get_candidate_vocab's own docstring), so no mapping-fallback logic
+  is needed here the way it is for object-side WordNet lookups
+  (resolve_to_wordnet). Needs `inflect`, but ONLY for this path — the
+  OBJECT_TEMPLATE default was reverted off inflect in v10 (below) and
+  is unaffected. Token-length/truncation diagnostics
+  (summary["clipmatch_candidates"]) track whether WordNet glosses risk
+  exceeding cm_scorer's context length, since a gloss can run
+  considerably longer than "a photo of a {class}".
 
 RESOLVED IN v10 (reverted per Pau):
 - The v8 inflect-checked OBJECT_TEMPLATE determiner (object_template_text)

@@ -367,3 +367,59 @@ def clipmatch(
 
 def object_texts(objects: List[str]) -> List[str]:
     return [OBJECT_TEMPLATE.format(o) for o in objects]
+
+
+_DEFINITION_INFLECT_ENGINE = None
+
+
+def _definition_inflect_engine():
+    """Lazy singleton, scoped to wordnet_definition_text only — this is an
+    opt-in ClipMatch candidate-text variant (--use_wordnet_definitions_clipmatch),
+    not the default path, so `inflect` is only imported when actually used."""
+    global _DEFINITION_INFLECT_ENGINE
+    if _DEFINITION_INFLECT_ENGINE is None:
+        import inflect
+        _DEFINITION_INFLECT_ENGINE = inflect.engine()
+    return _DEFINITION_INFLECT_ENGINE
+
+
+def wordnet_definition_text(synset_id: str) -> str:
+    """Richer ClipMatch candidate text for one GT class: its canonical
+    lemma(s) plus WordNet's own gloss, in natural prose —
+
+        "A golden retriever, also known as golden retriever dog. It is
+        defined as: an English breed having a long silky golden coat."
+
+    ...instead of the plain OBJECT_TEMPLATE ("a photo of a golden
+    retriever"). Motivation (Pau): a VLM's own image descriptions are
+    often definitional/explanatory in style, so giving the CANDIDATE side
+    more semantic content (not just a bare noun phrase) may align better
+    in CLIP's text embedding space than a templated phrase built the same
+    way for every class regardless of how distinctive or obscure it is.
+
+    Opt-in via --use_wordnet_definitions_clipmatch (ImageNet/Places only —
+    get_candidate_vocab guarantees every candidate's synset_id resolves via
+    `wn.synset()`, per its own docstring, so this doesn't need a mapping
+    fallback the way object-side WordNet lookups do).
+    """
+    from nltk.corpus import wordnet as wn
+
+    synset = wn.synset(synset_id)
+    lemmas = [lemma.name().replace("_", " ").lower() for lemma in synset.lemmas()]
+    primary_name = lemmas[0]
+    alt_names = f", also known as {', '.join(lemmas[1:])}" if len(lemmas) > 1 else ""
+
+    # inflect prepends the correct "a"/"an" for the primary lemma's own spelling.
+    name_with_article = _definition_inflect_engine().a(primary_name)
+
+    definition = synset.definition()
+    return f"{name_with_article.capitalize()}{alt_names}. It is defined as: {definition}."
+
+
+def candidate_vocab_texts(candidate_vocab: List[dict], use_wordnet_definitions: bool = False) -> List[str]:
+    """Text for each ClipMatch candidate class: the plain OBJECT_TEMPLATE
+    phrase by default, or wordnet_definition_text(synset_id) per class when
+    `use_wordnet_definitions` is set (--use_wordnet_definitions_clipmatch)."""
+    if use_wordnet_definitions:
+        return [wordnet_definition_text(c["synset_id"]) for c in candidate_vocab]
+    return [OBJECT_TEMPLATE.format(c["class_name"]) for c in candidate_vocab]

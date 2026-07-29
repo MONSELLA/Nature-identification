@@ -166,6 +166,16 @@ evaluating the models.
   caption. `--stage infer`'s `--no_summarize_clipmatch_caption` opts back into
   scoring the raw caption instead (kept as a SECONDARY reported comparison,
   `summary["clipmatch_caption"]`, whenever the summary is primary).
+  CANDIDATE text (the GT-class side, not the image-description side) is a
+  SEPARATE, independent choice: `--stage score`'s `--use_wordnet_definitions_clipmatch`
+  swaps the default `OBJECT_TEMPLATE` phrase ("a photo of a golden retriever")
+  for a richer WordNet lemma(s)+gloss prose per class
+  (`clip_metrics.wordnet_definition_text`) — untested hypothesis (not yet
+  validated as a win) that more semantic content on the candidate side aligns
+  better against a VLM's own descriptive summary. Needs `inflect` (only for
+  this path — the OBJECT_TEMPLATE default does not use it, see the recap's v10
+  entry on why). Recorded in `summary["clip_models"]["clipmatch_candidate_text"]`
+  and `summary["clipmatch_candidates"]` (token-length/truncation diagnostic).
 - **hP/hR/hF1** (hierarchical precision/recall/F1): ImageNet + Places only. Map
   the ClipMatch-predicted class onto a WordNet node via the extracted-object list
   (`resolve_to_wordnet`: rank objects by CLIP sim to the predicted class,

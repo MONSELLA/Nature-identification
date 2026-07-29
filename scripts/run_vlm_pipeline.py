@@ -535,6 +535,7 @@ def phase_score(args):
     summary_token_mean = None
     summary_token_counts = None
     caption_token_counts = caption_token_mean = n_caption_truncated = None
+    candidate_token_counts = candidate_token_mean = n_candidate_truncated = None
     primary_embs_cm = None
     if run_clipmatch:
         caption_embs_cm = caption_embs if cm_scorer is scorer else cm_scorer.encode_text(
@@ -553,9 +554,18 @@ def phase_score(args):
         # get_candidate_vocab), so every candidate here carries its own
         # gt_nature/gt_biotic and the ClipMatch top-1 prediction can be read
         # straight off its candidate_vocab entry — no separate graph lookup.
+        # --use_wordnet_definitions_clipmatch swaps the plain "a photo of a
+        # {class}" template for a richer WordNet-definition prose per class
+        # (clip_metrics.wordnet_definition_text) — untested hypothesis (per
+        # Pau) that giving the CANDIDATE side more semantic content aligns
+        # better against a VLM's own descriptive image summary in CLIP's text
+        # embedding space than a bare templated noun phrase.
+        candidate_texts = clip_metrics.candidate_vocab_texts(
+            candidate_vocab, use_wordnet_definitions=args.use_wordnet_definitions_clipmatch)
         candidate_embs = cm_scorer.encode_text(
-            [clip_metrics.OBJECT_TEMPLATE.format(c["class_name"]) for c in candidate_vocab],
-            verbose=args.verbose, desc="candidate_vocab")
+            candidate_texts, verbose=args.verbose, desc="candidate_vocab")
+        candidate_token_counts, candidate_token_mean, n_candidate_truncated = _clip_token_stats(
+            cm_scorer, candidate_texts)
 
         # Summary-caption ClipMatch — PRIMARY when the artifact has one (see
         # --summarize_clipmatch_caption / src.vlm_pipeline.summarize_caption_batch):
@@ -1076,6 +1086,8 @@ def phase_score(args):
             "clipmatch": clipmatch_model_name if run_clipmatch else None,
             "clipmatch_primary_source": ("summary_caption" if run_summary_clipmatch else "caption")
                                          if run_clipmatch else None,
+            "clipmatch_candidate_text": ("wordnet_definition" if args.use_wordnet_definitions_clipmatch
+                                         else "object_template") if run_clipmatch else None,
         },
         "nature": _binary_metrics(nat_true, nat_pred),
         "biotic_matched": _binary_metrics(bio_true, bio_pred),
@@ -1154,6 +1166,21 @@ def phase_score(args):
             }
         else:
             summary["clipmatch_caption"] = None
+        # Candidate-vocab text diagnostic: token stats for whichever text was
+        # used to build candidate_embs (plain OBJECT_TEMPLATE by default, or
+        # WordNet-definition prose under --use_wordnet_definitions_clipmatch —
+        # see clip_models.clipmatch_candidate_text above). Definitions can run
+        # much longer than a templated noun phrase, so this is worth watching
+        # for truncation even though candidate_vocab is usually short overall.
+        n_candidates = len(candidate_vocab)
+        summary["clipmatch_candidates"] = {
+            "n_candidates": n_candidates,
+            "mean_token_length": candidate_token_mean,
+            "truncation_rate": (n_candidate_truncated / n_candidates)
+                                if (n_candidate_truncated is not None and n_candidates) else None,
+            "truncated_count": n_candidate_truncated,
+            "context_length": cm_scorer.context_length,
+        }
         # Two hierarchical views over the SAME images (see the accumulation
         # comment above): "hierarchical" penalizes WordNet-mapping failures as
         # 0.0 (support = every ClipMatch-scored image); "hierarchical_mapped"
@@ -1277,6 +1304,13 @@ def _print_summary(s, run_clipmatch):
             print(f"Top-1: {cc['top1_accuracy']:.4f} | Mean token length: {cc_mean_tok_str} "
                   f"| Truncation rate (>= {cc['context_length']} tok): "
                   f"{cc_trunc_str} ({cc['truncated_count'] if cc['truncated_count'] is not None else 'n/a'}/{s['n_images']})")
+        cv = s["clipmatch_candidates"]
+        cv_trunc_str = f"{cv['truncation_rate']:.1%}" if cv["truncation_rate"] is not None else "n/a"
+        cv_mean_tok_str = f"{cv['mean_token_length']:.1f}" if cv["mean_token_length"] is not None else "n/a"
+        print(f"\n--- ClipMatch candidate vocab [{s['clip_models']['clipmatch_candidate_text']}] "
+              f"({cv['n_candidates']} classes) ---")
+        print(f"Mean token length: {cv_mean_tok_str} | Truncation rate (>= {cv['context_length']} tok): "
+              f"{cv_trunc_str} ({cv['truncated_count'] if cv['truncated_count'] is not None else 'n/a'}/{cv['n_candidates']})")
         h = s["hierarchical"]
         hm = s["hierarchical_mapped"]
         print(f"--- Hierarchical (support {h['support']}) ---")
@@ -1328,6 +1362,11 @@ def _log_wandb(args, summary, run_clipmatch):
                 log["ClipMatch_RawCaption/TruncationRate"] = summary["clipmatch_caption"]["truncation_rate"]
             if summary["clipmatch_caption"]["mean_token_length"] is not None:
                 log["ClipMatch_RawCaption/MeanTokenLength"] = summary["clipmatch_caption"]["mean_token_length"]
+        cv = summary["clipmatch_candidates"]
+        if cv["mean_token_length"] is not None:
+            log["ClipMatch_Candidates/MeanTokenLength"] = cv["mean_token_length"]
+        if cv["truncation_rate"] is not None:
+            log["ClipMatch_Candidates/TruncationRate"] = cv["truncation_rate"]
         log["Hierarchical/hF1"] = summary["hierarchical"]["hf1"]
         log["Hierarchical/WuPalmer"] = summary["hierarchical"]["wup"]
         log["Hierarchical/MappingFailureRate"] = summary["hierarchical"]["mapping_failure_rate"]
@@ -1425,6 +1464,15 @@ def build_arg_parser():
                    help="Max new tokens for the summary-caption VLM call (default 64 — generous "
                         "headroom over the ~20-word target so it isn't itself cut off "
                         "mid-sentence). No effect if --no_summarize_clipmatch_caption is passed.")
+    p.add_argument("--use_wordnet_definitions_clipmatch", action="store_true",
+                   help="--stage score only: build each ClipMatch candidate class's text from its "
+                        "WordNet lemma(s) + gloss in natural prose (clip_metrics."
+                        "wordnet_definition_text), e.g. 'A golden retriever, also known as golden "
+                        "retriever dog. It is defined as: an English breed having a long silky "
+                        "golden coat.' instead of the plain 'a photo of a golden retriever' "
+                        "template. Hypothesis (untested until you run it): richer candidate-side "
+                        "semantic content aligns better against a VLM's own descriptive image "
+                        "summary than a bare noun phrase. Needs the `inflect` package.")
     p.add_argument("--max_hops", type=int, default=0,
                    help="Maximum WordNet hop distance allowed when mapping an EXTRACTED "
                         "object onto the labeled taxonomy (map_object_to_taxonomy -> "
