@@ -502,8 +502,6 @@ def phase_score(args):
     # When cm_scorer IS scorer (default), reuse the embeddings already
     # computed above instead of re-encoding the same text twice.
     candidate_embs = None
-    objlist_sentences = None
-    objlist_token_counts = None
     if run_clipmatch:
         caption_embs_cm = caption_embs if cm_scorer is scorer else cm_scorer.encode_text(
             captions, warn_truncation=False, verbose=args.verbose, desc="captions (clipmatch)")
@@ -519,28 +517,6 @@ def phase_score(args):
         candidate_embs = cm_scorer.encode_text(
             [clip_metrics.OBJECT_TEMPLATE.format(c["class_name"]) for c in candidate_vocab],
             verbose=args.verbose, desc="candidate_vocab")
-
-        # Object-list ClipMatch (SECONDARY, diagnostic — see clip_metrics.py's
-        # module docstring): one sentence built from ALL of an image's
-        # extracted objects, instead of the caption. Encoded here (not inside
-        # the per-image loop below) for the same batching reason as
-        # everything else in this block.
-        objlist_sentences = [clip_metrics.object_list_sentence(r["objects"]) for r in records]
-        objlist_embs = cm_scorer.encode_text(
-            objlist_sentences, verbose=args.verbose, desc="object-list (clipmatch)")
-        # Truncation-rate diagnostic: how often this sentence alone would
-        # exceed cm_scorer's own context length (independent of whatever
-        # truncation encode_text silently applied). Only meaningful for a
-        # native-HF cm_scorer (see CLIPScorer.count_tokens) — Long-CLIP is
-        # never expected here in practice (recap: ClipMatch wants a
-        # retrieval-tuned CLIP, not the long-context model), so this is
-        # skipped rather than forced for that path.
-        try:
-            objlist_token_counts = cm_scorer.count_tokens(objlist_sentences)
-            n_objlist_truncated = sum(1 for n in objlist_token_counts if n >= cm_scorer.context_length)
-        except NotImplementedError:
-            objlist_token_counts = None
-            n_objlist_truncated = None
 
     # ---- Per-image metric accumulation ----
     # These lists/counters accumulate results across every image in the
@@ -570,8 +546,6 @@ def phase_score(args):
     n_map_nature = n_vlm_nature = 0
     clipmatch_top1 = 0
     clipmatch_support = 0
-    clipmatch_objlist_top1 = 0
-    clipmatch_objlist_support = 0
     flat_rows = []  # one row per stored IMAGE for the output CSV (see below)
 
     # How often to print per-image progress under --verbose: every 5% of the
@@ -611,9 +585,6 @@ def phase_score(args):
         wup_sim = None
         clipmatch_correct = None
         clipmatch_pred_similarity = None
-        objlist_pred_vocab_entry = None
-        clipmatch_objlist_correct = None
-        clipmatch_objlist_pred_similarity = None
         gt_nature_val = pred_nature_val = None
         gt_biotic_val = pred_biotic_val = None
         gt_material_val = pred_material_val = None
@@ -744,23 +715,6 @@ def phase_score(args):
                     hp_vals_mapped.append(hier["hp"]); hr_vals_mapped.append(hier["hr"])
                     hf1_vals_mapped.append(hier["hf1"])
                     wup_vals_mapped.append(wup_sim)
-
-                # --- Object-list ClipMatch (SECONDARY, diagnostic-only) ---
-                # Same candidate_embs/gt_syn, but matched against the
-                # object-list sentence's embedding instead of the caption's.
-                # Purely a reported comparison point — does NOT feed
-                # nature/biotic/material scoring or the hierarchical metrics
-                # above (those stay on the caption-based prediction, per the
-                # recap's settled empirical choice).
-                per_cand_sim_objlist, pred_idx_objlist = clip_metrics.clipmatch(
-                    objlist_embs[idx], candidate_embs)
-                if pred_idx_objlist >= 0:
-                    objlist_pred_vocab_entry = candidate_vocab[pred_idx_objlist]
-                    clipmatch_objlist_pred_similarity = float(per_cand_sim_objlist[pred_idx_objlist])
-                    clipmatch_objlist_support += 1
-                    clipmatch_objlist_correct = objlist_pred_vocab_entry["synset_id"] == gt_syn
-                    if clipmatch_objlist_correct:
-                        clipmatch_objlist_top1 += 1
         elif dataset == "big5":
             # --- BIG-5 (holistic image-level annotation) ---
             # GT here is ONE label per axis for the WHOLE scene (see
@@ -951,14 +905,6 @@ def phase_score(args):
             "clipmatch_pred_biotic": best_final["final_biotic"] if best_final else None,
             "clipmatch_pred_material": best_final["final_material"] if best_final else None,
             "clipmatch_top1_correct": clipmatch_correct,
-            # ClipMatch (object-list variant) — SECONDARY/diagnostic, see
-            # clip_metrics.py's module docstring; does not drive scoring.
-            "clipmatch_objlist_pred_class": objlist_pred_vocab_entry["class_name"] if objlist_pred_vocab_entry else None,
-            "clipmatch_objlist_pred_synset": objlist_pred_vocab_entry["synset_id"] if objlist_pred_vocab_entry else None,
-            "clipmatch_objlist_pred_similarity": clipmatch_objlist_pred_similarity,
-            "clipmatch_objlist_top1_correct": clipmatch_objlist_correct,
-            "clipmatch_objlist_sentence": objlist_sentences[idx] if objlist_sentences is not None else None,
-            "clipmatch_objlist_token_count": objlist_token_counts[idx] if objlist_token_counts is not None else None,
             "gt_synset": gt_syn,
             "resolved_pred_synset": pred_node,
             "hierarchical_precision": hier["hp"], "hierarchical_recall": hier["hr"],
@@ -1014,19 +960,6 @@ def phase_score(args):
         summary["clipmatch"] = {
             "top1_accuracy": (clipmatch_top1 / clipmatch_support) if clipmatch_support else 0.0,
             "support": clipmatch_support,
-        }
-        # Object-list ClipMatch (SECONDARY, diagnostic-only — see
-        # clip_metrics.py's module docstring). truncation_rate is None when
-        # cm_scorer isn't native-HF (CLIPScorer.count_tokens doesn't support
-        # Long-CLIP's tokenizer).
-        summary["clipmatch_objlist"] = {
-            "top1_accuracy": (clipmatch_objlist_top1 / clipmatch_objlist_support)
-                              if clipmatch_objlist_support else 0.0,
-            "support": clipmatch_objlist_support,
-            "truncation_rate": (n_objlist_truncated / n_images)
-                                if (n_objlist_truncated is not None and n_images) else None,
-            "truncated_count": n_objlist_truncated,
-            "context_length": cm_scorer.context_length,
         }
         # Two hierarchical views over the SAME images (see the accumulation
         # comment above): "hierarchical" penalizes WordNet-mapping failures as
@@ -1131,11 +1064,6 @@ def _print_summary(s, run_clipmatch):
     if run_clipmatch:
         print(f"\n--- ClipMatch [caption-based] (support {s['clipmatch']['support']}) ---")
         print(f"Top-1: {s['clipmatch']['top1_accuracy']:.4f}")
-        co = s["clipmatch_objlist"]
-        trunc_str = f"{co['truncation_rate']:.1%}" if co["truncation_rate"] is not None else "n/a"
-        print(f"\n--- ClipMatch [object-list, diagnostic] (support {co['support']}) ---")
-        print(f"Top-1: {co['top1_accuracy']:.4f} | Truncation rate (>= {co['context_length']} tok): "
-              f"{trunc_str} ({co['truncated_count'] if co['truncated_count'] is not None else 'n/a'}/{s['n_images']})")
         h = s["hierarchical"]
         hm = s["hierarchical_mapped"]
         print(f"--- Hierarchical (support {h['support']}) ---")
@@ -1177,9 +1105,6 @@ def _log_wandb(args, summary, run_clipmatch):
     }
     if run_clipmatch:
         log["ClipMatch/Top1"] = summary["clipmatch"]["top1_accuracy"]
-        log["ClipMatch_ObjectList/Top1"] = summary["clipmatch_objlist"]["top1_accuracy"]
-        if summary["clipmatch_objlist"]["truncation_rate"] is not None:
-            log["ClipMatch_ObjectList/TruncationRate"] = summary["clipmatch_objlist"]["truncation_rate"]
         log["Hierarchical/hF1"] = summary["hierarchical"]["hf1"]
         log["Hierarchical/WuPalmer"] = summary["hierarchical"]["wup"]
         log["Hierarchical/MappingFailureRate"] = summary["hierarchical"]["mapping_failure_rate"]
