@@ -36,9 +36,8 @@ the BIG-5 taxonomy graph (see src/loaders/excel_loader.py) via
 `get_gt_from_graph` below.
 """
 
+import glob
 import os
-import ast
-import urllib.request
 import pandas as pd
 from pathlib import Path
 
@@ -404,52 +403,63 @@ def load_places365(data_dir, categories_txt, excel_path, taxonomy_graph):
     return results
 
 
-def load_big5(en_gt, es_gt, en_media, es_media, cache_dir):
+def load_big5(en_gt, es_gt, images_dir):
     """Load the BIG-5 social-media dataset itself: human-annotated tweet
     images (English + Spanish), each with its OWN direct nature/biotic/
-    material annotation (no WordNet class lookup needed — these are already
-    the ground truth, straight from human annotators)."""
+    material annotation — a MAJORITY VOTE across multiple coders (no WordNet
+    class lookup needed — these are already the ground truth).
+
+    IMAGES ARE LOCAL, NOT DOWNLOADED: `images_dir` is one flat folder
+    (shared by both languages) that already contains every image, named
+    "<platform_id>_<idx>.<ext>". The extension is NOT fixed (jpg/jpeg/png all
+    appear in practice), so each image is located by GLOBBING for
+    "<platform_id>_<idx>.*" rather than assuming one. This replaced an older
+    two-CSV-per-language scheme (a separate "media" CSV supplying exact
+    filenames via a media_files column, images downloaded from a remote
+    IMG_BASE_URL and cached locally) — that media CSV and the download step
+    are both gone; `platform_id` + `n_images` from the GT CSV alone are
+    enough to name and count every image.
+    """
     # Small helper functions to turn the raw CSV cell text ("Yes"/"No",
     # "Material"/"Immaterial", "Biotic"/"Abiotic") into 1/0/None. Kept as
     # local closures since they're only used within this one function.
+    # NOTE: the majority-vote GT can also carry DISAGREEMENT cells (coders
+    # split), e.g. "material; immaterial" or "biotic; abiotic" — those don't
+    # match any of the single-word checks below, so they fall through to
+    # None ("not applicable") exactly like a genuinely blank/"-" cell. This
+    # is a deliberate simplification, not an oversight: revisit if disagreement
+    # rows should be scored differently instead of excluded from that axis.
     def map_yn(val): return 1 if str(val).strip().lower() == 'yes' else (0 if str(val).strip().lower() == 'no' else None)
     def map_mat(val): return 1 if str(val).strip().lower() == 'material' else (0 if str(val).strip().lower() == 'immaterial' else None)
     def map_bio(val): return 1 if str(val).strip().lower() == 'biotic' else (0 if str(val).strip().lower() == 'abiotic' else None)
 
-    # BIG-5 images are hosted remotely; we download and cache them locally the
-    # first time each one is needed, rather than re-downloading on every run.
-    IMG_BASE_URL = "https://big5.cssh.bsc.es/STATIC/phase1-media/twitter_1_all/scaled/"
-    os.makedirs(cache_dir, exist_ok=True)
     results = []
 
-    # BIG-5 data comes as two SEPARATE CSV pairs (one per language): a
-    # "ground truth" CSV (the human annotations) and a "media" CSV (which
-    # tweet has which image files attached). We process English and Spanish
-    # identically, just looping over both pairs in turn.
-    for lang, gt_csv, media_csv in [("en", en_gt, en_media), ("es", es_gt, es_media)]:
-        if not gt_csv or not media_csv: continue
-        gt = pd.read_csv(gt_csv)
-        media = pd.read_csv(media_csv)
-        # Join the two tables on their shared tweet id ("platform_id"), so
-        # each row afterward has BOTH the annotation columns and the media
-        # filename columns together.
-        joined = gt.merge(media, on='platform_id', how='inner')
+    # BIG-5 data comes as one majority-vote GT CSV per language; English and
+    # Spanish are processed identically, just looping over both in turn.
+    for lang, gt_csv in [("en", en_gt), ("es", es_gt)]:
+        if not gt_csv:
+            continue
+        # dtype=str for platform_id: it's a large integer-looking id, and we
+        # only ever use it to build a filename string — reading it as a
+        # plain string sidesteps any pandas int/float parsing quirks.
+        gt = pd.read_csv(gt_csv, dtype={"platform_id": str})
 
-        for _, row in joined.iterrows():
-            media_files_raw = row.get('media_files')
-            if pd.isna(media_files_raw): continue
+        for _, row in gt.iterrows():
+            platform_id = row.get("platform_id")
+            if pd.isna(platform_id):
+                continue
             try:
-                # The media_files column stores a Python-list-looking string,
-                # e.g. "['photo1.jpg', 'photo2.jpg']" — ast.literal_eval safely
-                # parses that string back into an actual Python list (safer
-                # than eval() since it only allows literal data, no code execution).
-                filenames = ast.literal_eval(media_files_raw)
-            except: continue
+                # How many images this tweet actually has (0-4). Needed
+                # because nature_visual_1/2/3 etc. are NOT blank for a
+                # nonexistent image slot — they default to "No" the same as
+                # a real non-nature image would — so n_images is the ONLY
+                # reliable way to know how many of the 4 columns are real.
+                n_images = int(row.get("n_images", 0))
+            except (TypeError, ValueError):
+                n_images = 0
 
-            # A single tweet can have up to 4 attached images/videos; the
-            # annotation columns are suffixed _0, _1, _2, _3 for each one.
-            for idx in range(4):
-                if idx >= len(filenames): continue
+            for idx in range(min(4, n_images)):
                 nat = map_yn(row.get(f'nature_visual_{idx}'))
                 if nat is None: continue
 
@@ -464,11 +474,10 @@ def load_big5(en_gt, es_gt, en_media, es_media, cache_dir):
                     # pipeline (no biotic/material label when nature is False).
                     mat, bio = None, None
 
-                filename = filenames[idx]
-                local_path = os.path.join(cache_dir, filename)
-                if not os.path.isfile(local_path):
-                    try: urllib.request.urlretrieve(IMG_BASE_URL + filename, local_path)
-                    except: continue
+                matches = glob.glob(os.path.join(images_dir, f"{platform_id}_{idx}.*"))
+                if not matches:
+                    continue
+                local_path = matches[0]
 
                 results.append({
                     "image_path": local_path,
@@ -496,7 +505,7 @@ def load_dataset(dataset_name, taxonomy_graph, **kwargs):
     elif dataset_name == "places365":
         return load_places365(kwargs.get("data_dir"), kwargs.get("places_categories_txt"), kwargs.get("excel_path"), taxonomy_graph)
     elif dataset_name == "big5":
-        return load_big5(kwargs.get("en_gt"), kwargs.get("es_gt"), kwargs.get("en_media"), kwargs.get("es_media"), kwargs.get("cache_dir"))
+        return load_big5(kwargs.get("en_gt"), kwargs.get("es_gt"), kwargs.get("images_dir"))
     else:
         raise ValueError(f"Unknown dataset: {dataset_name}")
 

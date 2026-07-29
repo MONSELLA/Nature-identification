@@ -67,11 +67,14 @@ def parse_args():
     parser.add_argument("--places_categories_txt", type=str, help="Path to categories_places365.txt (for Places).", default = "/home/pmonserrat/datasets/places/categories_places365.txt")
 
     # BIG-5 Dataset Arguments
-    parser.add_argument("--twitter_en_gt_csv", type=str, default=None, help="table_for_pau_twitter-en-6.csv")
-    parser.add_argument("--twitter_es_gt_csv", type=str, default=None, help="table_for_pau_twitter-es-6.csv")
-    parser.add_argument("--twitter_en_media_csv", type=str, default=None, help="phase-1_twitter-en.csv")
-    parser.add_argument("--twitter_es_media_csv", type=str, default=None, help="phase-1_twitter-es.csv")
-    parser.add_argument("--images_cache_dir", type=str, default="./big_5_cache", help="Cache for BIG-5 downloads.")
+    parser.add_argument("--twitter_en_gt_csv", type=str, default=None,
+                        help="BIG-5 English majority-vote GT CSV (e.g. twitteren6_majority.csv).")
+    parser.add_argument("--twitter_es_gt_csv", type=str, default=None,
+                        help="BIG-5 Spanish majority-vote GT CSV (e.g. twitteres6_majority.csv).")
+    parser.add_argument("--big5_images_dir", type=str, default="./big_5_images",
+                        help="Local folder (shared by both languages) already containing every "
+                             "BIG-5 image, named '<platform_id>_<idx>.<ext>' — located by "
+                             "globbing for that stem since the extension isn't fixed.")
 
     # Model Arguments
     parser.add_argument("--model_family", type=str, required=True, choices=sorted(MODEL_REGISTRY))
@@ -229,9 +232,7 @@ def main():
         excel_path=args.excel_path,
         en_gt=args.twitter_en_gt_csv,
         es_gt=args.twitter_es_gt_csv,
-        en_media=args.twitter_en_media_csv,
-        es_media=args.twitter_es_media_csv,
-        cache_dir=args.images_cache_dir
+        images_dir=args.big5_images_dir,
     )
 
     # Flatten the dataset into independent evaluation instances

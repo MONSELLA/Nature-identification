@@ -276,8 +276,7 @@ def phase_infer(args):
         data_dir=args.data_dir, instances_json=args.instances_json,
         places_categories_txt=args.places_categories_txt, excel_path=args.excel_path,
         en_gt=args.twitter_en_gt_csv, es_gt=args.twitter_es_gt_csv,
-        en_media=args.twitter_en_media_csv, es_media=args.twitter_es_media_csv,
-        cache_dir=args.images_cache_dir,
+        images_dir=args.big5_images_dir,
     )
     if not dataset:
         print("No dataset instances loaded — exiting."); sys.exit(1)
@@ -1144,11 +1143,18 @@ def build_arg_parser():
     p.add_argument("--data_dir", type=str)
     p.add_argument("--instances_json", type=str)
     p.add_argument("--places_categories_txt", type=str)
-    p.add_argument("--twitter_en_gt_csv", type=str, default=None)
-    p.add_argument("--twitter_es_gt_csv", type=str, default=None)
-    p.add_argument("--twitter_en_media_csv", type=str, default=None)
-    p.add_argument("--twitter_es_media_csv", type=str, default=None)
-    p.add_argument("--images_cache_dir", type=str, default="./big_5_cache")
+    p.add_argument("--twitter_en_gt_csv", type=str, default=None,
+                   help="BIG-5 English majority-vote GT CSV (platform_id, n_images, "
+                        "nature_visual_<idx>/nep_materiality_visual_<idx>/"
+                        "nep_biological_visual_<idx> per up-to-4 images).")
+    p.add_argument("--twitter_es_gt_csv", type=str, default=None,
+                   help="BIG-5 Spanish majority-vote GT CSV, same schema as "
+                        "--twitter_en_gt_csv.")
+    p.add_argument("--big5_images_dir", type=str, default="./big_5_images",
+                   help="Local folder (shared by both languages) already containing every "
+                        "BIG-5 image, named '<platform_id>_<idx>.<ext>'. Images are located "
+                        "by globbing for that stem (the extension isn't fixed — jpg/jpeg/png "
+                        "all appear) rather than downloaded — there is no remote fetch step.")
 
     # VLM (infer)
     p.add_argument("--model_family", type=str, choices=sorted(MODEL_REGISTRY))
