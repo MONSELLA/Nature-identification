@@ -198,10 +198,12 @@ evaluating the models.
   The summary prompt is FORKED PER DATASET (v15,
   `prompts.SUMMARY_CAPTION_PROMPTS` / `get_summary_caption_prompt`), because
   the two candidate vocabularies are different KINDS of label: ImageNet gets
-  an OBJECT-centric prompt ("identify the single main object or creature as
-  specifically as you can"), Places365 a SCENE-centric one ("identify what
-  kind of place this is... rather than any individual person or object").
-  Unknown dataset raises rather than silently defaulting to one of them.
+  an OBJECT-centric prompt ("the key objects and prominent entities in the
+  scene, along with their identifying details"), Places365 a SCENE-centric
+  one ("the overall scene, environment, or setting"). Both cap at 30 words
+  (down from the shared prompt's 50) and both end with "Output ONLY the
+  summary text." so no conversational preamble gets embedded as if it were
+  image content. Unknown dataset raises rather than silently defaulting.
   Which variant a run used is recorded in the artifact header's
   `summary_caption_prompt`.
   CANDIDATE text (the GT-class side, not the image-description side) is a

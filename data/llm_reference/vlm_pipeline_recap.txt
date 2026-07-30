@@ -848,15 +848,20 @@ RESOLVED IN v15 (decided per Pau):
   terminal"). The shared prompt asked for BOTH subject and setting on every
   image, so each dataset spent half its ~50-word budget on the axis its
   candidates aren't built from. Now prompts.SUMMARY_CAPTION_PROMPTS keys
-  prompts.SUMMARY_CAPTION_PROMPT_IMAGENET (name the main object/creature as
-  specifically as possible; surroundings only if identifying) and
-  prompts.SUMMARY_CAPTION_PROMPT_PLACES (name the KIND of place; setting/
-  architecture over any individual person or object), selected by
-  get_summary_caption_prompt(dataset), which RAISES on an unknown dataset
+  prompts.SUMMARY_CAPTION_PROMPT_IMAGENET ("the key objects and prominent
+  entities in the scene, along with their identifying details") and
+  prompts.SUMMARY_CAPTION_PROMPT_PLACES ("the overall scene, environment, or
+  setting"), selected by get_summary_caption_prompt(dataset), which RAISES
+  on an unknown dataset
   rather than silently defaulting. run_inference takes a `dataset` kwarg
   (the NAME — not to be confused with its positional dataset_instances) and
   the artifact header records summary_caption_prompt, so runs made with
-  different variants are never silently compared. NOT YET VALIDATED —
+  different variants are never silently compared. Both prompts (Pau's own
+  wording) also tighten the budget from 50 to 30 words — the point is to stay
+  well inside a 77-token CLIP context, and a tighter cap forces the model to
+  lead with identifying content — and both end with "Output ONLY the summary
+  text.", which stops a conversational preamble ("Sure! Here's a summary:")
+  being embedded as though it were image content. NOT YET VALIDATED —
   re-check ClipMatch top-1 per dataset against the shared-prompt baseline.
 - INFLECT DETERMINERS REINSTATED across every template fill
   (clip_metrics.fill_template), REVERSING the v10 revert. Applies to
