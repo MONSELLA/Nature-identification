@@ -131,7 +131,7 @@ Image: A person sitting in an indoor office chair at a desk with a laptop. On th
 EXAMPLE 2 (Pure Nature Space):
 Image: A sunny beach with crashing ocean waves and sand. A surfer carrying a surfboard with a bird logo walks near the water. A small crab is resting on the sand.
 {
-  "reasoning": "Step 1: The macro elements are the beach, ocean, wave, sand, surfer, and surfboard. Step 2: For micro elements, the small crab and the bird logo represents nature and will be extracted.",
+  "reasoning": "Step 1: The macro elements are the beach, ocean, sand, surfer, and surfboard. Step 2: For micro elements, the small crab and the bird logo represents nature and will be extracted.",
   "objects": ["beach", "ocean", "sand", "surfer", "surfboard", "crab", "bird logo"]
 }
 
