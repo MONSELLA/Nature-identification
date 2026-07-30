@@ -30,6 +30,23 @@ evaluating the models.
   is likewise not part of the shipped pipeline (FG-CLIP2 was abandoned as a CLIP
   backend — see clip_metrics.CLIP_PRESETS's comment).
 
+## Two output files — distinct purposes, do not conflate
+- **`.jsonl` artifact** (`vlm_responses_<model>.jsonl`, enriched in place by
+  grounding): the RAW PREDICTION RECORD, model-facing. Everything either
+  pipeline actually predicted — caption, extracted objects, per-object
+  labels + reasoning, hybrid finals, ClipMatch summary caption, SAM3
+  groundings + relevance scores — lives here, complete and unflattened, so
+  it can feed metrics not yet invented. Nothing here is a computed metric.
+- **predictions `.csv`** (written by `--stage score`, one row per image):
+  the QUALITATIVE-REVIEW file — everything from the `.jsonl` PLUS every
+  per-image metric/diagnostic computed at scoring time, flattened into one
+  browsable row. The goal is that this file alone is sufficient for
+  spot-checking a run — nothing in the `.jsonl` should require going back
+  to it. When adding a new prediction field (raw model output) or a new
+  per-image metric, it belongs in BOTH files: the `.jsonl` because it's a
+  prediction that might feed a metric not yet written, the `.csv` because
+  it's needed for qualitative review right now.
+
 ## VLM pipeline — code layout & how to run
 - Entrypoint: `scripts/run_vlm_pipeline.py` (`--stage all|infer|score`).
 - `--stage all` runs infer then score in SEPARATE spawned subprocesses so the
@@ -62,6 +79,17 @@ evaluating the models.
   nature-related context — neither an explicit priming instruction nor the
   passive definition file. Extraction (the "second look") and both labeling
   calls still receive it as normal.
+- Extraction prompt (`src/models/prompts.py`'s `EXTRACTION_PROMPT`) explicitly
+  asks for the overall SETTING/SCENE/ENVIRONMENT as its own extractable
+  entity, not just discrete objects — needed because this one prompt is
+  shared across ImageNet/COCO (object-centric) AND Places365 (whose candidate
+  classes ARE scenes, e.g. "kitchen") AND BIG-5 (whose nature taxonomy lists
+  "Ecosystems & Environments" as a first-class inclusion category, not just
+  the flora/fauna within them). Without this, extraction only ever lists
+  discrete objects inside a scene, leaving no extracted phrase for ClipMatch's
+  anchor-selection or hP/hR's WordNet resolution to match against a
+  scene-level GT class — same failure mode `SUMMARY_CAPTION_PROMPT` had before
+  its "subject or setting" fix.
 - Context files go in the `system` role, never `user`. Read once at startup,
   not per-call (keeps the string stable for vLLM prefix caching).
 - Taxonomy labeling is a HYBRID, resolved during PHASE-1 INFERENCE (mapping is
@@ -101,6 +129,14 @@ evaluating the models.
   Everything else gets `grounded: null` = never attempted; `grounded: false` =
   SAM3 looked and found nothing. Entities are NEVER deleted from the record —
   the full VLM output stays auditable.
+- `run_vlm_pipeline.py --stage score`'s predictions CSV mirrors the grounding
+  fields for qualitative review WITHOUT needing the raw `.jsonl` open
+  alongside it: `object_groundings` (per-object JSON, now including
+  `mask_rle`), `grounding_ungrounded_objects` (nature entities SAM3 attempted
+  but whose mask never crossed `--mask_threshold` — `grounded: false`, not
+  `null`), and `grounding_confirmation_rate_image`. The run summary/console/
+  W&B also report a dataset-wide `confirmation_rate` (recap §9: agreement
+  with SAM3, an INDEPENDENT model, never ground truth).
 - SAM3 (`facebook/sam3`) via plain transformers AutoModel/AutoProcessor. Read
   `outputs.semantic_seg` (concept-level pixel coverage), NOT the instance-level
   `pred_masks`/`pred_boxes`/`pred_logits`.
@@ -141,14 +177,34 @@ evaluating the models.
   around this range, Jina-CLIP-v2 handles much longer text. FG-CLIP2 was
   tried as a long-context option and abandoned — see
   src/evaluation/clip_metrics.py's `CLIP_PRESETS` comment.
-- **ClipMatch** (ImageNet + Places only — not COCO, not BIG-5): score the
-  WHOLE CAPTION's CLIP embedding against each GT candidate class; argmax =
-  predicted class. SUPERSEDES the earlier object-list variant (max similarity
-  across independently-embedded extracted objects) — the caption-based version
-  empirically performs better, so the object-list implementation has been
-  removed from the codebase (see data/llm_reference/vlm_pipeline_recap.txt for
-  the history). Known caveat carried over: long captions risk CLIP's 77-token
-  truncation — accepted given the empirical gain.
+- **ClipMatch** (ImageNet + Places only — not COCO, not BIG-5): score a text
+  embedding against each GT candidate class; argmax = predicted class.
+  SUPERSEDES the earlier object-list variant (max similarity across
+  independently-embedded extracted objects) — tried TWICE (v5 and again in
+  2026-07) and beaten both times by scoring a caption-derived text instead;
+  removed from the codebase both times (see
+  data/llm_reference/vlm_pipeline_recap.txt for the history).
+  PRIMARY text (DEFAULT on ImageNet/Places): the VLM's own short (<=~20-word)
+  SUMMARY of its baseline caption, grounded in the image
+  (`src.vlm_pipeline.summarize_caption_batch`,
+  `prompts.SUMMARY_CAPTION_PROMPT`) — measured 0.41 vs. 0.34 top-1 against the
+  raw caption on the spot-check run, with ~0% CLIP-tokenizer truncation vs.
+  the raw caption's frequent silent cutoff. A real re-summarization is more
+  defensible than letting CLIP truncate arbitrary content from the ~248-token
+  caption. `--stage infer`'s `--no_summarize_clipmatch_caption` opts back into
+  scoring the raw caption instead (kept as a SECONDARY reported comparison,
+  `summary["clipmatch_caption"]`, whenever the summary is primary).
+  CANDIDATE text (the GT-class side, not the image-description side) is a
+  SEPARATE, independent choice: `--stage score`'s `--use_wordnet_definitions_clipmatch`
+  swaps the default `OBJECT_TEMPLATE` phrase ("a photo of a golden retriever")
+  for a richer WordNet lemma(s)+gloss prose per class
+  (`clip_metrics.wordnet_definition_text`) — MEASURED (v12): no meaningful
+  ClipMatch top-1 difference vs. the plain template, so the "richer candidate
+  text aligns better" hypothesis is not supported; kept as a non-default flag
+  rather than removed. Needs `inflect` (only for this path — the OBJECT_TEMPLATE
+  default does not use it, see the recap's v10 entry on why). Recorded in
+  `summary["clip_models"]["clipmatch_candidate_text"]`
+  and `summary["clipmatch_candidates"]` (token-length/truncation diagnostic).
 - **hP/hR/hF1** (hierarchical precision/recall/F1): ImageNet + Places only. Map
   the ClipMatch-predicted class onto a WordNet node via the extracted-object list
   (`resolve_to_wordnet`: rank objects by CLIP sim to the predicted class,
@@ -156,10 +212,12 @@ evaluating the models.
   of the GT node vs. the predicted node.
 
 ## Axis scoring (nature/biotic/material accuracy) — per dataset
-- **ImageNet/Places (single-label)**: ClipMatch (whole-caption CLIP embedding
-  vs. candidate_vocab, global argmax — no lexical matching, no similarity
-  threshold) picks the top-1 predicted class, restricted to classes mapped into
-  the graph. That predicted class is then used ONLY to pick an ANCHOR among the
+- **ImageNet/Places (single-label)**: ClipMatch (PRIMARY text's CLIP embedding
+  — the VLM's summary caption by default, raw caption if
+  `--no_summarize_clipmatch_caption` — vs. candidate_vocab, global argmax — no
+  lexical matching, no similarity threshold) picks the top-1 predicted class,
+  restricted to classes mapped into the graph. That predicted class is then
+  used ONLY to pick an ANCHOR among the
   extracted objects: the object whose own CLIP embedding is most similar to the
   predicted class's embedding (`best_obj_idx`/`best_final` in
   `run_vlm_pipeline.py`'s single-label branch). nature/biotic/material are all

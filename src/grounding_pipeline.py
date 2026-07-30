@@ -354,7 +354,10 @@ class SAM3Grounder:
         dtype: str = "auto",
         mask_threshold: float = DEFAULT_MASK_THRESHOLD,
         debug_semantic_range: bool = False,
+        hf_token: Optional[str] = None,
     ) -> None:
+        import os
+
         import torch
         from transformers import AutoModel, AutoProcessor
 
@@ -372,8 +375,15 @@ class SAM3Grounder:
         dtype_kwargs = {}
         if dtype and dtype != "auto":
             dtype_kwargs["torch_dtype"] = getattr(torch, dtype)
-        self.processor = AutoProcessor.from_pretrained(model_name)
-        self.model = AutoModel.from_pretrained(model_name, **dtype_kwargs)
+        # facebook/sam3 is a gated repo — needs an authenticated HF token with
+        # accepted license terms. NEVER hardcode the token: pass it explicitly
+        # (--hf_token, plumbed from run_grounding_pipeline.py) or, by default,
+        # pick it up from the HF_TOKEN env var / `huggingface-cli login`'s
+        # cached token (huggingface_hub's own resolution order — passing
+        # token=None here still lets that automatic lookup happen).
+        token = hf_token or os.environ.get("HF_TOKEN")
+        self.processor = AutoProcessor.from_pretrained(model_name, token=token)
+        self.model = AutoModel.from_pretrained(model_name, token=token, **dtype_kwargs)
         self.model.eval().to(device)
 
     def _load_image(self, path: str):

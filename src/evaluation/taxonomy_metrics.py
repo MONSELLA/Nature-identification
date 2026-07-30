@@ -44,16 +44,6 @@ import networkx as nx
 from nltk.corpus import wordnet as wn
 
 
-# Optional hand-curated synonyms for senses WordNet lemmatizes awkwardly.
-# Mirrors the reference file's `custom_synonyms`; extend as needed.
-# Example: WordNet's literal synsets for "boy"/"girl"/etc. don't map cleanly
-# onto "person.n.01" the way we'd want for this project, so we hardcode the
-# mapping here instead of relying on WordNet's own synonym lookup for these.
-CUSTOM_SYNONYMS = {
-    "person.n.01": ["boy", "girl", "man", "woman", "kid", "child", "guy", "lady"],
-}
-
-
 # =============================================================================
 # Wu-Palmer similarity
 # =============================================================================
@@ -217,6 +207,26 @@ def compute_hierarchical_metrics(
 # =============================================================================
 # Free-text object → WordNet synset resolution
 # =============================================================================
+def _synsets_for_phrase(phrase: str) -> List["wn.synset"]:
+    """WordNet noun synsets for one space-joined phrase, or [] if unrecognized
+    (WordNet keys use underscores, e.g. "polar bear" -> "polar_bear")."""
+    key = phrase.strip().replace(" ", "_")
+    if not key:
+        return []
+    try:
+        return wn.synsets(key, pos="n")
+    except Exception:
+        return []
+
+
+def _best_sense(synsets: List["wn.synset"], pred_synset_id: str) -> "wn.synset":
+    """Disambiguate polysemous synsets by maximizing Wu-Palmer similarity
+    against `pred_synset_id` (the ClipMatch-predicted class)."""
+    if len(synsets) == 1:
+        return synsets[0]
+    return max(synsets, key=lambda s: compute_wup_similarity(s.name(), pred_synset_id))
+
+
 def resolve_to_wordnet(
     candidate_scores: List[float],
     pred_synset_id: str,
@@ -224,17 +234,20 @@ def resolve_to_wordnet(
     threshold: float = 0.0,
 ) -> Optional[str]:
     """
-    Map a list of free-text object phrases to a single canonical WordNet synset
-    id, used to turn the VLM's extracted-object list into the predicted node for
-    hP/hR. Candidates are considered in descending `candidate_scores` order
-    (e.g. each object's CLIP similarity to the ClipMatch-predicted class), only
-    those above `threshold`. The first candidate that maps to WordNet wins;
-    polysemous candidates are disambiguated by maximizing Wu-Palmer similarity
-    against `pred_synset_id` (the ClipMatch-predicted class). Returns None if no
-    candidate maps to the WordNet vocabulary.
+    Map the SINGLE best-scoring free-text object phrase to a canonical WordNet
+    synset id, used to turn the VLM's extracted-object list into the predicted
+    node for hP/hR. Only the highest-scoring candidate above `threshold` is
+    tried directly (no falling through to the next-best candidate on failure —
+    the caller passes one candidate in practice; see run_vlm_pipeline.py).
 
-    Object phrases are expected space-joined (e.g. "polar bear"); they are
-    converted to WordNet's underscore form ("polar_bear") for lookup.
+    If that top candidate is a COMPOUND NOUN (multiple space-separated words)
+    and does not map to WordNet as a whole phrase (e.g. "bear rug" has no
+    synset), each of its constituent words is tried individually as a fallback
+    (e.g. "bear", "rug") — compound nouns are frequently absent from WordNet
+    even when their parts are common nouns. Among whichever constituent words
+    DO resolve, the one whose (polysemy-disambiguated) synset maximizes
+    Wu-Palmer similarity to `pred_synset_id` is kept. Returns None if neither
+    the full phrase nor any constituent word maps to the WordNet vocabulary.
 
     WHY DOES THIS FUNCTION EXIST? ClipMatch (see clip_metrics.py) tells us
     WHICH candidate class the model's extracted objects best match overall,
@@ -242,48 +255,32 @@ def resolve_to_wordnet(
     ancestor chain. This function picks the single BEST extracted-object
     phrase to represent that match and converts it into a synset id.
     """
-    # Pair up each object phrase with its score, sort by score descending
-    # (best/most-confident match first), and drop anything below `threshold`.
-    # `zip(candidate_scores, candidate_strings)` pairs them positionally, e.g.
-    # scores=[0.9, 0.2], strings=["dog","car"] -> [(0.9,"dog"), (0.2,"car")].
-    sorted_candidates = [
-        string
-        for score, string in sorted(zip(candidate_scores, candidate_strings), key=lambda p: p[0], reverse=True)
-        if score > threshold
-    ]
+    if not candidate_strings:
+        return None
+    # Take only the single highest-scoring candidate (ties broken by whichever
+    # max() finds first). `zip` pairs scores/strings positionally.
+    best_score, top_candidate = max(zip(candidate_scores, candidate_strings), key=lambda p: p[0])
+    if best_score <= threshold:
+        return None
 
-    # Walk candidates from most to least confident, and take the FIRST one
-    # that we can successfully turn into a WordNet synset. Less confident
-    # candidates are only reached if earlier ones fail to resolve at all.
-    for candidate in sorted_candidates:
-        # WordNet's dictionary keys use underscores instead of spaces, e.g.
-        # the phrase "polar bear" is looked up as "polar_bear".
-        key = candidate.strip().replace(" ", "_")
-        # Custom synonym expansion: if this string is a known alias of the
-        # predicted class, accept the predicted class directly.
-        if pred_synset_id in CUSTOM_SYNONYMS and candidate.strip().lower() in CUSTOM_SYNONYMS[pred_synset_id]:
-            return pred_synset_id
-        try:
-            # `wn.synsets(key, pos="n")` returns EVERY noun sense WordNet knows
-            # for this word/phrase — a word like "bank" has multiple unrelated
-            # meanings (river bank vs. financial bank), each its own synset.
-            synsets = wn.synsets(key, pos="n")
-        except Exception:
-            continue
-        if not synsets:
-            # This phrase isn't a recognized WordNet noun at all — try the
-            # next-best candidate instead of giving up entirely.
-            continue
-        if len(synsets) == 1:
-            # No ambiguity — there's only one possible sense, so use it.
-            return synsets[0].name()
-        # Polysemy: pick the sense closest to the predicted class by Wu-Palmer.
-        # `max(..., key=...)` scores every candidate sense's similarity to the
-        # already-known predicted class and keeps whichever sense scores
-        # highest — i.e. whichever meaning of this ambiguous word makes most
-        # sense given what we already believe the image is about.
-        best = max(synsets, key=lambda s: compute_wup_similarity(s.name(), pred_synset_id))
-        return best.name()
+    synsets = _synsets_for_phrase(top_candidate)
+    if synsets:
+        return _best_sense(synsets, pred_synset_id).name()
 
-    # None of the candidate phrases mapped to any WordNet noun sense at all.
-    return None
+    # The full phrase didn't resolve. Only fall back to per-word truncations
+    # if it's actually a compound (multi-word) — a single unmapped word has
+    # no smaller unit to try.
+    words = top_candidate.strip().split()
+    if len(words) <= 1:
+        return None
+
+    resolved: List["wn.synset"] = []
+    for word in words:
+        word_synsets = _synsets_for_phrase(word)
+        if word_synsets:
+            resolved.append(_best_sense(word_synsets, pred_synset_id))
+    if not resolved:
+        return None
+    # Among the constituent words that DID map, keep whichever synset
+    # maximizes Wu-Palmer similarity to the predicted class.
+    return max(resolved, key=lambda s: compute_wup_similarity(s.name(), pred_synset_id)).name()

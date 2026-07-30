@@ -37,6 +37,28 @@ CLIP_PRESETS = {
     "original": "openai/clip-vit-large-patch14",
     "metaclip": "facebook/metaclip-h14-fullcc2.5b",
     "altclip": "BAAI/AltCLIP",
+    # SigLIP2: native transformers AutoModel/AutoProcessor, NO trust_remote_code
+    # — unlike FG-CLIP2 (tried and abandoned as a CLIP backend: its
+    # trust_remote_code __init__ crashed with a meta-tensor error under this
+    # project's transformers version; see data/llm_reference/vlm_pipeline_recap.txt
+    # §11 for the full history), SigLIP2's whole forward path is plain library
+    # code, so there's no custom-model-class __init__ to crash. SiglipModel has
+    # no separate text_projection/visual_projection submodule (the pooled
+    # output from text_model/vision_model IS already the projected embedding),
+    # so CLIPScorer._text_features/_image_features fall through to their
+    # get_text_features/get_image_features branch, which already returns a
+    # plain Tensor — no special-casing needed here.
+    "siglip2": "google/siglip2-base-patch16-224",
+    # EVA-CLIP itself needs open_clip or a trust_remote_code wrapper — exactly
+    # the dependency risk this project avoids (see FG-CLIP2 above). These two
+    # LAION checkpoints are the hassle-free equivalent: they're OpenCLIP
+    # weights converted to the SAME "original" CLIPModel/CLIPProcessor classes
+    # (plain transformers, no trust_remote_code, identical code path to
+    # "original" — literally just a different repo id), but trained on
+    # LAION-2B (much larger/broader data than OpenAI's original CLIP), landing
+    # in the same performance tier as EVA-CLIP's stronger variants.
+    "laion_h14": "laion/CLIP-ViT-H-14-laion2B-s32B-b79K",       # ~78% zero-shot IN1k, faster
+    "laion_bigg": "laion/CLIP-ViT-bigG-14-laion2B-39B-b160k",   # ~80% zero-shot IN1k, EVA-CLIP-tier, slower/bigger
     "longclip": "longclip",  # Routed directly to local GitHub clone
 }
 
@@ -243,6 +265,25 @@ class CLIPScorer:
                 print(f"🔎 [CLIP] {desc}: {done}/{n_total} ({done / n_total:.1%})", flush=True)
         return np.concatenate(out, axis=0)
 
+    def count_tokens(self, texts: List[str]) -> List[int]:
+        """Untruncated token count per text under this model's OWN tokenizer —
+        used for a truncation-rate diagnostic (e.g. run_vlm_pipeline.py's
+        summary-caption ClipMatch ablation), independent of `context_length`.
+
+        Native-HF only: a plain HF tokenizer call with truncation=False gives
+        the real length directly. Long-CLIP's tokenizer is a bespoke function
+        (`longclip.tokenize`) that always returns a fixed `context_length`-wide
+        padded tensor regardless of truncate=True/False, so it can't report an
+        untruncated count the same way — raise rather than silently return a
+        misleading number.
+        """
+        if not self._is_native_hf:
+            raise NotImplementedError(
+                "count_tokens needs a native-HF tokenizer (Long-CLIP's tokenize() always "
+                "pads/truncates to a fixed context_length and can't report a raw token count)."
+            )
+        return [len(self.tokenizer(t, truncation=False)["input_ids"]) for t in texts]
+
     def encode_images(self, image_paths: List[str], verbose: bool = False) -> np.ndarray:
         from PIL import Image
 
@@ -326,3 +367,59 @@ def clipmatch(
 
 def object_texts(objects: List[str]) -> List[str]:
     return [OBJECT_TEMPLATE.format(o) for o in objects]
+
+
+_DEFINITION_INFLECT_ENGINE = None
+
+
+def _definition_inflect_engine():
+    """Lazy singleton, scoped to wordnet_definition_text only — this is an
+    opt-in ClipMatch candidate-text variant (--use_wordnet_definitions_clipmatch),
+    not the default path, so `inflect` is only imported when actually used."""
+    global _DEFINITION_INFLECT_ENGINE
+    if _DEFINITION_INFLECT_ENGINE is None:
+        import inflect
+        _DEFINITION_INFLECT_ENGINE = inflect.engine()
+    return _DEFINITION_INFLECT_ENGINE
+
+
+def wordnet_definition_text(synset_id: str) -> str:
+    """Richer ClipMatch candidate text for one GT class: its canonical
+    lemma(s) plus WordNet's own gloss, in natural prose —
+
+        "A golden retriever, also known as golden retriever dog. It is
+        defined as: an English breed having a long silky golden coat."
+
+    ...instead of the plain OBJECT_TEMPLATE ("a photo of a golden
+    retriever"). Motivation (Pau): a VLM's own image descriptions are
+    often definitional/explanatory in style, so giving the CANDIDATE side
+    more semantic content (not just a bare noun phrase) may align better
+    in CLIP's text embedding space than a templated phrase built the same
+    way for every class regardless of how distinctive or obscure it is.
+
+    Opt-in via --use_wordnet_definitions_clipmatch (ImageNet/Places only —
+    get_candidate_vocab guarantees every candidate's synset_id resolves via
+    `wn.synset()`, per its own docstring, so this doesn't need a mapping
+    fallback the way object-side WordNet lookups do).
+    """
+    from nltk.corpus import wordnet as wn
+
+    synset = wn.synset(synset_id)
+    lemmas = [lemma.name().replace("_", " ").lower() for lemma in synset.lemmas()]
+    primary_name = lemmas[0]
+    alt_names = f", also known as {', '.join(lemmas[1:])}" if len(lemmas) > 1 else ""
+
+    # inflect prepends the correct "a"/"an" for the primary lemma's own spelling.
+    name_with_article = _definition_inflect_engine().a(primary_name)
+
+    definition = synset.definition()
+    return f"{name_with_article.capitalize()}{alt_names}. It is defined as: {definition}."
+
+
+def candidate_vocab_texts(candidate_vocab: List[dict], use_wordnet_definitions: bool = False) -> List[str]:
+    """Text for each ClipMatch candidate class: the plain OBJECT_TEMPLATE
+    phrase by default, or wordnet_definition_text(synset_id) per class when
+    `use_wordnet_definitions` is set (--use_wordnet_definitions_clipmatch)."""
+    if use_wordnet_definitions:
+        return [wordnet_definition_text(c["synset_id"]) for c in candidate_vocab]
+    return [OBJECT_TEMPLATE.format(c["class_name"]) for c in candidate_vocab]

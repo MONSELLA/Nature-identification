@@ -62,6 +62,7 @@ from typing import Any, Dict, List, Optional
 from src.models.prompts import (
     CAPTION_PROMPT,
     EXTRACTION_PROMPT,
+    SUMMARY_CAPTION_PROMPT,
     MaterialResponse,
     ObjectExtractionResponse,
     TaxonomyResponse,
@@ -194,6 +195,39 @@ def caption_batch(
 
 
 # =============================================================================
+# Stage 1b — ClipMatch summary caption (default text ClipMatch scores against
+# on ImageNet/Places — see prompts.py)
+# =============================================================================
+def summarize_caption_batch(
+    vlm,
+    image_paths: List[str],
+    captions: List[str],
+    system_prompt: Optional[str] = None,
+    max_new_tokens: int = 64,
+    temperature: float = 0.0,
+) -> List[str]:
+    """ClipMatch-only (ImageNet/Places): compress each image's own baseline
+    caption into a short (<=~20-word) summary, grounded in BOTH the image and
+    that caption (re-sent as context, same "second look" idea as
+    extract_objects_batch) — real re-summarization instead of blindly
+    truncating at the CLIP tokenizer. Measured 0.41 vs. 0.34 top-1 against the
+    raw caption, so this is now the PRIMARY text ClipMatch scores against
+    (run_vlm_pipeline.py's --no_summarize_clipmatch_caption opts back into the
+    raw caption). No system prompt by default, matching caption_batch's own
+    neutrality rationale (this call only compresses content the neutral
+    caption already produced, so there's nothing to keep unbiased beyond that).
+    """
+    prompts = [SUMMARY_CAPTION_PROMPT.format(caption=c) for c in captions]
+    outs = vlm.generate_batch_safe(
+        prompts, image_paths,
+        label="summarize_caption_batch", item_labels=image_paths,
+        system_prompt=system_prompt, max_new_tokens=max_new_tokens,
+        temperature=temperature, output_mode="free_form",
+    )
+    return [(o if isinstance(o, str) else "") for o in outs]
+
+
+# =============================================================================
 # Stage 2 — object extraction (structured)
 # =============================================================================
 def extract_objects_batch(
@@ -203,9 +237,17 @@ def extract_objects_batch(
     system_prompt: Optional[str],
     max_new_tokens: int = 256,
     temperature: float = 0.0,
-) -> List[List[str]]:
+) -> List[Dict[str, Any]]:
     """Ask the VLM to list every object in each image, using the Stage-1
-    caption as extra context alongside a fresh look at the image itself."""
+    caption as extra context alongside a fresh look at the image itself.
+
+    Returns one {"objects": [...], "reasoning": str | None} dict per image —
+    "reasoning" is EXTRACTION_PROMPT's own optional chain-of-thought field
+    (ObjectExtractionResponse may or may not define one, depending on the
+    current prompt/schema), captured here so it can be stored in the artifact
+    for auditing/qualitative review rather than silently discarded. None
+    when the schema has no such field, or on a parse failure.
+    """
     # Fill in each image's own caption into the shared EXTRACTION_PROMPT
     # template (see src/models/prompts.py) — so each per-image prompt is
     # slightly different this time, referencing that image's own description.
@@ -222,12 +264,13 @@ def extract_objects_batch(
         if isinstance(o, dict):
             # Successful structured output: pull out the "objects" list (or
             # an empty list if that key is somehow missing) and clean it up.
-            results.append(normalize_objects(o.get("objects", [])))
+            results.append({"objects": normalize_objects(o.get("objects", [])),
+                             "reasoning": o.get("reasoning")})
         else:  # parse failure / None
             # The model's output didn't parse into valid JSON matching our
             # schema — treat this image as having zero extracted objects
             # rather than crashing the whole batch.
-            results.append([])
+            results.append({"objects": [], "reasoning": None})
     return results
 
 
@@ -373,9 +416,12 @@ def run_inference(
     max_hops: int = 3,
     batch_size: int = 16,
     caption_max_new_tokens: int = 256,
+    extraction_max_new_tokens: Optional[int] = None,
     label_max_new_tokens: int = 300,
     temperature: float = 0.0,
     verbose: bool = False,
+    summarize_for_clipmatch: bool = False,
+    summary_max_new_tokens: int = 64,
 ):
     """
     Run caption -> extraction -> (mapping + labeling) over every image and yield
@@ -391,7 +437,33 @@ def run_inference(
           "objects": [str, ...],
           "object_labels": [ {reasoning,nature,biotic,material,parse_failed,vlm_called}, ... ],
           "object_finals": [ resolve_hybrid_label(...) dicts, ... ],
+          "clipmatch_summary_caption": str | None,  # only when summarize_for_clipmatch
+          "extraction_reasoning": str | None,  # EXTRACTION_PROMPT's own chain-of-thought
+                                               # field, when its schema defines one; None
+                                               # otherwise or on a parse failure.
         }
+
+    `extraction_max_new_tokens` sets Stage 2's own token budget, independent
+    of `caption_max_new_tokens` — falls back to `caption_max_new_tokens` when
+    left None (the old shared-budget behavior). Worth setting explicitly and
+    HIGHER whenever EXTRACTION_PROMPT's schema (ObjectExtractionResponse)
+    includes a 'reasoning' field: under guided decoding the model must write
+    that reasoning out in full before it can emit the objects array, and
+    captioning's own budget was never sized for a reasoning-plus-list schema —
+    too small a shared budget can silently truncate the objects list (or the
+    whole structured output) with no parse-failure signal, showing up only as
+    a suspiciously low objects-per-image diagnostic.
+
+    `summarize_for_clipmatch` (see prompts.SUMMARY_CAPTION_PROMPT) adds one
+    extra VLM call per batch: a short (<=~20-word) re-summarization of this
+    image's own caption, grounded in the image, which then becomes the PRIMARY
+    text ClipMatch scores against (measured 0.41 vs. 0.34 top-1 against the
+    full ~248-token caption, which a short-context ClipMatch CLIP would
+    otherwise truncate). Only meaningful for ImageNet/Places (the only
+    ClipMatch datasets — see clip_metrics.CLIPMATCH_DATASETS); the caller is
+    responsible for not setting this on COCO/BIG-5 runs. Records carry
+    `clipmatch_summary_caption: None` when the flag is off, so the key's
+    presence/absence never has to be special-cased downstream.
 
     `object_labels[k]` and `object_finals[k]` both align with `objects[k]`.
     `object_finals` are the fully resolved hybrid labels (WordNet + VLM), so
@@ -412,6 +484,18 @@ def run_inference(
         # caption call (the nature-definition context) unless a caller
         # explicitly wants something different for that stage.
         extraction_system_prompt = caption_system_prompt
+
+    # Extraction gets its OWN token budget, independent of captioning's, when
+    # a caller sets one explicitly — falls back to caption_max_new_tokens
+    # otherwise (the old shared-budget behavior). Needed because
+    # EXTRACTION_PROMPT's schema (ObjectExtractionResponse) can include a
+    # 'reasoning' field the model must write out in full BEFORE it can emit
+    # the objects array under guided decoding — captioning's own budget was
+    # never sized for that, and a too-small shared budget can silently
+    # truncate the objects list with no parse-failure signal.
+    resolved_extraction_max_new_tokens = (
+        extraction_max_new_tokens if extraction_max_new_tokens is not None else caption_max_new_tokens
+    )
 
     n = len(dataset_instances)
     # Standard "ceiling division" trick: computes how many batches of size
@@ -457,10 +541,27 @@ def run_inference(
         if verbose:
             print(f"[infer] batch {b + 1}/{num_batches}: extract_objects_batch "
                   f"(structured, ObjectExtractionResponse)...", flush=True)
-        objects_per_image = extract_objects_batch(
+        extraction_results = extract_objects_batch(
             vlm, image_paths, captions, extraction_system_prompt,
-            max_new_tokens=caption_max_new_tokens, temperature=temperature,
+            max_new_tokens=resolved_extraction_max_new_tokens, temperature=temperature,
         )
+        objects_per_image = [r["objects"] for r in extraction_results]
+        extraction_reasoning_per_image = [r["reasoning"] for r in extraction_results]
+
+        # ImageNet/Places DEFAULT: compress this image's own caption into a
+        # short ClipMatch-friendly summary. summary_captions[i] is None for
+        # every image when the flag is off, so the zip below always has a
+        # value to assign, whether or not this ran.
+        if summarize_for_clipmatch:
+            if verbose:
+                print(f"[infer] batch {b + 1}/{num_batches}: summarize_caption_batch "
+                      f"(free_form, ClipMatch primary text)...", flush=True)
+            summary_captions = summarize_caption_batch(
+                vlm, image_paths, captions,
+                max_new_tokens=summary_max_new_tokens, temperature=temperature,
+            )
+        else:
+            summary_captions = [None] * len(image_paths)
 
         # Map every extracted object to the taxonomy FIRST (cheap dict/graph
         # lookup) so Stage-3 labeling can route each object to the minimal VLM
@@ -492,8 +593,9 @@ def run_inference(
         # GT `targets`), caption, extracted objects, per-object mappings, and
         # per-object raw labels, all aligned by position. Resolve the final
         # hybrid label per object (reusing the precomputed mapping) and yield.
-        for inst, cap, objs, maps, labels in zip(
-            chunk, captions, objects_per_image, mappings_per_image, labels_per_image
+        for inst, cap, objs, maps, labels, summ, extr_reasoning in zip(
+            chunk, captions, objects_per_image, mappings_per_image, labels_per_image,
+            summary_captions, extraction_reasoning_per_image
         ):
             finals = [
                 resolve_hybrid_label(obj, lab, tax_graph, mapping=mp)
@@ -506,6 +608,8 @@ def run_inference(
                 "objects": objs,
                 "object_labels": labels,
                 "object_finals": finals,
+                "clipmatch_summary_caption": summ,
+                "extraction_reasoning": extr_reasoning,
             }
 
         if verbose:

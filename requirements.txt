@@ -62,16 +62,25 @@ Pillow>=10.0
 
 # --- CLIP-based metrics (src/evaluation/clip_metrics.py) ---
 # F-CLIPScore, Object-CLIPScore, ClipMatch all run through a CLIPScorer.
-# clip_metrics.CLIP_PRESETS currently offers FOUR checkpoints — keep this
+# clip_metrics.CLIP_PRESETS currently offers SEVEN checkpoints — keep this
 # list in sync with that dict if it changes, this has drifted before:
 #   "original" (openai/clip-vit-large-patch14), "metaclip"
-#   (facebook/metaclip-h14-fullcc2.5b), "altclip" (BAAI/AltCLIP) — all three
-#   native transformers AutoModel/AutoProcessor, covered by transformers
+#   (facebook/metaclip-h14-fullcc2.5b), "altclip" (BAAI/AltCLIP), "siglip2"
+#   (google/siglip2-base-patch16-224), "laion_h14"
+#   (laion/CLIP-ViT-H-14-laion2B-s32B-b79K), "laion_bigg"
+#   (laion/CLIP-ViT-bigG-14-laion2B-39B-b160k) — all six native transformers
+#   AutoModel/AutoProcessor, NO trust_remote_code, covered by transformers
 #   above, no extra packages — PLUS "longclip", which is different enough to
 #   need its own dependencies below.
 sentencepiece>=0.1.99  # AltCLIP's text tower is XLM-RoBERTa-based; its
                        # tokenizer needs sentencepiece, which transformers
                        # does NOT pull in as a hard dependency on its own.
+# inflect: ONLY needed for the opt-in --use_wordnet_definitions_clipmatch
+# ClipMatch candidate-text variant (clip_metrics.wordnet_definition_text) —
+# picks the correct "a"/"an" for each WordNet lemma's primary name. Not used
+# by the default OBJECT_TEMPLATE path (that was tried project-wide and
+# reverted — see data/llm_reference/vlm_pipeline_recap.txt's v10 entry).
+inflect>=7.0
 # longclip (CLIP_PRESETS["longclip"]) is NOT a transformers checkpoint at
 # all — clip_metrics.py routes it to a LOCAL CLONE of the Long-CLIP GitHub
 # repo (LONG_CLIP_REPO_PATH, currently "/home/pmonserrat/Long-CLIP") plus its

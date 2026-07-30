@@ -114,6 +114,7 @@ def phase_ground(args):
         model_name=args.sam3_model, device=args.device, dtype=args.dtype,
         mask_threshold=args.mask_threshold,
         debug_semantic_range=args.debug_semantic_range,
+        hf_token=args.hf_token,
     )
 
     # Record the grounding configuration in the artifact header, next to the
@@ -267,6 +268,11 @@ def build_arg_parser():
                    help=f"HuggingFace repo id for SAM3 (default {SAM3_MODEL_ID}). One model "
                         "handles both discrete objects and amorphous regions — there is no "
                         "thing/stuff routing and no separate detector in this pipeline.")
+    p.add_argument("--hf_token", type=str, default=None,
+                   help="HuggingFace token for gated repos (facebook/sam3 requires accepting "
+                        "its license). Default: the HF_TOKEN env var, or the token cached by "
+                        "`huggingface-cli login` if neither is set. Prefer those over this "
+                        "flag so the token never ends up in shell history or a Slurm script.")
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--dtype", type=str, default="auto",
                    help="'auto' (checkpoint default) or a torch dtype name, e.g. float16 / "

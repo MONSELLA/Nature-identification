@@ -55,6 +55,44 @@ from pydantic import BaseModel, Field
 CAPTION_PROMPT = "Describe this image, including any text."
 
 # =============================================================================
+# Stage 1b — ClipMatch summary caption (ImageNet/Places DEFAULT for ClipMatch)
+# =============================================================================
+# ClipMatch's own CLIP checkpoint is typically a short-context model (vanilla
+# CLIP, 77 tokens), which silently truncates the baseline caption above (run
+# through LongCLIP, ~248 tokens). Rather than truncate blindly at the
+# tokenizer, this asks the VLM itself to compress its OWN caption into a short
+# (<=~20-word) summary, grounded in BOTH the image and that caption — so the
+# model decides what to keep instead of a mid-sentence cutoff. Measured 0.41
+# vs. 0.34 top-1 against the raw caption on the spot-check run, with far less
+# truncation — this is now the PRIMARY text ClipMatch scores against on
+# ImageNet/Places (see src/vlm_pipeline.summarize_caption_batch,
+# run_vlm_pipeline.py's --no_summarize_clipmatch_caption to opt out). Still
+# NOT part of the baseline two-pass pipeline itself — only feeds ClipMatch.
+#
+# ALWAYS asks for BOTH the subject and the setting (not "subject OR setting"
+# — that phrasing handed the model an unconstrained, arbitrary choice with no
+# criterion for which to pick, risking inconsistent behavior across images).
+# ImageNet's candidate classes are object-centric (a discrete figure-in-a-
+# scene, e.g. "golden retriever"); Places365's ARE the scene itself ("airport
+# terminal", "kitchen"). Asking for the subject alone risks the summary
+# fixating on an incidental foreground object (e.g. "a man walking") on a
+# Places image where the SETTING is what ClipMatch actually needs to match
+# (e.g. "restaurant") — asking for both means the setting still gets
+# mentioned even when a person/object is also in frame. One shared prompt
+# across both datasets, not forked per-dataset — simpler to defend
+# methodologically, and not yet validated as a net win vs the original
+# subject-only wording (worth re-checking ClipMatch top-1 on Places
+# specifically after this change, since that's the dataset it targets).
+SUMMARY_CAPTION_PROMPT = (
+    "Here is a detailed description of this image:\n\n"
+    "\"{caption}\"\n\n"
+    "Using both the image and this description, write a short summary "
+    "(at most 50 words) capturing both the main subject (if there is one) "
+    "and the setting or scene, along with the most important surrounding "
+    "context."
+)
+
+# =============================================================================
 # Stage 2 — Object extraction (structured)
 # =============================================================================
 # The image is re-sent on this call (recap §5a "second look"): the model gets
@@ -69,40 +107,64 @@ CAPTION_PROMPT = "Describe this image, including any text."
 # list of individual objects/elements. This list is what gets fed into Stage 3
 # (one taxonomy-labeling call per object) and into the CLIP-based metrics
 # (each object becomes its own "a photo of a {object}" text embedding).
-EXTRACTION_PROMPT = (
-    "Below is a general description of the image:\n\n"
-    "\"{caption}\"\n\n"
-    "Using BOTH the image and the description, list every distinct "
-    "object, element, or entity that appears in the image. Follow these rules:\n"
-    "  - Return each entity as a noun or a compound noun (e.g. \"grass\", "
-    "\"golden retriever\", \"mountain\", \"sea lion\").\n"
-    "  - Include secondary and background entities, not just the main subject.\n"
-    "  - Include an entity even when it is only PART of a larger one or is "
-    "depicted on its surface (e.g. a flower printed on a dress -> list "
-    "\"flower\"; a bird on a logo -> list \"bird\").\n"
-    "  - Do not repeat the same entity twice. Do not invent entities that are "
-    "not supported by the image."
-)
- 
+EXTRACTION_PROMPT = """You are an expert computer vision annotator. Below is a baseline description of the image:
+
+"{caption}"
+
+Your task is to extract visual entities from the image, keeping the total to a maximum of 12 items to avoid noise.
+
+RULES:
+ - Macro Elements (Objective): Extract the overarching scene (e.g., forest, office, restaurant, garden), amorphous elements (e.g., sky, grass, ocean, road), and salient objects (e.g., dog, desk, guitar) objectively.
+ - Micro Elements (Nature-Filtered): For tiny details, non-salient items, background objects, or depicted entities (e.g., stars in a night sky, a small orange, a little dog figurine, or a flower printed on a dress), ONLY extract them if they represent nature according to your system instructions. Ignore all other minor details.
+ - Use the 'reasoning' field to explicitly state your two-step plan: list the macro elements, then identify any valid nature-related micro elements.
+ - Format all extracted entities as concise, singular nouns or compound nouns.
+ - Place all chosen entities into the single 'objects' list.
+ - Do not hallucinate entities not visually present.
+
+EXAMPLE 1 (Mixed Environment):
+Image: A person sitting in an indoor office chair at a desk with a laptop. On the desk is a little dog figurine and an orange. The person is wearing a shirt with a geometric triangle pattern. In the background, there is a potted plant near a window.
+{{
+  "reasoning": "Step 1: The macro elements are the office, desk, chair, person, window, and laptop. Step 2: For micro elements, the little dog figurine, the orange, and the potted plant represent nature, so they will be extracted. I will ignore the geometric pattern on the shirt as it is a non-nature detail.",
+  "objects": ["office", "desk", "chair", "person", "window", "laptop", "dog figurine", "orange", "potted plant"]
+}}
+
+EXAMPLE 2 (Pure Nature Space):
+Image: A sunny beach with crashing ocean waves and sand. A surfer carrying a surfboard with a bird logo walks near the water. A small crab is resting on the sand.
+{{
+  "reasoning": "Step 1: The macro elements are the beach, ocean, sand, surfer, and surfboard. Step 2: For micro elements, the small crab and the bird logo represents nature and will be extracted.",
+  "objects": ["beach", "ocean", "sand", "surfer", "surfboard", "crab", "bird logo"]
+}}
+
+EXAMPLE 3 (Pure No-nature Space):
+Image: A photograph of a brightly lit convenience store in an urban city. Shelves are stocked with snacks and soda bottles. A cashier stands behind the counter.
+{{
+  "reasoning": "Step 1: The macro elements are the store, city, shelf, cashier, and counter. Step 2: For micro elements, there are junk food snacks and soda bottles, but since none of these represent nature, they will be ignored. I will only extract the macro items.",
+  "objects": ["store", "city", "shelf", "cashier", "counter"]
+}}
+
+EXAMPLE 4 (Social Media Text & Depiction):
+Image: A messy indoor bedroom with a desk, a chair and a bed. A person wearing a shirt with a flower print is taking a selfie in the mirror. A teddy bear is laying on the bed. Overlaid on the image is a text banner that says "Save the trees!".
+{{
+  "reasoning": "Step 1: The macro elements are the bedroom, person, mirror, desk, and bed. Step 2: For micro elements, the 'flower' print on the shirt, the 'teddy bear' (depicting an animal), and the word 'trees' from the text overlay all represent nature-related concepts and will be extracted. The rest of the messy room clutter will be ignored.",
+  "objects": ["bedroom", "person", "mirror", "desk", "chair", "bed", "flower", "teddy bear", "tree"]
+}}"""
+
 class ObjectExtractionResponse(BaseModel):
-    """Structured schema for the extraction call: a flat list of object phrases.
-
-    When we pass this class as `schema=` to the VLM, the model's JSON output is
-    forced to look like: {"objects": ["dog", "grass", "fence", ...]}. Our code
-    then just reads `result["objects"]` to get a plain Python list of strings —
-    no manual text-parsing needed.
-    """
-
-    # `List[str]` tells pydantic (and the guided-decoding machinery) that this
-    # field must be a JSON array of strings. `Field(description=...)` is not
-    # just documentation — some structured-output backends surface this text
-    # to the model itself as part of the schema, so it doubles as an
-    # instruction to the model about what belongs in this field.
+    """Structured schema for baseline and nature-filtered entity extraction."""
+    
+    reasoning: str = Field(
+        description=(
+            "Briefly analyze the image using a two-step process. First, identify the macro elements "
+            "(scene, amorphous stuff, salient objects) objectively. Second, scan for micro elements "
+            "(tiny details, non-salient items, depictions). ONLY extract these micro elements if they "
+            "represent nature according to the system definition. Ignore all other minor details. "
+            "Keep the final list to a maximum of 12 items."
+        )
+    )
     objects: List[str] = Field(
         description=(
-            "The distinct physical objects, elements, or entities present in the "
-            "image, each as a noun or a compound noun. Include part-objects and "
-            "background elements."
+            "A unified list of all extracted entities. This includes objective macro elements AND "
+            "nature-filtered micro elements. Format purely as concise, singular nouns or compound nouns. Return [] if none."
         )
     )
 

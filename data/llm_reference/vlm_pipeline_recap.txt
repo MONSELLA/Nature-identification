@@ -1,10 +1,41 @@
-BIG-5 VLM PIPELINE — DESIGN RECAP (v6)
+BIG-5 VLM PIPELINE — DESIGN RECAP (v13)
 (v4: the VLM pipeline is now IMPLEMENTED — this doc records both the original
 design rationale AND, in "IMPLEMENTED:" notes, how the shipped code actually
 does it where the two differ. v5: ClipMatch switched to the caption-based
 variant as the only implementation — see Section 8e and Section 11. v6:
-FG-CLIP2 tried and ABANDONED as a CLIP backend — see Section 11 — replaced
-in CLIP_PRESETS by SigLIP2 and Jina-CLIP-v2.)
+FG-CLIP2 tried and ABANDONED as a CLIP backend — see Section 11 — SigLIP2
+and Jina-CLIP-v2 proposed as replacements at the time, but NOT actually
+wired into CLIP_PRESETS until v8 (SigLIP2 only — see below); v6 itself
+overclaimed this. The object-list ClipMatch variant was briefly
+reintroduced as a diagnostic and re-removed the same day — CONFIRMED AGAIN
+worse than caption-based (0.28 vs 0.34 top-1 on the spot-check run); see
+Section 8e/11, this is the SECOND time this exact result has held. v7:
+ClipMatch's PRIMARY text is now a VLM-written SUMMARY of the caption (not
+the raw caption itself) on ImageNet/Places — measured 0.41 vs 0.34 top-1,
+~0% truncation vs. the raw caption's frequent silent CLIP-tokenizer cutoff
+— see Section 8e/11. v8: SigLIP2 actually added to CLIP_PRESETS (native
+transformers, no trust_remote_code); OBJECT_TEMPLATE's "a photo of a {}"
+now goes through an inflect-checked determiner everywhere it's filled in
+— see Section 11. v9: SigLIP2 measured WORSE than MetaCLIP for ClipMatch —
+added two LAION OpenCLIP-in-CLIPModel-format checkpoints ("laion_h14",
+"laion_bigg") as the hassle-free EVA-CLIP-tier option instead — see
+Section 11. v10: the v8 inflect-checked OBJECT_TEMPLATE determiner was
+REVERTED per Pau — suspected (not confirmed in isolation) of contributing
+to a ClipMatch drop observed after switching to MetaCLIP; OBJECT_TEMPLATE
+is back to a hardcoded "a" — see Section 11. v11: added an OPT-IN ClipMatch
+candidate-text variant (--use_wordnet_definitions_clipmatch) that swaps the
+plain OBJECT_TEMPLATE phrase for a WordNet lemma(s)+gloss prose per
+candidate class — untested hypothesis, not a default — see Section 8e/11.
+v12: that variant MEASURED — no meaningful difference vs the plain
+OBJECT_TEMPLATE phrase on ClipMatch top-1; kept as an available, non-default
+flag rather than removed, per Pau — see Section 11. v13: EXTRACTION_PROMPT
+now explicitly asks for the overall setting/scene/environment as its own
+extractable entity (not just discrete objects) — same scene-centric gap the
+v?? SUMMARY_CAPTION_PROMPT fix addressed, but for the object-extraction
+stage, needed since this one prompt is shared across ImageNet/COCO
+(object-centric) AND Places365 (scene-centric candidate classes) AND BIG-5
+(whose taxonomy lists "Ecosystems & Environments" as first-class nature) —
+see Section 5.)
 
 ===============================================================
 0. IMPLEMENTATION STATUS (NEW in v4)
@@ -284,6 +315,32 @@ even if (b) wins for extraction/object-naming, material/immaterial
 classification specifically must stay VLM-based. Not a fully open
 50/50 comparison for that one axis.
 
+v13 UPDATE: EXTRACTION_PROMPT now explicitly instructs the model to
+list the overall SETTING/SCENE/ENVIRONMENT as its own entity when
+it's a meaningful part of what the image depicts, not just discrete
+objects within it (e.g. an empty office interior -> also list
+"office", not only "desk"/"chair"). Motivation: this one prompt is
+shared across ALL FOUR datasets (ImageNet, COCO, Places365, BIG-5),
+but the original wording and its examples ("grass", "golden
+retriever", "mountain", "sea lion") were entirely object-centric —
+fine for ImageNet/COCO, but Places365's candidate classes ARE scenes
+("kitchen", "airport terminal"), and without a matching extracted
+phrase, ClipMatch's anchor-object selection and hP/hR's WordNet
+resolution have nothing scene-level to grab onto (same gap
+SUMMARY_CAPTION_PROMPT had before its "subject or setting" fix —
+Section 8e). Also directly serves BIG-5: its own nature taxonomy
+(data/big5_taxonomy/big5_nature_definition.txt) lists "Ecosystems &
+Environments" (forests, parks, nature reserves) as a first-class
+INCLUSION category, not just the flora/fauna within them, so
+extraction should be able to surface "forest"/"park" as entities in
+their own right. Scoped with "when it is a meaningful part of what
+the image depicts" specifically to avoid trivially tacking a generic
+"room"/"outdoors" entity onto every single image regardless of
+relevance. NOT YET VALIDATED empirically (unlike the summary-caption
+fix, which was later confirmed to change ClipMatch behavior on
+Places) — worth checking extraction-hit rate and the hP/hR mapping-
+failure rate on Places before/after this change.
+
 ===============================================================
 6. VLM PIPELINE — TAXONOMY LABELING STRATEGY
 ===============================================================
@@ -529,6 +586,15 @@ e) ClipMatch (Ging et al.-inspired), ImageNet + Places ONLY —
            many objects is a smeared average, diluting the signal for
            any single target GT class, hurting matching precisely in
            richer scenes. (Still not used — this rejection stands.)
+     - CANDIDATE-SIDE text (v11, OPT-IN, separate from all of the
+       above — those are all about the IMAGE-description side):
+       `--use_wordnet_definitions_clipmatch` swaps each GT candidate
+       class's plain OBJECT_TEMPLATE phrase ("a photo of a golden
+       retriever") for its WordNet lemma(s) + gloss in natural prose
+       (clip_metrics.wordnet_definition_text — "A golden retriever,
+       also known as ... . It is defined as: <definition>."). NOT the
+       default; not yet empirically validated either way. See
+       RESOLVED/PROPOSED IN v11, Section 11.
 
 f) Hierarchical Precision / Recall (hP/hR) + Wu-Palmer, per
    Snæbjarnarson et al.'s taxonomy-aware evaluation — ImageNet +
@@ -693,10 +759,125 @@ RESOLVED IN v6 (decided after repeated integration failures):
   separate FG-CLIP2 issue — its get_text_features() needing a
   walk_type kwarg tied to a fixed 64/196-token sequence length) has
   been removed along with it, since it's moot without a working load.
-  CLIP_PRESETS now offers SigLIP2 (google/siglip2-base-patch16-224,
-  native transformers, no trust_remote_code needed) and Jina-CLIP-v2
-  (jinaai/jina-clip-v2, trust_remote_code, RAW string/image input
-  convention — see clip_metrics.CLIPScorer's class docstring) instead.
+  SigLIP2 (google/siglip2-base-patch16-224, native transformers, no
+  trust_remote_code needed) and Jina-CLIP-v2 (jinaai/jina-clip-v2,
+  trust_remote_code, RAW string/image input convention — see
+  clip_metrics.CLIPScorer's class docstring) were PROPOSED as
+  replacements here, but neither was actually added to CLIP_PRESETS at
+  the time — see RESOLVED IN v8 below for what's actually wired in.
+
+RESOLVED IN v12 (measured, per Pau):
+- The v11 WordNet-definition ClipMatch candidate text
+  (`clip_metrics.wordnet_definition_text`, `--use_wordnet_definitions_clipmatch`)
+  was run and compared against the plain OBJECT_TEMPLATE phrase — NO
+  MEANINGFUL DIFFERENCE in ClipMatch top-1 between the two. The
+  "richer candidate-side semantic content aligns better against a
+  VLM's own descriptive summary" hypothesis (v11) is NOT supported by
+  this result. Kept in the codebase as a non-default, opt-in flag
+  (cheap to keep, not proven harmful either, and may behave
+  differently on a larger sample or a different CLIP backend) rather
+  than removed outright — unlike the inflect-determiner change (v10),
+  which was reverted because it was suspected of actively hurting the
+  score. If revisited, a larger sample than the earlier spot-check
+  runs would be needed to rule out this being a real-but-small effect
+  hidden by run-to-run noise (see the earlier non-determinism
+  discussion) rather than a genuine null result.
+
+v11 PROPOSAL (for reference — see RESOLVED IN v12 above for the outcome):
+- ClipMatch candidate-vocab text got an independent, opt-in variant:
+  `clip_metrics.wordnet_definition_text(synset_id)` builds "A {primary
+  lemma}, also known as {other lemmas}. It is defined as: {WordNet
+  gloss}." per GT candidate class, instead of the plain OBJECT_TEMPLATE
+  phrase. `clip_metrics.candidate_vocab_texts(..., use_wordnet_definitions=...)`
+  picks between the two; wired to run_vlm_pipeline.py's
+  `--use_wordnet_definitions_clipmatch` (--stage score only — the
+  choice doesn't affect --stage infer at all). Every candidate's
+  synset_id is guaranteed to resolve via `wn.synset()`
+  (get_candidate_vocab's own docstring), so no mapping-fallback logic
+  is needed here the way it is for object-side WordNet lookups
+  (resolve_to_wordnet). Needs `inflect`, but ONLY for this path — the
+  OBJECT_TEMPLATE default was reverted off inflect in v10 (below) and
+  is unaffected. Token-length/truncation diagnostics
+  (summary["clipmatch_candidates"]) track whether WordNet glosses risk
+  exceeding cm_scorer's context length, since a gloss can run
+  considerably longer than "a photo of a {class}".
+
+RESOLVED IN v10 (reverted per Pau):
+- The v8 inflect-checked OBJECT_TEMPLATE determiner (object_template_text)
+  was REMOVED — Pau observed a ClipMatch drop after switching to MetaCLIP
+  and suspected this change as a contributing factor. NOTE: this was not
+  isolated/confirmed as the actual cause (the MetaCLIP switch itself is a
+  confounding variable in that same comparison), but reverted anyway per
+  Pau's call. OBJECT_TEMPLATE ("a photo of a {}") is back to a hardcoded
+  "a" for both Object-CLIPScore's per-object text and ClipMatch's
+  candidate_vocab class-name text; `inflect` dependency removed from
+  requirements.txt. If revisited, isolate this change from any concurrent
+  CLIP-backend swap before attributing a score change to it.
+
+RESOLVED IN v9 (decided from empirical comparison, per Pau):
+- SigLIP2 (v8) measured WORSE than MetaCLIP for ClipMatch on a
+  spot-check comparison — not the drop-in upgrade its native-HF/
+  no-trust_remote_code convenience suggested. Kept in CLIP_PRESETS
+  (still useful for other reference-free metrics/comparisons) but no
+  longer the go-to "safe" option for ClipMatch specifically.
+- EVA-CLIP itself needs open_clip or a trust_remote_code wrapper —
+  the exact dependency risk this project has twice already hit (FG-
+  CLIP2, and the general "custom modeling code can crash under this
+  transformers version" lesson). Added the hassle-free equivalent
+  instead: two LAION OpenCLIP checkpoints that were converted to the
+  SAME "original" CLIPModel/CLIPProcessor classes (plain transformers,
+  no trust_remote_code, byte-identical code path to "original" — only
+  the repo id differs, so CLIPScorer needed zero new code):
+    "laion_h14"  -> laion/CLIP-ViT-H-14-laion2B-s32B-b79K   (~78% zero-shot IN1k)
+    "laion_bigg" -> laion/CLIP-ViT-bigG-14-laion2B-39B-b160k (~80% zero-shot IN1k,
+                    EVA-CLIP-tier scale, slower/bigger)
+  Both trained on LAION-2B (much larger/broader than OpenAI's original
+  CLIP training data), landing in the same performance tier as EVA-
+  CLIP's stronger variants without EVA-CLIP's loading risk.
+
+RESOLVED IN v8:
+- SigLIP2 (google/siglip2-base-patch16-224) actually added to
+  clip_metrics.CLIP_PRESETS as "siglip2" — native transformers
+  AutoModel/AutoProcessor, NO trust_remote_code, so there's no
+  custom-model-class __init__ that can hit FG-CLIP2's meta-tensor crash.
+  SiglipModel has no separate text_projection/visual_projection
+  submodule (its text_model/vision_model pooled output IS already the
+  projected embedding), so CLIPScorer._text_features/_image_features
+  fall through to the get_text_features/get_image_features branch,
+  which already handles a plain-Tensor return — no SigLIP-specific
+  code needed in CLIPScorer itself. Jina-CLIP-v2 was NOT added (still
+  requires trust_remote_code, which this change specifically avoided).
+- OBJECT_TEMPLATE ("a photo of a {}") is now filled in via
+  `clip_metrics.object_template_text`, which picks the grammatically
+  correct determiner via `inflect` instead of hardcoding "a" — "a"/"an"
+  for a singular noun phrase (by actual spelling, e.g. "an hour", "a
+  university"), no article at all for an already-plural phrase (e.g.
+  "trees" -> "a photo of trees"). Applies everywhere OBJECT_TEMPLATE is
+  used: Object-CLIPScore's per-object text (`object_texts`) and
+  ClipMatch's candidate_vocab class-name text
+  (run_vlm_pipeline.py's candidate_embs encoding call).
+
+RESOLVED IN v7 (decided from empirical comparison, same day as the
+object-list re-confirmation below):
+- The RAW caption, even scoring better than the object-list variant
+  (v5), still suffers CLIP-tokenizer truncation on a short-context
+  ClipMatch CLIP (captions run ~248 tokens, vanilla CLIP truncates at
+  77). Rather than accept that as a stated limitation (v5's original
+  call), asked the VLM itself (image + its own caption as context) for
+  a short (<=~20-word) SUMMARY caption
+  (`src.vlm_pipeline.summarize_caption_batch`,
+  `prompts.SUMMARY_CAPTION_PROMPT`) and scored ClipMatch against THAT
+  instead. Measured 0.41 top-1 vs. 0.34 for the raw caption, with ~0%
+  truncation (vs. the raw caption's frequent silent cutoff) — a real
+  re-summarization beats both blind truncation of a long caption AND
+  the object-list variant. This is now the PRIMARY/default text
+  ClipMatch scores against on ImageNet/Places
+  (`run_vlm_pipeline.py`'s `--no_summarize_clipmatch_caption` opts back
+  into the raw caption, kept as a reported SECONDARY comparison,
+  `summary["clipmatch_caption"]`, whenever the summary is primary).
+  Costs one extra VLM call per image on ImageNet/Places only — never
+  triggered on COCO/BIG-5, which don't run ClipMatch at all, so this
+  doesn't touch the final 2M-image BIG-5 production inference run.
 
 RESOLVED IN v5 (decided from empirical comparison):
 - ClipMatch: caption-based similarity beats the object-list variant
@@ -704,6 +885,15 @@ RESOLVED IN v5 (decided from empirical comparison):
   clip_metrics.py; the raw-caption approach is now the ONLY
   implementation, its 77-token truncation caveat accepted as a
   stated limitation.
+- RE-CONFIRMED (2026-07, same day): re-implemented the object-list
+  variant a second time as a diagnostic (`clip_metrics.object_list_sentence`,
+  "a photo in which appear a {}, a {}, ... and a {}" with per-object
+  `inflect`-driven determiners) specifically to re-test whether it
+  would beat caption-based ClipMatch now that captions run ~248
+  tokens. Measured 0.28 top-1 vs. 0.34 for caption-based on the
+  spot-check run — still worse. Code removed again; not worth
+  re-testing a third time without a different underlying change (e.g.
+  a different sentence template or CLIP backend), per Pau's call.
 
 RESOLVED IN v4 (decided during implementation):
 - hP/hR predicted-class -> WordNet-node step: uses CLIP-ranked object

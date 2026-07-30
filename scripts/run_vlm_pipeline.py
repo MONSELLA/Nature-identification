@@ -249,6 +249,21 @@ def _mean(vals):
     return float(sum(vals) / len(vals)) if vals else 0.0
 
 
+def _clip_token_stats(scorer, texts):
+    """Per-text CLIP-tokenizer token counts, mean length, and truncated count
+    (>= scorer.context_length) for a list of texts under `scorer`'s own
+    tokenizer. Returns (None, None, None) when the scorer can't count tokens
+    (Long-CLIP's tokenizer always pads/truncates to a fixed length — see
+    CLIPScorer.count_tokens)."""
+    try:
+        counts = scorer.count_tokens(texts)
+    except NotImplementedError:
+        return None, None, None
+    mean = sum(counts) / len(counts) if counts else 0.0
+    truncated = sum(1 for n in counts if n >= scorer.context_length)
+    return counts, mean, truncated
+
+
 # =============================================================================
 # PHASE 1 — inference
 # =============================================================================
@@ -300,6 +315,15 @@ def phase_infer(args):
     caption_system, label_system_full, label_system_material = build_system_prompts(
         args.nature_definition_path, args.biotic_definition_path, args.material_definition_path)
 
+    # Summary-caption ClipMatch is now the DEFAULT wherever ClipMatch itself
+    # runs (ImageNet/Places — see clip_metrics.CLIPMATCH_DATASETS): measured
+    # 0.41 vs 0.34 top-1 against the raw caption, with far less truncation.
+    # --no_summarize_clipmatch_caption opts back into the old raw-caption
+    # behavior. Never runs on COCO/BIG-5 regardless of the flag — nothing
+    # there would ever read the result, so don't spend the extra VLM call.
+    summarize_for_clipmatch = (args.dataset in clip_metrics.CLIPMATCH_DATASETS
+                                and not args.no_summarize_clipmatch_caption)
+
     # Every registered family is vLLM-served (see src/models/vlm_models.py's
     # MODEL_REGISTRY) — the HuggingFace-served BLIP family was removed.
     vlm_kwargs = {"dtype": args.dtype, "gpu_memory_utilization": args.gpu_memory_utilization,
@@ -323,6 +347,7 @@ def phase_infer(args):
         "model_name": args.model_name,
         "candidate_vocab": candidate_vocab,
         "max_hops": args.max_hops,
+        "summarize_clipmatch_caption": summarize_for_clipmatch,
     }
 
     out_path = Path(args.responses_file)
@@ -344,8 +369,11 @@ def phase_infer(args):
             tax_graph=graph, max_hops=args.max_hops,
             batch_size=args.batch_size,
             caption_max_new_tokens=args.max_new_tokens_caption,
+            extraction_max_new_tokens=args.max_new_tokens_extraction,
             label_max_new_tokens=args.max_new_tokens_label,
             temperature=args.temperature, verbose=args.verbose,
+            summarize_for_clipmatch=summarize_for_clipmatch,
+            summary_max_new_tokens=args.summary_max_new_tokens,
         ):
             rec["record_type"] = "image"
             f.write(json.dumps(rec) + "\n")
@@ -502,9 +530,22 @@ def phase_score(args):
     # When cm_scorer IS scorer (default), reuse the embeddings already
     # computed above instead of re-encoding the same text twice.
     candidate_embs = None
+    run_summary_clipmatch = False
+    summary_texts = summary_embs_cm = None
+    n_summary_truncated = None
+    summary_token_mean = None
+    summary_token_counts = None
+    caption_token_counts = caption_token_mean = n_caption_truncated = None
+    candidate_token_counts = candidate_token_mean = n_candidate_truncated = None
+    primary_embs_cm = None
     if run_clipmatch:
         caption_embs_cm = caption_embs if cm_scorer is scorer else cm_scorer.encode_text(
             captions, warn_truncation=False, verbose=args.verbose, desc="captions (clipmatch)")
+        # Raw-caption token stats under cm_scorer's OWN tokenizer — always
+        # tracked (not gated on run_summary_clipmatch) so the raw caption's
+        # truncation is visible whether it's driving scoring (no summary
+        # available) or just reported as the secondary comparison.
+        caption_token_counts, caption_token_mean, n_caption_truncated = _clip_token_stats(cm_scorer, captions)
         obj_embs_all_cm = obj_embs_all if cm_scorer is scorer else cm_scorer.encode_text(
             flat_texts, verbose=args.verbose, desc="objects (clipmatch)")
         # Also encode the FIXED candidate-class vocabulary just once (rather
@@ -514,9 +555,41 @@ def phase_score(args):
         # get_candidate_vocab), so every candidate here carries its own
         # gt_nature/gt_biotic and the ClipMatch top-1 prediction can be read
         # straight off its candidate_vocab entry — no separate graph lookup.
+        # --use_wordnet_definitions_clipmatch swaps the plain "a photo of a
+        # {class}" template for a richer WordNet-definition prose per class
+        # (clip_metrics.wordnet_definition_text) — untested hypothesis (per
+        # Pau) that giving the CANDIDATE side more semantic content aligns
+        # better against a VLM's own descriptive image summary in CLIP's text
+        # embedding space than a bare templated noun phrase.
+        candidate_texts = clip_metrics.candidate_vocab_texts(
+            candidate_vocab, use_wordnet_definitions=args.use_wordnet_definitions_clipmatch)
         candidate_embs = cm_scorer.encode_text(
-            [clip_metrics.OBJECT_TEMPLATE.format(c["class_name"]) for c in candidate_vocab],
-            verbose=args.verbose, desc="candidate_vocab")
+            candidate_texts, verbose=args.verbose, desc="candidate_vocab")
+        candidate_token_counts, candidate_token_mean, n_candidate_truncated = _clip_token_stats(
+            cm_scorer, candidate_texts)
+
+        # Summary-caption ClipMatch — PRIMARY when the artifact has one (see
+        # --summarize_clipmatch_caption / src.vlm_pipeline.summarize_caption_batch):
+        # each image's own short VLM-written summary of its baseline caption.
+        # Measured 0.41 vs 0.34 top-1 against the full caption on the
+        # spot-check run, with 0% truncation vs. the full caption's silent
+        # CLIP-tokenizer cutoff — a real re-summarization beats letting CLIP
+        # truncate arbitrary content, so this now DRIVES anchor selection /
+        # axis scoring / hierarchical metrics whenever available. Falls back
+        # to the full caption for any individual record where the summary is
+        # missing/empty (e.g. an older partial artifact) so this never
+        # silently drops an image from scoring.
+        run_summary_clipmatch = bool(header.get("summarize_clipmatch_caption"))
+        if run_summary_clipmatch:
+            summary_texts = [r.get("clipmatch_summary_caption") or r["caption"] for r in records]
+            summary_embs_cm = cm_scorer.encode_text(
+                summary_texts, verbose=args.verbose, desc="summary captions (clipmatch)")
+            summary_token_counts, summary_token_mean, n_summary_truncated = _clip_token_stats(
+                cm_scorer, summary_texts)
+        # Whichever embedding space drives scoring THIS run — summary caption
+        # when the artifact has one, else the full caption (old artifacts /
+        # --no_summarize_clipmatch_caption). Computed once here, not per-image.
+        primary_embs_cm = summary_embs_cm if run_summary_clipmatch else caption_embs_cm
 
     # ---- Per-image metric accumulation ----
     # These lists/counters accumulate results across every image in the
@@ -544,8 +617,20 @@ def phase_score(args):
     n_gt_targets = n_extraction_hits = 0
     n_objects_total = n_parse_fail = n_object_records = 0
     n_map_nature = n_vlm_nature = 0
+    # Grounding diagnostics (see src/grounding_pipeline.py): only meaningful
+    # when this artifact was actually enriched by the Grounding pipeline
+    # (run_grounding = header carries a "grounding" key, added by
+    # run_grounding_pipeline.py's phase_ground). "attempted" = nature entities
+    # SAM3 was asked about (grounded is True or False, never None); "confirmed"
+    # = SAM3 found nature pixels for it; the rest were attempted but SAM3's
+    # confidence never crossed --mask_threshold (recap §9's "agreement with an
+    # independent model", never a ground-truth signal).
+    run_grounding = bool(header.get("grounding"))
+    n_grounding_attempted = n_grounding_confirmed = 0
     clipmatch_top1 = 0
     clipmatch_support = 0
+    clipmatch_caption_top1 = 0
+    clipmatch_caption_support = 0
     flat_rows = []  # one row per stored IMAGE for the output CSV (see below)
 
     # How often to print per-image progress under --verbose: every 5% of the
@@ -585,6 +670,9 @@ def phase_score(args):
         wup_sim = None
         clipmatch_correct = None
         clipmatch_pred_similarity = None
+        caption_pred_vocab_entry = None
+        clipmatch_caption_correct = None
+        clipmatch_caption_pred_similarity = None
         gt_nature_val = pred_nature_val = None
         gt_biotic_val = pred_biotic_val = None
         gt_material_val = pred_material_val = None
@@ -635,8 +723,16 @@ def phase_score(args):
             pred_class_synset = pred_node = None
             best_obj_idx = None
 
-            # 1. ClipMatch Top-1 Class (The Anchor) — uses cm_scorer's embedding space
-            per_cand_sim, pred_idx = clip_metrics.clipmatch(caption_embs_cm[idx], candidate_embs)
+            # 1. ClipMatch Top-1 Class (The Anchor) — uses cm_scorer's embedding space.
+            # PRIMARY text source is the VLM's short summary caption when the
+            # artifact has one (run_summary_clipmatch): measured 0.41 vs 0.34
+            # top-1 against the full caption on the spot-check run, with 0%
+            # truncation vs. the full caption's silent CLIP-tokenizer cutoff —
+            # a real re-summarization beats leaving CLIP to truncate arbitrary
+            # content. Falls back to the full caption when the artifact
+            # predates --summarize_clipmatch_caption (primary_embs_cm is set
+            # once, above the per-image loop).
+            per_cand_sim, pred_idx = clip_metrics.clipmatch(primary_embs_cm[idx], candidate_embs)
             if pred_idx >= 0:
                 pred_vocab_entry = candidate_vocab[pred_idx]
                 pred_class_synset = pred_vocab_entry["synset_id"]
@@ -659,6 +755,21 @@ def phase_score(args):
                     pred_node = taxonomy_metrics.resolve_to_wordnet(
                         [sims_to_pred[best_obj_idx]], pred_class_synset, [objs[best_obj_idx]]
                     )
+
+            # --- Raw-caption ClipMatch (SECONDARY comparison) ---
+            # Computed unconditionally alongside the primary prediction above
+            # (NOT gated on gt_syn) so the CSV's comparison columns are
+            # populated whenever ClipMatch itself ran, exactly mirroring the
+            # primary block's own structure — only its ACCURACY accumulation
+            # below is gated on actually having a GT synset to compare
+            # against. Does not feed nature/biotic/material scoring or hP/hR
+            # either way.
+            if run_summary_clipmatch:
+                per_cand_sim_caption, pred_idx_caption = clip_metrics.clipmatch(
+                    caption_embs_cm[idx], candidate_embs)
+                if pred_idx_caption >= 0:
+                    caption_pred_vocab_entry = candidate_vocab[pred_idx_caption]
+                    clipmatch_caption_pred_similarity = float(per_cand_sim_caption[pred_idx_caption])
 
             t0 = targets[0]
             # Pull the VLM hybrid resolved labels for the argmax extracted object
@@ -715,6 +826,14 @@ def phase_score(args):
                     hp_vals_mapped.append(hier["hp"]); hr_vals_mapped.append(hier["hr"])
                     hf1_vals_mapped.append(hier["hf1"])
                     wup_vals_mapped.append(wup_sim)
+
+                # Raw-caption ClipMatch accuracy accumulation (prediction
+                # itself was already computed above, unconditionally).
+                if run_summary_clipmatch and caption_pred_vocab_entry is not None:
+                    clipmatch_caption_support += 1
+                    clipmatch_caption_correct = caption_pred_vocab_entry["synset_id"] == gt_syn
+                    if clipmatch_caption_correct:
+                        clipmatch_caption_top1 += 1
         elif dataset == "big5":
             # --- BIG-5 (holistic image-level annotation) ---
             # GT here is ONE label per axis for the WHOLE scene (see
@@ -846,6 +965,14 @@ def phase_score(args):
                 "material": fin["final_material"],
                 "nature_source": fin["nature_source"], "biotic_source": fin["biotic_source"],
                 "parse_failed": lab.get("parse_failed"),
+                # Stage-3 labeling justification (TaxonomyResponse's combined
+                # nature_reasoning+sub_axes_reasoning, or MaterialResponse's own
+                # reasoning) and whether this object even got its own VLM call
+                # at all (False = mapped non-nature, skipped the VLM entirely —
+                # see label_objects_batch) — both already stored in the .jsonl
+                # artifact's object_labels, previously not surfaced here.
+                "reasoning": lab.get("reasoning"),
+                "vlm_called": lab.get("vlm_called"),
             }
             for obj, lab, fin in zip(objs, rec["object_labels"], finals)
         ])
@@ -858,23 +985,41 @@ def phase_score(args):
         # Grounding-pipeline results, present only when src/grounding_pipeline.py
         # has enriched this artifact (see run_pipeline.py / run_grounding_pipeline.py)
         # — None/blank on a VLM-only artifact, so scoring one still works fine.
-        # mask_rle is deliberately DROPPED here (too bulky for a CSV cell, and
-        # not useful in tabular form); it stays in the .jsonl artifact. This is
-        # the grounding VERDICT per object — was it confirmed, how many pixels —
-        # not the raw masks, which is what makes this "the actual SAM3
-        # prediction" belong in the results CSV rather than only the raw
-        # artifact.
+        # mask_rle IS included here (pycocotools RLE — a small JSON dict, not
+        # the decoded pixel array) so the predictions CSV is self-sufficient
+        # for qualitative review (decode_rle in grounding_pipeline.py turns it
+        # back into a boolean mask for overlay plotting) without needing the
+        # raw .jsonl artifact open alongside it.
         object_groundings = rec.get("object_groundings")
         groundings_json = json.dumps([
             {"object": g["object"], "prompt": g["prompt"], "is_nature": g["is_nature"],
-             "grounded": g["grounded"], "pixel_count": g["pixel_count"]}
+             "grounded": g["grounded"], "pixel_count": g["pixel_count"], "mask_rle": g["mask_rle"]}
             for g in object_groundings
         ]) if object_groundings is not None else None
+        # Nature entities SAM3 actually ATTEMPTED (is_nature True implies an
+        # attempt was made — see _nature_object_indices) but whose predicted
+        # mask never crossed --mask_threshold: `grounded is False` distinguishes
+        # this from `grounded is None` (never attempted at all, not nature).
+        # Surfaced per image for qualitative review (which specific objects the
+        # VLM claimed but SAM3 couldn't confirm in pixels) and accumulated below
+        # into a run-level rate (recap §9: agreement with an independent model,
+        # never ground truth — a low confirmation rate flags VLM hallucination
+        # OR an under-sensitive --mask_threshold, not "ground truth says wrong").
+        ungrounded_objects = ([g["object"] for g in object_groundings
+                               if g["is_nature"] and g["grounded"] is False]
+                              if object_groundings is not None else None)
+        image_n_attempted = image_n_confirmed = None
+        if object_groundings is not None:
+            image_n_attempted = sum(1 for g in object_groundings if g["is_nature"])
+            image_n_confirmed = sum(1 for g in object_groundings if g["grounded"] is True)
+            n_grounding_attempted += image_n_attempted
+            n_grounding_confirmed += image_n_confirmed
         flat_rows.append({
             "image_path": rec["image_path"],
             "dataset": dataset,
             "model": header.get("model"),
             "caption": rec["caption"],
+            "extraction_reasoning": rec.get("extraction_reasoning"),
             "objects": objects_json,
             "gt_targets": gt_targets_json,
             "n_objects": len(objs),
@@ -884,6 +1029,11 @@ def phase_score(args):
             "object_groundings": groundings_json,
             "nature_relevance_score_coverage_ratio": rec.get("nature_relevance_score_coverage_ratio"),
             "nature_relevance_score_center_weighted": rec.get("nature_relevance_score_center_weighted"),
+            "grounding_ungrounded_objects": json.dumps(ungrounded_objects) if ungrounded_objects is not None else None,
+            "grounding_nature_entities_attempted_image": image_n_attempted,
+            "grounding_confirmed_image": image_n_confirmed,
+            "grounding_confirmation_rate_image": (image_n_confirmed / image_n_attempted)
+                                                  if image_n_attempted else None,
             "wordnet_mapping_rate_image": (image_n_map_nature / (image_n_map_nature + image_n_vlm_nature))
                                            if (image_n_map_nature + image_n_vlm_nature) else None,
             "parse_failure_count_image": image_n_parse_fail,
@@ -897,7 +1047,10 @@ def phase_score(args):
             "gt_nature": gt_nature_val, "pred_nature": pred_nature_val,
             "gt_biotic": gt_biotic_val, "pred_biotic": pred_biotic_val,
             "gt_material": gt_material_val, "pred_material": pred_material_val,
-            # ClipMatch (caption-based) — the metric actually used for scoring
+            # ClipMatch (PRIMARY) — the metric actually used for scoring: the
+            # VLM's summary caption when available (run_summary_clipmatch),
+            # else the full caption. See "clip_models"/"clipmatch_primary_source"
+            # in the run summary for which one this run used.
             "clipmatch_pred_class": pred_vocab_entry["class_name"] if pred_vocab_entry else None,
             "clipmatch_pred_synset": pred_vocab_entry["synset_id"] if pred_vocab_entry else None,
             "clipmatch_pred_similarity": clipmatch_pred_similarity,
@@ -905,6 +1058,16 @@ def phase_score(args):
             "clipmatch_pred_biotic": best_final["final_biotic"] if best_final else None,
             "clipmatch_pred_material": best_final["final_material"] if best_final else None,
             "clipmatch_top1_correct": clipmatch_correct,
+            "clipmatch_summary_caption": summary_texts[idx] if summary_texts is not None else None,
+            "clipmatch_summary_caption_token_length": summary_token_counts[idx] if summary_token_counts is not None else None,
+            # ClipMatch (raw-caption variant) — SECONDARY comparison, only
+            # populated when the summary caption is primary; does not drive
+            # scoring either way.
+            "clipmatch_caption_pred_class": caption_pred_vocab_entry["class_name"] if caption_pred_vocab_entry else None,
+            "clipmatch_caption_pred_synset": caption_pred_vocab_entry["synset_id"] if caption_pred_vocab_entry else None,
+            "clipmatch_caption_pred_similarity": clipmatch_caption_pred_similarity,
+            "clipmatch_caption_top1_correct": clipmatch_caption_correct,
+            "clipmatch_caption_token_length": caption_token_counts[idx] if caption_token_counts is not None else None,
             "gt_synset": gt_syn,
             "resolved_pred_synset": pred_node,
             "hierarchical_precision": hier["hp"], "hierarchical_recall": hier["hr"],
@@ -931,15 +1094,24 @@ def phase_score(args):
         "clip_models": {
             "reference_free": args.clipscore_model,
             "clipmatch": clipmatch_model_name if run_clipmatch else None,
+            "clipmatch_primary_source": ("summary_caption" if run_summary_clipmatch else "caption")
+                                         if run_clipmatch else None,
+            "clipmatch_candidate_text": ("wordnet_definition" if args.use_wordnet_definitions_clipmatch
+                                         else "object_template") if run_clipmatch else None,
         },
         "nature": _binary_metrics(nat_true, nat_pred),
         "biotic_matched": _binary_metrics(bio_true, bio_pred),
         "material_matched": _binary_metrics(mat_true, mat_pred),
         "axis_scoring_note": ("imagenet/places: nature/biotic come from the ClipMatch TOP-1 "
                               "predicted class's OWN taxonomy position — ClipMatch predicts the "
-                              "class from the WHOLE CAPTION's CLIP similarity to candidate_vocab "
+                              "class from a text embedding's CLIP similarity to candidate_vocab "
                               "(which is restricted to classes mapped into the graph — see "
-                              "get_candidate_vocab); material is ALWAYS the VLM's own judgment "
+                              "get_candidate_vocab); that text is the VLM's own short summary "
+                              "caption when the artifact was produced with "
+                              "--summarize_clipmatch_caption (measured 0.41 vs 0.34 top-1 against "
+                              "the full caption, with far less CLIP-tokenizer truncation — see "
+                              "clip_models.clipmatch_primary_source), else the WHOLE raw caption; "
+                              "material is ALWAYS the VLM's own judgment "
                               "(never mapped), taken from the extracted object most representative "
                               "of that predicted class. big5 (holistic, one GT label per image): "
                               "nature is the same image-level OR as always; biotic/material are "
@@ -956,10 +1128,68 @@ def phase_score(args):
                             "(never mapped), so on imagenet/places it is scored against that "
                             "heuristic GT default — BIG-5 is the only genuine material benchmark."),
     }
+    if run_grounding:
+        # recap §9: this is agreement with an INDEPENDENT model (SAM3), never
+        # ground truth — a low confirmation_rate flags either VLM hallucination
+        # (claimed an entity SAM3 can't find in pixels) or an under-sensitive
+        # --mask_threshold, not "the model was wrong" in a GT sense.
+        summary["grounding"] = {
+            "nature_entities_attempted": n_grounding_attempted,
+            "confirmed": n_grounding_confirmed,
+            "confirmation_rate": (n_grounding_confirmed / n_grounding_attempted)
+                                  if n_grounding_attempted else 0.0,
+            "sam3_model": header["grounding"].get("sam3_model"),
+            "mask_threshold": header["grounding"].get("mask_threshold"),
+        }
     if run_clipmatch:
+        # Token stats for whichever text is PRIMARY this run: the summary
+        # caption when the artifact has one, else the raw caption itself
+        # (both are always tracked via _clip_token_stats above, so this is
+        # just picking the one that's actually driving scoring).
+        primary_truncated = n_summary_truncated if run_summary_clipmatch else n_caption_truncated
+        primary_mean_tokens = summary_token_mean if run_summary_clipmatch else caption_token_mean
         summary["clipmatch"] = {
             "top1_accuracy": (clipmatch_top1 / clipmatch_support) if clipmatch_support else 0.0,
             "support": clipmatch_support,
+            "truncation_rate": (primary_truncated / n_images)
+                                if (primary_truncated is not None and n_images) else None,
+            "truncated_count": primary_truncated,
+            "context_length": cm_scorer.context_length,
+            "mean_token_length": primary_mean_tokens,
+        }
+        # Raw-caption ClipMatch (SECONDARY comparison) — only computed/
+        # meaningful when the summary caption is primary above; None
+        # otherwise, so callers can tell "not run" apart from "run and scored 0".
+        # Its OWN token stats are reported here too (caption_token_mean/
+        # n_caption_truncated), even though the raw caption isn't primary in
+        # this branch — that's the whole point of the comparison.
+        if run_summary_clipmatch:
+            summary["clipmatch_caption"] = {
+                "top1_accuracy": (clipmatch_caption_top1 / clipmatch_caption_support)
+                                  if clipmatch_caption_support else 0.0,
+                "support": clipmatch_caption_support,
+                "truncation_rate": (n_caption_truncated / n_images)
+                                    if (n_caption_truncated is not None and n_images) else None,
+                "truncated_count": n_caption_truncated,
+                "context_length": cm_scorer.context_length,
+                "mean_token_length": caption_token_mean,
+            }
+        else:
+            summary["clipmatch_caption"] = None
+        # Candidate-vocab text diagnostic: token stats for whichever text was
+        # used to build candidate_embs (plain OBJECT_TEMPLATE by default, or
+        # WordNet-definition prose under --use_wordnet_definitions_clipmatch —
+        # see clip_models.clipmatch_candidate_text above). Definitions can run
+        # much longer than a templated noun phrase, so this is worth watching
+        # for truncation even though candidate_vocab is usually short overall.
+        n_candidates = len(candidate_vocab)
+        summary["clipmatch_candidates"] = {
+            "n_candidates": n_candidates,
+            "mean_token_length": candidate_token_mean,
+            "truncation_rate": (n_candidate_truncated / n_candidates)
+                                if (n_candidate_truncated is not None and n_candidates) else None,
+            "truncated_count": n_candidate_truncated,
+            "context_length": cm_scorer.context_length,
         }
         # Two hierarchical views over the SAME images (see the accumulation
         # comment above): "hierarchical" penalizes WordNet-mapping failures as
@@ -1061,9 +1291,36 @@ def _print_summary(s, run_clipmatch):
         print(f"Acc {m['accuracy']:.4f}")
         print(f"  {axis.split('_')[0]:<12} (pos) P {m['precision']:.4f} | R {m['recall']:.4f} | F1 {m['f1']:.4f}")
         print(f"  {neg_labels[axis]:<12} (neg) P {m['precision_neg']:.4f} | R {m['recall_neg']:.4f} | F1 {m['f1_neg']:.4f}")
+    g = s.get("grounding")
+    if g is not None:
+        print(f"\n--- Grounding [{g['sam3_model']}, threshold {g['mask_threshold']}] "
+              f"(nature entities attempted {g['nature_entities_attempted']}) ---")
+        print(f"Confirmation rate: {g['confirmation_rate']:.1%} "
+              f"({g['confirmed']}/{g['nature_entities_attempted']}) — agreement with SAM3, not ground truth")
     if run_clipmatch:
-        print(f"\n--- ClipMatch [caption-based] (support {s['clipmatch']['support']}) ---")
-        print(f"Top-1: {s['clipmatch']['top1_accuracy']:.4f}")
+        primary_label = "summary-caption" if s["clip_models"]["clipmatch_primary_source"] == "summary_caption" else "caption-based"
+        cm = s["clipmatch"]
+        trunc_str = f"{cm['truncation_rate']:.1%}" if cm["truncation_rate"] is not None else "n/a"
+        mean_tok_str = f"{cm['mean_token_length']:.1f}" if cm["mean_token_length"] is not None else "n/a"
+        print(f"\n--- ClipMatch [{primary_label}, PRIMARY] (support {cm['support']}) ---")
+        print(f"Top-1: {cm['top1_accuracy']:.4f} | Mean token length: {mean_tok_str} "
+              f"| Truncation rate (>= {cm['context_length']} tok): "
+              f"{trunc_str} ({cm['truncated_count'] if cm['truncated_count'] is not None else 'n/a'}/{s['n_images']})")
+        cc = s.get("clipmatch_caption")
+        if cc is not None:
+            cc_trunc_str = f"{cc['truncation_rate']:.1%}" if cc["truncation_rate"] is not None else "n/a"
+            cc_mean_tok_str = f"{cc['mean_token_length']:.1f}" if cc["mean_token_length"] is not None else "n/a"
+            print(f"\n--- ClipMatch [raw-caption, secondary comparison] (support {cc['support']}) ---")
+            print(f"Top-1: {cc['top1_accuracy']:.4f} | Mean token length: {cc_mean_tok_str} "
+                  f"| Truncation rate (>= {cc['context_length']} tok): "
+                  f"{cc_trunc_str} ({cc['truncated_count'] if cc['truncated_count'] is not None else 'n/a'}/{s['n_images']})")
+        cv = s["clipmatch_candidates"]
+        cv_trunc_str = f"{cv['truncation_rate']:.1%}" if cv["truncation_rate"] is not None else "n/a"
+        cv_mean_tok_str = f"{cv['mean_token_length']:.1f}" if cv["mean_token_length"] is not None else "n/a"
+        print(f"\n--- ClipMatch candidate vocab [{s['clip_models']['clipmatch_candidate_text']}] "
+              f"({cv['n_candidates']} classes) ---")
+        print(f"Mean token length: {cv_mean_tok_str} | Truncation rate (>= {cv['context_length']} tok): "
+              f"{cv_trunc_str} ({cv['truncated_count'] if cv['truncated_count'] is not None else 'n/a'}/{cv['n_candidates']})")
         h = s["hierarchical"]
         hm = s["hierarchical_mapped"]
         print(f"--- Hierarchical (support {h['support']}) ---")
@@ -1105,11 +1362,30 @@ def _log_wandb(args, summary, run_clipmatch):
     }
     if run_clipmatch:
         log["ClipMatch/Top1"] = summary["clipmatch"]["top1_accuracy"]
+        if summary["clipmatch"]["truncation_rate"] is not None:
+            log["ClipMatch/TruncationRate"] = summary["clipmatch"]["truncation_rate"]
+        if summary["clipmatch"]["mean_token_length"] is not None:
+            log["ClipMatch/MeanTokenLength"] = summary["clipmatch"]["mean_token_length"]
+        if summary.get("clipmatch_caption") is not None:
+            log["ClipMatch_RawCaption/Top1"] = summary["clipmatch_caption"]["top1_accuracy"]
+            if summary["clipmatch_caption"]["truncation_rate"] is not None:
+                log["ClipMatch_RawCaption/TruncationRate"] = summary["clipmatch_caption"]["truncation_rate"]
+            if summary["clipmatch_caption"]["mean_token_length"] is not None:
+                log["ClipMatch_RawCaption/MeanTokenLength"] = summary["clipmatch_caption"]["mean_token_length"]
+        cv = summary["clipmatch_candidates"]
+        if cv["mean_token_length"] is not None:
+            log["ClipMatch_Candidates/MeanTokenLength"] = cv["mean_token_length"]
+        if cv["truncation_rate"] is not None:
+            log["ClipMatch_Candidates/TruncationRate"] = cv["truncation_rate"]
         log["Hierarchical/hF1"] = summary["hierarchical"]["hf1"]
         log["Hierarchical/WuPalmer"] = summary["hierarchical"]["wup"]
         log["Hierarchical/MappingFailureRate"] = summary["hierarchical"]["mapping_failure_rate"]
         log["Hierarchical/hF1_MappedOnly"] = summary["hierarchical_mapped"]["hf1"]
         log["Hierarchical/WuPalmer_MappedOnly"] = summary["hierarchical_mapped"]["wup"]
+    if summary.get("grounding") is not None:
+        log["Grounding/ConfirmationRate"] = summary["grounding"]["confirmation_rate"]
+        log["Grounding/NatureEntitiesAttempted"] = summary["grounding"]["nature_entities_attempted"]
+        log["Grounding/Confirmed"] = summary["grounding"]["confirmed"]
     wandb.log(log)
     wandb.finish()
 
@@ -1181,8 +1457,44 @@ def build_arg_parser():
     p.add_argument("--trust_remote_code", action="store_true")
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--max_new_tokens_caption", type=int, default=248) # 248 tokens is the maximum length that LongCLIP can handle
+    p.add_argument("--max_new_tokens_extraction", type=int, default=None,
+                   help="Max new tokens for the Stage-2 object-extraction call (structured, "
+                        "ObjectExtractionResponse). Defaults to --max_new_tokens_caption if not set "
+                        "(the old shared-budget behavior), but is worth setting HIGHER and "
+                        "independently once EXTRACTION_PROMPT's schema includes a 'reasoning' field "
+                        "(current prompts.py does): under guided decoding the model must write that "
+                        "full reasoning paragraph BEFORE it can emit the objects array, and "
+                        "--max_new_tokens_caption's default (248) was sized for captioning alone, "
+                        "not for a reasoning-plus-list schema — a too-small budget here can silently "
+                        "truncate the objects list (or the whole structured output) without any "
+                        "parse-failure signal, showing up only as a suspiciously low "
+                        "objects-per-image diagnostic.")
     p.add_argument("--max_new_tokens_label", type=int, default=248)
     p.add_argument("--temperature", type=float, default=0.0)
+    p.add_argument("--no_summarize_clipmatch_caption", action="store_true",
+                   help="On ImageNet/Places, --stage infer asks the VLM for an extra short "
+                        "(<=~20-word) summary of its own caption, grounded in the image, and "
+                        "--stage score uses THAT (not the full ~248-token caption) to drive "
+                        "ClipMatch/nature/biotic/material/hP-hR — measured 0.41 vs 0.34 top-1 "
+                        "against the raw caption, with far less CLIP-tokenizer truncation. This "
+                        "is now the DEFAULT for those two datasets (ignored on COCO/BIG-5, where "
+                        "ClipMatch never runs). Pass this flag to opt back into the raw-caption "
+                        "behavior (e.g. to reproduce old results, or skip the extra VLM call). "
+                        "The raw-caption ClipMatch is still reported alongside as "
+                        "summary['clipmatch_caption'] whenever the summary is primary.")
+    p.add_argument("--summary_max_new_tokens", type=int, default=77,
+                   help="Max new tokens for the summary-caption VLM call (default 64 — generous "
+                        "headroom over the ~50-word target so it isn't itself cut off "
+                        "mid-sentence). No effect if --no_summarize_clipmatch_caption is passed.")
+    p.add_argument("--use_wordnet_definitions_clipmatch", action="store_true",
+                   help="--stage score only: build each ClipMatch candidate class's text from its "
+                        "WordNet lemma(s) + gloss in natural prose (clip_metrics."
+                        "wordnet_definition_text), e.g. 'A golden retriever, also known as golden "
+                        "retriever dog. It is defined as: an English breed having a long silky "
+                        "golden coat.' instead of the plain 'a photo of a golden retriever' "
+                        "template. Hypothesis (untested until you run it): richer candidate-side "
+                        "semantic content aligns better against a VLM's own descriptive image "
+                        "summary than a bare noun phrase. Needs the `inflect` package.")
     p.add_argument("--max_hops", type=int, default=0,
                    help="Maximum WordNet hop distance allowed when mapping an EXTRACTED "
                         "object onto the labeled taxonomy (map_object_to_taxonomy -> "
@@ -1217,7 +1529,7 @@ def build_arg_parser():
                         "custom modeling code on the Hub that requires this; it's a no-op for "
                         "checkpoints that don't need it (e.g. the original OpenAI CLIP, "
                         "SigLIP2). Pass --clipscore_trust_remote_code false to disable.")
-    p.add_argument("--clip_batch_size", type=int, default=64)
+    p.add_argument("--clip_batch_size", type=int, default=77)
     p.add_argument("--clipmatch_model", type=str, default=None,
                    help="CLIP checkpoint used for ClipMatch + hP/hR/hF1 (ImageNet + Places "
                         "only) — kept independently selectable from --clipscore_model since the two "
