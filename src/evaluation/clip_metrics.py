@@ -468,22 +468,109 @@ def clipmatch(
     per_candidate_sim = candidate_embs @ caption_emb
     return per_candidate_sim, int(np.argmax(per_candidate_sim))
 
-def object_texts(objects: List[str]) -> List[str]:
-    return [OBJECT_TEMPLATE.format(o) for o in objects]
+_INFLECT_ENGINE = None
 
 
-_DEFINITION_INFLECT_ENGINE = None
-
-
-def _definition_inflect_engine():
-    """Lazy singleton, scoped to wordnet_definition_text only — this is an
-    opt-in ClipMatch candidate-text variant (--use_wordnet_definitions_clipmatch),
-    not the default path, so `inflect` is only imported when actually used."""
-    global _DEFINITION_INFLECT_ENGINE
-    if _DEFINITION_INFLECT_ENGINE is None:
+def _inflect_engine():
+    """Lazy `inflect.engine()` singleton — imported on first use rather than at
+    module import so a caller that never fills a template (e.g. a unit test of
+    the pure-numpy metric math) doesn't need the dependency."""
+    global _INFLECT_ENGINE
+    if _INFLECT_ENGINE is None:
         import inflect
-        _DEFINITION_INFLECT_ENGINE = inflect.engine()
-    return _DEFINITION_INFLECT_ENGINE
+        _INFLECT_ENGINE = inflect.engine()
+    return _INFLECT_ENGINE
+
+
+# Prepositions/conjunctions that end a noun phrase. If one of these sits
+# between a candidate article and the "{}" slot, that article belongs to some
+# EARLIER noun, not to the class name — see fill_template.
+_NP_BOUNDARY_WORDS = frozenset({"of", "in", "on", "at", "with", "from", "for", "by"})
+
+
+def _is_plural(phrase: str) -> bool:
+    """Whether `phrase`'s head noun (its LAST word) is plural — "cars",
+    "sunglasses", "french fries". inflect's singular_noun() returns the
+    singular form for a plural input and False otherwise, which is exactly
+    this test. Only the last word is checked because that's the head of an
+    English noun phrase ("mountain bikes" is plural, "bike wheel" is not)."""
+    words = phrase.strip().split()
+    if not words:
+        return False
+    return bool(_inflect_engine().singular_noun(words[-1]))
+
+
+def fill_template(template: str, name: str) -> str:
+    """Fill a CLIP prompt template's "{}" slot with `name`, fixing the
+    indefinite article in front of it so the result is grammatical:
+
+        "a photo of a {}"  + "apple"  -> "a photo of an apple"
+        "a photo of a {}"  + "cars"   -> "a photo of cars"
+        "a photo of a {}"  + "forest" -> "a photo of a forest"
+
+    Only an article that actually GOVERNS the class name is touched, which is
+    what makes this safe to run over all 80 ImageNet + 15 scene templates
+    rather than just the plain "a photo of a {}" one. Three cases:
+
+      1. No indefinite article governs the slot — "the plastic {}.",
+         "a photo of many {}.", "itap of my {}." Nothing to fix; "the"/"many"/
+         "my" are already correct for singular and plural alike. Note the "a"
+         in "a photo of many {}" belongs to "photo", NOT to the class — that
+         is what _NP_BOUNDARY_WORDS detects, and dropping it would corrupt the
+         template into "photo of many trees".
+      2. The article sits directly before the slot — "a photo of a {}.",
+         "art of a {}.", "a tattoo of a {}." Here it agrees with the class
+         name itself, so inflect picks "a" vs "an" by the name's actual
+         spelling/sound ("an hour", "a university"), or drops it for a plural.
+      3. An adjective intervenes — "a photo of a clean {}.", "a photo of a
+         hard to see {}." The article agrees with the ADJECTIVE ("a clean",
+         "a hard to see"), which the template already got right, so a/an is
+         left alone — but it is still dropped for a plural class, since
+         "a clean trees" is wrong while "clean trees" is right.
+    """
+    slot = template.find("{}")
+    if slot == -1:
+        return template.format(name)
+    prefix = template[:slot]
+    tokens = prefix.split()
+
+    # Walk backwards for the nearest "a"/"an", stopping at a noun-phrase
+    # boundary (case 1) — anything found past one governs an earlier noun.
+    article_idx = None
+    for i in range(len(tokens) - 1, -1, -1):
+        word = tokens[i].lower()
+        if word in _NP_BOUNDARY_WORDS:
+            break
+        if word in ("a", "an"):
+            article_idx = i
+            break
+
+    if article_idx is None:
+        return template.format(name)
+
+    plural = _is_plural(name)
+    intervening = tokens[article_idx + 1:]
+
+    if plural:
+        # Case 2/3 with a plural head noun: drop the article outright.
+        kept = tokens[:article_idx] + intervening
+        rebuilt = " ".join(kept)
+        return (rebuilt + (" " if kept else "")) + template[slot:].format(name)
+
+    if intervening:
+        return template.format(name)  # case 3: article agrees with the adjective
+
+    # Case 2: the article agrees with the class name itself.
+    article = _inflect_engine().a(name).split(maxsplit=1)[0]
+    kept = tokens[:article_idx] + [article]
+    return " ".join(kept) + " " + template[slot:].format(name)
+
+
+def object_texts(objects: List[str]) -> List[str]:
+    """Per-extracted-object text for Object-CLIPScore / F-CLIPScore's object
+    terms and ClipMatch's anchor-object search: the single OBJECT_TEMPLATE
+    (never the 80/15-template ensemble — that is candidate-side only)."""
+    return [fill_template(OBJECT_TEMPLATE, o) for o in objects]
 
 
 def wordnet_definition_text(synset_id: str) -> str:
@@ -513,7 +600,7 @@ def wordnet_definition_text(synset_id: str) -> str:
     alt_names = f", also known as {', '.join(lemmas[1:])}" if len(lemmas) > 1 else ""
 
     # inflect prepends the correct "a"/"an" for the primary lemma's own spelling.
-    name_with_article = _definition_inflect_engine().a(primary_name)
+    name_with_article = _inflect_engine().a(primary_name)
 
     definition = synset.definition()
     return f"{name_with_article.capitalize()}{alt_names}. It is defined as: {definition}."
@@ -532,13 +619,16 @@ def candidate_vocab_texts(candidate_vocab: List[dict], use_wordnet_definitions: 
     embeddings, not a single text)."""
     if use_wordnet_definitions:
         return [wordnet_definition_text(c["synset_id"]) for c in candidate_vocab]
-    return [OBJECT_TEMPLATE.format(c["class_name"]) for c in candidate_vocab]
+    return [fill_template(OBJECT_TEMPLATE, c["class_name"]) for c in candidate_vocab]
 
 
 def candidate_template_texts(candidate_vocab: List[dict], templates: List[str]) -> List[List[str]]:
     """Per-class list of templated texts (one row per candidate class, one
-    column per template) — the raw material for encode_candidate_vocab_ensemble."""
-    return [[t.format(c["class_name"]) for t in templates] for c in candidate_vocab]
+    column per template) — the raw material for encode_candidate_vocab_ensemble.
+    Every fill goes through fill_template, so the article in front of the class
+    name is corrected per template AND per class ("a photo of an airfield",
+    "a photo of badlands")."""
+    return [[fill_template(t, c["class_name"]) for t in templates] for c in candidate_vocab]
 
 
 def encode_candidate_vocab_ensemble(

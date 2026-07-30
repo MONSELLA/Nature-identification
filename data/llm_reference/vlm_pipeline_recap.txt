@@ -1,4 +1,4 @@
-BIG-5 VLM PIPELINE — DESIGN RECAP (v14)
+BIG-5 VLM PIPELINE — DESIGN RECAP (v15)
 (v4: the VLM pipeline is now IMPLEMENTED — this doc records both the original
 design rationale AND, in "IMPLEMENTED:" notes, how the shipped code actually
 does it where the two differ. v5: ClipMatch switched to the caption-based
@@ -46,7 +46,16 @@ is fixed for the whole run), never per image; extracted-object text (Object-
 CLIPScore, anchor-object search) is unaffected, still the single
 OBJECT_TEMPLATE. --use_wordnet_definitions_clipmatch is unaffected as a
 separate opt-in. Also: hP/hR/hF1/Wu-Palmer are now reported as mean ±
-population std, not just mean — see Section 8f/11.)
+population std, not just mean — see Section 8f/11. v15: five changes, all
+per Pau — (a) the SECONDARY raw-caption ClipMatch comparison is REMOVED
+entirely (summary["clipmatch_caption"] + five CSV columns); there is now
+exactly one ClipMatch text per run. (b) the labeling parse-failure rate is
+now reported over the objects the VLM was ACTUALLY called on, split
+full/material-only. (c) resolve_to_wordnet hardened — diacritics, "/"
+alternation, contiguous spans, specificity-ranked. (d) SUMMARY_CAPTION_PROMPT
+forked per dataset (object-centric ImageNet vs scene-centric Places). (e)
+inflect determiners reinstated across ALL template fills, reversing v10.
+See Section 11.)
 
 ===============================================================
 0. IMPLEMENTATION STATUS (NEW in v4)
@@ -777,6 +786,103 @@ RESOLVED IN v6 (decided after repeated integration failures):
   replacements here, but neither was actually added to CLIP_PRESETS at
   the time — see RESOLVED IN v8 below for what's actually wired in.
 
+RESOLVED IN v15 (decided per Pau):
+- SECONDARY raw-caption ClipMatch REMOVED. When the summary caption is
+  primary, the raw caption was additionally scored and reported as a
+  comparison (summary["clipmatch_caption"], plus clipmatch_caption_pred_class/
+  _pred_synset/_pred_similarity/_top1_correct/_token_length in the predictions
+  CSV). Per Pau this is junk information in the CSV and not useful — deleted
+  outright, not made optional. Side benefit: when the summary is primary the
+  raw caption is no longer ENCODED at all (it existed only to feed this
+  comparison), so a --clipmatch_model that differs from --clipscore_model now
+  does one less full-corpus text encode. --no_summarize_clipmatch_caption is
+  unaffected and still switches which single text is primary. DO NOT
+  reintroduce the secondary comparison.
+- LABELING PARSE-FAILURE RATE properly scoped. The old
+  diagnostics["parse_failure_rate"] divided parse failures by EVERY extracted
+  object record, but label_objects_batch never calls the VLM for a mapped
+  non-nature object (Section 6's routing) — so the denominator included
+  objects that could not possibly have failed to parse, silently diluting the
+  rate. Replaced by diagnostics["label_parse_failure_rate"] over vlm_called
+  objects only, split into _full (unmapped -> TaxonomyResponse, all three
+  axes) and _material (mapped-nature -> MaterialResponse, one axis) since the
+  two calls use different schemas and different system prompts and can fail at
+  genuinely different rates. label_vlm_call_rate reports how much of the
+  extracted set the mapping answered outright. Per-image equivalents land in
+  the predictions CSV (label_vlm_calls_image, label_parse_failure_rate_image).
+  Needs no re-inference — the vlm_called/parse_failed flags were already in
+  the artifact.
+- resolve_to_wordnet (Section 8f) HARDENED after two observed failures:
+  "café seating area" resolved to area.n.05 instead of cafe.n.01, and
+  "insect/larva" (one entity the VLM hedged on) resolved to nothing.
+  Root cause of the first was NOT the ranking but the lookup: wn.synsets("café")
+  returns [] — WordNet's lemma is the unaccented "cafe" — so the identifying
+  word was dropped before ranking even began, leaving only "seating"/"area"
+  to compete. Three fixes: (1) _normalize_phrase lowercases and NFKD-strips
+  diacritics; (2) _split_alternatives splits "/" and " or " (NOT "and"/","
+  which would wreck "black and white"); (3) _phrase_variants tries the whole
+  phrase, then contiguous multi-word spans, then single words.
+  RANKING — deliberately NOT Wu-Palmer for the span search, which is the
+  non-obvious part. Wu-Palmer structurally favours GENERIC nodes, because a
+  shallow node shrinks the denominator in 2*depth(LCS)/(depth(a)+depth(b)).
+  Measured against a brown_bear prediction: bare bear.n.01 = 0.963 but
+  ice_bear (polar bear) = 0.929; against dog.n.01, retriever = 0.839 but
+  golden_retriever = 0.812. A Wu-Palmer-ranked search therefore actively
+  prefers the vaguer reading — it picks "retriever" over "golden retriever"
+  and "area" over "cafe". Ranking spans by WordNet min_depth (specificity)
+  has no such bias. A whole-phrase lemma stays AUTHORITATIVE and short-
+  circuits the search, which is what stops "swimming pool" decomposing into
+  the deeper-but-wrong activity swimming.n.01. Wu-Palmer is still used for
+  word-SENSE disambiguation and to pick between alternation branches (there
+  "insect" vs "larva" are competing labels, not a generic/specific pair).
+  Validated on 10 cases incl. regressions. NOTE this is prediction-side only
+  (pred_synset_id is ClipMatch's own output, never GT) so none of it is
+  leakage — a wrong ClipMatch prediction drags hP/hR down, not up.
+  The same diacritic strip was added to vlm_pipeline._normalize_object, since
+  the MAPPING vocabularies are ASCII and had the identical blind spot; that
+  one is inference-time and needs a re-run to show up.
+- SUMMARY_CAPTION_PROMPT FORKED PER DATASET (reversing v7-v14's single shared
+  prompt). ClipMatch scores the summary against a fixed candidate vocabulary,
+  and the two vocabularies are different KINDS of label: ImageNet's classes
+  are OBJECTS ("golden retriever"), Places365's ARE scenes ("airport
+  terminal"). The shared prompt asked for BOTH subject and setting on every
+  image, so each dataset spent half its ~50-word budget on the axis its
+  candidates aren't built from. Now prompts.SUMMARY_CAPTION_PROMPTS keys
+  prompts.SUMMARY_CAPTION_PROMPT_IMAGENET (name the main object/creature as
+  specifically as possible; surroundings only if identifying) and
+  prompts.SUMMARY_CAPTION_PROMPT_PLACES (name the KIND of place; setting/
+  architecture over any individual person or object), selected by
+  get_summary_caption_prompt(dataset), which RAISES on an unknown dataset
+  rather than silently defaulting. run_inference takes a `dataset` kwarg
+  (the NAME — not to be confused with its positional dataset_instances) and
+  the artifact header records summary_caption_prompt, so runs made with
+  different variants are never silently compared. NOT YET VALIDATED —
+  re-check ClipMatch top-1 per dataset against the shared-prompt baseline.
+- INFLECT DETERMINERS REINSTATED across every template fill
+  (clip_metrics.fill_template), REVERSING the v10 revert. Applies to
+  OBJECT_TEMPLATE (extracted entities), all 80 OPENAI_TEMPLATES and all 15
+  SCENE_TEMPLATES: "a photo of an apple", "a photo of a university" (a/an by
+  SOUND not spelling), "a photo of cars" (article DROPPED for a plural head
+  noun). The non-trivial part is that these templates place articles
+  differently, so only an article that actually GOVERNS the "{}" slot may be
+  touched: (i) "the plastic {}" / "itap of my {}" have no indefinite article —
+  untouched; (ii) the "a" in "a photo of many {}" belongs to "photo", detected
+  via _NP_BOUNDARY_WORDS ("of", "in", ...), so it is NOT dropped for a plural
+  (that would corrupt the template into "photo of many trees"); (iii) in
+  "a photo of a clean {}" / "a photo of a hard to see {}" the article agrees
+  with the ADJECTIVE, so a/an is left as the template wrote it but is still
+  dropped for a plural ("a clean trees" -> "clean trees"). Note "a origami {}"
+  and "a embroidered {}" keep their original (slightly ungrammatical) article
+  — those are the seminal paper's verbatim wording and the article governs the
+  adjective, not the class. Validated over all 96 templates x 10 class names
+  (960 fills) against explicit invariants. inflect moves from an opt-in-only
+  dependency to a hard requirement of the default path. HISTORY TO KEEP IN
+  MIND: v8 added this, v10 reverted it because Pau saw a ClipMatch drop and
+  suspected it — but that was never isolated and was confounded with a
+  concurrent MetaCLIP switch. If a ClipMatch change shows up now, isolate this
+  from any backend swap before attributing it, so the v10 ambiguity is not
+  repeated a second time.
+
 RESOLVED IN v14 (decided per Pau):
 - MetaCLIP 2 (facebook/metaclip-2-worldwide-huge-quickgelu, ViT-H-14-quickgelu-
   worldwide) added to clip_metrics.CLIP_PRESETS as "metaclip2" — a from-
@@ -934,8 +1040,12 @@ object-list re-confirmation below):
   the object-list variant. This is now the PRIMARY/default text
   ClipMatch scores against on ImageNet/Places
   (`run_vlm_pipeline.py`'s `--no_summarize_clipmatch_caption` opts back
-  into the raw caption, kept as a reported SECONDARY comparison,
-  `summary["clipmatch_caption"]`, whenever the summary is primary).
+  into the raw caption). SUPERSEDED IN PART (v15): the raw caption was
+  ALSO kept as a reported SECONDARY comparison
+  (`summary["clipmatch_caption"]`) whenever the summary was primary —
+  that comparison has since been REMOVED entirely; the flag still
+  chooses which single text is primary. The 0.41-vs-0.34 measurement
+  above stands as the reason the summary is the default.
   Costs one extra VLM call per image on ImageNet/Places only — never
   triggered on COCO/BIG-5, which don't run ClipMatch at all, so this
   doesn't touch the final 2M-image BIG-5 production inference run.

@@ -69,20 +69,27 @@ CAPTION_PROMPT = "Describe this image, including any text."
 # run_vlm_pipeline.py's --no_summarize_clipmatch_caption to opt out). Still
 # NOT part of the baseline two-pass pipeline itself — only feeds ClipMatch.
 #
-# ALWAYS asks for BOTH the subject and the setting (not "subject OR setting"
-# — that phrasing handed the model an unconstrained, arbitrary choice with no
-# criterion for which to pick, risking inconsistent behavior across images).
-# ImageNet's candidate classes are object-centric (a discrete figure-in-a-
-# scene, e.g. "golden retriever"); Places365's ARE the scene itself ("airport
-# terminal", "kitchen"). Asking for the subject alone risks the summary
-# fixating on an incidental foreground object (e.g. "a man walking") on a
-# Places image where the SETTING is what ClipMatch actually needs to match
-# (e.g. "restaurant") — asking for both means the setting still gets
-# mentioned even when a person/object is also in frame. One shared prompt
-# across both datasets, not forked per-dataset — simpler to defend
-# methodologically, and not yet validated as a net win vs the original
-# subject-only wording (worth re-checking ClipMatch top-1 on Places
-# specifically after this change, since that's the dataset it targets).
+# NOW FORKED PER DATASET (superseding the earlier single shared prompt).
+# ClipMatch scores this summary against a FIXED candidate vocabulary, and the
+# two datasets' vocabularies are different KINDS of label:
+#   - ImageNet's classes are OBJECTS — a discrete figure in a scene
+#     ("golden retriever", "sea lion"), so the summary should spend its words
+#     on the objects/entities present and what identifies them.
+#   - Places365's classes ARE the scene ("airport terminal", "kitchen"), so
+#     the summary should describe the setting as a whole; a summary that
+#     fixates on an incidental foreground object buries the one thing
+#     ClipMatch has to match.
+# The previous shared prompt asked for BOTH subject and setting on every
+# image, so each dataset paid for the half it does not want.
+#
+# Both cap at 30 words (down from the shared prompt's 50 — the point is to
+# stay well inside a 77-token CLIP context, and a tighter budget forces the
+# model to lead with the identifying content) and both end with "Output ONLY
+# the summary text." to stop the model prefixing a conversational preamble
+# ("Sure! Here's a summary: ...") that would be embedded as if it were image
+# content. Both keep the "{caption}" placeholder and the grounded-in-the-image
+# framing, and both stay neutral on nature — this feeds ClipMatch only, never
+# the taxonomy axes.
 SUMMARY_CAPTION_PROMPT_IMAGENET = (
     "Here is a detailed description of this image:\n\n"
     "\"{caption}\"\n\n"
@@ -99,6 +106,30 @@ SUMMARY_CAPTION_PROMPT_PLACES = (
     "focusing on the overall scene, environment, or setting. "
     "Output ONLY the summary text."
 )
+
+# Keyed by the same dataset names as clip_metrics.CLIPMATCH_DATASETS — those
+# are the only two datasets that run ClipMatch, so they are the only two that
+# ever request a summary caption.
+SUMMARY_CAPTION_PROMPTS = {
+    "imagenet": SUMMARY_CAPTION_PROMPT_IMAGENET,
+    "places365": SUMMARY_CAPTION_PROMPT_PLACES,
+}
+
+
+def get_summary_caption_prompt(dataset: str) -> str:
+    """The ClipMatch summary-caption prompt for `dataset` (see
+    SUMMARY_CAPTION_PROMPTS). Raises on an unknown dataset rather than
+    silently falling back to one of the two — a silent fallback would mean
+    scoring Places images with the object-centric prompt (or vice versa) with
+    nothing in the artifact to show it happened."""
+    try:
+        return SUMMARY_CAPTION_PROMPTS[dataset]
+    except KeyError:
+        raise ValueError(
+            f"No summary-caption prompt for dataset {dataset!r}; expected one of "
+            f"{sorted(SUMMARY_CAPTION_PROMPTS)}. Only these datasets run ClipMatch "
+            f"(clip_metrics.CLIPMATCH_DATASETS), so only these need a summary caption."
+        ) from None
 
 # =============================================================================
 # Stage 2 — Object extraction (structured)

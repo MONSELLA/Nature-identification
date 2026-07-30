@@ -38,6 +38,8 @@ synset's full ancestor chain overlaps with the other's.
 
 from __future__ import annotations
 
+import re
+import unicodedata
 from typing import Dict, List, Optional
 
 import networkx as nx
@@ -207,10 +209,71 @@ def compute_hierarchical_metrics(
 # =============================================================================
 # Free-text object → WordNet synset resolution
 # =============================================================================
+def _normalize_phrase(phrase: str) -> str:
+    """Lowercase + strip diacritics from a free-text object phrase so it can be
+    looked up in WordNet's ASCII vocabulary.
+
+    WHY THIS MATTERS (a real, observed failure): a VLM happily writes "café
+    seating area", but `wn.synsets("café")` returns [] — WordNet's lemma is the
+    unaccented "cafe". Without this the accented word resolves to NOTHING and
+    is silently dropped, leaving only the semantically empty words ("seating",
+    "area") to compete, so the phrase resolved to `area.n.05` instead of
+    `cafe.n.01`. Unicode NFKD decomposes "é" into "e" + a combining acute
+    accent, which is then dropped as a combining character.
+    """
+    decomposed = unicodedata.normalize("NFKD", phrase.strip().lower())
+    return "".join(c for c in decomposed if not unicodedata.combining(c))
+
+
+def _split_alternatives(phrase: str) -> List[str]:
+    """Split a phrase the VLM wrote as a set of ALTERNATIVE names for one
+    entity into its separate candidates, e.g. "insect/larva" -> ["insect",
+    "larva"].
+
+    VLMs regularly hedge between two labels for the same thing in a single
+    extracted entity. "insect/larva" is not a WordNet lemma and never will be,
+    so without splitting it resolves to nothing at all. Only unambiguous
+    ALTERNATION markers are split on — "/" and " or ". Deliberately NOT "and"
+    or "," which mark conjunction/apposition rather than alternation and would
+    wreck legitimate multi-word lemmas ("black and white", "cut, copy").
+    """
+    parts = re.split(r"\s*/\s*|\s+or\s+", phrase)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _phrase_variants(phrase: str) -> List[tuple]:
+    """Every sub-string of `phrase` worth trying against WordNet, as
+    (tier, text) pairs ordered from most to least specific:
+
+        tier 0 — the whole phrase                ("polar bear cub")
+        tier 1 — contiguous multi-word spans,     ("polar bear", "bear cub")
+                 longest first
+        tier 2 — individual words                 ("polar", "bear", "cub")
+
+    Tier 1 is the addition that matters: compound nouns are frequently absent
+    from WordNet as a whole ("polar bear cub") while a CONTIGUOUS SPAN inside
+    them is a real lemma ("polar bear"). Going straight from the whole phrase
+    to single words — the previous behavior — threw that span away and left
+    "bear" to stand in for "polar bear".
+    """
+    words = phrase.split()
+    variants = [(0, phrase)]
+    for span in range(len(words) - 1, 1, -1):
+        for start in range(len(words) - span + 1):
+            variants.append((1, " ".join(words[start : start + span])))
+    if len(words) > 1:
+        variants.extend((2, w) for w in words)
+    return variants
+
+
 def _synsets_for_phrase(phrase: str) -> List["wn.synset"]:
     """WordNet noun synsets for one space-joined phrase, or [] if unrecognized
-    (WordNet keys use underscores, e.g. "polar bear" -> "polar_bear")."""
-    key = phrase.strip().replace(" ", "_")
+    (WordNet keys use underscores, e.g. "polar bear" -> "polar_bear"). The
+    phrase is diacritic-stripped and lowercased first (see _normalize_phrase),
+    and any character outside WordNet's own lemma alphabet is dropped so
+    punctuation the VLM emitted can't cause a spurious miss."""
+    key = _normalize_phrase(phrase).replace(" ", "_")
+    key = re.sub(r"[^a-z0-9_'.-]", "", key)
     if not key:
         return []
     try:
@@ -240,14 +303,43 @@ def resolve_to_wordnet(
     tried directly (no falling through to the next-best candidate on failure —
     the caller passes one candidate in practice; see run_vlm_pipeline.py).
 
-    If that top candidate is a COMPOUND NOUN (multiple space-separated words)
-    and does not map to WordNet as a whole phrase (e.g. "bear rug" has no
-    synset), each of its constituent words is tried individually as a fallback
-    (e.g. "bear", "rug") — compound nouns are frequently absent from WordNet
-    even when their parts are common nouns. Among whichever constituent words
-    DO resolve, the one whose (polysemy-disambiguated) synset maximizes
-    Wu-Palmer similarity to `pred_synset_id` is kept. Returns None if neither
-    the full phrase nor any constituent word maps to the WordNet vocabulary.
+    Resolution proceeds in three steps, each fixing a distinct way VLM free
+    text fails to be a WordNet lemma:
+
+      1. ALTERNATION SPLIT (_split_alternatives) — "insect/larva" is two
+         candidate names for ONE entity, not a lemma; each side is resolved
+         independently and the better match wins. Previously this resolved to
+         nothing at all.
+      2. NORMALIZATION (_normalize_phrase, via _synsets_for_phrase) — "café"
+         is lowercased and stripped of diacritics to "cafe", which IS a
+         WordNet lemma. Without this the word resolved to nothing and was
+         silently dropped from the competition, which is exactly how
+         "café seating area" ended up as `area.n.05` instead of `cafe.n.01`.
+      3. SPAN SEARCH (_phrase_variants) — if the whole phrase is itself a
+         lemma that is AUTHORITATIVE and used as-is. Otherwise every
+         contiguous multi-word span and every single word is tried, and the
+         MOST SPECIFIC resolving one (greatest WordNet min_depth) wins.
+
+    Why specificity and not Wu-Palmer for step 3: Wu-Palmer systematically
+    favours GENERIC concepts, because a shallow node shrinks the denominator
+    in `2·depth(LCS)/(depth(a)+depth(b))`. Measured against a "brown bear"
+    prediction, bare `bear.n.01` scores 0.963 while `polar bear` scores only
+    0.929 — so a Wu-Palmer-ranked search actively prefers the vaguer word. It
+    picks `retriever` over `golden retriever`, and (the originally reported
+    bug) the near-empty `area`/`seating area` over `cafe`. Depth has no such
+    bias: it just asks which reading of the phrase carries the most
+    information, which is what "café seating area" means by "café".
+
+    Wu-Palmer to `pred_synset_id` is still used for the two jobs it IS suited
+    to: disambiguating word SENSES within one lemma, and choosing between
+    genuine ALTERNATIVES from step 1 (there "insect" vs "larva" are competing
+    labels for the same thing, not a generic/specific pair, so closeness to
+    what the image was classified as is exactly the right tie-break). Note
+    `pred_synset_id` is the ClipMatch PREDICTION, never ground truth, so
+    steering resolution with it is not GT leakage — and if ClipMatch predicted
+    wrongly it drags hP/hR DOWN, not up.
+
+    Returns None if nothing in the phrase maps to the WordNet vocabulary.
 
     WHY DOES THIS FUNCTION EXIST? ClipMatch (see clip_metrics.py) tells us
     WHICH candidate class the model's extracted objects best match overall,
@@ -263,24 +355,38 @@ def resolve_to_wordnet(
     if best_score <= threshold:
         return None
 
-    synsets = _synsets_for_phrase(top_candidate)
-    if synsets:
-        return _best_sense(synsets, pred_synset_id).name()
+    # Resolve each alternation branch down to at most one synset.
+    per_alternative: List["wn.synset"] = []
+    for alternative in _split_alternatives(_normalize_phrase(top_candidate)):
+        # A whole-phrase lemma is authoritative — if the VLM's entire phrase
+        # IS a WordNet entry, no sub-span can be a better reading of it. This
+        # is what keeps "swimming pool" from decomposing into the (deeper, but
+        # wrong) activity `swimming.n.01`, and "golden retriever" from
+        # collapsing to `retriever`.
+        whole = _synsets_for_phrase(alternative)
+        if whole:
+            per_alternative.append(_best_sense(whole, pred_synset_id))
+            continue
+        # No whole-phrase match: search every contiguous span and single word,
+        # and keep the MOST SPECIFIC hit (see the docstring on why depth, not
+        # Wu-Palmer, ranks here). Wu-Palmer breaks exact depth ties.
+        spans = []
+        for tier, text in _phrase_variants(alternative):
+            if tier == 0:
+                continue  # already tried as the whole phrase above
+            synsets = _synsets_for_phrase(text)
+            if synsets:
+                sense = _best_sense(synsets, pred_synset_id)
+                spans.append((sense.min_depth(),
+                              compute_wup_similarity(sense.name(), pred_synset_id),
+                              sense))
+        if spans:
+            per_alternative.append(max(spans, key=lambda s: (s[0], s[1]))[2])
 
-    # The full phrase didn't resolve. Only fall back to per-word truncations
-    # if it's actually a compound (multi-word) — a single unmapped word has
-    # no smaller unit to try.
-    words = top_candidate.strip().split()
-    if len(words) <= 1:
+    if not per_alternative:
         return None
-
-    resolved: List["wn.synset"] = []
-    for word in words:
-        word_synsets = _synsets_for_phrase(word)
-        if word_synsets:
-            resolved.append(_best_sense(word_synsets, pred_synset_id))
-    if not resolved:
-        return None
-    # Among the constituent words that DID map, keep whichever synset
-    # maximizes Wu-Palmer similarity to the predicted class.
-    return max(resolved, key=lambda s: compute_wup_similarity(s.name(), pred_synset_id)).name()
+    # Across genuine alternatives ("insect" vs "larva"), closeness to the
+    # predicted class is the right discriminator — they are competing names
+    # for one entity, not a generic/specific pair.
+    return max(per_alternative,
+               key=lambda s: compute_wup_similarity(s.name(), pred_synset_id)).name()
