@@ -209,9 +209,37 @@ def compute_hierarchical_metrics(
 # =============================================================================
 # Free-text object → WordNet synset resolution
 # =============================================================================
+# Words that never NAME an entity on their own. They are excluded as
+# standalone lookup candidates because several of them resolve to real but
+# absurd WordNet nouns that then WIN the specificity ranking: "an" ->
+# associate_in_nursing.n.01, "in" -> indiana.n.01, "a" -> vitamin_a.n.01,
+# "it" -> information_technology.n.01, "one" -> one.n.01. Observed turning
+# "an apple" into Associate-in-Nursing and "man in a suit" into Indiana.
+# NOTE this filter applies ONLY to a candidate span that is ENTIRELY made of
+# these words — a multi-word span that merely CONTAINS one is still tried in
+# full, so genuine lemmas like "bird of prey" and "man of war" survive.
+_NON_ENTITY_WORDS = frozenset({
+    "a", "an", "the", "this", "that", "these", "those",
+    "my", "your", "his", "her", "its", "our", "their",
+    "of", "in", "on", "at", "with", "from", "for", "by", "to", "into", "onto",
+    "over", "under", "near", "behind", "between", "through", "across",
+    "and", "or", "but", "as", "is", "are", "was", "were", "be", "being", "been",
+    "i", "you", "he", "she", "it", "we", "they",
+    "some", "any", "many", "much", "few", "several", "one", "two", "three",
+    "there", "here", "other", "another", "same", "such", "very", "more", "most",
+})
+
+# Beyond this many words a phrase stops being an entity name and starts being
+# a sentence; generating every contiguous span of one is O(n^2) lookups for
+# steadily less meaningful candidates. The whole phrase and its single words
+# are still tried — only the span sweep is capped.
+_MAX_SPAN_SEARCH_WORDS = 8
+
+
 def _normalize_phrase(phrase: str) -> str:
-    """Lowercase + strip diacritics from a free-text object phrase so it can be
-    looked up in WordNet's ASCII vocabulary.
+    """Lowercase, strip diacritics, drop possessives, and strip surrounding
+    punctuation from a free-text object phrase so it can be looked up in
+    WordNet's ASCII vocabulary.
 
     WHY THIS MATTERS (a real, observed failure): a VLM happily writes "café
     seating area", but `wn.synsets("café")` returns [] — WordNet's lemma is the
@@ -220,9 +248,26 @@ def _normalize_phrase(phrase: str) -> str:
     "area") to compete, so the phrase resolved to `area.n.05` instead of
     `cafe.n.01`. Unicode NFKD decomposes "é" into "e" + a combining acute
     accent, which is then dropped as a combining character.
+
+    The same class of silent miss applies to ordinary punctuation a VLM emits:
+    a trailing period ("dog.") or a possessive ("dog's bowl") is not part of
+    any WordNet lemma, so without stripping them the word resolves to nothing
+    at all.
     """
     decomposed = unicodedata.normalize("NFKD", phrase.strip().lower())
-    return "".join(c for c in decomposed if not unicodedata.combining(c))
+    text = "".join(c for c in decomposed if not unicodedata.combining(c))
+    # Normalize curly apostrophes first so the possessive rule sees both forms.
+    text = text.replace("’", "'")
+    text = re.sub(r"'s\b", "", text)          # "dog's bowl" -> "dog bowl"
+    text = re.sub(r"[^\w\s/-]", " ", text)    # keep word chars, "/" (alternation), "-"
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _is_lookupable(text: str) -> bool:
+    """Whether `text` is worth looking up at all — non-empty and not composed
+    ENTIRELY of function words (see _NON_ENTITY_WORDS)."""
+    words = text.split()
+    return bool(words) and not all(w in _NON_ENTITY_WORDS for w in words)
 
 
 def _split_alternatives(phrase: str) -> List[str]:
@@ -258,12 +303,13 @@ def _phrase_variants(phrase: str) -> List[tuple]:
     """
     words = phrase.split()
     variants = [(0, phrase)]
-    for span in range(len(words) - 1, 1, -1):
-        for start in range(len(words) - span + 1):
-            variants.append((1, " ".join(words[start : start + span])))
+    if len(words) <= _MAX_SPAN_SEARCH_WORDS:
+        for span in range(len(words) - 1, 1, -1):
+            for start in range(len(words) - span + 1):
+                variants.append((1, " ".join(words[start : start + span])))
     if len(words) > 1:
         variants.extend((2, w) for w in words)
-    return variants
+    return [(tier, text) for tier, text in variants if _is_lookupable(text)]
 
 
 def _synsets_for_phrase(phrase: str) -> List["wn.synset"]:
@@ -273,7 +319,7 @@ def _synsets_for_phrase(phrase: str) -> List["wn.synset"]:
     and any character outside WordNet's own lemma alphabet is dropped so
     punctuation the VLM emitted can't cause a spurious miss."""
     key = _normalize_phrase(phrase).replace(" ", "_")
-    key = re.sub(r"[^a-z0-9_'.-]", "", key)
+    key = re.sub(r"[^a-z0-9_'-]", "", key)
     if not key:
         return []
     try:
@@ -363,6 +409,8 @@ def resolve_to_wordnet(
         # is what keeps "swimming pool" from decomposing into the (deeper, but
         # wrong) activity `swimming.n.01`, and "golden retriever" from
         # collapsing to `retriever`.
+        if not _is_lookupable(alternative):
+            continue
         whole = _synsets_for_phrase(alternative)
         if whole:
             per_alternative.append(_best_sense(whole, pred_synset_id))

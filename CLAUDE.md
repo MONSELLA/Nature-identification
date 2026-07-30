@@ -301,6 +301,19 @@ evaluating the models.
   than the mapping). material is always the VLM's own label (never mapped).
   No anchor object (empty extraction or failed ClipMatch) → prediction-unmapped
   → penalized as wrong.
+- **BIG-5 datasets** (`dataset_loader.BIG5_DATASETS`): `big5` pools every
+  configured platform; `big5_twitter` / `big5_weibo` restrict to one. Use the
+  per-platform names when comparing platforms — the results store and the
+  predictions CSV are keyed by dataset name, so pooling would average them.
+  GT CSVs: `--twitter_en_gt_csv` / `--twitter_es_gt_csv` (4 image slots per
+  row) and `--weibo_ch0_gt_csv` / `--weibo_ch1_gt_csv` (NINE slots,
+  `nature_visual_0..8`). The slot count is AUTO-DETECTED from each CSV's own
+  `nature_visual_<idx>` columns (`_big5_slot_count`) — never hardcode it; the
+  old hardcoded `min(4, ...)` silently dropped 47% of Weibo's annotated
+  images. A slot whose `nature_visual_<idx>` is `-` is unannotated and skipped
+  (660 of 7364 across the four CSVs). `nep_immaterial_specific_visual_<idx>`
+  (illustration/infographic/videogame/plain_text/other) is deliberately
+  IGNORED — those format subcategories are not a classification target.
 - **BIG-5 (holistic, one GT label per image)**: nature = OR over extracted
   objects, same as always. biotic/material use a DIRECTION-AWARE "at least one
   matching entity" rule instead of matching a specific object (there is no
@@ -340,7 +353,11 @@ evaluating the models.
 ## Environment
 - W&B project: `TFM_VLM`, entity `paumonserrat03-universitat-aut-noma-de-barcelona`
 - Taxonomy Excel: `/home/pmonserrat/code/flat_wordnet_tree_fixed.xlsx`
-- BIG-5 data: `/home/pmonserrat/datasets/big_5/`
+- BIG-5 data: `/home/pmonserrat/datasets/big_5/` — TWO platforms, each a flat
+  image folder: `.../big_5/twitter` (`--big_5_twitter_images_dir`) and
+  `.../big_5/weibo` (`--big_5_weibo_images_dir`). No intra-folder split by
+  language or channel; every image is named `<platform_id>_<idx>.<ext>` and
+  found by globbing that stem.
 - Imagenet data: `/home/pmonserrat/datasets/imagenet/`
 - COCO data: `/home/pmonserrat/datasets/coco/`
 - Places365 data: `/home/pmonserrat/datasets/places/`

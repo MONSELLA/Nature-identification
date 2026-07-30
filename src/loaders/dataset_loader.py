@@ -38,6 +38,7 @@ the BIG-5 taxonomy graph (see src/loaders/excel_loader.py) via
 
 import glob
 import os
+import re
 import pandas as pd
 from pathlib import Path
 
@@ -403,14 +404,78 @@ def load_places365(data_dir, categories_txt, excel_path, taxonomy_graph):
     return results
 
 
-def load_big5(en_gt, es_gt, images_dir):
-    """Load the BIG-5 social-media dataset itself: human-annotated tweet
-    images (English + Spanish), each with its OWN direct nature/biotic/
-    material annotation — a MAJORITY VOTE across multiple coders (no WordNet
-    class lookup needed — these are already the ground truth).
+# The BIG-5 dataset names accepted by load_dataset/--dataset. "big5" pools
+# every configured platform into one run; the per-platform names restrict it
+# to one, which is what you want when comparing Twitter against Weibo (the
+# results store and the predictions CSV are keyed by dataset name, so a
+# per-platform name keeps the two sets of numbers separate instead of
+# silently averaging them together).
+BIG5_DATASETS = ("big5", "big5_twitter", "big5_weibo")
 
-    IMAGES ARE LOCAL, NOT DOWNLOADED: `images_dir` is one flat folder
-    (shared by both languages) that already contains every image, named
+
+def big5_sources(dataset_name, **kwargs):
+    """Build load_big5's (label, gt_csv, images_dir) triples from the CLI
+    kwargs, restricted to the platform(s) `dataset_name` selects. A split
+    whose GT CSV wasn't supplied is passed through as None and skipped by
+    load_big5, so partial configurations (e.g. Twitter-English only) work."""
+    twitter = [
+        ("twitter_en", kwargs.get("twitter_en_gt"), kwargs.get("twitter_images_dir")),
+        ("twitter_es", kwargs.get("twitter_es_gt"), kwargs.get("twitter_images_dir")),
+    ]
+    weibo = [
+        ("weibo_ch0", kwargs.get("weibo_ch0_gt"), kwargs.get("weibo_images_dir")),
+        ("weibo_ch1", kwargs.get("weibo_ch1_gt"), kwargs.get("weibo_images_dir")),
+    ]
+    if dataset_name == "big5_twitter":
+        return twitter
+    if dataset_name == "big5_weibo":
+        return weibo
+    return twitter + weibo
+
+
+def _big5_slot_count(columns) -> int:
+    """How many per-image annotation slots a BIG-5 majority-vote CSV carries,
+    read off its OWN `nature_visual_<idx>` column names.
+
+    This MUST be detected rather than hardcoded: the Twitter CSVs have 4 slots
+    (nature_visual_0..3) but the Weibo CSVs have 9 (nature_visual_0..8), and a
+    Weibo post can genuinely have all 9. The previous hardcoded `min(4, ...)`
+    silently discarded images 4-8 of every 9-image Weibo post — ~27% of Weibo
+    rows have n_images == 9, so that would have dropped a large fraction of
+    the dataset without any error.
+    """
+    slots = [int(m.group(1)) for c in columns
+             if (m := re.fullmatch(r"nature_visual_(\d+)", str(c)))]
+    return (max(slots) + 1) if slots else 0
+
+
+def load_big5(sources):
+    """Load the BIG-5 social-media dataset: human-annotated social-media
+    images, each with its OWN direct nature/biotic/material annotation — a
+    MAJORITY VOTE across multiple coders (no WordNet class lookup needed —
+    these are already the ground truth).
+
+    `sources` is a list of (label, gt_csv, images_dir) triples, one per
+    majority-vote CSV, so several PLATFORMS and several per-platform splits
+    can be pooled into one dataset. In practice:
+      - Twitter: two splits (English, Spanish), 4 image slots per row, both
+        sharing one images dir.
+      - Weibo:   two splits (ch6B0, ch6B1), 9 image slots per row, sharing a
+        DIFFERENT images dir.
+    Each source carries its own images_dir precisely because the two
+    platforms' images live in separate folders on the cluster. A source whose
+    gt_csv is None is skipped, so a run can enable any subset.
+
+    All splits share one column schema — `platform_id`, `n_images`, and
+    `nature_visual_<idx>` / `nep_materiality_visual_<idx>` /
+    `nep_biological_visual_<idx>` per image slot — differing ONLY in how many
+    slots they have (see _big5_slot_count). `nep_immaterial_specific_visual_<idx>`
+    (the format subcategory: illustration/infographic/videogame/plain_text/
+    other) is deliberately IGNORED — per recap §2b those subcategories are not
+    a classification target for this pipeline.
+
+    IMAGES ARE LOCAL, NOT DOWNLOADED: each images_dir is one flat folder that
+    already contains every image for its platform, named
     "<platform_id>_<idx>.<ext>". The extension is NOT fixed (jpg/jpeg/png all
     appear in practice), so each image is located by GLOBBING for
     "<platform_id>_<idx>.*" rather than assuming one. This replaced an older
@@ -454,31 +519,34 @@ def load_big5(en_gt, es_gt, images_dir):
 
     results = []
 
-    # BIG-5 data comes as one majority-vote GT CSV per language; English and
-    # Spanish are processed identically, just looping over both in turn.
-    for lang, gt_csv in [("en", en_gt), ("es", es_gt)]:
+    # One majority-vote GT CSV per platform-split (twitter en/es, weibo
+    # ch6B0/ch6B1). Every split is processed identically — only the slot
+    # count and the images dir differ.
+    for label, gt_csv, images_dir in sources:
         if not gt_csv:
             continue
-        # dtype=str for platform_id: it's a large integer-looking id, and we
-        # only ever use it to build a filename string — reading it as a
-        # plain string sidesteps any pandas int/float parsing quirks.
+        # dtype=str for platform_id: on Twitter it's a large integer-looking
+        # id and on Weibo an alphanumeric string that can begin with "-" and
+        # contain "_" — reading it as a plain string sidesteps any pandas
+        # int/float parsing quirks and keeps leading characters intact.
         gt = pd.read_csv(gt_csv, dtype={"platform_id": str})
+        n_slots = _big5_slot_count(gt.columns)
 
         for _, row in gt.iterrows():
             platform_id = row.get("platform_id")
             if pd.isna(platform_id):
                 continue
             try:
-                # How many images this tweet actually has (0-4). Needed
-                # because nature_visual_1/2/3 etc. are NOT blank for a
+                # How many images this post actually has (0..n_slots). Needed
+                # because nature_visual_1/2/3... are NOT blank for a
                 # nonexistent image slot — they default to "No" the same as
                 # a real non-nature image would — so n_images is the ONLY
-                # reliable way to know how many of the 4 columns are real.
+                # reliable way to know how many of the slot columns are real.
                 n_images = int(row.get("n_images", 0))
             except (TypeError, ValueError):
                 n_images = 0
 
-            for idx in range(min(4, n_images)):
+            for idx in range(min(n_slots, n_images)):
                 nat = map_yn(row.get(f'nature_visual_{idx}'))
                 if nat is None: continue
 
@@ -493,7 +561,12 @@ def load_big5(en_gt, es_gt, images_dir):
                     # pipeline (no biotic/material label when nature is False).
                     mat_vals, bio_vals = [], []
 
-                matches = glob.glob(os.path.join(images_dir, f"{platform_id}_{idx}.*"))
+                # glob.escape the id but NOT the "*": Weibo ids are arbitrary
+                # alphanumeric strings, so a "[" / "]" / "?" in one would
+                # otherwise be read as a glob character class and silently
+                # fail to match its own file.
+                pattern = os.path.join(images_dir, f"{glob.escape(str(platform_id))}_{idx}.*")
+                matches = sorted(glob.glob(pattern))
                 if not matches:
                     continue
                 local_path = matches[0]
@@ -530,8 +603,8 @@ def load_dataset(dataset_name, taxonomy_graph, **kwargs):
         return load_coco(kwargs.get("data_dir"), kwargs.get("instances_json"), taxonomy_graph)
     elif dataset_name == "places365":
         return load_places365(kwargs.get("data_dir"), kwargs.get("places_categories_txt"), kwargs.get("excel_path"), taxonomy_graph)
-    elif dataset_name == "big5":
-        return load_big5(kwargs.get("en_gt"), kwargs.get("es_gt"), kwargs.get("images_dir"))
+    elif dataset_name in BIG5_DATASETS:
+        return load_big5(big5_sources(dataset_name, **kwargs))
     else:
         raise ValueError(f"Unknown dataset: {dataset_name}")
 

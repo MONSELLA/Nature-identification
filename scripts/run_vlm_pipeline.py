@@ -111,7 +111,7 @@ logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 
 from src.evaluation import taxonomy_metrics
 from src.loaders.excel_loader import TaxonomyGraph
-from src.loaders.dataset_loader import load_dataset, get_candidate_vocab
+from src.loaders.dataset_loader import load_dataset, get_candidate_vocab, BIG5_DATASETS
 from src.models.prompts import build_system_prompts
 from src.models.vlm_models import MODEL_REGISTRY, create_vlm
 from src.vlm_pipeline import run_inference, resolve_hybrid_label, _normalize_object
@@ -305,8 +305,10 @@ def phase_infer(args):
         args.dataset, taxonomy_graph=graph,
         data_dir=args.data_dir, instances_json=args.instances_json,
         places_categories_txt=args.places_categories_txt, excel_path=args.excel_path,
-        en_gt=args.twitter_en_gt_csv, es_gt=args.twitter_es_gt_csv,
-        images_dir=args.big5_images_dir,
+        twitter_en_gt=args.twitter_en_gt_csv, twitter_es_gt=args.twitter_es_gt_csv,
+        twitter_images_dir=args.big_5_twitter_images_dir,
+        weibo_ch0_gt=args.weibo_ch0_gt_csv, weibo_ch1_gt=args.weibo_ch1_gt_csv,
+        weibo_images_dir=args.big_5_weibo_images_dir,
     )
     if not dataset:
         print("No dataset instances loaded — exiting."); sys.exit(1)
@@ -864,8 +866,11 @@ def phase_score(args):
                     hf1_vals_mapped.append(hier["hf1"])
                     wup_vals_mapped.append(wup_sim)
 
-        elif dataset == "big5":
+        elif dataset in BIG5_DATASETS:
             # --- BIG-5 (holistic image-level annotation) ---
+            # Covers every BIG-5 variant (pooled "big5" and the per-platform
+            # "big5_twitter"/"big5_weibo") — they share one GT schema and one
+            # scoring rule; only which CSVs get loaded differs.
             # GT here is ONE label per axis for the WHOLE scene (see
             # src.loaders.dataset_loader.load_big5 — a single "scene" target,
             # not a named object to find lexically), so unlike COCO there is
@@ -1446,7 +1451,12 @@ def build_arg_parser():
                    help="'all' (default) runs the full end-to-end pipeline in one process, "
                         "releasing the VLM's GPU memory before loading CLIP for scoring. "
                         "'infer'/'score' split the two halves across separate invocations.")
-    p.add_argument("--dataset", choices=["coco", "imagenet", "places365", "big5"], required=True)
+    # "big5" pools every configured BIG-5 platform into one run; "big5_twitter"
+    # / "big5_weibo" restrict it to one. Since the results store and the
+    # predictions CSV are keyed by dataset name, the per-platform names are
+    # what keep Twitter and Weibo numbers separate rather than pooled.
+    p.add_argument("--dataset", required=True,
+                   choices=["coco", "imagenet", "places365", *BIG5_DATASETS])
     p.add_argument("--responses_file", type=str, default=None,
                    help="Intermediate artifact: written by infer, read by score. Default: "
                         f"'vlm_responses_<model_slug>.jsonl' inside --results_dir/--run_name/"
@@ -1472,18 +1482,40 @@ def build_arg_parser():
     p.add_argument("--data_dir", type=str)
     p.add_argument("--instances_json", type=str)
     p.add_argument("--places_categories_txt", type=str)
+    # BIG-5 — one majority-vote GT CSV per platform split, plus one images
+    # folder per PLATFORM (Twitter and Weibo live in separate folders on the
+    # cluster; each platform's own splits share its folder). All splits use
+    # the same column schema and differ only in how many per-image annotation
+    # slots they carry (Twitter 4, Weibo 9 — auto-detected, see
+    # dataset_loader._big5_slot_count).
     p.add_argument("--twitter_en_gt_csv", type=str, default=None,
-                   help="BIG-5 English majority-vote GT CSV (platform_id, n_images, "
+                   help="BIG-5 Twitter ENGLISH majority-vote GT CSV (platform_id, n_images, "
                         "nature_visual_<idx>/nep_materiality_visual_<idx>/"
                         "nep_biological_visual_<idx> per up-to-4 images).")
     p.add_argument("--twitter_es_gt_csv", type=str, default=None,
-                   help="BIG-5 Spanish majority-vote GT CSV, same schema as "
+                   help="BIG-5 Twitter SPANISH majority-vote GT CSV, same schema as "
                         "--twitter_en_gt_csv.")
-    p.add_argument("--big5_images_dir", type=str, default="./big_5_images",
-                   help="Local folder (shared by both languages) already containing every "
-                        "BIG-5 image, named '<platform_id>_<idx>.<ext>'. Images are located "
-                        "by globbing for that stem (the extension isn't fixed — jpg/jpeg/png "
-                        "all appear) rather than downloaded — there is no remote fetch step.")
+    p.add_argument("--weibo_ch0_gt_csv", type=str, default=None,
+                   help="BIG-5 WEIBO majority-vote GT CSV, split ch6B0 (e.g. "
+                        "weiboch6B0_majority.csv). Same column schema as the Twitter CSVs "
+                        "but with NINE image slots per row (nature_visual_0..8) instead of "
+                        "four — the slot count is read off the CSV's own columns, so nothing "
+                        "needs to be told which platform it is.")
+    p.add_argument("--weibo_ch1_gt_csv", type=str, default=None,
+                   help="BIG-5 WEIBO majority-vote GT CSV, split ch6B1. Same schema as "
+                        "--weibo_ch0_gt_csv.")
+    p.add_argument("--big_5_twitter_images_dir", "--big5_images_dir", type=str,
+                   default="./big_5_images", dest="big_5_twitter_images_dir",
+                   help="Local folder (shared by the English and Spanish splits) already "
+                        "containing every BIG-5 TWITTER image, named "
+                        "'<platform_id>_<idx>.<ext>'. Images are located by globbing for that "
+                        "stem (the extension isn't fixed — jpg/jpeg/png all appear) rather "
+                        "than downloaded — there is no remote fetch step. "
+                        "--big5_images_dir is kept as an alias for backwards compatibility.")
+    p.add_argument("--big_5_weibo_images_dir", type=str, default="./big_5_weibo_images",
+                   help="Local folder (shared by both Weibo splits) already containing every "
+                        "BIG-5 WEIBO image, named '<platform_id>_<idx>.<ext>' — same flat "
+                        "layout and same glob-by-stem lookup as the Twitter folder.")
 
     # VLM (infer)
     p.add_argument("--model_family", type=str, choices=sorted(MODEL_REGISTRY))
