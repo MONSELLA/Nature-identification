@@ -369,6 +369,7 @@ def phase_infer(args):
             tax_graph=graph, max_hops=args.max_hops,
             batch_size=args.batch_size,
             caption_max_new_tokens=args.max_new_tokens_caption,
+            extraction_max_new_tokens=args.max_new_tokens_extraction,
             label_max_new_tokens=args.max_new_tokens_label,
             temperature=args.temperature, verbose=args.verbose,
             summarize_for_clipmatch=summarize_for_clipmatch,
@@ -1447,6 +1448,18 @@ def build_arg_parser():
     p.add_argument("--trust_remote_code", action="store_true")
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--max_new_tokens_caption", type=int, default=248) # 248 tokens is the maximum length that LongCLIP can handle
+    p.add_argument("--max_new_tokens_extraction", type=int, default=None,
+                   help="Max new tokens for the Stage-2 object-extraction call (structured, "
+                        "ObjectExtractionResponse). Defaults to --max_new_tokens_caption if not set "
+                        "(the old shared-budget behavior), but is worth setting HIGHER and "
+                        "independently once EXTRACTION_PROMPT's schema includes a 'reasoning' field "
+                        "(current prompts.py does): under guided decoding the model must write that "
+                        "full reasoning paragraph BEFORE it can emit the objects array, and "
+                        "--max_new_tokens_caption's default (248) was sized for captioning alone, "
+                        "not for a reasoning-plus-list schema — a too-small budget here can silently "
+                        "truncate the objects list (or the whole structured output) without any "
+                        "parse-failure signal, showing up only as a suspiciously low "
+                        "objects-per-image diagnostic.")
     p.add_argument("--max_new_tokens_label", type=int, default=248)
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--no_summarize_clipmatch_caption", action="store_true",

@@ -407,6 +407,7 @@ def run_inference(
     max_hops: int = 3,
     batch_size: int = 16,
     caption_max_new_tokens: int = 256,
+    extraction_max_new_tokens: Optional[int] = None,
     label_max_new_tokens: int = 300,
     temperature: float = 0.0,
     verbose: bool = False,
@@ -429,6 +430,17 @@ def run_inference(
           "object_finals": [ resolve_hybrid_label(...) dicts, ... ],
           "clipmatch_summary_caption": str | None,  # only when summarize_for_clipmatch
         }
+
+    `extraction_max_new_tokens` sets Stage 2's own token budget, independent
+    of `caption_max_new_tokens` — falls back to `caption_max_new_tokens` when
+    left None (the old shared-budget behavior). Worth setting explicitly and
+    HIGHER whenever EXTRACTION_PROMPT's schema (ObjectExtractionResponse)
+    includes a 'reasoning' field: under guided decoding the model must write
+    that reasoning out in full before it can emit the objects array, and
+    captioning's own budget was never sized for a reasoning-plus-list schema —
+    too small a shared budget can silently truncate the objects list (or the
+    whole structured output) with no parse-failure signal, showing up only as
+    a suspiciously low objects-per-image diagnostic.
 
     `summarize_for_clipmatch` (see prompts.SUMMARY_CAPTION_PROMPT) adds one
     extra VLM call per batch: a short (<=~20-word) re-summarization of this
@@ -460,6 +472,18 @@ def run_inference(
         # caption call (the nature-definition context) unless a caller
         # explicitly wants something different for that stage.
         extraction_system_prompt = caption_system_prompt
+
+    # Extraction gets its OWN token budget, independent of captioning's, when
+    # a caller sets one explicitly — falls back to caption_max_new_tokens
+    # otherwise (the old shared-budget behavior). Needed because
+    # EXTRACTION_PROMPT's schema (ObjectExtractionResponse) can include a
+    # 'reasoning' field the model must write out in full BEFORE it can emit
+    # the objects array under guided decoding — captioning's own budget was
+    # never sized for that, and a too-small shared budget can silently
+    # truncate the objects list with no parse-failure signal.
+    resolved_extraction_max_new_tokens = (
+        extraction_max_new_tokens if extraction_max_new_tokens is not None else caption_max_new_tokens
+    )
 
     n = len(dataset_instances)
     # Standard "ceiling division" trick: computes how many batches of size
@@ -507,7 +531,7 @@ def run_inference(
                   f"(structured, ObjectExtractionResponse)...", flush=True)
         objects_per_image = extract_objects_batch(
             vlm, image_paths, captions, extraction_system_prompt,
-            max_new_tokens=caption_max_new_tokens, temperature=temperature,
+            max_new_tokens=resolved_extraction_max_new_tokens, temperature=temperature,
         )
 
         # ImageNet/Places DEFAULT: compress this image's own caption into a
