@@ -25,6 +25,8 @@ import warnings
 from typing import List, Optional, Tuple
 import numpy as np
 
+from src.utils import crosses_decile
+
 OBJECT_TEMPLATE = "a photo of a {}"
 DEFAULT_CLIPSCORE_SCALE = 2.5
 CLIPMATCH_DATASETS = ("imagenet", "places365")
@@ -357,7 +359,12 @@ class CLIPScorer:
             out.append(self._encode_text_batch(batch))
             if verbose:
                 done = min(i + self.batch_size, n_total)
-                print(f"🔎 [CLIP] {desc}: {done}/{n_total} ({done / n_total:.1%})", flush=True)
+                # Only print every ~10% of n_total (see utils.crosses_decile)
+                # — one line per batch is unreadable spam once n_total is
+                # large relative to batch_size (e.g. an 80k-text candidate
+                # vocab encoded self.batch_size at a time).
+                if crosses_decile(i, done, n_total):
+                    print(f"🔎 [CLIP] {desc}: {done}/{n_total} ({done / n_total:.1%})", flush=True)
         return np.concatenate(out, axis=0)
 
     def count_tokens(self, texts: List[str]) -> List[int]:
@@ -414,7 +421,8 @@ class CLIPScorer:
             
             if verbose:
                 done = min(i + self.batch_size, n_total)
-                print(f"🔎 [CLIP] images: {done}/{n_total} ({done / n_total:.1%})", flush=True)
+                if crosses_decile(i, done, n_total):
+                    print(f"🔎 [CLIP] images: {done}/{n_total} ({done / n_total:.1%})", flush=True)
         return np.concatenate(out, axis=0)
 
 

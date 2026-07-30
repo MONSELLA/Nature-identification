@@ -116,7 +116,8 @@ from src.models.prompts import build_system_prompts
 from src.models.vlm_models import MODEL_REGISTRY, create_vlm
 from src.vlm_pipeline import run_inference, resolve_hybrid_label, _normalize_object
 from src.evaluation import clip_metrics
-from src.utils import update_results_store, update_dataset_class_stats, compute_class_stats, format_duration
+from src.utils import (update_results_store, update_dataset_class_stats, compute_class_stats,
+                       format_duration, crosses_decile)
 
 # Per-model outputs are split by FILE TYPE into these two subfolders of
 # <results_dir>/<run_name>, so a run_name folder full of models stays
@@ -656,16 +657,14 @@ def phase_score(args):
     clipmatch_caption_support = 0
     flat_rows = []  # one row per stored IMAGE for the output CSV (see below)
 
-    # How often to print per-image progress under --verbose: every 5% of the
-    # dataset (at least every 1 image, at most every 500) rather than a fixed
-    # step, so the cadence stays sensible on both tiny (--max_samples) and
-    # full-scale runs.
-    progress_every = max(1, min(500, len(records) // 20)) if args.verbose else None
-
     for idx, rec in enumerate(records):
-        if progress_every and (idx % progress_every == 0 or idx == len(records) - 1):
+        if args.verbose:
             done = idx + 1
-            print(f"🔎 [CLIP] scoring: {done}/{len(records)} images ({done / len(records):.1%})", flush=True)
+            # Every ~10% of the dataset (see utils.crosses_decile), same
+            # cadence as CLIPScorer's own encode_text/encode_images progress
+            # prints — not once per image, which floods a redirected log.
+            if crosses_decile(idx, done, len(records)):
+                print(f"🔎 [CLIP] scoring: {done}/{len(records)} images ({done / len(records):.1%})", flush=True)
         objs = rec["objects"]
         finals = rec["object_finals"]
         targets = rec.get("targets", [])
