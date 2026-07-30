@@ -140,6 +140,13 @@ Image: A photograph of a brightly lit convenience store in an urban city. Shelve
 {{
   "reasoning": "Step 1: The macro elements are the store, city, shelf, cashier, and counter. Step 2: For micro elements, there are junk food snacks and soda bottles, but since none of these represent nature, they will be ignored. I will only extract the macro items.",
   "objects": ["store", "city", "shelf", "cashier", "counter"]
+}}
+
+EXAMPLE 4 (Social Media Text & Depiction):
+Image: A messy indoor bedroom with a desk, a chair and a bed. A person wearing a shirt with a flower print is taking a selfie in the mirror. A teddy bear is laying on the bed. Overlaid on the image is a text banner that says "Save the trees!".
+{{
+  "reasoning": "Step 1: The macro elements are the bedroom, person, mirror, desk, and bed. Step 2: For micro elements, the 'flower' print on the shirt, the 'teddy bear' (depicting an animal), and the word 'trees' from the text overlay all represent nature-related concepts and will be extracted. The rest of the messy room clutter will be ignored.",
+  "objects": ["bedroom", "person", "mirror", "desk", "chair", "bed", "flower", "teddy bear", "tree"]
 }}"""
 
 class ObjectExtractionResponse(BaseModel):
