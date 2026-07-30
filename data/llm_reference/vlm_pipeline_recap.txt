@@ -1,4 +1,4 @@
-BIG-5 VLM PIPELINE — DESIGN RECAP (v18)
+BIG-5 VLM PIPELINE — DESIGN RECAP (v19)
 (v4: the VLM pipeline is now IMPLEMENTED — this doc records both the original
 design rationale AND, in "IMPLEMENTED:" notes, how the shipped code actually
 does it where the two differ. v5: ClipMatch switched to the caption-based
@@ -77,7 +77,21 @@ social-media images (arbitrary phone-camera/screenshot resolutions) blow up
 a vision encoder's patch count (and therefore its attention memory,
 quadratically) far more than the typically-modest pre-resized ImageNet/COCO/
 Places images. New --max_image_side (default 1024, 0 disables) downscales
-any oversized image before it reaches the VLM. See Section 3/11.)
+any oversized image before it reaches the VLM. See Section 3/11. v19: the
+v18 --max_image_side=1024 fix REDUCED the BIG-5 OOM but did not fully
+eliminate it at batch_size=24/32 (2-3 batches now complete before it dies,
+vs immediately before) — root cause of the REMAINING gap: vLLM reserves its
+KV cache upfront (--gpu_memory_utilization=0.9 leaves only ~1-5GiB free
+after weights+KV-cache, and this project's own --batch_size only bounds how
+many prompts get SUBMITTED per call, not how many the engine actually runs
+concurrently, which is a separate, previously-uncapped scheduling decision).
+Per Pau: --batch_size stays at 32 (already proven fine for ImageNet/Places)
+and image quality/--max_image_side is NOT to be reduced further as the
+fix — added --max_num_seqs (passed straight through to vLLM's own
+EngineArgs) as the actual lever, capping concurrent engine scheduling
+(and therefore concurrent vision-encoding) independently of --batch_size.
+--gpu_memory_utilization (already existed) is the complementary zero-cost
+lever for the same OOM. See Section 3/11.)
 
 ===============================================================
 0. IMPLEMENTATION STATUS (NEW in v4)

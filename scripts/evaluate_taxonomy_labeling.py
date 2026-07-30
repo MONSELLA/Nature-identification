@@ -96,6 +96,11 @@ def parse_args():
     parser.add_argument("--dtype", type=str, default="auto")
     parser.add_argument("--gpu_memory_utilization", type=float, default=0.9)
     parser.add_argument("--max_model_len", type=int, default=None)
+    parser.add_argument("--max_num_seqs", type=int, default=None,
+                        help="Passed straight to vLLM's EngineArgs — caps how many sequences "
+                             "the engine runs (and vision-encodes) concurrently, independent of "
+                             "--batch_size. See run_vlm_pipeline.py's --max_num_seqs help for "
+                             "the full rationale.")
     parser.add_argument("--trust_remote_code", action="store_true")
     parser.add_argument("--max_image_side", type=int, default=1024,
                         help="Downscale any image whose longest side exceeds this many pixels "
@@ -307,6 +312,7 @@ def main():
         "max_image_side": args.max_image_side or None,
     }
     if args.max_model_len is not None: vlm_kwargs["max_model_len"] = args.max_model_len
+    if args.max_num_seqs is not None: vlm_kwargs["max_num_seqs"] = args.max_num_seqs
 
     vlm = create_vlm(args.model_family, args.model_name, **vlm_kwargs)
 

@@ -376,6 +376,8 @@ def phase_infer(args):
                   "max_image_side": args.max_image_side or None}
     if args.max_model_len is not None:
         vlm_kwargs["max_model_len"] = args.max_model_len
+    if args.max_num_seqs is not None:
+        vlm_kwargs["max_num_seqs"] = args.max_num_seqs
     vlm = create_vlm(args.model_family, args.model_name, **vlm_kwargs)
 
     # The very first line written to the output file is a special "header"
@@ -1609,6 +1611,18 @@ def build_arg_parser():
     p.add_argument("--dtype", type=str, default="auto")
     p.add_argument("--gpu_memory_utilization", type=float, default=0.9)
     p.add_argument("--max_model_len", type=int, default=None)
+    p.add_argument("--max_num_seqs", type=int, default=None,
+                   help="Passed straight to vLLM's own EngineArgs (LLM(max_num_seqs=...)) — "
+                        "caps how many sequences the ENGINE runs concurrently, independent of "
+                        "--batch_size (which only controls how many prompts THIS SCRIPT submits "
+                        "per generate_batch call; vLLM's own scheduler still decides how many of "
+                        "those it runs — and vision-encodes — at once, currently uncapped). This "
+                        "is the lever for a vision-encoder OOM that only shows up on "
+                        "large-image datasets (BIG-5) at a --batch_size that's fine for "
+                        "ImageNet/Places: fewer images processed by the vision encoder "
+                        "SIMULTANEOUSLY, without lowering --batch_size (still submitted/queued "
+                        "at full size) or --max_image_side (image quality untouched). Default "
+                        "None leaves vLLM's own default (unset — no change from prior behavior).")
     p.add_argument("--trust_remote_code", action="store_true")
     p.add_argument("--max_image_side", type=int, default=1024,
                    help="Downscale (preserving aspect ratio) any image whose longest side "

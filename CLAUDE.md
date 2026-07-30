@@ -76,6 +76,21 @@ evaluating the models.
   no decode/re-encode) so this costs ~nothing at the project's 2M-image
   scale; oversized images are downscaled and re-encoded as JPEG
   (quality=90) rather than the original format.
+- `--max_num_seqs` (default: unset, vLLM's own default): passed straight to
+  vLLM's `EngineArgs`, capping how many sequences the ENGINE runs — and
+  vision-encodes — concurrently. Distinct from `--batch_size`, which only
+  controls how many prompts THIS SCRIPT submits per `generate_batch` call;
+  vLLM's own scheduler still decides how many of those it actually runs
+  together, currently uncapped. Use this (not `--batch_size` or
+  `--max_image_side`) when a large-image dataset (BIG-5) OOMs the vision
+  encoder at a `--batch_size` that's fine for ImageNet/Places and you don't
+  want to sacrifice submission throughput or image resolution to fix it —
+  it reduces peak *concurrent* vision-encoder memory without touching
+  either. `--gpu_memory_utilization` (already existed) is the other
+  zero-cost lever for the same OOM: lowering it (e.g. 0.9 -> 0.85) shrinks
+  vLLM's upfront KV-cache reservation, leaving more real headroom for the
+  vision encoder's activation memory, again without touching batch size or
+  image quality.
 
 ## VLM pipeline — hard conventions
 - Baseline is TWO-PASS: open-ended caption (no schema) → separate structured
