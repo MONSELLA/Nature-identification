@@ -123,24 +123,24 @@ RULES:
 
 EXAMPLE 1 (Mixed Environment):
 Image: A person sitting in an indoor office chair at a desk with a laptop. On the desk is a little dog figurine and an orange. The person is wearing a shirt with a geometric triangle pattern. In the background, there is a potted plant near a window.
-{
+{{
   "reasoning": "Step 1: The macro elements are the office, desk, chair, person, window, and laptop. Step 2: For micro elements, the little dog figurine, the orange, and the potted plant represent nature, so they will be extracted. I will ignore the geometric pattern on the shirt as it is a non-nature detail.",
   "objects": ["office", "desk", "chair", "person", "window", "laptop", "dog figurine", "orange", "potted plant"]
-}
+}}
 
 EXAMPLE 2 (Pure Nature Space):
 Image: A sunny beach with crashing ocean waves and sand. A surfer carrying a surfboard with a bird logo walks near the water. A small crab is resting on the sand.
-{
+{{
   "reasoning": "Step 1: The macro elements are the beach, ocean, sand, surfer, and surfboard. Step 2: For micro elements, the small crab and the bird logo represents nature and will be extracted.",
   "objects": ["beach", "ocean", "sand", "surfer", "surfboard", "crab", "bird logo"]
-}
+}}
 
 EXAMPLE 3 (Pure No-nature Space):
 Image: A photograph of a brightly lit convenience store in an urban city. Shelves are stocked with snacks and soda bottles. A cashier stands behind the counter.
-{
+{{
   "reasoning": "Step 1: The macro elements are the store, city, shelf, cashier, and counter. Step 2: For micro elements, there are junk food snacks and soda bottles, but since none of these represent nature, they will be ignored. I will only extract the macro items.",
   "objects": ["store", "city", "shelf", "cashier", "counter"]
-}"""
+}}"""
 
 class ObjectExtractionResponse(BaseModel):
     """Structured schema for baseline and nature-filtered entity extraction."""
