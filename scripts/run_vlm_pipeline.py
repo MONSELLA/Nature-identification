@@ -369,7 +369,11 @@ def phase_infer(args):
     # Every registered family is vLLM-served (see src/models/vlm_models.py's
     # MODEL_REGISTRY) — the HuggingFace-served BLIP family was removed.
     vlm_kwargs = {"dtype": args.dtype, "gpu_memory_utilization": args.gpu_memory_utilization,
-                  "trust_remote_code": args.trust_remote_code}
+                  "trust_remote_code": args.trust_remote_code,
+                  # 0 is the CLI's "disabled" spelling (argparse can't default
+                  # an int flag to None while still accepting a positive int);
+                  # VLLMBackedVLM.__init__ itself expects None for "disabled".
+                  "max_image_side": args.max_image_side or None}
     if args.max_model_len is not None:
         vlm_kwargs["max_model_len"] = args.max_model_len
     vlm = create_vlm(args.model_family, args.model_name, **vlm_kwargs)
@@ -1606,6 +1610,18 @@ def build_arg_parser():
     p.add_argument("--gpu_memory_utilization", type=float, default=0.9)
     p.add_argument("--max_model_len", type=int, default=None)
     p.add_argument("--trust_remote_code", action="store_true")
+    p.add_argument("--max_image_side", type=int, default=1024,
+                   help="Downscale (preserving aspect ratio) any image whose longest side "
+                        "exceeds this many pixels before it reaches the VLM (see "
+                        "vlm_models.VLLMBackedVLM._encode_image). Nothing in this pipeline "
+                        "resizes images otherwise: ImageNet/COCO/Places images are typically "
+                        "already modest, but raw social-media images (BIG-5 Twitter/Weibo) can "
+                        "be arbitrary phone-camera/screenshot resolutions with no cap, and a "
+                        "vision encoder's patch count (and attention memory) scales with input "
+                        "resolution, not a fixed square — one oversized image in a batch can "
+                        "OOM the vision encoder even at a batch_size/max_model_len that's "
+                        "comfortable for ImageNet/Places at the same settings. Pass 0 to "
+                        "disable resizing entirely (reproduces old behavior).")
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--max_new_tokens_caption", type=int, default=248) # 248 tokens is the maximum length that LongCLIP can handle
     p.add_argument("--max_new_tokens_extraction", type=int, default=None,

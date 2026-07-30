@@ -1,4 +1,4 @@
-BIG-5 VLM PIPELINE — DESIGN RECAP (v17)
+BIG-5 VLM PIPELINE — DESIGN RECAP (v18)
 (v4: the VLM pipeline is now IMPLEMENTED — this doc records both the original
 design rationale AND, in "IMPLEMENTED:" notes, how the shipped code actually
 does it where the two differ. v5: ClipMatch switched to the caption-based
@@ -70,7 +70,14 @@ different WordNet synsets (cardigan the sweater vs Cardigan Welsh corgi the
 dog breed; crane the bird vs crane the machine), which fed ClipMatch
 IDENTICAL candidate text for genuinely different classes and silently
 mis-scored correct predictions that landed on the "other" sense. See
-Section 8f/11.)
+Section 8f/11. v18: fixed a real vision-encoder OOM on BIG-5 that did NOT
+reproduce on ImageNet/Places at the same or higher batch size — root cause
+was that NOTHING resized images anywhere in the pipeline, and raw
+social-media images (arbitrary phone-camera/screenshot resolutions) blow up
+a vision encoder's patch count (and therefore its attention memory,
+quadratically) far more than the typically-modest pre-resized ImageNet/COCO/
+Places images. New --max_image_side (default 1024, 0 disables) downscales
+any oversized image before it reaches the VLM. See Section 3/11.)
 
 ===============================================================
 0. IMPLEMENTATION STATUS (NEW in v4)
@@ -800,6 +807,51 @@ RESOLVED IN v6 (decided after repeated integration failures):
   clip_metrics.CLIPScorer's class docstring) were PROPOSED as
   replacements here, but neither was actually added to CLIP_PRESETS at
   the time — see RESOLVED IN v8 below for what's actually wired in.
+
+RESOLVED IN v18 (decided per Pau):
+- FIXED a real vision-encoder OOM that occurred on BIG-5 (Twitter) at
+  batch_size=24 but did NOT reproduce on ImageNet/Places at batch_size=32 —
+  same model, same GPU, same max_model_len. The failing traceback landed
+  inside vllm's pixtral.py vision_encoder -> scaled_dot_product_attention
+  with "CUDA out of memory. Tried to allocate 1.41 GiB" — i.e. the VISION
+  encoder's own attention over image patches, not the text KV cache, which
+  ruled out max_model_len/batch_size as the direct cause.
+  ROOT CAUSE: nothing anywhere in this pipeline resized images.
+  vlm_models.VLLMBackedVLM._encode_image read the raw file bytes straight
+  off disk and base64-encoded them as-is. ImageNet/COCO/Places images are
+  typically already modest (pre-resized benchmark images), but BIG-5's
+  Twitter/Weibo images are raw social-media downloads — arbitrary
+  phone-camera/screenshot resolutions with no upper bound. A vision encoder
+  like Pixtral scales its patch count (and therefore attention memory,
+  QUADRATICALLY in patch count) with input resolution rather than
+  processing every image at one fixed small square the way a CLIP-style
+  encoder does — so a single oversized raw image in a batch can dwarf the
+  memory footprint of an entire batch of already-small ImageNet images,
+  independent of batch_size.
+  FIX: new --max_image_side CLI flag (default 1024, 0 disables), threaded
+  into VLLMBackedVLM.__init__ as an explicit named parameter (kept OUT of
+  **kwargs specifically so it's never accidentally forwarded to vllm's own
+  LLM(...) constructor, which has no such argument and would raise on an
+  unexpected kwarg). _encode_image now checks each image's size before
+  encoding and downscales (preserving aspect ratio, LANCZOS resample, .
+  convert("RGB") first to avoid palette/CMYK color bugs) any image whose
+  longest side exceeds the cap, re-encoding as JPEG quality=90 (not PNG —
+  PNG is lossless and can be dramatically larger for photographic content).
+  FAST PATH for images already under the cap (true for most ImageNet/COCO/
+  Places images, and many BIG-5 images too): Image.open() only reads the
+  file header to get .size, not the full pixel data, so checking size is
+  cheap, and when no resize is needed the original file bytes are read and
+  base64-encoded directly with zero PIL decode/re-encode cost — matters at
+  this project's eventual 2M-image production scale, where paying a PIL
+  round-trip on every single image regardless of need would be wasteful.
+  Verified directly: a synthetic 4000x3000 "raw photo" downscales to
+  1024x768 and its encoded payload drops from ~189KB to ~13KB, while a
+  synthetic 256x224 "pre-resized benchmark image" passes through
+  byte-identical (fast path confirmed taken); --max_image_side 0 reproduces
+  the exact old (unresized) behavior for anyone who wants to opt out (e.g.
+  already pre-resized their own images). Wired into both
+  run_vlm_pipeline.py and evaluate_taxonomy_labeling.py (both create a VLM
+  the same way).
 
 RESOLVED IN v17 (decided per Pau):
 - hP/hR/hF1/Wu-Palmer (Section 8f) are now ALSO reported split by whether

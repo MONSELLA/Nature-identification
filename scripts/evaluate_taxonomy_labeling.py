@@ -97,6 +97,12 @@ def parse_args():
     parser.add_argument("--gpu_memory_utilization", type=float, default=0.9)
     parser.add_argument("--max_model_len", type=int, default=None)
     parser.add_argument("--trust_remote_code", action="store_true")
+    parser.add_argument("--max_image_side", type=int, default=1024,
+                        help="Downscale any image whose longest side exceeds this many pixels "
+                             "before it reaches the VLM (see "
+                             "vlm_models.VLLMBackedVLM._encode_image) — raw social-media images "
+                             "(BIG-5) have no resolution cap otherwise and can OOM the vision "
+                             "encoder. Pass 0 to disable.")
 
     # Generation Arguments
     parser.add_argument("--batch_size", type=int, default=16)
@@ -296,7 +302,9 @@ def main():
     # Every registered family is vLLM-served (see src/models/vlm_models.py's
     # MODEL_REGISTRY) — the HuggingFace-served BLIP family was removed.
     vlm_kwargs = {
-        "dtype": args.dtype, "gpu_memory_utilization": args.gpu_memory_utilization, "trust_remote_code": args.trust_remote_code
+        "dtype": args.dtype, "gpu_memory_utilization": args.gpu_memory_utilization,
+        "trust_remote_code": args.trust_remote_code,
+        "max_image_side": args.max_image_side or None,
     }
     if args.max_model_len is not None: vlm_kwargs["max_model_len"] = args.max_model_len
 

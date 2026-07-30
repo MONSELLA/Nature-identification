@@ -60,6 +60,22 @@ evaluating the models.
   (`COCO_LABELS`, `COCO_TO_WNSYNSET`, `build_mapping_vocab`),
   `src/loaders/excel_loader.py` (`TaxonomyGraph.resolve_labels`, `max_hops`),
   `src/evaluation/clip_metrics.py` + `taxonomy_metrics.py` (metrics).
+- `--max_image_side` (default 1024): every image is downscaled to this many
+  pixels on its longest side before reaching the VLM
+  (`vlm_models.VLLMBackedVLM._encode_image`) — pass 0 to disable. Nothing
+  else in this pipeline resizes images. ImageNet/COCO/Places images are
+  typically already modest (pre-resized benchmark images), but raw
+  social-media images (BIG-5 Twitter/Weibo) can be arbitrary phone-camera/
+  screenshot resolutions with no cap, and a vision encoder's patch count
+  (and attention memory) scales with input resolution rather than a fixed
+  square — one oversized image in a batch can OOM the vision encoder at a
+  `--batch_size`/`--max_model_len` that's comfortable for ImageNet/Places at
+  the exact same settings (confirmed: a BIG-5 OOM traceback failed inside
+  the vision encoder's own attention, not the text KV cache). Fast path for
+  already-small images (`Image.open()` only reads the header to check size,
+  no decode/re-encode) so this costs ~nothing at the project's 2M-image
+  scale; oversized images are downscaled and re-encoded as JPEG
+  (quality=90) rather than the original format.
 
 ## VLM pipeline — hard conventions
 - Baseline is TWO-PASS: open-ended caption (no schema) → separate structured
