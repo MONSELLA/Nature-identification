@@ -1462,7 +1462,7 @@ def build_arg_parser():
                         "summary['clipmatch_caption'] whenever the summary is primary.")
     p.add_argument("--summary_max_new_tokens", type=int, default=77,
                    help="Max new tokens for the summary-caption VLM call (default 64 — generous "
-                        "headroom over the ~20-word target so it isn't itself cut off "
+                        "headroom over the ~50-word target so it isn't itself cut off "
                         "mid-sentence). No effect if --no_summarize_clipmatch_caption is passed.")
     p.add_argument("--use_wordnet_definitions_clipmatch", action="store_true",
                    help="--stage score only: build each ClipMatch candidate class's text from its "

@@ -107,40 +107,57 @@ SUMMARY_CAPTION_PROMPT = (
 # list of individual objects/elements. This list is what gets fed into Stage 3
 # (one taxonomy-labeling call per object) and into the CLIP-based metrics
 # (each object becomes its own "a photo of a {object}" text embedding).
-EXTRACTION_PROMPT = (
-    "Below is a general description of the image:\n\n"
-    "\"{caption}\"\n\n"
-    "Using BOTH the image and the description, list every distinct "
-    "object, element, or entity that appears in the image. Follow these rules:\n"
-    "  - Return each entity as a noun or a compound noun (e.g. \"grass\", "
-    "\"golden retriever\", \"mountain\", \"sea lion\").\n"
-    "  - Include secondary and background entities, not just the main subject.\n"
-    "  - Include an entity even when it is only PART of a larger one or is "
-    "depicted on its surface (e.g. a flower printed on a dress -> list "
-    "\"flower\"; a bird on a logo -> list \"bird\").\n"
-    "  - Do not repeat the same entity twice. Do not invent entities that are "
-    "not supported by the image."
-)
- 
+EXTRACTION_PROMPT = """You are an expert computer vision annotator. Below is a baseline description of the image:
+
+"{caption}"
+
+Your task is to extract visual entities from the image, keeping the total to a maximum of 12 items to avoid noise.
+
+RULES:
+ - Macro Elements (Objective): Extract the overarching scene (e.g., forest, office, restaurant, garden), amorphous elements (e.g., sky, grass, ocean, road), and salient objects (e.g., dog, desk, guitar) objectively.
+ - Micro Elements (Nature-Filtered): For tiny details, non-salient items, background objects, or depicted entities (e.g., stars in a night sky, a small orange, a little dog figurine, or a flower printed on a dress), ONLY extract them if they represent nature according to your system instructions. Ignore all other minor details.
+ - Use the 'reasoning' field to explicitly state your two-step plan: list the macro elements, then identify any valid nature-related micro elements.
+ - Format all extracted entities as concise, singular nouns or compound nouns.
+ - Place all chosen entities into the single 'objects' list.
+ - Do not hallucinate entities not visually present.
+
+EXAMPLE 1 (Mixed Environment):
+Image: A person sitting in an indoor office chair at a desk with a laptop. On the desk is a little dog figurine and an orange. The person is wearing a shirt with a geometric triangle pattern. In the background, there is a potted plant near a window.
+{
+  "reasoning": "Step 1: The macro elements are the office, desk, chair, person, window, and laptop. Step 2: For micro elements, the little dog figurine, the orange, and the potted plant represent nature, so they will be extracted. I will ignore the geometric pattern on the shirt as it is a non-nature detail.",
+  "objects": ["office", "desk", "chair", "person", "window", "laptop", "dog figurine", "orange", "potted plant"]
+}
+
+EXAMPLE 2 (Pure Nature Space):
+Image: A sunny beach with crashing ocean waves and sand. A surfer carrying a surfboard with a bird logo walks near the water. A small crab is resting on the sand.
+{
+  "reasoning": "Step 1: The macro elements are the beach, ocean, wave, sand, surfer, and surfboard. Step 2: For micro elements, the small crab and the bird logo represents nature and will be extracted.",
+  "objects": ["beach", "ocean", "sand", "surfer", "surfboard", "crab", "bird logo"]
+}
+
+EXAMPLE 3 (Pure No-nature Space):
+Image: A photograph of a brightly lit convenience store in an urban city. Shelves are stocked with snacks and soda bottles. A cashier stands behind the counter.
+{
+  "reasoning": "Step 1: The macro elements are the store, city, shelf, cashier, and counter. Step 2: For micro elements, there are junk food snacks and soda bottles, but since none of these represent nature, they will be ignored. I will only extract the macro items.",
+  "objects": ["store", "city", "shelf", "cashier", "counter"]
+}"""
+
 class ObjectExtractionResponse(BaseModel):
-    """Structured schema for the extraction call: a flat list of object phrases.
-
-    When we pass this class as `schema=` to the VLM, the model's JSON output is
-    forced to look like: {"objects": ["dog", "grass", "fence", ...]}. Our code
-    then just reads `result["objects"]` to get a plain Python list of strings —
-    no manual text-parsing needed.
-    """
-
-    # `List[str]` tells pydantic (and the guided-decoding machinery) that this
-    # field must be a JSON array of strings. `Field(description=...)` is not
-    # just documentation — some structured-output backends surface this text
-    # to the model itself as part of the schema, so it doubles as an
-    # instruction to the model about what belongs in this field.
+    """Structured schema for baseline and nature-filtered entity extraction."""
+    
+    reasoning: str = Field(
+        description=(
+            "Briefly analyze the image using a two-step process. First, identify the macro elements "
+            "(scene, amorphous stuff, salient objects) objectively. Second, scan for micro elements "
+            "(tiny details, non-salient items, depictions). ONLY extract these micro elements if they "
+            "represent nature according to the system definition. Ignore all other minor details. "
+            "Keep the final list to a maximum of 12 items."
+        )
+    )
     objects: List[str] = Field(
         description=(
-            "The distinct physical objects, elements, or entities present in the "
-            "image, each as a noun or a compound noun. Include part-objects and "
-            "background elements."
+            "A unified list of all extracted entities. This includes objective macro elements AND "
+            "nature-filtered micro elements. Format purely as concise, singular nouns or compound nouns. Return [] if none."
         )
     )
 
