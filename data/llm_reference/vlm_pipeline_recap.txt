@@ -1,4 +1,4 @@
-BIG-5 VLM PIPELINE — DESIGN RECAP (v15)
+BIG-5 VLM PIPELINE — DESIGN RECAP (v16)
 (v4: the VLM pipeline is now IMPLEMENTED — this doc records both the original
 design rationale AND, in "IMPLEMENTED:" notes, how the shipped code actually
 does it where the two differ. v5: ClipMatch switched to the caption-based
@@ -55,7 +55,12 @@ full/material-only. (c) resolve_to_wordnet hardened — diacritics, "/"
 alternation, contiguous spans, specificity-ranked. (d) SUMMARY_CAPTION_PROMPT
 forked per dataset (object-centric ImageNet vs scene-centric Places). (e)
 inflect determiners reinstated across ALL template fills, reversing v10.
-See Section 11.)
+See Section 11. v16: v15's inflect reinstatement (e, above) is made OPT-IN
+again via --use_inflect_for_clipmatch, rather than the hard default v15 set
+it to — default fill_template behavior is back to a plain template.format()
+with whatever article the template hardcodes. This is NOT a v10-style
+"suspected it hurt ClipMatch" revert; per Pau it's simply a preference to
+keep it as an explicit, comparable flag. See Section 11.)
 
 ===============================================================
 0. IMPLEMENTATION STATUS (NEW in v4)
@@ -785,6 +790,33 @@ RESOLVED IN v6 (decided after repeated integration failures):
   clip_metrics.CLIPScorer's class docstring) were PROPOSED as
   replacements here, but neither was actually added to CLIP_PRESETS at
   the time — see RESOLVED IN v8 below for what's actually wired in.
+
+RESOLVED IN v16 (decided per Pau):
+- The v15 inflect-determiner reinstatement is made OPT-IN again, gated
+  behind a new --use_inflect_for_clipmatch flag (--stage score only), rather
+  than v15's hard default. clip_metrics.fill_template gained a
+  use_inflect=False parameter (default): with it False, filling is a plain
+  template.format(name) — whatever article the template itself hardcodes
+  goes in as written, e.g. "a photo of a apple", ungrammatical or not. With
+  use_inflect=True, the full v15 grammar-correction logic runs (a/an by
+  sound, article dropped for a plural, only an article that actually governs
+  the "{}" slot touched — see the v15 entry below for the full mechanics,
+  unchanged). Threaded through object_texts, candidate_vocab_texts,
+  candidate_template_texts, and encode_candidate_vocab_ensemble, all
+  defaulting to False; run_vlm_pipeline.py passes
+  args.use_inflect_for_clipmatch through to all of them and records it in
+  summary["clip_models"]["use_inflect_for_clipmatch"]. Re-validated: the same
+  960-fill regression (96 templates x 10 names) passes identically under
+  use_inflect=True as it did in v15; use_inflect=False reproduces the
+  pre-v15 pure-format() behavior exactly (verified against the same name
+  set). --use_wordnet_definitions_clipmatch is UNAFFECTED — that path always
+  inflects its own article regardless of this flag, since that's its own
+  separate, pre-existing behavior (wordnet_definition_text). NOTE: unlike the
+  v10 revert, this is NOT because a ClipMatch regression was observed or
+  suspected — it's a preference to keep this comparison explicit and opt-in
+  rather than baked into the default path. requirements.txt's inflect
+  dependency reverts to "opt-in only" framing (still a hard install
+  requirement either way, just not exercised by the default code path).
 
 RESOLVED IN v15 (decided per Pau):
 - SECONDARY raw-caption ClipMatch REMOVED. When the summary caption is

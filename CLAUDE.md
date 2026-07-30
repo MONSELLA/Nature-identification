@@ -226,17 +226,22 @@ evaluating the models.
   extracted entity per image was never validated and would be needlessly
   expensive at 2M-image scale.
   EVERY template fill — `OBJECT_TEMPLATE`, all 80 ImageNet, all 15 scene —
-  goes through `clip_metrics.fill_template`, which fixes the determiner in
-  front of the entity with `inflect` (v15): "a photo of an apple", "a photo
-  of a university" (a/an by SOUND, not spelling), "a photo of cars" (article
-  DROPPED for a plural). Only an article that actually GOVERNS the slot is
-  touched — "the plastic {}" and "itap of my {}" are left alone, and the "a"
-  in "a photo of many {}" belongs to "photo", not the class, so it survives.
-  Where an adjective intervenes ("a photo of a clean {}") the article agrees
-  with the adjective and is kept, but still dropped for a plural. NOTE the
-  history: v8 added an inflect determiner, v10 reverted it on suspicion (never
-  isolated; confounded with a concurrent MetaCLIP switch), v15 reinstates it
-  deliberately — if a ClipMatch change is observed, isolate this from any
+  goes through `clip_metrics.fill_template`. DEFAULT is a plain
+  `template.format(name)`: whatever article the template hardcodes goes in
+  as written (e.g. "a photo of a apple"), ungrammatical or not. `--stage
+  score`'s `--use_inflect_for_clipmatch` (v16, opt-in) instead fixes the
+  determiner in front of the entity with `inflect`: "a photo of an apple",
+  "a photo of a university" (a/an by SOUND, not spelling), "a photo of cars"
+  (article DROPPED for a plural). Only an article that actually GOVERNS the
+  slot is touched — "the plastic {}" and "itap of my {}" are left alone, and
+  the "a" in "a photo of many {}" belongs to "photo", not the class, so it
+  survives. Where an adjective intervenes ("a photo of a clean {}") the
+  article agrees with the adjective and is kept, but still dropped for a
+  plural. NOTE the history: v8 added an inflect determiner project-wide, v10
+  reverted it on suspicion (never isolated; confounded with a concurrent
+  MetaCLIP switch), v15 reinstated it as the hard default, v16 makes it
+  opt-in via this flag instead of reopening that same v10 ambiguity — if a
+  ClipMatch change is observed with the flag on, isolate this from any
   concurrent backend swap before attributing it.
   `--stage score`'s `--use_wordnet_definitions_clipmatch` is a SEPARATE,
   non-default opt-in that swaps the whole ensemble for a single richer

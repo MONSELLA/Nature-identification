@@ -542,7 +542,7 @@ def phase_score(args):
     flat_texts, offsets = [], []
     for r in records:
         offsets.append(len(flat_texts))
-        flat_texts.extend(clip_metrics.object_texts(r["objects"]))
+        flat_texts.extend(clip_metrics.object_texts(r["objects"], use_inflect=args.use_inflect_for_clipmatch))
     offsets.append(len(flat_texts))  # sentinel end-offset for the last image
     # encode_text([]) itself returns a correctly-shaped zero-row array (see
     # CLIPScorer.encode_text), so this is called unconditionally — NOT gated
@@ -600,7 +600,8 @@ def phase_score(args):
             candidate_templates = clip_metrics.CLIPMATCH_CANDIDATE_TEMPLATES[dataset]
             candidate_embs, candidate_texts = clip_metrics.encode_candidate_vocab_ensemble(
                 cm_scorer, candidate_vocab, candidate_templates,
-                verbose=args.verbose, desc="candidate_vocab")
+                verbose=args.verbose, desc="candidate_vocab",
+                use_inflect=args.use_inflect_for_clipmatch)
         candidate_token_counts, candidate_token_mean, n_candidate_truncated = _clip_token_stats(
             cm_scorer, candidate_texts)
 
@@ -1151,6 +1152,7 @@ def phase_score(args):
                                          if run_clipmatch else None,
             "clipmatch_candidate_text": ("wordnet_definition" if args.use_wordnet_definitions_clipmatch
                                          else f"prompt_ensemble_{dataset}") if run_clipmatch else None,
+            "use_inflect_for_clipmatch": args.use_inflect_for_clipmatch,
         },
         "nature": _binary_metrics(nat_true, nat_pred),
         "biotic_matched": _binary_metrics(bio_true, bio_pred),
@@ -1564,6 +1566,21 @@ def build_arg_parser():
                         "template. Hypothesis (untested until you run it): richer candidate-side "
                         "semantic content aligns better against a VLM's own descriptive image "
                         "summary than a bare noun phrase. Needs the `inflect` package.")
+    p.add_argument("--use_inflect_for_clipmatch", action="store_true",
+                   help="--stage score only: grammar-correct the indefinite article in front of "
+                        "every class/entity name filled into a CLIP template (clip_metrics."
+                        "fill_template), e.g. 'a photo of a apple' -> 'a photo of an apple', "
+                        "'a photo of a cars' -> 'a photo of cars'. Applies to OBJECT_TEMPLATE "
+                        "(extracted-object text, ClipMatch's anchor-object search) AND the "
+                        "80/15-template candidate-vocab ensemble on ImageNet/Places. OFF by "
+                        "default — an inflect-driven determiner was tried project-wide once "
+                        "before, reverted on suspicion of a ClipMatch drop, and that suspicion "
+                        "was never actually isolated from a concurrent CLIP-backend swap at the "
+                        "time (see the recap), so it's an explicit opt-in rather than the default "
+                        "this time, to keep any future comparison unambiguous. Needs the "
+                        "`inflect` package. Has no effect together with "
+                        "--use_wordnet_definitions_clipmatch (that path always inflects its own "
+                        "article regardless, as its own separate pre-existing behavior).")
     p.add_argument("--max_hops", type=int, default=0,
                    help="Maximum WordNet hop distance allowed when mapping an EXTRACTED "
                         "object onto the labeled taxonomy (map_object_to_taxonomy -> "

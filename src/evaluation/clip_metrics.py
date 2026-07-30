@@ -500,9 +500,22 @@ def _is_plural(phrase: str) -> bool:
     return bool(_inflect_engine().singular_noun(words[-1]))
 
 
-def fill_template(template: str, name: str) -> str:
-    """Fill a CLIP prompt template's "{}" slot with `name`, fixing the
-    indefinite article in front of it so the result is grammatical:
+def fill_template(template: str, name: str, use_inflect: bool = False) -> str:
+    """Fill a CLIP prompt template's "{}" slot with `name`.
+
+    `use_inflect=False` (the DEFAULT) is a plain `template.format(name)` — the
+    template's own hardcoded article, whatever it is, goes in as written
+    ("a photo of a apple", "a photo of a cars"). This is deliberately NOT
+    grammar-corrected by default: --use_inflect_for_clipmatch is what opts
+    into that (see below), and the project's own history (recap v10) is that
+    an inflect-driven determiner was tried project-wide once before, reverted
+    on suspicion of hurting ClipMatch, and that suspicion was never actually
+    isolated from a concurrent CLIP-backend swap — so it stays an explicit,
+    labeled opt-in rather than the default this time, to keep any future
+    comparison unambiguous.
+
+    `use_inflect=True` additionally fixes the indefinite article in front of
+    `name` so the result is grammatical:
 
         "a photo of a {}"  + "apple"  -> "a photo of an apple"
         "a photo of a {}"  + "cars"   -> "a photo of cars"
@@ -528,6 +541,9 @@ def fill_template(template: str, name: str) -> str:
          left alone — but it is still dropped for a plural class, since
          "a clean trees" is wrong while "clean trees" is right.
     """
+    if not use_inflect:
+        return template.format(name)
+
     slot = template.find("{}")
     if slot == -1:
         return template.format(name)
@@ -566,11 +582,13 @@ def fill_template(template: str, name: str) -> str:
     return " ".join(kept) + " " + template[slot:].format(name)
 
 
-def object_texts(objects: List[str]) -> List[str]:
+def object_texts(objects: List[str], use_inflect: bool = False) -> List[str]:
     """Per-extracted-object text for Object-CLIPScore / F-CLIPScore's object
     terms and ClipMatch's anchor-object search: the single OBJECT_TEMPLATE
-    (never the 80/15-template ensemble — that is candidate-side only)."""
-    return [fill_template(OBJECT_TEMPLATE, o) for o in objects]
+    (never the 80/15-template ensemble — that is candidate-side only).
+    `use_inflect` — see fill_template — is off by default; pass
+    --use_inflect_for_clipmatch through to enable it."""
+    return [fill_template(OBJECT_TEMPLATE, o, use_inflect=use_inflect) for o in objects]
 
 
 def wordnet_definition_text(synset_id: str) -> str:
@@ -606,7 +624,8 @@ def wordnet_definition_text(synset_id: str) -> str:
     return f"{name_with_article.capitalize()}{alt_names}. It is defined as: {definition}."
 
 
-def candidate_vocab_texts(candidate_vocab: List[dict], use_wordnet_definitions: bool = False) -> List[str]:
+def candidate_vocab_texts(candidate_vocab: List[dict], use_wordnet_definitions: bool = False,
+                          use_inflect: bool = False) -> List[str]:
     """Text for each ClipMatch candidate class: the plain OBJECT_TEMPLATE
     phrase by default, or wordnet_definition_text(synset_id) per class when
     `use_wordnet_definitions` is set (--use_wordnet_definitions_clipmatch).
@@ -616,24 +635,31 @@ def candidate_vocab_texts(candidate_vocab: List[dict], use_wordnet_definitions: 
     fallback for any dataset without an entry in CLIPMATCH_CANDIDATE_TEMPLATES.
     For the default templated path on ImageNet/Places, prefer
     encode_candidate_vocab_ensemble below (mean of 80/15 prompt-template
-    embeddings, not a single text)."""
+    embeddings, not a single text).
+
+    `use_inflect` (see fill_template) only affects the OBJECT_TEMPLATE branch
+    — wordnet_definition_text always inflects its own article regardless,
+    since that's --use_wordnet_definitions_clipmatch's own separate,
+    pre-existing opt-in behavior."""
     if use_wordnet_definitions:
         return [wordnet_definition_text(c["synset_id"]) for c in candidate_vocab]
-    return [fill_template(OBJECT_TEMPLATE, c["class_name"]) for c in candidate_vocab]
+    return [fill_template(OBJECT_TEMPLATE, c["class_name"], use_inflect=use_inflect) for c in candidate_vocab]
 
 
-def candidate_template_texts(candidate_vocab: List[dict], templates: List[str]) -> List[List[str]]:
+def candidate_template_texts(candidate_vocab: List[dict], templates: List[str],
+                             use_inflect: bool = False) -> List[List[str]]:
     """Per-class list of templated texts (one row per candidate class, one
     column per template) — the raw material for encode_candidate_vocab_ensemble.
-    Every fill goes through fill_template, so the article in front of the class
-    name is corrected per template AND per class ("a photo of an airfield",
-    "a photo of badlands")."""
-    return [[fill_template(t, c["class_name"]) for t in templates] for c in candidate_vocab]
+    `use_inflect=True` (see fill_template) corrects the article per template
+    AND per class ("a photo of an airfield", "a photo of badlands"); the
+    default False leaves each template's own hardcoded article as written."""
+    return [[fill_template(t, c["class_name"], use_inflect=use_inflect) for t in templates]
+            for c in candidate_vocab]
 
 
 def encode_candidate_vocab_ensemble(
     scorer, candidate_vocab: List[dict], templates: List[str],
-    verbose: bool = False, desc: str = "candidate_vocab",
+    verbose: bool = False, desc: str = "candidate_vocab", use_inflect: bool = False,
 ) -> Tuple[np.ndarray, List[str]]:
     """Encode each ClipMatch candidate class as the MEAN of its `len(templates)`
     prompt-template embeddings, L2-renormalized afterwards — the OpenAI CLIP
@@ -642,11 +668,15 @@ def encode_candidate_vocab_ensemble(
     (candidate classes are constant across the whole evaluation run, unlike
     the per-image caption/object embeddings) — never recomputed per image.
 
+    `use_inflect` (see fill_template) is off by default — pass
+    --use_inflect_for_clipmatch through to grammar-correct the article in
+    front of every candidate name across all 80/15 templates.
+
     Returns (candidate_embs [n_classes, dim], flat_texts [n_classes *
     len(templates)]) — flat_texts is exposed so callers can still run their
     existing token-length/truncation diagnostics over the actual encoded text.
     """
-    per_class_texts = candidate_template_texts(candidate_vocab, templates)
+    per_class_texts = candidate_template_texts(candidate_vocab, templates, use_inflect=use_inflect)
     flat_texts = [t for row in per_class_texts for t in row]
     flat_embs = scorer.encode_text(flat_texts, verbose=verbose, desc=desc)
     n_templates = len(templates)
