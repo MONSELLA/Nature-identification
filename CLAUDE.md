@@ -62,6 +62,17 @@ evaluating the models.
   nature-related context — neither an explicit priming instruction nor the
   passive definition file. Extraction (the "second look") and both labeling
   calls still receive it as normal.
+- Extraction prompt (`src/models/prompts.py`'s `EXTRACTION_PROMPT`) explicitly
+  asks for the overall SETTING/SCENE/ENVIRONMENT as its own extractable
+  entity, not just discrete objects — needed because this one prompt is
+  shared across ImageNet/COCO (object-centric) AND Places365 (whose candidate
+  classes ARE scenes, e.g. "kitchen") AND BIG-5 (whose nature taxonomy lists
+  "Ecosystems & Environments" as a first-class inclusion category, not just
+  the flora/fauna within them). Without this, extraction only ever lists
+  discrete objects inside a scene, leaving no extracted phrase for ClipMatch's
+  anchor-selection or hP/hR's WordNet resolution to match against a
+  scene-level GT class — same failure mode `SUMMARY_CAPTION_PROMPT` had before
+  its "subject or setting" fix.
 - Context files go in the `system` role, never `user`. Read once at startup,
   not per-call (keeps the string stable for vLLM prefix caching).
 - Taxonomy labeling is a HYBRID, resolved during PHASE-1 INFERENCE (mapping is
