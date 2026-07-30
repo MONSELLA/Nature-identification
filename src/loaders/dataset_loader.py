@@ -174,6 +174,102 @@ def _wnid_to_synset(wnid):
         return None
 
 
+def _imagenet_class_names(wnids) -> dict:
+    """Map each ImageNet WNID to a human-readable class name, DISAMBIGUATING
+    any two WNIDs whose naive name (`synset_name.split('.')[0]`) would
+    otherwise collide — a real, documented ImageNet-1k quirk: n02963159
+    ("cardigan", the sweater, cardigan.n.01) and n02113186 ("Cardigan
+    Welsh corgi", a dog breed, cardigan.n.02) are two ENTIRELY DIFFERENT
+    classes that both stringify to "cardigan" under the naive scheme, as do
+    n02012849 (crane the bird, crane.n.05) and n03126707 (crane the
+    machine, crane.n.04).
+
+    WHY THIS MATTERS: class_name is what actually gets embedded as ClipMatch
+    candidate text ("a photo of a {class_name}"). Two DIFFERENT classes
+    sharing IDENTICAL text produce near-identical CLIP embeddings, so
+    ClipMatch's argmax between them degenerates into noise — a genuinely
+    correct "cardigan" prediction can land on the wrong SENSE's synset and
+    get scored as flat-out wrong, even though the model got the right word.
+    (Observed directly: a caption clearly describing a knitted sweater
+    correctly matched candidate text "cardigan", but the candidate_vocab
+    entry that text ambiguously represented could be EITHER cardigan.n.01
+    OR cardigan.n.02 — same text, so ClipMatch's argmax could land on either.)
+
+    Resolution, tried in order, only for WNIDs that actually collide (a
+    unique naive name is returned unchanged):
+      1. The synset's own LONGEST lemma name (most specific known synonym).
+         Fixes cardigan: cardigan.n.02's lemmas are ['Cardigan',
+         'Cardigan_Welsh_corgi'] — the second is unambiguous on its own.
+      2. If every colliding synset's longest lemma is STILL identical (e.g.
+         crane.n.04 and crane.n.05 both have the single lemma "crane", so
+         step 1 changes nothing), qualify with the synset's own immediate
+         hypernym: "crane, a type of lifting device" vs "crane, a type of
+         wading bird".
+      3. Last resort (should not occur in practice — logged if it does):
+         append the synset id itself so the text is at least distinct, e.g.
+         "crane (crane.n.04)".
+    """
+    from collections import defaultdict
+    from nltk.corpus import wordnet as wn
+
+    synset_of = {}
+    for wnid in wnids:
+        name = _wnid_to_synset(wnid)
+        if name is not None:
+            synset_of[wnid] = name
+
+    def naive_name(synset_name):
+        return synset_name.split(".")[0].replace("_", " ")
+
+    groups = defaultdict(list)
+    for wnid, synset_name in synset_of.items():
+        groups[naive_name(synset_name)].append(wnid)
+
+    result = {}
+    for naive, group_wnids in groups.items():
+        if len(group_wnids) == 1:
+            result[group_wnids[0]] = naive
+            continue
+
+        # Real collision — try the longest-lemma disambiguation per WNID.
+        for wnid in group_wnids:
+            synset = wn.synset(synset_of[wnid])
+            longest = max(synset.lemma_names(), key=len).replace("_", " ")
+            result[wnid] = longest if longest.lower() != naive.lower() else naive
+
+        # If longest-lemma didn't separate everyone (e.g. "crane"/"crane"),
+        # qualify the still-colliding subset with their own hypernym.
+        by_name = defaultdict(list)
+        for wnid in group_wnids:
+            by_name[result[wnid]].append(wnid)
+        for name, tied_wnids in by_name.items():
+            if len(tied_wnids) == 1:
+                continue
+            for wnid in tied_wnids:
+                synset = wn.synset(synset_of[wnid])
+                hypernyms = synset.hypernyms()
+                if hypernyms:
+                    qualifier = hypernyms[0].lemma_names()[0].replace("_", " ")
+                    result[wnid] = f"{name}, a type of {qualifier}"
+
+        # Final fallback: if the hypernym qualifier STILL didn't separate
+        # everyone (essentially never happens), fall back to the raw synset
+        # id so at least the text differs, and say so — silently leaving two
+        # different classes indistinguishable is worse than an ugly name.
+        by_name = defaultdict(list)
+        for wnid in group_wnids:
+            by_name[result[wnid]].append(wnid)
+        for name, tied_wnids in by_name.items():
+            if len(tied_wnids) > 1:
+                for wnid in tied_wnids:
+                    print(f"⚠️  ImageNet class-name collision could not be fully resolved "
+                          f"for {name!r} ({[synset_of[w] for w in tied_wnids]}); "
+                          f"appending the synset id to keep candidate text distinct.")
+                    result[wnid] = f"{name} ({synset_of[wnid]})"
+
+    return result
+
+
 def load_imagenet(data_dir, taxonomy_graph):
     """Load ImageNet: one folder per class (named by WordNet id), one label
     per image (single-label classification)."""
@@ -200,6 +296,13 @@ def load_imagenet(data_dir, taxonomy_graph):
     # Precompute EACH CLASS's taxonomy label just once (rather than doing this
     # lookup again for every single image, which could number in the tens of
     # thousands) — then just look up the pre-computed answer per image below.
+    # class_names is DISAMBIGUATED (see _imagenet_class_names) so classes like
+    # "cardigan" (sweater) and "Cardigan Welsh corgi" (dog breed) — same naive
+    # name, entirely different WordNet synsets — get distinct text instead of
+    # colliding, which matters wherever this class_name feeds a CLIP/VLM
+    # prompt (get_candidate_vocab's matching branch below, and the calibration
+    # eval in evaluate_taxonomy_labeling.py).
+    class_names = _imagenet_class_names(idx_to_wnid.values())
     for idx, wnid in idx_to_wnid.items():
         synset_name = _wnid_to_synset(wnid)
         if synset_name is None:
@@ -207,10 +310,7 @@ def load_imagenet(data_dir, taxonomy_graph):
 
         gt = get_gt_from_graph(synset_name, taxonomy_graph)
         if gt:
-            # e.g. "golden_retriever.n.01" -> "golden retriever" (human-readable,
-            # used later as the text fed to the VLM's classification prompt).
-            class_name = synset_name.split('.')[0].replace('_', ' ')
-            class_to_target[idx] = {"class_name": class_name, **gt}
+            class_to_target[idx] = {"class_name": class_names[wnid], **gt}
 
     results = []
     # `dataset.samples` is torchvision's full list of (file_path, class_index)
@@ -671,6 +771,15 @@ def get_candidate_vocab(dataset_name, taxonomy_graph, **kwargs):
     if dataset_name == "imagenet":
         from torchvision.datasets import ImageFolder
         classes = ImageFolder(kwargs.get("data_dir")).classes  # sorted WNIDs
+        # DISAMBIGUATED class names (see _imagenet_class_names) — without
+        # this, two DIFFERENT ImageNet classes sharing a naive name (e.g.
+        # "cardigan" the sweater vs "Cardigan Welsh corgi" the dog breed,
+        # both -> "cardigan") would get IDENTICAL ClipMatch candidate text
+        # ("a photo of a cardigan" for both entries), making ClipMatch's
+        # argmax between them essentially a coin flip rather than a real
+        # classification, and silently mis-scoring a textually-correct
+        # prediction whenever it lands on the "other" sense's synset.
+        class_names = _imagenet_class_names(classes)
         vocab = []
         seen = set()
         for wnid in classes:
@@ -681,8 +790,7 @@ def get_candidate_vocab(dataset_name, taxonomy_graph, **kwargs):
             if gt is None:
                 continue
             seen.add(synset_name)
-            class_name = synset_name.split('.')[0].replace('_', ' ')
-            vocab.append({"class_name": class_name, "synset_id": synset_name,
+            vocab.append({"class_name": class_names[wnid], "synset_id": synset_name,
                           "gt_nature": gt["gt_nature"], "gt_biotic": gt["gt_biotic"]})
         return vocab
 

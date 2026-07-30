@@ -1,4 +1,4 @@
-BIG-5 VLM PIPELINE — DESIGN RECAP (v16)
+BIG-5 VLM PIPELINE — DESIGN RECAP (v17)
 (v4: the VLM pipeline is now IMPLEMENTED — this doc records both the original
 design rationale AND, in "IMPLEMENTED:" notes, how the shipped code actually
 does it where the two differ. v5: ClipMatch switched to the caption-based
@@ -60,7 +60,17 @@ again via --use_inflect_for_clipmatch, rather than the hard default v15 set
 it to — default fill_template behavior is back to a plain template.format()
 with whatever article the template hardcodes. This is NOT a v10-style
 "suspected it hurt ClipMatch" revert; per Pau it's simply a preference to
-keep it as an explicit, comparable flag. See Section 11.)
+keep it as an explicit, comparable flag. See Section 11. v17: two changes,
+both per Pau — (a) hP/hR/hF1/Wu-Palmer are now ALSO reported split by
+whether the image's own GT is nature or no-nature (summary[
+"hierarchical_by_gt_nature"]/["hierarchical_mapped_by_gt_nature"]), on top
+of the existing pooled macro-average. (b) fixed a real ImageNet class-name
+collision bug: some WNIDs share a naive class name despite being entirely
+different WordNet synsets (cardigan the sweater vs Cardigan Welsh corgi the
+dog breed; crane the bird vs crane the machine), which fed ClipMatch
+IDENTICAL candidate text for genuinely different classes and silently
+mis-scored correct predictions that landed on the "other" sense. See
+Section 8f/11.)
 
 ===============================================================
 0. IMPLEMENTATION STATUS (NEW in v4)
@@ -790,6 +800,57 @@ RESOLVED IN v6 (decided after repeated integration failures):
   clip_metrics.CLIPScorer's class docstring) were PROPOSED as
   replacements here, but neither was actually added to CLIP_PRESETS at
   the time — see RESOLVED IN v8 below for what's actually wired in.
+
+RESOLVED IN v17 (decided per Pau):
+- hP/hR/hF1/Wu-Palmer (Section 8f) are now ALSO reported split by whether
+  the IMAGE'S OWN GT is nature or no-nature, on top of the existing pooled
+  macro-average (summary["hierarchical"]/["hierarchical_mapped"]). New keys
+  summary["hierarchical_by_gt_nature"] / ["hierarchical_mapped_by_gt_nature"],
+  each {"nature": {...}, "no_nature": {...}} with the exact same schema as
+  the pooled dicts (mean, *_std, support, mapping_failure_rate/failures for
+  the "failures as error" view). Accumulated via a single
+  hier_by_gt_nature[gt_nature_val][...] dict keyed by the bool GT value,
+  reusing gt_nature_val (already computed earlier in the per-image loop for
+  the nature-axis scoring) — an image whose GT nature is missing (None) is
+  skipped from the split entirely, not folded into "no_nature". Turned into
+  the reported dicts via a new _hier_bucket_summary() helper shared by both
+  buckets. Printed per-run (both "failures as error" and "mapped only"
+  views, same ± std formatting as the pooled numbers) and logged to W&B as
+  Hierarchical/hF1_GTNature, Hierarchical/hF1_GTNoNature, etc.
+- FIXED a real ImageNet class-name collision bug, found while investigating
+  a "cardigan" prediction that ClipMatch text-matched correctly but still
+  scored as wrong. Root cause: n02963159 ("cardigan", the sweater,
+  cardigan.n.01) and n02113186 ("Cardigan Welsh corgi", a dog breed,
+  cardigan.n.02) are DIFFERENT ImageNet-1k classes whose class_name was
+  built as `synset_name.split('.')[0]` — both strip down to the identical
+  string "cardigan". Since class_name IS the ClipMatch candidate text ("a
+  photo of a {class_name}"), the two DIFFERENT classes got IDENTICAL
+  embeddings, so ClipMatch's argmax between them was noise, not a real
+  choice — a correct "cardigan" prediction landed on cardigan.n.02 half the
+  time even when the image was unambiguously the sweater sense (confirmed:
+  the run's own VLM summary caption described a knitted sweater). The same
+  collision exists for n02012849 "crane" (the bird, crane.n.05) vs
+  n03126707 "crane" (the machine, crane.n.04) — a second, independently
+  well-known ImageNet-1k quirk, confirming this wasn't a one-off.
+  FIX: new dataset_loader._imagenet_class_names(wnids) builds a
+  disambiguated wnid->name map ONCE, used by BOTH load_imagenet (GT target
+  class_name) and get_candidate_vocab's imagenet branch (candidate text) so
+  the two stay consistent with each other. Only WNIDs that actually collide
+  are touched (a unique naive name passes through unchanged). Resolution,
+  tried in order: (1) the synset's own LONGEST lemma name — cardigan.n.02's
+  lemmas are ['Cardigan', 'Cardigan_Welsh_corgi'], and the second alone is
+  unambiguous, so this fixes cardigan outright; (2) if every colliding
+  synset's longest lemma is STILL identical (crane.n.04 and crane.n.05 both
+  have only the single lemma "crane" — step 1 changes nothing), qualify with
+  the synset's own immediate hypernym instead: "crane, a type of wading
+  bird" vs "crane, a type of lifting device"; (3) last-resort fallback
+  (should not trigger in practice) appends the raw synset id and prints a
+  warning, rather than silently leaving two different classes
+  indistinguishable. Verified against both known collisions plus a batch of
+  ordinary non-colliding WNIDs (unchanged). NOTE: this changes candidate
+  class_name TEXT for any WNID that collides — a re-run is needed for it to
+  take effect; old artifacts' candidate_vocab in the header still has the
+  old (colliding) names.
 
 RESOLVED IN v16 (decided per Pau):
 - The v15 inflect-determiner reinstatement is made OPT-IN again, gated

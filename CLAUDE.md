@@ -280,6 +280,33 @@ evaluating the models.
   alternatives. The same diacritic strip is in `_normalize_object`
   (`src/vlm_pipeline.py`) so the MAPPING path doesn't miss "café" either —
   that one is inference-time, so it needs a re-run to take effect.
+  ALSO reported split by whether the IMAGE'S OWN GT is nature or no-nature
+  (`summary["hierarchical_by_gt_nature"]`/`["hierarchical_mapped_by_gt_nature"]`,
+  each `{"nature": {...}, "no_nature": {...}}` with the same keys as the
+  pooled `"hierarchical"`/`"hierarchical_mapped"` dicts) — the one pooled
+  macro-average can hide a model that resolves nature GTs onto a fine-grained
+  WordNet node far better (or worse) than no-nature ones.
+- **ImageNet class-name collisions**: some ImageNet-1k WNIDs share a naive
+  class name (`synset_name.split('.')[0]`) despite being ENTIRELY DIFFERENT
+  WordNet synsets — e.g. n02963159 "cardigan" (the sweater, `cardigan.n.01`)
+  vs n02113186 "Cardigan Welsh corgi" (a dog breed, `cardigan.n.02`); also
+  n02012849 "crane" (the bird, `crane.n.05`) vs n03126707 "crane" (the
+  machine, `crane.n.04`). Since `class_name` is what gets embedded as
+  ClipMatch candidate text, two DIFFERENT classes with IDENTICAL text produce
+  near-identical embeddings, so ClipMatch's argmax between them degenerates
+  into noise — a genuinely correct prediction can land on the wrong sense's
+  synset and get scored as flat-out wrong even though the model named the
+  right thing. `dataset_loader._imagenet_class_names` disambiguates any
+  colliding WNIDs (used by both `load_imagenet` and
+  `get_candidate_vocab`'s imagenet branch, so GT and candidate text always
+  agree): try each colliding synset's own LONGEST lemma name first (fixes
+  cardigan — `cardigan.n.02`'s lemmas are `['Cardigan',
+  'Cardigan_Welsh_corgi']`); if that still collides (e.g. both "crane"
+  senses have only the single lemma "crane"), qualify with the synset's own
+  immediate hypernym instead ("crane, a type of wading bird" vs "crane, a
+  type of lifting device"); a synset-id suffix is the last-resort fallback,
+  logged with a warning if it's ever actually reached. A unique naive name is
+  returned unchanged — this only touches the WNIDs that actually collide.
 - **Labeling parse-failure rate**: reported over the objects the VLM was
   ACTUALLY asked about (`vlm_called`), never over all extracted objects —
   mapped non-nature objects get no labeling call at all, so including them

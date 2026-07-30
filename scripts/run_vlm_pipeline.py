@@ -264,6 +264,31 @@ def _std(vals):
     return float(np.std(vals))
 
 
+def _hier_bucket_summary(bucket):
+    """Turn one hier_by_gt_nature[...] accumulator into the same
+    ("failures as error", "mapped only") pair of dicts as the top-level
+    summary["hierarchical"]/["hierarchical_mapped"] — same keys, same mean +
+    population-std convention, just scoped to this one GT-nature bucket."""
+    failures_as_error = {
+        "hp": _mean(bucket["hp"]), "hr": _mean(bucket["hr"]),
+        "hf1": _mean(bucket["hf1"]), "wup": _mean(bucket["wup"]),
+        "hp_std": _std(bucket["hp"]), "hr_std": _std(bucket["hr"]),
+        "hf1_std": _std(bucket["hf1"]), "wup_std": _std(bucket["wup"]),
+        "support": len(bucket["hf1"]),
+        "mapping_failure_rate": (bucket["mapping_fail"] / len(bucket["hf1"]))
+                                 if bucket["hf1"] else 0.0,
+        "mapping_failures": bucket["mapping_fail"],
+    }
+    mapped_only = {
+        "hp": _mean(bucket["hp_mapped"]), "hr": _mean(bucket["hr_mapped"]),
+        "hf1": _mean(bucket["hf1_mapped"]), "wup": _mean(bucket["wup_mapped"]),
+        "hp_std": _std(bucket["hp_mapped"]), "hr_std": _std(bucket["hr_mapped"]),
+        "hf1_std": _std(bucket["hf1_mapped"]), "wup_std": _std(bucket["wup_mapped"]),
+        "support": len(bucket["hf1_mapped"]),
+    }
+    return failures_as_error, mapped_only
+
+
 def _clip_token_stats(scorer, texts):
     """Per-text CLIP-tokenizer token counts, mean length, and truncated count
     (>= scorer.context_length) for a list of texts under `scorer`'s own
@@ -650,6 +675,22 @@ def phase_score(args):
     hp_vals_mapped, hr_vals_mapped, hf1_vals_mapped = [], [], []
     wup_vals_mapped = []
     n_hier_mapping_fail = 0
+    # Same hierarchical metrics as above, additionally bucketed by whether
+    # the IMAGE'S OWN GT is nature or no-nature (ImageNet/Places only) — a
+    # model can be much better at resolving nature GTs onto a fine-grained
+    # WordNet node than no-nature ones (or vice versa), which the one pooled
+    # macro-average above cannot show. Keyed by the GT nature bool so the
+    # accumulation loop below can do `hier_by_gt_nature[gt_nature_val][...]`
+    # directly; each bucket carries both the "failures as error" and
+    # "mapped only" views, mirroring hp_vals vs hp_vals_mapped above.
+    hier_by_gt_nature = {
+        True: {"hp": [], "hr": [], "hf1": [], "wup": [],
+               "hp_mapped": [], "hr_mapped": [], "hf1_mapped": [], "wup_mapped": [],
+               "mapping_fail": 0},
+        False: {"hp": [], "hr": [], "hf1": [], "wup": [],
+                "hp_mapped": [], "hr_mapped": [], "hf1_mapped": [], "wup_mapped": [],
+                "mapping_fail": 0},
+    }
     n_gt_targets = n_extraction_hits = 0
     n_objects_total = n_parse_fail = n_object_records = 0
     n_map_nature = n_vlm_nature = 0
@@ -866,6 +907,20 @@ def phase_score(args):
                     hp_vals_mapped.append(hier["hp"]); hr_vals_mapped.append(hier["hr"])
                     hf1_vals_mapped.append(hier["hf1"])
                     wup_vals_mapped.append(wup_sim)
+
+                # Same accumulation again, bucketed by this image's GT nature
+                # value — skipped (not just bucketed as False) when GT itself
+                # is missing (gt_nature_val is None), since that's "unknown",
+                # not "no-nature".
+                if gt_nature_val is not None:
+                    bucket = hier_by_gt_nature[gt_nature_val]
+                    bucket["hp"].append(hier["hp"]); bucket["hr"].append(hier["hr"])
+                    bucket["hf1"].append(hier["hf1"]); bucket["wup"].append(wup_sim)
+                    if pred_node is None:
+                        bucket["mapping_fail"] += 1
+                    else:
+                        bucket["hp_mapped"].append(hier["hp"]); bucket["hr_mapped"].append(hier["hr"])
+                        bucket["hf1_mapped"].append(hier["hf1"]); bucket["wup_mapped"].append(wup_sim)
 
         elif dataset in BIG5_DATASETS:
             # --- BIG-5 (holistic image-level annotation) ---
@@ -1251,6 +1306,15 @@ def phase_score(args):
                                           "hp_std": _std(hp_vals_mapped), "hr_std": _std(hr_vals_mapped),
                                           "hf1_std": _std(hf1_vals_mapped), "wup_std": _std(wup_vals_mapped),
                                           "support": len(hf1_vals_mapped)}
+        # Same two views, additionally split by whether THIS IMAGE's own GT is
+        # nature or no-nature — see hier_by_gt_nature's accumulation comment
+        # above for why (one pooled macro-average can hide a model that's
+        # much better at one GT direction than the other).
+        hier_nat, hier_nat_mapped = _hier_bucket_summary(hier_by_gt_nature[True])
+        hier_nonat, hier_nonat_mapped = _hier_bucket_summary(hier_by_gt_nature[False])
+        summary["hierarchical_by_gt_nature"] = {"nature": hier_nat, "no_nature": hier_nonat}
+        summary["hierarchical_mapped_by_gt_nature"] = {"nature": hier_nat_mapped,
+                                                        "no_nature": hier_nonat_mapped}
 
     # Wall-clock time this model took to finish this run, formatted "D-HH:MM:SS"
     # (SLURM-style elapsed time). inference_time_seconds comes from phase_infer's
@@ -1373,6 +1437,16 @@ def _print_summary(s, run_clipmatch):
         print(f"[mapped only, support {hm['support']}]  hP {hm['hp']:.4f}±{hm['hp_std']:.4f} "
               f"| hR {hm['hr']:.4f}±{hm['hr_std']:.4f} | hF1 {hm['hf1']:.4f}±{hm['hf1_std']:.4f} "
               f"| Wu-Palmer {hm['wup']:.4f}±{hm['wup_std']:.4f}")
+        for split_label, key in (("GT=nature", "nature"), ("GT=no-nature", "no_nature")):
+            hn = s["hierarchical_by_gt_nature"][key]
+            hnm = s["hierarchical_mapped_by_gt_nature"][key]
+            print(f"--- Hierarchical [{split_label}] (support {hn['support']}) ---")
+            print(f"  [failures as error]  hP {hn['hp']:.4f}±{hn['hp_std']:.4f} "
+                  f"| hR {hn['hr']:.4f}±{hn['hr_std']:.4f} | hF1 {hn['hf1']:.4f}±{hn['hf1_std']:.4f} "
+                  f"| Wu-Palmer {hn['wup']:.4f}±{hn['wup_std']:.4f}")
+            print(f"  [mapped only, support {hnm['support']}]  hP {hnm['hp']:.4f}±{hnm['hp_std']:.4f} "
+                  f"| hR {hnm['hr']:.4f}±{hnm['hr_std']:.4f} | hF1 {hnm['hf1']:.4f}±{hnm['hf1_std']:.4f} "
+                  f"| Wu-Palmer {hnm['wup']:.4f}±{hnm['wup_std']:.4f}")
     t = s["execution_time"]
     inf_str = t["inference"] if t["inference"] is not None else "n/a"
     print(f"\nExecution time (D-HH:MM:SS): inference {inf_str} | scoring {t['scoring']} | total {t['total']}")
@@ -1427,6 +1501,11 @@ def _log_wandb(args, summary, run_clipmatch):
         log["Hierarchical/hF1_MappedOnly_Std"] = summary["hierarchical_mapped"]["hf1_std"]
         log["Hierarchical/WuPalmer_MappedOnly"] = summary["hierarchical_mapped"]["wup"]
         log["Hierarchical/WuPalmer_MappedOnly_Std"] = summary["hierarchical_mapped"]["wup_std"]
+        for key, wandb_key in (("nature", "GTNature"), ("no_nature", "GTNoNature")):
+            log[f"Hierarchical/hF1_{wandb_key}"] = summary["hierarchical_by_gt_nature"][key]["hf1"]
+            log[f"Hierarchical/WuPalmer_{wandb_key}"] = summary["hierarchical_by_gt_nature"][key]["wup"]
+            log[f"Hierarchical/hF1_{wandb_key}_MappedOnly"] = summary["hierarchical_mapped_by_gt_nature"][key]["hf1"]
+            log[f"Hierarchical/WuPalmer_{wandb_key}_MappedOnly"] = summary["hierarchical_mapped_by_gt_nature"][key]["wup"]
     if summary.get("grounding") is not None:
         log["Grounding/ConfirmationRate"] = summary["grounding"]["confirmation_rate"]
         log["Grounding/NatureEntitiesAttempted"] = summary["grounding"]["nature_entities_attempted"]
