@@ -195,21 +195,44 @@ evaluating the models.
   scoring the raw caption instead (kept as a SECONDARY reported comparison,
   `summary["clipmatch_caption"]`, whenever the summary is primary).
   CANDIDATE text (the GT-class side, not the image-description side) is a
-  SEPARATE, independent choice: `--stage score`'s `--use_wordnet_definitions_clipmatch`
-  swaps the default `OBJECT_TEMPLATE` phrase ("a photo of a golden retriever")
-  for a richer WordNet lemma(s)+gloss prose per class
-  (`clip_metrics.wordnet_definition_text`) — MEASURED (v12): no meaningful
-  ClipMatch top-1 difference vs. the plain template, so the "richer candidate
-  text aligns better" hypothesis is not supported; kept as a non-default flag
-  rather than removed. Needs `inflect` (only for this path — the OBJECT_TEMPLATE
-  default does not use it, see the recap's v10 entry on why). Recorded in
+  SEPARATE, independent choice. DEFAULT (v14): each candidate class's
+  embedding is the MEAN of a fixed prompt-template ensemble for that class,
+  L2-renormalized, computed ONCE per class (constant across the whole run) —
+  `clip_metrics.encode_candidate_vocab_ensemble` /
+  `clip_metrics.CLIPMATCH_CANDIDATE_TEMPLATES`. Two DIFFERENT template sets,
+  never mixed: `OPENAI_TEMPLATES` (the official 80-template ImageNet ensemble
+  from Radford et al. 2021 — object-centric, e.g. "a sculpture of a {}.",
+  "a {} in a video game.") for ImageNet; a smaller 15-template
+  `SCENE_TEMPLATES` for Places365 — the ImageNet set doesn't fit scene classes
+  ("kitchen", "airport terminal"; a "tattoo of a kitchen" is nonsensical), and
+  the original CLIP paper only used 2 bare templates for SUN397 scene
+  recognition, which this deliberately improves on with contextual-anchoring
+  and lighting/quality variants while staying scene-appropriate (no
+  material/medium templates like sculpture/origami/embroidery/tattoo). Per-
+  image extracted objects (Object-CLIPScore, ClipMatch's anchor-object search)
+  still use the single `OBJECT_TEMPLATE` — ensembling 80 embeddings per
+  extracted entity per image was never validated and would be needlessly
+  expensive at 2M-image scale.
+  `--stage score`'s `--use_wordnet_definitions_clipmatch` is a SEPARATE,
+  non-default opt-in that swaps the whole ensemble for a single richer
+  WordNet lemma(s)+gloss prose per class (`clip_metrics.wordnet_definition_text`)
+  — MEASURED (v12, back when the default was the single `OBJECT_TEMPLATE`
+  phrase): no meaningful ClipMatch top-1 difference, so the "richer candidate
+  text aligns better" hypothesis is not supported; kept as a flag rather than
+  removed. Needs `inflect` (only for this path). Recorded in
   `summary["clip_models"]["clipmatch_candidate_text"]`
-  and `summary["clipmatch_candidates"]` (token-length/truncation diagnostic).
+  (`"prompt_ensemble_<dataset>"` or `"wordnet_definition"`) and
+  `summary["clipmatch_candidates"]` (token-length/truncation diagnostic, now
+  over the flat per-template text count — `n_candidate_texts` — not just the
+  class count `n_candidates`).
 - **hP/hR/hF1** (hierarchical precision/recall/F1): ImageNet + Places only. Map
   the ClipMatch-predicted class onto a WordNet node via the extracted-object list
   (`resolve_to_wordnet`: rank objects by CLIP sim to the predicted class,
   Wu-Palmer disambiguation for polysemy), then score ancestral-closure overlap
-  of the GT node vs. the predicted node.
+  of the GT node vs. the predicted node. Reported as mean ± population std
+  (`summary["hierarchical"]`/`["hierarchical_mapped"]`'s `*_std` keys) for hP,
+  hR, hF1, AND Wu-Palmer — the mean alone doesn't say whether per-image scores
+  cluster tightly around it or are widely spread.
 
 ## Axis scoring (nature/biotic/material accuracy) — per dataset
 - **ImageNet/Places (single-label)**: ClipMatch (PRIMARY text's CLIP embedding

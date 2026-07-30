@@ -30,6 +30,88 @@ DEFAULT_CLIPSCORE_SCALE = 2.5
 CLIPMATCH_DATASETS = ("imagenet", "places365")
 LONG_CLIP_REPO_PATH = "/home/pmonserrat/Long-CLIP"
 
+# Official OpenAI CLIP 80 prompt templates for ImageNet (Radford et al., 2021
+# — "Learning Transferable Visual Models From Natural Language Supervision",
+# Appendix A.6 / the repo's notebooks/Prompt_Engineering_for_ImageNet.ipynb).
+# Object-centric ("a photo of a {}", "a sculpture of a {}", ...) — designed
+# for object-recognition classes, NOT scenes. Used ONLY for the ClipMatch
+# CANDIDATE (GT-class) side on ImageNet: each class's embedding is the mean of
+# its 80 templated-text embeddings, L2-renormalized (the paper's "prompt
+# ensembling" recipe) — computed ONCE per class since it's constant across the
+# whole evaluation run. Extracted objects (Object-CLIPScore, per-image, one
+# per entity) still use the single OBJECT_TEMPLATE — encoding 80 embeddings
+# per extracted entity per image would be needlessly expensive and these were
+# never validated for that use case.
+OPENAI_TEMPLATES = [
+    'a bad photo of a {}.', 'a photo of many {}.', 'a sculpture of a {}.',
+    'a photo of the hard to see {}.', 'a low resolution photo of the {}.',
+    'a rendering of a {}.', 'graffiti of a {}.', 'a bad photo of the {}.',
+    'a cropped photo of the {}.', 'a tattoo of a {}.', 'the embroidered {}.',
+    'a photo of a hard to see {}.', 'a bright photo of a {}.', 'a photo of a clean {}.',
+    'a photo of a dirty {}.', 'a dark photo of the {}.', 'a drawing of a {}.',
+    'a photo of my {}.', 'the plastic {}.', 'a photo of the cool {}.',
+    'a close-up photo of a {}.', 'a black and white photo of the {}.',
+    'a painting of the {}.', 'a painting of a {}.', 'a pixelated photo of the {}.',
+    'a sculpture of the {}.', 'a bright photo of the {}.', 'a cropped photo of a {}.',
+    'a plastic {}.', 'a photo of the dirty {}.', 'a jpeg corrupted photo of a {}.',
+    'a blurry photo of the {}.', 'a photo of the {}.', 'a good photo of the {}.',
+    'a rendering of the {}.', 'a {} in a video game.', 'a photo of one {}.',
+    'a doodle of a {}.', 'a close-up photo of the {}.', 'a photo of a {}.',
+    'the origami {}.', 'the {} in a video game.', 'a sketch of a {}.',
+    'a doodle of the {}.', 'a origami {}.', 'a low resolution photo of a {}.',
+    'the toy {}.', 'a rendition of the {}.', 'a photo of the clean {}.',
+    'a photo of a large {}.', 'a rendition of a {}.', 'a photo of a nice {}.',
+    'a photo of a weird {}.', 'a blurry photo of a {}.', 'a cartoon {}.',
+    'art of a {}.', 'a sketch of the {}.', 'a embroidered {}.',
+    'a pixelated photo of a {}.', 'itap of the {}.', 'a jpeg corrupted photo of the {}.',
+    'a good photo of a {}.', 'a plushie {}.', 'a photo of the nice {}.',
+    'a photo of the small {}.', 'a photo of the weird {}.', 'the cartoon {}.',
+    'art of the {}.', 'a drawing of the {}.', 'a photo of the large {}.',
+    'a black and white photo of a {}.', 'the plushie {}.', 'a dark photo of a {}.',
+    'itap of a {}.', 'graffiti of the {}.', 'a toy {}.', 'itap of my {}.',
+    'a photo of a cool {}.', 'a photo of a small {}.', 'a tattoo of the {}.',
+]
+
+# Scene-recognition prompt ensemble for Places365's ClipMatch candidate side
+# (per Pau). Original CLIP used only 2 bare templates for SUN397 scene
+# recognition; OPENAI_TEMPLATES above is object-centric (tattoos, origami,
+# video-game renders, plushies, ...) and doesn't fit scene classes ("kitchen",
+# "airport terminal") — a "tattoo of a kitchen" or "the plushie kitchen" is
+# nonsensical, so the ImageNet set is not reused here. Kept deliberately
+# smaller than the 80-template ImageNet set: scenes don't have the same
+# medium/material variety (no sculptures, embroidery, origami, tattoos), so
+# most ImageNet templates have no scene-recognition analogue in the first
+# place — this list only keeps variations that plausibly still describe a
+# PLACE (contextual anchoring + camera-quality/lighting variation).
+SCENE_TEMPLATES = [
+    # Base structural
+    "a photo of a {}.",
+    "a photo of the {}.",
+    "a scene of a {}.",
+    "a view of the {}.",
+    "a scenery of the {}.",
+    # Contextual anchoring
+    "a photo of a {}, a type of place.",
+    "a photo of the {}, a place.",
+    "a photo taken in a {}.",
+    "a scene taken in a {}.",
+    # Quality & lighting variations (safe for scenes)
+    "a bad photo of a {}.",
+    "a good photo of a {}.",
+    "a black and white photo of a {}.",
+    "a blurry photo of a {}.",
+    "a low contrast photo of a {}.",
+    "a high contrast photo of a {}.",
+]
+
+# ClipMatch candidate-side prompt ensemble, per dataset (see OPENAI_TEMPLATES/
+# SCENE_TEMPLATES above). Only imagenet/places365 run ClipMatch at all
+# (CLIPMATCH_DATASETS), so only those two need an entry.
+CLIPMATCH_CANDIDATE_TEMPLATES = {
+    "imagenet": OPENAI_TEMPLATES,
+    "places365": SCENE_TEMPLATES,
+}
+
 # =============================================================================
 # CLIP model wrapper (HuggingFace Native OR Local Pure-PyTorch)
 # =============================================================================
@@ -419,7 +501,46 @@ def wordnet_definition_text(synset_id: str) -> str:
 def candidate_vocab_texts(candidate_vocab: List[dict], use_wordnet_definitions: bool = False) -> List[str]:
     """Text for each ClipMatch candidate class: the plain OBJECT_TEMPLATE
     phrase by default, or wordnet_definition_text(synset_id) per class when
-    `use_wordnet_definitions` is set (--use_wordnet_definitions_clipmatch)."""
+    `use_wordnet_definitions` is set (--use_wordnet_definitions_clipmatch).
+
+    Single text per class — used for the WordNet-definition variant (a
+    template ensemble doesn't apply to prose) and as the one-template
+    fallback for any dataset without an entry in CLIPMATCH_CANDIDATE_TEMPLATES.
+    For the default templated path on ImageNet/Places, prefer
+    encode_candidate_vocab_ensemble below (mean of 80/15 prompt-template
+    embeddings, not a single text)."""
     if use_wordnet_definitions:
         return [wordnet_definition_text(c["synset_id"]) for c in candidate_vocab]
     return [OBJECT_TEMPLATE.format(c["class_name"]) for c in candidate_vocab]
+
+
+def candidate_template_texts(candidate_vocab: List[dict], templates: List[str]) -> List[List[str]]:
+    """Per-class list of templated texts (one row per candidate class, one
+    column per template) — the raw material for encode_candidate_vocab_ensemble."""
+    return [[t.format(c["class_name"]) for t in templates] for c in candidate_vocab]
+
+
+def encode_candidate_vocab_ensemble(
+    scorer, candidate_vocab: List[dict], templates: List[str],
+    verbose: bool = False, desc: str = "candidate_vocab",
+) -> Tuple[np.ndarray, List[str]]:
+    """Encode each ClipMatch candidate class as the MEAN of its `len(templates)`
+    prompt-template embeddings, L2-renormalized afterwards — the OpenAI CLIP
+    "prompt ensembling" recipe (Radford et al., 2021, and the zero-shot
+    notebooks distributed with it). One embedding per class, computed ONCE
+    (candidate classes are constant across the whole evaluation run, unlike
+    the per-image caption/object embeddings) — never recomputed per image.
+
+    Returns (candidate_embs [n_classes, dim], flat_texts [n_classes *
+    len(templates)]) — flat_texts is exposed so callers can still run their
+    existing token-length/truncation diagnostics over the actual encoded text.
+    """
+    per_class_texts = candidate_template_texts(candidate_vocab, templates)
+    flat_texts = [t for row in per_class_texts for t in row]
+    flat_embs = scorer.encode_text(flat_texts, verbose=verbose, desc=desc)
+    n_templates = len(templates)
+    embs = flat_embs.reshape(len(candidate_vocab), n_templates, -1).mean(axis=1)
+    norms = np.linalg.norm(embs, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    embs = (embs / norms).astype(np.float32)
+    return embs, flat_texts

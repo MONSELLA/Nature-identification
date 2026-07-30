@@ -102,6 +102,8 @@ import sys
 import time
 from pathlib import Path
 
+import numpy as np
+
 # The HF "You are sending unauthenticated requests to the HF Hub" notice is
 # emitted by huggingface_hub at WARNING level; hide it unless a token is truly
 # needed. (Setting HF_TOKEN is the real fix and also lifts rate limits.)
@@ -247,6 +249,18 @@ def _mean(vals):
     rather than counted as zero). Returns 0.0 for an empty/all-None list."""
     vals = [v for v in vals if v is not None]
     return float(sum(vals) / len(vals)) if vals else 0.0
+
+
+def _std(vals):
+    """Population standard deviation of a list (None entries dropped, same
+    convention as _mean) — reported alongside the hierarchical metrics' means
+    (hP/hR/hF1/Wu-Palmer) so a mean alone doesn't hide whether per-image scores
+    cluster tightly around it or are spread widely. Returns 0.0 for a list with
+    fewer than 2 values (nothing to measure spread over)."""
+    vals = [v for v in vals if v is not None]
+    if len(vals) < 2:
+        return 0.0
+    return float(np.std(vals))
 
 
 def _clip_token_stats(scorer, texts):
@@ -560,11 +574,20 @@ def phase_score(args):
         # (clip_metrics.wordnet_definition_text) — untested hypothesis (per
         # Pau) that giving the CANDIDATE side more semantic content aligns
         # better against a VLM's own descriptive image summary in CLIP's text
-        # embedding space than a bare templated noun phrase.
-        candidate_texts = clip_metrics.candidate_vocab_texts(
-            candidate_vocab, use_wordnet_definitions=args.use_wordnet_definitions_clipmatch)
-        candidate_embs = cm_scorer.encode_text(
-            candidate_texts, verbose=args.verbose, desc="candidate_vocab")
+        # embedding space than a bare templated noun phrase. Otherwise, the
+        # candidate side is the OpenAI CLIP prompt-ensemble mean (80
+        # ImageNet-object templates / 15 Places-scene templates — see
+        # clip_metrics.CLIPMATCH_CANDIDATE_TEMPLATES), computed once per class
+        # since the candidate vocab is fixed for the whole run.
+        if args.use_wordnet_definitions_clipmatch:
+            candidate_texts = clip_metrics.candidate_vocab_texts(candidate_vocab, use_wordnet_definitions=True)
+            candidate_embs = cm_scorer.encode_text(
+                candidate_texts, verbose=args.verbose, desc="candidate_vocab")
+        else:
+            candidate_templates = clip_metrics.CLIPMATCH_CANDIDATE_TEMPLATES[dataset]
+            candidate_embs, candidate_texts = clip_metrics.encode_candidate_vocab_ensemble(
+                cm_scorer, candidate_vocab, candidate_templates,
+                verbose=args.verbose, desc="candidate_vocab")
         candidate_token_counts, candidate_token_mean, n_candidate_truncated = _clip_token_stats(
             cm_scorer, candidate_texts)
 
@@ -1097,7 +1120,7 @@ def phase_score(args):
             "clipmatch_primary_source": ("summary_caption" if run_summary_clipmatch else "caption")
                                          if run_clipmatch else None,
             "clipmatch_candidate_text": ("wordnet_definition" if args.use_wordnet_definitions_clipmatch
-                                         else "object_template") if run_clipmatch else None,
+                                         else f"prompt_ensemble_{dataset}") if run_clipmatch else None,
         },
         "nature": _binary_metrics(nat_true, nat_pred),
         "biotic_matched": _binary_metrics(bio_true, bio_pred),
@@ -1177,17 +1200,22 @@ def phase_score(args):
         else:
             summary["clipmatch_caption"] = None
         # Candidate-vocab text diagnostic: token stats for whichever text was
-        # used to build candidate_embs (plain OBJECT_TEMPLATE by default, or
-        # WordNet-definition prose under --use_wordnet_definitions_clipmatch —
-        # see clip_models.clipmatch_candidate_text above). Definitions can run
-        # much longer than a templated noun phrase, so this is worth watching
-        # for truncation even though candidate_vocab is usually short overall.
+        # used to build candidate_embs (the 80/15-template prompt ensemble per
+        # class by default, or WordNet-definition prose under
+        # --use_wordnet_definitions_clipmatch — see
+        # clip_models.clipmatch_candidate_text above). candidate_texts is the
+        # FLAT list actually encoded (n_candidates * n_templates under the
+        # ensemble path, just n_candidates under wordnet-definitions), so the
+        # truncation rate is reported over that same flat count, not the class
+        # count, while n_candidates itself still reports the class count.
         n_candidates = len(candidate_vocab)
+        n_candidate_texts = len(candidate_texts)
         summary["clipmatch_candidates"] = {
             "n_candidates": n_candidates,
+            "n_candidate_texts": n_candidate_texts,
             "mean_token_length": candidate_token_mean,
-            "truncation_rate": (n_candidate_truncated / n_candidates)
-                                if (n_candidate_truncated is not None and n_candidates) else None,
+            "truncation_rate": (n_candidate_truncated / n_candidate_texts)
+                                if (n_candidate_truncated is not None and n_candidate_texts) else None,
             "truncated_count": n_candidate_truncated,
             "context_length": cm_scorer.context_length,
         }
@@ -1199,12 +1227,16 @@ def phase_score(args):
         # images where the predicted object could not be mapped at all.
         summary["hierarchical"] = {"hp": _mean(hp_vals), "hr": _mean(hr_vals),
                                    "hf1": _mean(hf1_vals), "wup": _mean(wup_vals),
+                                   "hp_std": _std(hp_vals), "hr_std": _std(hr_vals),
+                                   "hf1_std": _std(hf1_vals), "wup_std": _std(wup_vals),
                                    "support": len(hf1_vals),
                                    "mapping_failure_rate": (n_hier_mapping_fail / len(hf1_vals))
                                                            if hf1_vals else 0.0,
                                    "mapping_failures": n_hier_mapping_fail}
         summary["hierarchical_mapped"] = {"hp": _mean(hp_vals_mapped), "hr": _mean(hr_vals_mapped),
                                           "hf1": _mean(hf1_vals_mapped), "wup": _mean(wup_vals_mapped),
+                                          "hp_std": _std(hp_vals_mapped), "hr_std": _std(hr_vals_mapped),
+                                          "hf1_std": _std(hf1_vals_mapped), "wup_std": _std(wup_vals_mapped),
                                           "support": len(hf1_vals_mapped)}
 
     # Wall-clock time this model took to finish this run, formatted "D-HH:MM:SS"
@@ -1320,15 +1352,17 @@ def _print_summary(s, run_clipmatch):
         print(f"\n--- ClipMatch candidate vocab [{s['clip_models']['clipmatch_candidate_text']}] "
               f"({cv['n_candidates']} classes) ---")
         print(f"Mean token length: {cv_mean_tok_str} | Truncation rate (>= {cv['context_length']} tok): "
-              f"{cv_trunc_str} ({cv['truncated_count'] if cv['truncated_count'] is not None else 'n/a'}/{cv['n_candidates']})")
+              f"{cv_trunc_str} ({cv['truncated_count'] if cv['truncated_count'] is not None else 'n/a'}/{cv['n_candidate_texts']})")
         h = s["hierarchical"]
         hm = s["hierarchical_mapped"]
         print(f"--- Hierarchical (support {h['support']}) ---")
-        print(f"[failures as error]  hP {h['hp']:.4f} | hR {h['hr']:.4f} | hF1 {h['hf1']:.4f} | Wu-Palmer {h['wup']:.4f}")
+        print(f"[failures as error]  hP {h['hp']:.4f}±{h['hp_std']:.4f} | hR {h['hr']:.4f}±{h['hr_std']:.4f} "
+              f"| hF1 {h['hf1']:.4f}±{h['hf1_std']:.4f} | Wu-Palmer {h['wup']:.4f}±{h['wup_std']:.4f}")
         print(f"WordNet mapping-failure rate: {h['mapping_failure_rate']:.1%} "
               f"({h['mapping_failures']}/{h['support']})")
-        print(f"[mapped only, support {hm['support']}]  hP {hm['hp']:.4f} | hR {hm['hr']:.4f} "
-              f"| hF1 {hm['hf1']:.4f} | Wu-Palmer {hm['wup']:.4f}")
+        print(f"[mapped only, support {hm['support']}]  hP {hm['hp']:.4f}±{hm['hp_std']:.4f} "
+              f"| hR {hm['hr']:.4f}±{hm['hr_std']:.4f} | hF1 {hm['hf1']:.4f}±{hm['hf1_std']:.4f} "
+              f"| Wu-Palmer {hm['wup']:.4f}±{hm['wup_std']:.4f}")
     t = s["execution_time"]
     inf_str = t["inference"] if t["inference"] is not None else "n/a"
     print(f"\nExecution time (D-HH:MM:SS): inference {inf_str} | scoring {t['scoring']} | total {t['total']}")
@@ -1378,10 +1412,14 @@ def _log_wandb(args, summary, run_clipmatch):
         if cv["truncation_rate"] is not None:
             log["ClipMatch_Candidates/TruncationRate"] = cv["truncation_rate"]
         log["Hierarchical/hF1"] = summary["hierarchical"]["hf1"]
+        log["Hierarchical/hF1_Std"] = summary["hierarchical"]["hf1_std"]
         log["Hierarchical/WuPalmer"] = summary["hierarchical"]["wup"]
+        log["Hierarchical/WuPalmer_Std"] = summary["hierarchical"]["wup_std"]
         log["Hierarchical/MappingFailureRate"] = summary["hierarchical"]["mapping_failure_rate"]
         log["Hierarchical/hF1_MappedOnly"] = summary["hierarchical_mapped"]["hf1"]
+        log["Hierarchical/hF1_MappedOnly_Std"] = summary["hierarchical_mapped"]["hf1_std"]
         log["Hierarchical/WuPalmer_MappedOnly"] = summary["hierarchical_mapped"]["wup"]
+        log["Hierarchical/WuPalmer_MappedOnly_Std"] = summary["hierarchical_mapped"]["wup_std"]
     if summary.get("grounding") is not None:
         log["Grounding/ConfirmationRate"] = summary["grounding"]["confirmation_rate"]
         log["Grounding/NatureEntitiesAttempted"] = summary["grounding"]["nature_entities_attempted"]
