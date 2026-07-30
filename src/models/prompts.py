@@ -94,8 +94,7 @@ SUMMARY_CAPTION_PROMPT_IMAGENET = (
     "Here is a detailed description of this image:\n\n"
     "\"{caption}\"\n\n"
     "Using both the image and this description, write a short summary (at most 30 words) "
-    "capturing the key objects and prominent entities in the scene, "
-    "along with their identifying details. "
+    "capturing the key objects in the scene. "
     "Output ONLY the summary text."
 )
 
@@ -153,9 +152,9 @@ EXTRACTION_PROMPT = """You are an expert computer vision annotator. Below is a b
 Your task is to extract visual entities from the image, keeping the total to a maximum of 12 items to avoid noise.
 
 RULES:
- - Macro Elements (Objective): Extract the overarching scene (e.g., forest, office, restaurant, garden), amorphous elements (e.g., sky, grass, ocean, road), and salient objects (e.g., dog, desk, guitar) objectively.
- - Micro Elements (Nature-Filtered): For tiny details, non-salient items, background objects, or depicted entities (e.g., stars in a night sky, a small orange, a little dog figurine, or a flower printed on a dress), ONLY extract them if they represent nature according to your system instructions. Ignore all other minor details.
- - Use the 'reasoning' field to explicitly state your two-step plan: list the macro elements, then identify any valid nature-related micro elements.
+ - Macro Elements (Objective): Extract the countable Things (salient objects like dog, guitar, desk, tree), uncountable Stuff (amorphous regions like sky, grass, ocean, sand, road), and the overarching Scene (settings like forest, office, restaurant), objectively.
+ - Micro Elements (Nature-Filtered): For tiny details, non-salient items, background objects, or depicted entities (e.g., a distant cat in the background, a little dog figurine, or a flower printed on a dress), ONLY extract them if they represent nature according to your system instructions. Ignore all other minor details.
+ - Use the 'reasoning' field to explicitly state your two-step plan: list the macro elements (things, stuff, and scenes), then identify any valid nature-related micro elements.
  - Format all extracted entities as concise, singular nouns or compound nouns.
  - Place all chosen entities into the single 'objects' list.
  - Do not hallucinate entities not visually present.
@@ -163,29 +162,29 @@ RULES:
 EXAMPLE 1 (Mixed Environment):
 Image: A person sitting in an indoor office chair at a desk with a laptop. On the desk is a little dog figurine and an orange. The person is wearing a shirt with a geometric triangle pattern. In the background, there is a potted plant near a window.
 {{
-  "reasoning": "Step 1: The macro elements are the office, desk, chair, person, window, and laptop. Step 2: For micro elements, the little dog figurine, the orange, and the potted plant represent nature, so they will be extracted. I will ignore the geometric pattern on the shirt as it is a non-nature detail.",
-  "objects": ["office", "desk", "chair", "person", "window", "laptop", "dog figurine", "orange", "potted plant"]
+  "reasoning": "Step 1: Macro elements include things (desk, chair, person, laptop, window), and the scene (office). Step 2: For micro elements, the little dog figurine, the orange, and the potted plant represent nature, so they will be extracted. I will ignore the geometric pattern on the shirt as it is a non-nature detail.",
+  "objects": ["desk", "chair", "person", "laptop", "window", "office", "dog figurine", "orange", "potted plant"]
 }}
 
 EXAMPLE 2 (Pure Nature Space):
 Image: A sunny beach with crashing ocean waves and sand. A surfer carrying a surfboard with a bird logo walks near the water. A small crab is resting on the sand.
 {{
-  "reasoning": "Step 1: The macro elements are the beach, ocean, sand, surfer, and surfboard. Step 2: For micro elements, the small crab and the bird logo represents nature and will be extracted.",
-  "objects": ["beach", "ocean", "sand", "surfer", "surfboard", "crab", "bird logo"]
+  "reasoning": "Step 1: Macro elements include things (surfer, surfboard), stuff (ocean, sand), and the scene (beach). Step 2: For micro elements, the small crab and the bird logo represents nature and will be extracted.",
+  "objects": ["surfer", "surfboard", "ocean", "sand", "beach", "crab", "bird logo"]
 }}
 
 EXAMPLE 3 (Pure No-nature Space):
 Image: A photograph of a brightly lit convenience store in an urban city. Shelves are stocked with snacks and soda bottles. A cashier stands behind the counter.
 {{
-  "reasoning": "Step 1: The macro elements are the store, city, shelf, cashier, and counter. Step 2: For micro elements, there are junk food snacks and soda bottles, but since none of these represent nature, they will be ignored. I will only extract the macro items.",
-  "objects": ["store", "city", "shelf", "cashier", "counter"]
+  "reasoning": "Step 1: Macro elements include things (shelf, cashier, counter) and the scene (store, city). Step 2: For micro elements, there are junk food snacks and soda bottles, but since none of these represent nature, they will be ignored. I will only extract the macro items.",
+  "objects": ["shelf", "cashier", "counter", "store", "city"]
 }}
 
 EXAMPLE 4 (Social Media Text & Depiction):
 Image: A messy indoor bedroom with a desk, a chair and a bed. A person wearing a shirt with a flower print is taking a selfie in the mirror. A teddy bear is laying on the bed. Overlaid on the image is a text banner that says "Save the trees!".
 {{
-  "reasoning": "Step 1: The macro elements are the bedroom, person, mirror, desk, and bed. Step 2: For micro elements, the 'flower' print on the shirt, the 'teddy bear' (depicting an animal), and the word 'trees' from the text overlay all represent nature-related concepts and will be extracted. The rest of the messy room clutter will be ignored.",
-  "objects": ["bedroom", "person", "mirror", "desk", "chair", "bed", "flower", "teddy bear", "tree"]
+  "reasoning": "Step 1: Macro elements include things (person, mirror, desk, chair, bed) and the scene (bedroom). Step 2: For micro elements, the 'flower' print on the shirt, the 'teddy bear' (depicting an animal), and the word 'trees' from the text overlay all represent nature-related concepts and will be extracted. The rest of the messy room clutter will be ignored.",
+  "objects": ["person", "mirror", "desk", "chair", "bed", "bedroom", "flower", "teddy bear", "tree"]
 }}"""
 
 class ObjectExtractionResponse(BaseModel):
@@ -194,10 +193,10 @@ class ObjectExtractionResponse(BaseModel):
     reasoning: str = Field(
         description=(
             "Briefly analyze the image using a two-step process. First, identify the macro elements "
-            "(scene, amorphous stuff, salient objects) objectively. Second, scan for micro elements "
-            "(tiny details, non-salient items, depictions). ONLY extract these micro elements if they "
-            "represent nature according to the system definition. Ignore all other minor details. "
-            "Keep the final list to a maximum of 12 items."
+            "(countable things/objects, uncountable amorphous stuff, and overarching scenes) objectively. "
+            "Second, scan for micro elements (tiny details, non-salient items, depictions). "
+            "ONLY extract these micro elements if they represent nature according to the system definition. "
+            "Ignore all other minor details. Keep the final list to a maximum of 12 items."
         )
     )
     objects: List[str] = Field(
