@@ -531,6 +531,17 @@ def load_big5(sources):
         # int/float parsing quirks and keeps leading characters intact.
         gt = pd.read_csv(gt_csv, dtype={"platform_id": str})
         n_slots = _big5_slot_count(gt.columns)
+        if n_slots == 0:
+            # No nature_visual_<idx> column matched at all — this CSV's schema
+            # doesn't look like a BIG-5 majority-vote GT file. Every row will
+            # contribute zero images below with no further signal, so raise
+            # here instead of silently returning nothing for this source.
+            raise ValueError(
+                f"BIG-5 source {label!r} ({gt_csv}): no 'nature_visual_<idx>' columns found "
+                f"— got columns {list(gt.columns)[:10]}{'...' if len(gt.columns) > 10 else ''}. "
+                f"Is this the right CSV / has its schema changed?"
+            )
+        n_annotated = n_matched = 0
 
         for _, row in gt.iterrows():
             platform_id = row.get("platform_id")
@@ -549,6 +560,8 @@ def load_big5(sources):
             for idx in range(min(n_slots, n_images)):
                 nat = map_yn(row.get(f'nature_visual_{idx}'))
                 if nat is None: continue
+
+                n_annotated += 1
 
                 mat_vals = map_mat(row.get(f'nep_materiality_visual_{idx}'))
                 bio_vals = map_bio(row.get(f'nep_biological_visual_{idx}'))
@@ -570,6 +583,7 @@ def load_big5(sources):
                 if not matches:
                     continue
                 local_path = matches[0]
+                n_matched += 1
 
                 results.append({
                     "image_path": local_path,
@@ -588,6 +602,22 @@ def load_big5(sources):
                         "gt_material": [v == 1 for v in mat_vals] or None,
                     }]
                 })
+
+        # An annotated CSV that matched ZERO images is almost always a wrong
+        # --big_5_twitter_images_dir/--big_5_weibo_images_dir, not a genuinely
+        # empty dataset — silently returning nothing here is what produces the
+        # unhelpful "No dataset instances loaded" a few frames up the stack.
+        # Surface the actual images_dir that was searched so it's a one-line
+        # fix instead of a debugging session.
+        if n_annotated and not n_matched:
+            print(f"⚠️  BIG-5 source {label!r}: {n_annotated} annotated image slots in "
+                  f"{gt_csv}, but NONE matched a file under images_dir={images_dir!r} "
+                  f"(pattern: '<platform_id>_<idx>.*'). Check that this path is correct "
+                  f"and that it directly contains the image files (not a parent folder).")
+        elif n_annotated and n_matched < n_annotated:
+            print(f"⚠️  BIG-5 source {label!r}: only {n_matched}/{n_annotated} annotated "
+                  f"image slots matched a file under images_dir={images_dir!r} — some images "
+                  f"may be missing from disk.")
     return results
 
 # ============================================================================
