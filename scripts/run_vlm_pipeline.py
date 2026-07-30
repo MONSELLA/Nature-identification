@@ -965,6 +965,14 @@ def phase_score(args):
                 "material": fin["final_material"],
                 "nature_source": fin["nature_source"], "biotic_source": fin["biotic_source"],
                 "parse_failed": lab.get("parse_failed"),
+                # Stage-3 labeling justification (TaxonomyResponse's combined
+                # nature_reasoning+sub_axes_reasoning, or MaterialResponse's own
+                # reasoning) and whether this object even got its own VLM call
+                # at all (False = mapped non-nature, skipped the VLM entirely —
+                # see label_objects_batch) — both already stored in the .jsonl
+                # artifact's object_labels, previously not surfaced here.
+                "reasoning": lab.get("reasoning"),
+                "vlm_called": lab.get("vlm_called"),
             }
             for obj, lab, fin in zip(objs, rec["object_labels"], finals)
         ])
@@ -1011,6 +1019,7 @@ def phase_score(args):
             "dataset": dataset,
             "model": header.get("model"),
             "caption": rec["caption"],
+            "extraction_reasoning": rec.get("extraction_reasoning"),
             "objects": objects_json,
             "gt_targets": gt_targets_json,
             "n_objects": len(objs),

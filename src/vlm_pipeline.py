@@ -237,9 +237,17 @@ def extract_objects_batch(
     system_prompt: Optional[str],
     max_new_tokens: int = 256,
     temperature: float = 0.0,
-) -> List[List[str]]:
+) -> List[Dict[str, Any]]:
     """Ask the VLM to list every object in each image, using the Stage-1
-    caption as extra context alongside a fresh look at the image itself."""
+    caption as extra context alongside a fresh look at the image itself.
+
+    Returns one {"objects": [...], "reasoning": str | None} dict per image —
+    "reasoning" is EXTRACTION_PROMPT's own optional chain-of-thought field
+    (ObjectExtractionResponse may or may not define one, depending on the
+    current prompt/schema), captured here so it can be stored in the artifact
+    for auditing/qualitative review rather than silently discarded. None
+    when the schema has no such field, or on a parse failure.
+    """
     # Fill in each image's own caption into the shared EXTRACTION_PROMPT
     # template (see src/models/prompts.py) — so each per-image prompt is
     # slightly different this time, referencing that image's own description.
@@ -256,12 +264,13 @@ def extract_objects_batch(
         if isinstance(o, dict):
             # Successful structured output: pull out the "objects" list (or
             # an empty list if that key is somehow missing) and clean it up.
-            results.append(normalize_objects(o.get("objects", [])))
+            results.append({"objects": normalize_objects(o.get("objects", [])),
+                             "reasoning": o.get("reasoning")})
         else:  # parse failure / None
             # The model's output didn't parse into valid JSON matching our
             # schema — treat this image as having zero extracted objects
             # rather than crashing the whole batch.
-            results.append([])
+            results.append({"objects": [], "reasoning": None})
     return results
 
 
@@ -429,6 +438,9 @@ def run_inference(
           "object_labels": [ {reasoning,nature,biotic,material,parse_failed,vlm_called}, ... ],
           "object_finals": [ resolve_hybrid_label(...) dicts, ... ],
           "clipmatch_summary_caption": str | None,  # only when summarize_for_clipmatch
+          "extraction_reasoning": str | None,  # EXTRACTION_PROMPT's own chain-of-thought
+                                               # field, when its schema defines one; None
+                                               # otherwise or on a parse failure.
         }
 
     `extraction_max_new_tokens` sets Stage 2's own token budget, independent
@@ -529,10 +541,12 @@ def run_inference(
         if verbose:
             print(f"[infer] batch {b + 1}/{num_batches}: extract_objects_batch "
                   f"(structured, ObjectExtractionResponse)...", flush=True)
-        objects_per_image = extract_objects_batch(
+        extraction_results = extract_objects_batch(
             vlm, image_paths, captions, extraction_system_prompt,
             max_new_tokens=resolved_extraction_max_new_tokens, temperature=temperature,
         )
+        objects_per_image = [r["objects"] for r in extraction_results]
+        extraction_reasoning_per_image = [r["reasoning"] for r in extraction_results]
 
         # ImageNet/Places DEFAULT: compress this image's own caption into a
         # short ClipMatch-friendly summary. summary_captions[i] is None for
@@ -579,8 +593,9 @@ def run_inference(
         # GT `targets`), caption, extracted objects, per-object mappings, and
         # per-object raw labels, all aligned by position. Resolve the final
         # hybrid label per object (reusing the precomputed mapping) and yield.
-        for inst, cap, objs, maps, labels, summ in zip(
-            chunk, captions, objects_per_image, mappings_per_image, labels_per_image, summary_captions
+        for inst, cap, objs, maps, labels, summ, extr_reasoning in zip(
+            chunk, captions, objects_per_image, mappings_per_image, labels_per_image,
+            summary_captions, extraction_reasoning_per_image
         ):
             finals = [
                 resolve_hybrid_label(obj, lab, tax_graph, mapping=mp)
@@ -594,6 +609,7 @@ def run_inference(
                 "object_labels": labels,
                 "object_finals": finals,
                 "clipmatch_summary_caption": summ,
+                "extraction_reasoning": extr_reasoning,
             }
 
         if verbose:

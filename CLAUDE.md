@@ -30,6 +30,23 @@ evaluating the models.
   is likewise not part of the shipped pipeline (FG-CLIP2 was abandoned as a CLIP
   backend — see clip_metrics.CLIP_PRESETS's comment).
 
+## Two output files — distinct purposes, do not conflate
+- **`.jsonl` artifact** (`vlm_responses_<model>.jsonl`, enriched in place by
+  grounding): the RAW PREDICTION RECORD, model-facing. Everything either
+  pipeline actually predicted — caption, extracted objects, per-object
+  labels + reasoning, hybrid finals, ClipMatch summary caption, SAM3
+  groundings + relevance scores — lives here, complete and unflattened, so
+  it can feed metrics not yet invented. Nothing here is a computed metric.
+- **predictions `.csv`** (written by `--stage score`, one row per image):
+  the QUALITATIVE-REVIEW file — everything from the `.jsonl` PLUS every
+  per-image metric/diagnostic computed at scoring time, flattened into one
+  browsable row. The goal is that this file alone is sufficient for
+  spot-checking a run — nothing in the `.jsonl` should require going back
+  to it. When adding a new prediction field (raw model output) or a new
+  per-image metric, it belongs in BOTH files: the `.jsonl` because it's a
+  prediction that might feed a metric not yet written, the `.csv` because
+  it's needed for qualitative review right now.
+
 ## VLM pipeline — code layout & how to run
 - Entrypoint: `scripts/run_vlm_pipeline.py` (`--stage all|infer|score`).
 - `--stage all` runs infer then score in SEPARATE spawned subprocesses so the
