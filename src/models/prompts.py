@@ -83,13 +83,21 @@ CAPTION_PROMPT = "Describe this image, including any text."
 # methodologically, and not yet validated as a net win vs the original
 # subject-only wording (worth re-checking ClipMatch top-1 on Places
 # specifically after this change, since that's the dataset it targets).
-SUMMARY_CAPTION_PROMPT = (
+SUMMARY_CAPTION_PROMPT_IMAGENET = (
     "Here is a detailed description of this image:\n\n"
     "\"{caption}\"\n\n"
-    "Using both the image and this description, write a short summary "
-    "(at most 50 words) capturing both the main subject (if there is one) "
-    "and the setting or scene, along with the most important surrounding "
-    "context."
+    "Using both the image and this description, write a short summary (at most 30 words) "
+    "capturing the key objects and prominent entities in the scene, "
+    "along with their identifying details. "
+    "Output ONLY the summary text."
+)
+
+SUMMARY_CAPTION_PROMPT_PLACES = (
+    "Here is a detailed description of this image:\n\n"
+    "\"{caption}\"\n\n"
+    "Using both the image and this description, write a short summary (at most 30 words) "
+    "focusing on the overall scene, environment, or setting. "
+    "Output ONLY the summary text."
 )
 
 # =============================================================================
