@@ -647,6 +647,19 @@ def load_big5(sources):
             platform_id = row.get("platform_id")
             if pd.isna(platform_id):
                 continue
+            # Strip a leading apostrophe — Excel's own "force text" marker
+            # (added so a value like "-3NEKN7YEcCmPzGy" isn't reinterpreted as
+            # a formula/number when the sheet is opened), which survives as a
+            # literal "'" character once the sheet is exported to CSV. Seen on
+            # the production Weibo annotation CSVs (not the earlier samples),
+            # where every platform_id came through as "'-3NEKN...". Only ONE
+            # leading apostrophe is ever added by Excel, and it is never part
+            # of the real id, so stripping it is always safe; only the
+            # LEADING one is touched — an apostrophe anywhere else in the
+            # string (were one ever legitimately part of the id) is untouched.
+            platform_id = str(platform_id)
+            if platform_id.startswith("'"):
+                platform_id = platform_id[1:]
             try:
                 # How many images this post actually has (0..n_slots). Needed
                 # because nature_visual_1/2/3... are NOT blank for a

@@ -1,4 +1,4 @@
-BIG-5 VLM PIPELINE — DESIGN RECAP (v19)
+BIG-5 VLM PIPELINE — DESIGN RECAP (v20)
 (v4: the VLM pipeline is now IMPLEMENTED — this doc records both the original
 design rationale AND, in "IMPLEMENTED:" notes, how the shipped code actually
 does it where the two differ. v5: ClipMatch switched to the caption-based
@@ -91,7 +91,21 @@ fix — added --max_num_seqs (passed straight through to vLLM's own
 EngineArgs) as the actual lever, capping concurrent engine scheduling
 (and therefore concurrent vision-encoding) independently of --batch_size.
 --gpu_memory_utilization (already existed) is the complementary zero-cost
-lever for the same OOM. See Section 3/11.)
+lever for the same OOM. See Section 3/11. v20: fixed a real bug found
+loading the PRODUCTION Weibo annotation CSVs (not the earlier sample files
+used to build the loader) — every platform_id came through with a leading
+apostrophe (Excel's "force text" marker, preserved as a literal "'"
+character on CSV export), so every glob.glob() image lookup missed and both
+Weibo sources silently loaded ZERO images ("No dataset instances loaded —
+exiting", no traceback). Caught immediately by load_big5's own zero-match
+warning (n_annotated vs n_matched, added alongside Weibo support) rather
+than being a silent mystery. Fix: strip a single leading apostrophe from
+platform_id in
+load_big5 before it's used to build the glob pattern or the image path.
+Verified against a reproduction of the exact failure (CSV ids with a
+leading "'", real files on disk without it) plus the double-hyphen edge
+case ("--45DiodCcnzt0Xa") to confirm only the apostrophe is touched, not
+genuine leading hyphens. See Section 6.)
 
 ===============================================================
 0. IMPLEMENTATION STATUS (NEW in v4)

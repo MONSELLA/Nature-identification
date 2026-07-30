@@ -377,6 +377,16 @@ evaluating the models.
   (660 of 7364 across the four CSVs). `nep_immaterial_specific_visual_<idx>`
   (illustration/infographic/videogame/plain_text/other) is deliberately
   IGNORED — those format subcategories are not a classification target.
+  `platform_id` has a leading apostrophe STRIPPED on load (`load_big5`) —
+  Excel's own "force text" marker (added so an id like `-3NEKN7YEcCmPzGy`
+  isn't reinterpreted as a formula/number), which survives as a literal `'`
+  character once exported to CSV; seen on the production Weibo annotation
+  CSVs specifically (not every export has it — the earlier sample CSVs used
+  to build this loader didn't). Left un-stripped, every `glob.glob()` image
+  lookup misses (the marker isn't part of the real filename) and the whole
+  source silently contributes zero images — caught in practice by
+  `load_big5`'s own zero-match warning (see `n_annotated`/`n_matched`),
+  which is what surfaced this bug.
 - **BIG-5 (holistic, one GT label per image)**: nature = OR over extracted
   objects, same as always. biotic/material use a DIRECTION-AWARE "at least one
   matching entity" rule instead of matching a specific object (there is no
