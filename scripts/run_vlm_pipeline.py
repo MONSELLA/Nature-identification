@@ -1558,8 +1558,8 @@ def build_arg_parser():
     p.add_argument("--clipscore_model", type=str, default="original",
                    help="CLIP checkpoint used for the REFERENCE-FREE metrics (CLIPScore, "
                         "F-CLIPScore, Object-CLIPScore — all datasets): a "
-                        "clip_metrics.CLIP_PRESETS alias ('original', 'eva-clip', 'siglip2', "
-                        "'jina-clip-v2') or a raw HuggingFace repo id. Also the default for "
+                        "clip_metrics.CLIP_PRESETS alias ('original', 'metaclip', 'metaclip2', "
+                        "'siglip2', 'jina-clip-v2') or a raw HuggingFace repo id. Also the default for "
                         "--clipmatch_model when that isn't set separately.")
     p.add_argument("--clipscore_trust_remote_code", type=lambda s: s.lower() != "false", default=True,
                    help="Passed to transformers' from_pretrained calls for --clipscore_model "

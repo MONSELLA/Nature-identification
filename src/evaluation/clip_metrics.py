@@ -118,6 +118,19 @@ CLIPMATCH_CANDIDATE_TEMPLATES = {
 CLIP_PRESETS = {
     "original": "openai/clip-vit-large-patch14",
     "metaclip": "facebook/metaclip-h14-fullcc2.5b",
+    # MetaCLIP 2 (worldwide, ViT-H-14-quickgelu-worldwide) — a from-scratch
+    # multilingual (300+ languages) successor to MetaCLIP 1 above, not a
+    # fine-tune of it. Native transformers `MetaClip2Model`/`MetaClip2Processor`
+    # (auto-dispatched via AutoModel/AutoProcessor), NO trust_remote_code —
+    # same hassle-free category as SigLIP2/the LAION checkpoints below, not
+    # FG-CLIP2's custom-init risk (see that preset's comment / recap §11).
+    # Needs transformers>=4.56.0 (when MetaClip2 was merged upstream); already
+    # covered by this project's transformers>=5.14.1 floor (requirements.txt),
+    # so no extra dependency bump. MetaClip2Model mirrors CLIPModel's own
+    # submodule shape (text_model+text_projection, vision_model+
+    # visual_projection), so CLIPScorer._text_features/_image_features's
+    # existing branch handles it with no special-casing.
+    "metaclip2": "facebook/metaclip-2-worldwide-huge-quickgelu",
     "altclip": "BAAI/AltCLIP",
     # SigLIP2: native transformers AutoModel/AutoProcessor, NO trust_remote_code
     # — unlike FG-CLIP2 (tried and abandoned as a CLIP backend: its
