@@ -1474,13 +1474,12 @@ def _print_summary(s, run_clipmatch):
           f"F-CLIPScore: {s['reference_free']['f_clipscore']:.4f} | "
           f"Object-CLIPScore: {s['reference_free']['object_clipscore']:.4f}")
     neg_labels = {"nature": "no_nature", "biotic_matched": "abiotic", "material_matched": "immaterial"}
-    axis_names = {"nature": "nature", "biotic_matched": "life category (biotic/abiotic)",
-                  "material_matched": "tangibility (material/immaterial)"}
+    axis_names = {"nature": "nature", "biotic_matched": "life category", "material_matched": "tangibility"}
     for axis in ("nature", "biotic_matched", "material_matched"):
         m = s[axis]
-        print(f"\n--- {axis} (support {m['support']}) ---")
-        print(f"{m['support']} supported {axis_names[axis]} axis images, of which "
-              f"{m['n_neg']} {neg_labels[axis]} and {m['n_pos']} {axis.split('_')[0]}")
+        pos_label = axis.split('_')[0]
+        print(f"\n--- {axis_names[axis]} (support {m['support']} | "
+              f"{m['n_pos']} {pos_label} | {m['n_neg']} {neg_labels[axis]}) ---")
         print(f"Acc {m['accuracy']:.4f}")
         print(f"  {axis.split('_')[0]:<12} (pos) P {m['precision']:.4f} | R {m['recall']:.4f} | F1 {m['f1']:.4f}")
         print(f"  {neg_labels[axis]:<12} (neg) P {m['precision_neg']:.4f} | R {m['recall_neg']:.4f} | F1 {m['f1_neg']:.4f}")
