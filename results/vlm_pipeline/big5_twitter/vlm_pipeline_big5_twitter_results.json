@@ -1,0 +1,88 @@
+{
+    "big5_twitter": {
+        "mistral/mistralai/Ministral-3-8B-Instruct-2512-BF16": {
+            "dataset": "big5_twitter",
+            "model": "mistral/mistralai/Ministral-3-8B-Instruct-2512-BF16",
+            "n_images": 160,
+            "diagnostics": {
+                "objects_per_image": 4.33125,
+                "extraction_hit_rate": 0.00625,
+                "extraction_parse_failures": 15,
+                "extraction_parse_failure_rate": 0.09375,
+                "wordnet_mapping_rate": 0.12987012987012986,
+                "vlm_fallback_rate": 0.8701298701298701,
+                "label_vlm_calls": 649,
+                "label_parse_failures": 19,
+                "label_parse_failure_rate": 0.029275808936825885,
+                "label_calls_full": 603,
+                "label_parse_failures_full": 19,
+                "label_parse_failure_rate_full": 0.03150912106135987,
+                "label_calls_material": 46,
+                "label_parse_failures_material": 0,
+                "label_parse_failure_rate_material": 0.0,
+                "label_vlm_call_rate": 0.9365079365079365
+            },
+            "reference_free": {
+                "clipscore": 0.6204706236720086,
+                "f_clipscore": 0.49186904826392136,
+                "object_clipscore": 0.39413869883865116
+            },
+            "clip_models": {
+                "reference_free": "longclip",
+                "clipmatch": null,
+                "clipmatch_primary_source": null,
+                "clipmatch_candidate_text": null,
+                "use_inflect_for_clipmatch": false
+            },
+            "nature": {
+                "accuracy": 0.75625,
+                "precision": 0.8640776699029126,
+                "recall": 0.7807017543859649,
+                "f1": 0.8202764976958525,
+                "precision_neg": 0.5614035087719298,
+                "recall_neg": 0.6956521739130435,
+                "f1_neg": 0.6213592233009708,
+                "support": 160
+            },
+            "biotic_matched": {
+                "accuracy": 0.7547169811320755,
+                "precision": 0.8974358974358975,
+                "recall": 0.7954545454545454,
+                "f1": 0.8433734939759037,
+                "precision_neg": 0.35714285714285715,
+                "recall_neg": 0.5555555555555556,
+                "f1_neg": 0.43478260869565216,
+                "support": 106
+            },
+            "material_matched": {
+                "accuracy": 0.7596153846153846,
+                "precision": 0.819672131147541,
+                "recall": 0.78125,
+                "f1": 0.8,
+                "precision_neg": 0.6744186046511628,
+                "recall_neg": 0.725,
+                "f1_neg": 0.6987951807228916,
+                "support": 104
+            },
+            "axis_scoring_note": "imagenet/places: nature/biotic come from the ClipMatch TOP-1 predicted class's OWN taxonomy position \u2014 ClipMatch predicts the class from a text embedding's CLIP similarity to candidate_vocab (which is restricted to classes mapped into the graph \u2014 see get_candidate_vocab); that text is the VLM's own short summary caption when the artifact was produced with --summarize_clipmatch_caption (measured 0.41 vs 0.34 top-1 against the full caption, with far less CLIP-tokenizer truncation \u2014 see clip_models.clipmatch_primary_source), else the WHOLE raw caption; material is ALWAYS the VLM's own judgment (never mapped), taken from the extracted object most representative of that predicted class. big5 (holistic, one GT label per image): nature is the same image-level OR as always; biotic/material are scored as 'did the model output at least one nature-positive entity matching the GT's own direction' (has_biotic when GT=biotic, has_abiotic when GT=abiotic, symmetrically for material) \u2014 an image can contain both a biotic AND an abiotic entity and still score correctly against a GT of just one of them. coco: image-level nature (OR) + matched-object biotic/material via lexical GT matching (box-IoU is future work, recap \u00a76.4).",
+            "material_caveat": "Material GT for imagenet/coco/places is the heuristic gt_material=True default (real photos); only BIG-5 has genuine material GT. Predicted material is always the VLM's judgment (never mapped), so on imagenet/places it is scored against that heuristic GT default \u2014 BIG-5 is the only genuine material benchmark.",
+            "execution_time": {
+                "inference": "0-00:12:37",
+                "scoring": "0-00:00:12",
+                "total": "0-00:12:49"
+            },
+            "evaluated_at": "2026-07-31T16:42:51.101056+00:00"
+        },
+        "dataset_class_stats": {
+            "160": {
+                "total_classes": 1,
+                "nature": 1,
+                "no_nature": 0,
+                "biotic": 0,
+                "abiotic": 0,
+                "material": 0,
+                "immaterial": 0
+            }
+        }
+    }
+}
