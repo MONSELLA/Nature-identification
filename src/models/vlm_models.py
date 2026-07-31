@@ -233,8 +233,29 @@ class VLLMBackedVLM(BaseVLM):
     chat API (`self.llm.chat(...)`) that internally handles GPU scheduling,
     KV-cache management, and batching for us."""
 
-    def __init__(self, model_name: str, **kwargs: Any) -> None:
+    def __init__(self, model_name: str, max_image_side: Optional[int] = 1024, **kwargs: Any) -> None:
         super().__init__(model_name, **kwargs)
+        # `max_image_side` is an EXPLICIT named parameter (not swept into
+        # **kwargs) specifically so it never gets forwarded to LLM(...)
+        # below — vLLM's own constructor has no such argument and would
+        # raise on an unexpected kwarg. See _encode_image for what it does:
+        # downscale any image whose longest side exceeds this many pixels
+        # before it ever reaches vLLM. This exists because nothing in this
+        # codebase resizes images at all otherwise — ImageNet/COCO/Places
+        # images are typically already modest (pre-resized benchmark images),
+        # but raw social-media images (BIG-5 Twitter/Weibo) can be arbitrary
+        # phone-camera/screenshot resolutions with no cap. A vision encoder
+        # like Pixtral scales its patch count (and therefore its attention
+        # memory, quadratically) with input resolution, not a fixed small
+        # square — one oversized raw image in a batch can OOM the vision
+        # encoder even when batch_size and max_model_len are both far lower
+        # than what ImageNet/Places comfortably handle at the same settings.
+        # Confirmed directly: a BIG-5 OOM traceback failed inside
+        # pixtral.py's vision_encoder -> scaled_dot_product_attention, not
+        # in the text KV cache, with no image resizing anywhere upstream.
+        # None disables resizing entirely (opt out, e.g. to reproduce old
+        # behavior or if you've pre-resized images yourself).
+        self.max_image_side = max_image_side
         _patch_transformers_config_registration()
         try:
             from vllm import LLM
@@ -255,29 +276,62 @@ class VLLMBackedVLM(BaseVLM):
         `generate_batch_safe` knows how to recover from."""
         return isinstance(exc, ValueError) and "longer than the maximum model length" in str(exc)
 
-    @staticmethod
-    def _encode_image(image: ImageInput) -> str:
+    def _encode_image(self, image: ImageInput) -> str:
         """Convert an image (file path or PIL Image) into a "data URL" string
         (base64-encoded bytes embedded directly in the string) — the format
-        vLLM's chat API expects for the `image_url` message field."""
-        if isinstance(image, str):
-            if image.startswith("data:image"):
-                # Already a data URL — nothing to do.
-                return image
-            with open(image, "rb") as f:
-                b64 = base64.b64encode(f.read()).decode("utf-8")
-            # Preserve the original file extension (jpg/png/etc.) in the data
-            # URL's MIME type, defaulting to png if there's no extension.
-            suffix = Path(image).suffix.lstrip(".").lower() or "png"
-            return f"data:image/{suffix};base64,{b64}"
+        vLLM's chat API expects for the `image_url` message field.
 
-        # Not a string — assume it's an already-loaded PIL Image object.
-        # Re-encode it as PNG bytes in memory (BytesIO acts like a temporary
-        # in-memory file) rather than needing to save it to disk first.
+        DOWNSCALES first if the image's longest side exceeds
+        `self.max_image_side` (see __init__'s comment for why this exists —
+        raw social-media images with no resolution cap can OOM the vision
+        encoder even at a modest batch size). Uses a FAST PATH for images
+        already under the cap (the common case for ImageNet/COCO/Places,
+        and most BIG-5 images too): `Image.open()` only reads the header to
+        get `.size`, not the full pixel data, so checking the size is cheap,
+        and if no resize is needed the original file bytes are read and
+        base64-encoded directly — no PIL decode/re-encode round-trip, which
+        matters at this project's 2M-image scale.
+        """
+        if isinstance(image, str) and image.startswith("data:image"):
+            return image  # already a data URL — nothing to do
+
+        from PIL import Image as PILImage
+
+        pil_image = PILImage.open(image) if isinstance(image, str) else image
+        width, height = pil_image.size
+        needs_resize = self.max_image_side is not None and max(width, height) > self.max_image_side
+
+        if not needs_resize:
+            if isinstance(image, str):
+                with open(image, "rb") as f:
+                    b64 = base64.b64encode(f.read()).decode("utf-8")
+                # Preserve the original file extension (jpg/png/etc.) in the
+                # data URL's MIME type, defaulting to png if there's none.
+                suffix = Path(image).suffix.lstrip(".").lower() or "png"
+                return f"data:image/{suffix};base64,{b64}"
+            # Already a PIL Image and small enough — encode as-is (in-memory
+            # "file" via BytesIO, rather than needing to save to disk first).
+            buffer = BytesIO()
+            pil_image.save(buffer, format="PNG")
+            b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+            return f"data:image/png;base64,{b64}"
+
+        # Oversized — downscale, preserving aspect ratio, before encoding.
+        scale = self.max_image_side / max(width, height)
+        new_size = (max(1, round(width * scale)), max(1, round(height * scale)))
+        # .convert("RGB") first: resizing a palette/CMYK/RGBA image directly
+        # can produce wrong colors or an unexpected channel count, and RGB is
+        # what every VLM here expects anyway.
+        resized = pil_image.convert("RGB").resize(new_size, PILImage.LANCZOS)
         buffer = BytesIO()
-        image.save(buffer, format="PNG")
+        # JPEG, not PNG: PNG is lossless and can be dramatically larger for
+        # photographic content, bloating both the base64 payload sent to
+        # vLLM and its own image preprocessing; quality=90 is visually
+        # near-lossless for a VLM's own patch embedding while keeping the
+        # request small.
+        resized.save(buffer, format="JPEG", quality=90)
         b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
-        return f"data:image/png;base64,{b64}"
+        return f"data:image/jpeg;base64,{b64}"
 
     def _build_messages(
         self,

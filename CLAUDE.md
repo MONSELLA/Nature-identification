@@ -60,6 +60,37 @@ evaluating the models.
   (`COCO_LABELS`, `COCO_TO_WNSYNSET`, `build_mapping_vocab`),
   `src/loaders/excel_loader.py` (`TaxonomyGraph.resolve_labels`, `max_hops`),
   `src/evaluation/clip_metrics.py` + `taxonomy_metrics.py` (metrics).
+- `--max_image_side` (default 1024): every image is downscaled to this many
+  pixels on its longest side before reaching the VLM
+  (`vlm_models.VLLMBackedVLM._encode_image`) — pass 0 to disable. Nothing
+  else in this pipeline resizes images. ImageNet/COCO/Places images are
+  typically already modest (pre-resized benchmark images), but raw
+  social-media images (BIG-5 Twitter/Weibo) can be arbitrary phone-camera/
+  screenshot resolutions with no cap, and a vision encoder's patch count
+  (and attention memory) scales with input resolution rather than a fixed
+  square — one oversized image in a batch can OOM the vision encoder at a
+  `--batch_size`/`--max_model_len` that's comfortable for ImageNet/Places at
+  the exact same settings (confirmed: a BIG-5 OOM traceback failed inside
+  the vision encoder's own attention, not the text KV cache). Fast path for
+  already-small images (`Image.open()` only reads the header to check size,
+  no decode/re-encode) so this costs ~nothing at the project's 2M-image
+  scale; oversized images are downscaled and re-encoded as JPEG
+  (quality=90) rather than the original format.
+- `--max_num_seqs` (default: unset, vLLM's own default): passed straight to
+  vLLM's `EngineArgs`, capping how many sequences the ENGINE runs — and
+  vision-encodes — concurrently. Distinct from `--batch_size`, which only
+  controls how many prompts THIS SCRIPT submits per `generate_batch` call;
+  vLLM's own scheduler still decides how many of those it actually runs
+  together, currently uncapped. Use this (not `--batch_size` or
+  `--max_image_side`) when a large-image dataset (BIG-5) OOMs the vision
+  encoder at a `--batch_size` that's fine for ImageNet/Places and you don't
+  want to sacrifice submission throughput or image resolution to fix it —
+  it reduces peak *concurrent* vision-encoder memory without touching
+  either. `--gpu_memory_utilization` (already existed) is the other
+  zero-cost lever for the same OOM: lowering it (e.g. 0.9 -> 0.85) shrinks
+  vLLM's upfront KV-cache reservation, leaving more real headroom for the
+  vision encoder's activation memory, again without touching batch size or
+  image quality.
 
 ## VLM pipeline — hard conventions
 - Baseline is TWO-PASS: open-ended caption (no schema) → separate structured
@@ -88,7 +119,7 @@ evaluating the models.
   the flora/fauna within them). Without this, extraction only ever lists
   discrete objects inside a scene, leaving no extracted phrase for ClipMatch's
   anchor-selection or hP/hR's WordNet resolution to match against a
-  scene-level GT class — same failure mode `SUMMARY_CAPTION_PROMPT` had before
+  scene-level GT class — same failure mode the summary-caption prompt had before
   its "subject or setting" fix.
 - Context files go in the `system` role, never `user`. Read once at startup,
   not per-call (keeps the string stable for vLLM prefix caching).
@@ -186,30 +217,133 @@ evaluating the models.
   data/llm_reference/vlm_pipeline_recap.txt for the history).
   PRIMARY text (DEFAULT on ImageNet/Places): the VLM's own short (<=~20-word)
   SUMMARY of its baseline caption, grounded in the image
-  (`src.vlm_pipeline.summarize_caption_batch`,
-  `prompts.SUMMARY_CAPTION_PROMPT`) — measured 0.41 vs. 0.34 top-1 against the
-  raw caption on the spot-check run, with ~0% CLIP-tokenizer truncation vs.
-  the raw caption's frequent silent cutoff. A real re-summarization is more
-  defensible than letting CLIP truncate arbitrary content from the ~248-token
-  caption. `--stage infer`'s `--no_summarize_clipmatch_caption` opts back into
-  scoring the raw caption instead (kept as a SECONDARY reported comparison,
-  `summary["clipmatch_caption"]`, whenever the summary is primary).
+  (`src.vlm_pipeline.summarize_caption_batch`) — measured 0.41 vs. 0.34 top-1
+  against the raw caption on the spot-check run, with ~0% CLIP-tokenizer
+  truncation vs. the raw caption's frequent silent cutoff. A real
+  re-summarization is more defensible than letting CLIP truncate arbitrary
+  content from the ~248-token caption. `--stage infer`'s
+  `--no_summarize_clipmatch_caption` opts back into scoring the raw caption
+  instead. There is exactly ONE ClipMatch text per run — the old SECONDARY
+  raw-caption comparison (`summary["clipmatch_caption"]` + its five
+  `clipmatch_caption_*` CSV columns) is REMOVED; do not reintroduce it.
+  The summary prompt is FORKED PER DATASET (v15,
+  `prompts.SUMMARY_CAPTION_PROMPTS` / `get_summary_caption_prompt`), because
+  the two candidate vocabularies are different KINDS of label: ImageNet gets
+  an OBJECT-centric prompt ("the key objects and prominent entities in the
+  scene, along with their identifying details"), Places365 a SCENE-centric
+  one ("the overall scene, environment, or setting"). Both cap at 30 words
+  (down from the shared prompt's 50) and both end with "Output ONLY the
+  summary text." so no conversational preamble gets embedded as if it were
+  image content. Unknown dataset raises rather than silently defaulting.
+  Which variant a run used is recorded in the artifact header's
+  `summary_caption_prompt`.
   CANDIDATE text (the GT-class side, not the image-description side) is a
-  SEPARATE, independent choice: `--stage score`'s `--use_wordnet_definitions_clipmatch`
-  swaps the default `OBJECT_TEMPLATE` phrase ("a photo of a golden retriever")
-  for a richer WordNet lemma(s)+gloss prose per class
-  (`clip_metrics.wordnet_definition_text`) — MEASURED (v12): no meaningful
-  ClipMatch top-1 difference vs. the plain template, so the "richer candidate
-  text aligns better" hypothesis is not supported; kept as a non-default flag
-  rather than removed. Needs `inflect` (only for this path — the OBJECT_TEMPLATE
-  default does not use it, see the recap's v10 entry on why). Recorded in
+  SEPARATE, independent choice. DEFAULT (v14): each candidate class's
+  embedding is the MEAN of a fixed prompt-template ensemble for that class,
+  L2-renormalized, computed ONCE per class (constant across the whole run) —
+  `clip_metrics.encode_candidate_vocab_ensemble` /
+  `clip_metrics.CLIPMATCH_CANDIDATE_TEMPLATES`. Two DIFFERENT template sets,
+  never mixed: `OPENAI_TEMPLATES` (the official 80-template ImageNet ensemble
+  from Radford et al. 2021 — object-centric, e.g. "a sculpture of a {}.",
+  "a {} in a video game.") for ImageNet; a smaller 15-template
+  `SCENE_TEMPLATES` for Places365 — the ImageNet set doesn't fit scene classes
+  ("kitchen", "airport terminal"; a "tattoo of a kitchen" is nonsensical), and
+  the original CLIP paper only used 2 bare templates for SUN397 scene
+  recognition, which this deliberately improves on with contextual-anchoring
+  and lighting/quality variants while staying scene-appropriate (no
+  material/medium templates like sculpture/origami/embroidery/tattoo). Per-
+  image extracted objects (Object-CLIPScore, ClipMatch's anchor-object search)
+  still use the single `OBJECT_TEMPLATE` — ensembling 80 embeddings per
+  extracted entity per image was never validated and would be needlessly
+  expensive at 2M-image scale.
+  EVERY template fill — `OBJECT_TEMPLATE`, all 80 ImageNet, all 15 scene —
+  goes through `clip_metrics.fill_template`. DEFAULT is a plain
+  `template.format(name)`: whatever article the template hardcodes goes in
+  as written (e.g. "a photo of a apple"), ungrammatical or not. `--stage
+  score`'s `--use_inflect_for_clipmatch` (v16, opt-in) instead fixes the
+  determiner in front of the entity with `inflect`: "a photo of an apple",
+  "a photo of a university" (a/an by SOUND, not spelling), "a photo of cars"
+  (article DROPPED for a plural). Only an article that actually GOVERNS the
+  slot is touched — "the plastic {}" and "itap of my {}" are left alone, and
+  the "a" in "a photo of many {}" belongs to "photo", not the class, so it
+  survives. Where an adjective intervenes ("a photo of a clean {}") the
+  article agrees with the adjective and is kept, but still dropped for a
+  plural. NOTE the history: v8 added an inflect determiner project-wide, v10
+  reverted it on suspicion (never isolated; confounded with a concurrent
+  MetaCLIP switch), v15 reinstated it as the hard default, v16 makes it
+  opt-in via this flag instead of reopening that same v10 ambiguity — if a
+  ClipMatch change is observed with the flag on, isolate this from any
+  concurrent backend swap before attributing it.
+  `--stage score`'s `--use_wordnet_definitions_clipmatch` is a SEPARATE,
+  non-default opt-in that swaps the whole ensemble for a single richer
+  WordNet lemma(s)+gloss prose per class (`clip_metrics.wordnet_definition_text`)
+  — MEASURED (v12, back when the default was the single `OBJECT_TEMPLATE`
+  phrase): no meaningful ClipMatch top-1 difference, so the "richer candidate
+  text aligns better" hypothesis is not supported; kept as a flag rather than
+  removed. Recorded in
   `summary["clip_models"]["clipmatch_candidate_text"]`
-  and `summary["clipmatch_candidates"]` (token-length/truncation diagnostic).
+  (`"prompt_ensemble_<dataset>"` or `"wordnet_definition"`) and
+  `summary["clipmatch_candidates"]` (token-length/truncation diagnostic, now
+  over the flat per-template text count — `n_candidate_texts` — not just the
+  class count `n_candidates`).
 - **hP/hR/hF1** (hierarchical precision/recall/F1): ImageNet + Places only. Map
   the ClipMatch-predicted class onto a WordNet node via the extracted-object list
   (`resolve_to_wordnet`: rank objects by CLIP sim to the predicted class,
   Wu-Palmer disambiguation for polysemy), then score ancestral-closure overlap
-  of the GT node vs. the predicted node.
+  of the GT node vs. the predicted node. Reported as mean ± population std
+  (`summary["hierarchical"]`/`["hierarchical_mapped"]`'s `*_std` keys) for hP,
+  hR, hF1, AND Wu-Palmer — the mean alone doesn't say whether per-image scores
+  cluster tightly around it or are widely spread.
+  The phrase→synset step (`resolve_to_wordnet`, hardened v15) does, in order:
+  (1) SPLIT alternation — "insect/larva" is two candidate names for one
+  entity, not a lemma (split on `/` and ` or ` ONLY; never `and`/`,`, which
+  would wreck "black and white"); (2) NORMALIZE — lowercase + strip diacritics,
+  so "café" reaches its actual WordNet lemma `cafe` instead of resolving to
+  nothing; (3) SEARCH SPANS — a whole-phrase lemma is AUTHORITATIVE if it
+  exists ("swimming pool", "golden retriever" stay intact), otherwise try
+  every contiguous span and single word and keep the MOST SPECIFIC (greatest
+  `min_depth`). Specificity, NOT Wu-Palmer, ranks step 3 on purpose: Wu-Palmer
+  structurally favours generic nodes (vs. a "brown bear" prediction, bare
+  `bear` scores 0.963 but `polar bear` only 0.929), so ranking by it picks
+  `retriever` over `golden retriever` and — the originally reported bug —
+  `area.n.05` over `cafe.n.01` for "café seating area". Wu-Palmer is still
+  used for word-SENSE disambiguation and to choose between step-1
+  alternatives. The same diacritic strip is in `_normalize_object`
+  (`src/vlm_pipeline.py`) so the MAPPING path doesn't miss "café" either —
+  that one is inference-time, so it needs a re-run to take effect.
+  ALSO reported split by whether the IMAGE'S OWN GT is nature or no-nature
+  (`summary["hierarchical_by_gt_nature"]`/`["hierarchical_mapped_by_gt_nature"]`,
+  each `{"nature": {...}, "no_nature": {...}}` with the same keys as the
+  pooled `"hierarchical"`/`"hierarchical_mapped"` dicts) — the one pooled
+  macro-average can hide a model that resolves nature GTs onto a fine-grained
+  WordNet node far better (or worse) than no-nature ones.
+- **ImageNet class-name collisions**: some ImageNet-1k WNIDs share a naive
+  class name (`synset_name.split('.')[0]`) despite being ENTIRELY DIFFERENT
+  WordNet synsets — e.g. n02963159 "cardigan" (the sweater, `cardigan.n.01`)
+  vs n02113186 "Cardigan Welsh corgi" (a dog breed, `cardigan.n.02`); also
+  n02012849 "crane" (the bird, `crane.n.05`) vs n03126707 "crane" (the
+  machine, `crane.n.04`). Since `class_name` is what gets embedded as
+  ClipMatch candidate text, two DIFFERENT classes with IDENTICAL text produce
+  near-identical embeddings, so ClipMatch's argmax between them degenerates
+  into noise — a genuinely correct prediction can land on the wrong sense's
+  synset and get scored as flat-out wrong even though the model named the
+  right thing. `dataset_loader._imagenet_class_names` disambiguates any
+  colliding WNIDs (used by both `load_imagenet` and
+  `get_candidate_vocab`'s imagenet branch, so GT and candidate text always
+  agree): try each colliding synset's own LONGEST lemma name first (fixes
+  cardigan — `cardigan.n.02`'s lemmas are `['Cardigan',
+  'Cardigan_Welsh_corgi']`); if that still collides (e.g. both "crane"
+  senses have only the single lemma "crane"), qualify with the synset's own
+  immediate hypernym instead ("crane, a type of wading bird" vs "crane, a
+  type of lifting device"); a synset-id suffix is the last-resort fallback,
+  logged with a warning if it's ever actually reached. A unique naive name is
+  returned unchanged — this only touches the WNIDs that actually collide.
+- **Labeling parse-failure rate**: reported over the objects the VLM was
+  ACTUALLY asked about (`vlm_called`), never over all extracted objects —
+  mapped non-nature objects get no labeling call at all, so including them
+  silently dilutes the rate. Split `_full` (unmapped → `TaxonomyResponse`,
+  three axes) vs `_material` (mapped-nature → `MaterialResponse`, one axis)
+  since the two use different schemas and can fail differently.
 
 ## Axis scoring (nature/biotic/material accuracy) — per dataset
 - **ImageNet/Places (single-label)**: ClipMatch (PRIMARY text's CLIP embedding
@@ -230,6 +364,29 @@ evaluating the models.
   than the mapping). material is always the VLM's own label (never mapped).
   No anchor object (empty extraction or failed ClipMatch) → prediction-unmapped
   → penalized as wrong.
+- **BIG-5 datasets** (`dataset_loader.BIG5_DATASETS`): `big5` pools every
+  configured platform; `big5_twitter` / `big5_weibo` restrict to one. Use the
+  per-platform names when comparing platforms — the results store and the
+  predictions CSV are keyed by dataset name, so pooling would average them.
+  GT CSVs: `--twitter_en_gt_csv` / `--twitter_es_gt_csv` (4 image slots per
+  row) and `--weibo_ch0_gt_csv` / `--weibo_ch1_gt_csv` (NINE slots,
+  `nature_visual_0..8`). The slot count is AUTO-DETECTED from each CSV's own
+  `nature_visual_<idx>` columns (`_big5_slot_count`) — never hardcode it; the
+  old hardcoded `min(4, ...)` silently dropped 47% of Weibo's annotated
+  images. A slot whose `nature_visual_<idx>` is `-` is unannotated and skipped
+  (660 of 7364 across the four CSVs). `nep_immaterial_specific_visual_<idx>`
+  (illustration/infographic/videogame/plain_text/other) is deliberately
+  IGNORED — those format subcategories are not a classification target.
+  `platform_id` has a leading apostrophe STRIPPED on load (`load_big5`) —
+  Excel's own "force text" marker (added so an id like `-3NEKN7YEcCmPzGy`
+  isn't reinterpreted as a formula/number), which survives as a literal `'`
+  character once exported to CSV; seen on the production Weibo annotation
+  CSVs specifically (not every export has it — the earlier sample CSVs used
+  to build this loader didn't). Left un-stripped, every `glob.glob()` image
+  lookup misses (the marker isn't part of the real filename) and the whole
+  source silently contributes zero images — caught in practice by
+  `load_big5`'s own zero-match warning (see `n_annotated`/`n_matched`),
+  which is what surfaced this bug.
 - **BIG-5 (holistic, one GT label per image)**: nature = OR over extracted
   objects, same as always. biotic/material use a DIRECTION-AWARE "at least one
   matching entity" rule instead of matching a specific object (there is no
@@ -269,7 +426,11 @@ evaluating the models.
 ## Environment
 - W&B project: `TFM_VLM`, entity `paumonserrat03-universitat-aut-noma-de-barcelona`
 - Taxonomy Excel: `/home/pmonserrat/code/flat_wordnet_tree_fixed.xlsx`
-- BIG-5 data: `/home/pmonserrat/datasets/big_5/`
+- BIG-5 data: `/home/pmonserrat/datasets/big_5/` — TWO platforms, each a flat
+  image folder: `.../big_5/twitter` (`--big_5_twitter_images_dir`) and
+  `.../big_5/weibo` (`--big_5_weibo_images_dir`). No intra-folder split by
+  language or channel; every image is named `<platform_id>_<idx>.<ext>` and
+  found by globbing that stem.
 - Imagenet data: `/home/pmonserrat/datasets/imagenet/`
 - COCO data: `/home/pmonserrat/datasets/coco/`
 - Places365 data: `/home/pmonserrat/datasets/places/`

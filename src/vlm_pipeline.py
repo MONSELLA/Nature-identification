@@ -57,12 +57,13 @@ object — that combining logic lives in the second half of this file
 
 from __future__ import annotations
 
+import unicodedata
 from typing import Any, Dict, List, Optional
 
 from src.models.prompts import (
     CAPTION_PROMPT,
     EXTRACTION_PROMPT,
-    SUMMARY_CAPTION_PROMPT,
+    get_summary_caption_prompt,
     MaterialResponse,
     ObjectExtractionResponse,
     TaxonomyResponse,
@@ -202,6 +203,7 @@ def summarize_caption_batch(
     vlm,
     image_paths: List[str],
     captions: List[str],
+    dataset: str,
     system_prompt: Optional[str] = None,
     max_new_tokens: int = 64,
     temperature: float = 0.0,
@@ -216,8 +218,12 @@ def summarize_caption_batch(
     raw caption). No system prompt by default, matching caption_batch's own
     neutrality rationale (this call only compresses content the neutral
     caption already produced, so there's nothing to keep unbiased beyond that).
+
+    `dataset` selects the prompt: ImageNet gets the object-centric wording,
+    Places365 the scene-centric one (prompts.get_summary_caption_prompt), since
+    each dataset's ClipMatch candidate vocabulary is a different KIND of label.
     """
-    prompts = [SUMMARY_CAPTION_PROMPT.format(caption=c) for c in captions]
+    prompts = [get_summary_caption_prompt(dataset).format(caption=c) for c in captions]
     outs = vlm.generate_batch_safe(
         prompts, image_paths,
         label="summarize_caption_batch", item_labels=image_paths,
@@ -422,6 +428,7 @@ def run_inference(
     verbose: bool = False,
     summarize_for_clipmatch: bool = False,
     summary_max_new_tokens: int = 64,
+    dataset: Optional[str] = None,
 ):
     """
     Run caption -> extraction -> (mapping + labeling) over every image and yield
@@ -454,7 +461,7 @@ def run_inference(
     whole structured output) with no parse-failure signal, showing up only as
     a suspiciously low objects-per-image diagnostic.
 
-    `summarize_for_clipmatch` (see prompts.SUMMARY_CAPTION_PROMPT) adds one
+    `summarize_for_clipmatch` (see prompts.SUMMARY_CAPTION_PROMPTS) adds one
     extra VLM call per batch: a short (<=~20-word) re-summarization of this
     image's own caption, grounded in the image, which then becomes the PRIMARY
     text ClipMatch scores against (measured 0.41 vs. 0.34 top-1 against the
@@ -557,7 +564,7 @@ def run_inference(
                 print(f"[infer] batch {b + 1}/{num_batches}: summarize_caption_batch "
                       f"(free_form, ClipMatch primary text)...", flush=True)
             summary_captions = summarize_caption_batch(
-                vlm, image_paths, captions,
+                vlm, image_paths, captions, dataset,
                 max_new_tokens=summary_max_new_tokens, temperature=temperature,
             )
         else:
@@ -631,9 +638,19 @@ _ARTICLES = ("a ", "an ", "the ")
 
 
 def _normalize_object(object_str: str) -> str:
-    """Lowercase an object phrase and strip a single leading article, so
-    "A Golden Retriever" and "golden retriever" normalize to the same string."""
-    s = object_str.strip().lower()
+    """Lowercase an object phrase, strip diacritics, and strip a single leading
+    article, so "A Golden Retriever" and "golden retriever" normalize to the
+    same string.
+
+    The diacritic strip is the same fix as taxonomy_metrics._normalize_phrase
+    and exists for the same reason: the mapping vocabularies (ImageNet/COCO/
+    Places class names) are ASCII, but a VLM writes "café"/"jalapeño", which
+    would otherwise never match their unaccented vocabulary entries and would
+    be pushed to the VLM fallback for no reason. NFKD splits an accented
+    character into a base letter plus a combining mark, which is then dropped.
+    """
+    decomposed = unicodedata.normalize("NFKD", object_str.strip().lower())
+    s = "".join(c for c in decomposed if not unicodedata.combining(c))
     for art in _ARTICLES:
         if s.startswith(art):
             s = s[len(art):]

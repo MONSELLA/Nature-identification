@@ -25,10 +25,94 @@ import warnings
 from typing import List, Optional, Tuple
 import numpy as np
 
+from src.utils import crosses_decile
+
 OBJECT_TEMPLATE = "a photo of a {}"
 DEFAULT_CLIPSCORE_SCALE = 2.5
 CLIPMATCH_DATASETS = ("imagenet", "places365")
 LONG_CLIP_REPO_PATH = "/home/pmonserrat/Long-CLIP"
+
+# Official OpenAI CLIP 80 prompt templates for ImageNet (Radford et al., 2021
+# — "Learning Transferable Visual Models From Natural Language Supervision",
+# Appendix A.6 / the repo's notebooks/Prompt_Engineering_for_ImageNet.ipynb).
+# Object-centric ("a photo of a {}", "a sculpture of a {}", ...) — designed
+# for object-recognition classes, NOT scenes. Used ONLY for the ClipMatch
+# CANDIDATE (GT-class) side on ImageNet: each class's embedding is the mean of
+# its 80 templated-text embeddings, L2-renormalized (the paper's "prompt
+# ensembling" recipe) — computed ONCE per class since it's constant across the
+# whole evaluation run. Extracted objects (Object-CLIPScore, per-image, one
+# per entity) still use the single OBJECT_TEMPLATE — encoding 80 embeddings
+# per extracted entity per image would be needlessly expensive and these were
+# never validated for that use case.
+OPENAI_TEMPLATES = [
+    'a bad photo of a {}.', 'a photo of many {}.', 'a sculpture of a {}.',
+    'a photo of the hard to see {}.', 'a low resolution photo of the {}.',
+    'a rendering of a {}.', 'graffiti of a {}.', 'a bad photo of the {}.',
+    'a cropped photo of the {}.', 'a tattoo of a {}.', 'the embroidered {}.',
+    'a photo of a hard to see {}.', 'a bright photo of a {}.', 'a photo of a clean {}.',
+    'a photo of a dirty {}.', 'a dark photo of the {}.', 'a drawing of a {}.',
+    'a photo of my {}.', 'the plastic {}.', 'a photo of the cool {}.',
+    'a close-up photo of a {}.', 'a black and white photo of the {}.',
+    'a painting of the {}.', 'a painting of a {}.', 'a pixelated photo of the {}.',
+    'a sculpture of the {}.', 'a bright photo of the {}.', 'a cropped photo of a {}.',
+    'a plastic {}.', 'a photo of the dirty {}.', 'a jpeg corrupted photo of a {}.',
+    'a blurry photo of the {}.', 'a photo of the {}.', 'a good photo of the {}.',
+    'a rendering of the {}.', 'a {} in a video game.', 'a photo of one {}.',
+    'a doodle of a {}.', 'a close-up photo of the {}.', 'a photo of a {}.',
+    'the origami {}.', 'the {} in a video game.', 'a sketch of a {}.',
+    'a doodle of the {}.', 'a origami {}.', 'a low resolution photo of a {}.',
+    'the toy {}.', 'a rendition of the {}.', 'a photo of the clean {}.',
+    'a photo of a large {}.', 'a rendition of a {}.', 'a photo of a nice {}.',
+    'a photo of a weird {}.', 'a blurry photo of a {}.', 'a cartoon {}.',
+    'art of a {}.', 'a sketch of the {}.', 'a embroidered {}.',
+    'a pixelated photo of a {}.', 'itap of the {}.', 'a jpeg corrupted photo of the {}.',
+    'a good photo of a {}.', 'a plushie {}.', 'a photo of the nice {}.',
+    'a photo of the small {}.', 'a photo of the weird {}.', 'the cartoon {}.',
+    'art of the {}.', 'a drawing of the {}.', 'a photo of the large {}.',
+    'a black and white photo of a {}.', 'the plushie {}.', 'a dark photo of a {}.',
+    'itap of a {}.', 'graffiti of the {}.', 'a toy {}.', 'itap of my {}.',
+    'a photo of a cool {}.', 'a photo of a small {}.', 'a tattoo of the {}.',
+]
+
+# Scene-recognition prompt ensemble for Places365's ClipMatch candidate side
+# (per Pau). Original CLIP used only 2 bare templates for SUN397 scene
+# recognition; OPENAI_TEMPLATES above is object-centric (tattoos, origami,
+# video-game renders, plushies, ...) and doesn't fit scene classes ("kitchen",
+# "airport terminal") — a "tattoo of a kitchen" or "the plushie kitchen" is
+# nonsensical, so the ImageNet set is not reused here. Kept deliberately
+# smaller than the 80-template ImageNet set: scenes don't have the same
+# medium/material variety (no sculptures, embroidery, origami, tattoos), so
+# most ImageNet templates have no scene-recognition analogue in the first
+# place — this list only keeps variations that plausibly still describe a
+# PLACE (contextual anchoring + camera-quality/lighting variation).
+SCENE_TEMPLATES = [
+    # Base structural
+    "a photo of a {}.",
+    "a photo of the {}.",
+    "a scene of a {}.",
+    "a view of the {}.",
+    "a scenery of the {}.",
+    # Contextual anchoring
+    "a photo of a {}, a type of place.",
+    "a photo of the {}, a place.",
+    "a photo taken in a {}.",
+    "a scene taken in a {}.",
+    # Quality & lighting variations (safe for scenes)
+    "a bad photo of a {}.",
+    "a good photo of a {}.",
+    "a black and white photo of a {}.",
+    "a blurry photo of a {}.",
+    "a low contrast photo of a {}.",
+    "a high contrast photo of a {}.",
+]
+
+# ClipMatch candidate-side prompt ensemble, per dataset (see OPENAI_TEMPLATES/
+# SCENE_TEMPLATES above). Only imagenet/places365 run ClipMatch at all
+# (CLIPMATCH_DATASETS), so only those two need an entry.
+CLIPMATCH_CANDIDATE_TEMPLATES = {
+    "imagenet": OPENAI_TEMPLATES,
+    "places365": SCENE_TEMPLATES,
+}
 
 # =============================================================================
 # CLIP model wrapper (HuggingFace Native OR Local Pure-PyTorch)
@@ -36,6 +120,19 @@ LONG_CLIP_REPO_PATH = "/home/pmonserrat/Long-CLIP"
 CLIP_PRESETS = {
     "original": "openai/clip-vit-large-patch14",
     "metaclip": "facebook/metaclip-h14-fullcc2.5b",
+    # MetaCLIP 2 (worldwide, ViT-H-14-quickgelu-worldwide) — a from-scratch
+    # multilingual (300+ languages) successor to MetaCLIP 1 above, not a
+    # fine-tune of it. Native transformers `MetaClip2Model`/`MetaClip2Processor`
+    # (auto-dispatched via AutoModel/AutoProcessor), NO trust_remote_code —
+    # same hassle-free category as SigLIP2/the LAION checkpoints below, not
+    # FG-CLIP2's custom-init risk (see that preset's comment / recap §11).
+    # Needs transformers>=4.56.0 (when MetaClip2 was merged upstream); already
+    # covered by this project's transformers>=5.14.1 floor (requirements.txt),
+    # so no extra dependency bump. MetaClip2Model mirrors CLIPModel's own
+    # submodule shape (text_model+text_projection, vision_model+
+    # visual_projection), so CLIPScorer._text_features/_image_features's
+    # existing branch handles it with no special-casing.
+    "metaclip2": "facebook/metaclip-2-worldwide-huge-quickgelu",
     "altclip": "BAAI/AltCLIP",
     # SigLIP2: native transformers AutoModel/AutoProcessor, NO trust_remote_code
     # — unlike FG-CLIP2 (tried and abandoned as a CLIP backend: its
@@ -262,7 +359,12 @@ class CLIPScorer:
             out.append(self._encode_text_batch(batch))
             if verbose:
                 done = min(i + self.batch_size, n_total)
-                print(f"🔎 [CLIP] {desc}: {done}/{n_total} ({done / n_total:.1%})", flush=True)
+                # Only print every ~10% of n_total (see utils.crosses_decile)
+                # — one line per batch is unreadable spam once n_total is
+                # large relative to batch_size (e.g. an 80k-text candidate
+                # vocab encoded self.batch_size at a time).
+                if crosses_decile(i, done, n_total):
+                    print(f"🔎 [CLIP] {desc}: {done}/{n_total} ({done / n_total:.1%})", flush=True)
         return np.concatenate(out, axis=0)
 
     def count_tokens(self, texts: List[str]) -> List[int]:
@@ -319,7 +421,8 @@ class CLIPScorer:
             
             if verbose:
                 done = min(i + self.batch_size, n_total)
-                print(f"🔎 [CLIP] images: {done}/{n_total} ({done / n_total:.1%})", flush=True)
+                if crosses_decile(i, done, n_total):
+                    print(f"🔎 [CLIP] images: {done}/{n_total} ({done / n_total:.1%})", flush=True)
         return np.concatenate(out, axis=0)
 
 
@@ -365,22 +468,127 @@ def clipmatch(
     per_candidate_sim = candidate_embs @ caption_emb
     return per_candidate_sim, int(np.argmax(per_candidate_sim))
 
-def object_texts(objects: List[str]) -> List[str]:
-    return [OBJECT_TEMPLATE.format(o) for o in objects]
+_INFLECT_ENGINE = None
 
 
-_DEFINITION_INFLECT_ENGINE = None
-
-
-def _definition_inflect_engine():
-    """Lazy singleton, scoped to wordnet_definition_text only — this is an
-    opt-in ClipMatch candidate-text variant (--use_wordnet_definitions_clipmatch),
-    not the default path, so `inflect` is only imported when actually used."""
-    global _DEFINITION_INFLECT_ENGINE
-    if _DEFINITION_INFLECT_ENGINE is None:
+def _inflect_engine():
+    """Lazy `inflect.engine()` singleton — imported on first use rather than at
+    module import so a caller that never fills a template (e.g. a unit test of
+    the pure-numpy metric math) doesn't need the dependency."""
+    global _INFLECT_ENGINE
+    if _INFLECT_ENGINE is None:
         import inflect
-        _DEFINITION_INFLECT_ENGINE = inflect.engine()
-    return _DEFINITION_INFLECT_ENGINE
+        _INFLECT_ENGINE = inflect.engine()
+    return _INFLECT_ENGINE
+
+
+# Prepositions/conjunctions that end a noun phrase. If one of these sits
+# between a candidate article and the "{}" slot, that article belongs to some
+# EARLIER noun, not to the class name — see fill_template.
+_NP_BOUNDARY_WORDS = frozenset({"of", "in", "on", "at", "with", "from", "for", "by"})
+
+
+def _is_plural(phrase: str) -> bool:
+    """Whether `phrase`'s head noun (its LAST word) is plural — "cars",
+    "sunglasses", "french fries". inflect's singular_noun() returns the
+    singular form for a plural input and False otherwise, which is exactly
+    this test. Only the last word is checked because that's the head of an
+    English noun phrase ("mountain bikes" is plural, "bike wheel" is not)."""
+    words = phrase.strip().split()
+    if not words:
+        return False
+    return bool(_inflect_engine().singular_noun(words[-1]))
+
+
+def fill_template(template: str, name: str, use_inflect: bool = False) -> str:
+    """Fill a CLIP prompt template's "{}" slot with `name`.
+
+    `use_inflect=False` (the DEFAULT) is a plain `template.format(name)` — the
+    template's own hardcoded article, whatever it is, goes in as written
+    ("a photo of a apple", "a photo of a cars"). This is deliberately NOT
+    grammar-corrected by default: --use_inflect_for_clipmatch is what opts
+    into that (see below), and the project's own history (recap v10) is that
+    an inflect-driven determiner was tried project-wide once before, reverted
+    on suspicion of hurting ClipMatch, and that suspicion was never actually
+    isolated from a concurrent CLIP-backend swap — so it stays an explicit,
+    labeled opt-in rather than the default this time, to keep any future
+    comparison unambiguous.
+
+    `use_inflect=True` additionally fixes the indefinite article in front of
+    `name` so the result is grammatical:
+
+        "a photo of a {}"  + "apple"  -> "a photo of an apple"
+        "a photo of a {}"  + "cars"   -> "a photo of cars"
+        "a photo of a {}"  + "forest" -> "a photo of a forest"
+
+    Only an article that actually GOVERNS the class name is touched, which is
+    what makes this safe to run over all 80 ImageNet + 15 scene templates
+    rather than just the plain "a photo of a {}" one. Three cases:
+
+      1. No indefinite article governs the slot — "the plastic {}.",
+         "a photo of many {}.", "itap of my {}." Nothing to fix; "the"/"many"/
+         "my" are already correct for singular and plural alike. Note the "a"
+         in "a photo of many {}" belongs to "photo", NOT to the class — that
+         is what _NP_BOUNDARY_WORDS detects, and dropping it would corrupt the
+         template into "photo of many trees".
+      2. The article sits directly before the slot — "a photo of a {}.",
+         "art of a {}.", "a tattoo of a {}." Here it agrees with the class
+         name itself, so inflect picks "a" vs "an" by the name's actual
+         spelling/sound ("an hour", "a university"), or drops it for a plural.
+      3. An adjective intervenes — "a photo of a clean {}.", "a photo of a
+         hard to see {}." The article agrees with the ADJECTIVE ("a clean",
+         "a hard to see"), which the template already got right, so a/an is
+         left alone — but it is still dropped for a plural class, since
+         "a clean trees" is wrong while "clean trees" is right.
+    """
+    if not use_inflect:
+        return template.format(name)
+
+    slot = template.find("{}")
+    if slot == -1:
+        return template.format(name)
+    prefix = template[:slot]
+    tokens = prefix.split()
+
+    # Walk backwards for the nearest "a"/"an", stopping at a noun-phrase
+    # boundary (case 1) — anything found past one governs an earlier noun.
+    article_idx = None
+    for i in range(len(tokens) - 1, -1, -1):
+        word = tokens[i].lower()
+        if word in _NP_BOUNDARY_WORDS:
+            break
+        if word in ("a", "an"):
+            article_idx = i
+            break
+
+    if article_idx is None:
+        return template.format(name)
+
+    plural = _is_plural(name)
+    intervening = tokens[article_idx + 1:]
+
+    if plural:
+        # Case 2/3 with a plural head noun: drop the article outright.
+        kept = tokens[:article_idx] + intervening
+        rebuilt = " ".join(kept)
+        return (rebuilt + (" " if kept else "")) + template[slot:].format(name)
+
+    if intervening:
+        return template.format(name)  # case 3: article agrees with the adjective
+
+    # Case 2: the article agrees with the class name itself.
+    article = _inflect_engine().a(name).split(maxsplit=1)[0]
+    kept = tokens[:article_idx] + [article]
+    return " ".join(kept) + " " + template[slot:].format(name)
+
+
+def object_texts(objects: List[str], use_inflect: bool = False) -> List[str]:
+    """Per-extracted-object text for Object-CLIPScore / F-CLIPScore's object
+    terms and ClipMatch's anchor-object search: the single OBJECT_TEMPLATE
+    (never the 80/15-template ensemble — that is candidate-side only).
+    `use_inflect` — see fill_template — is off by default; pass
+    --use_inflect_for_clipmatch through to enable it."""
+    return [fill_template(OBJECT_TEMPLATE, o, use_inflect=use_inflect) for o in objects]
 
 
 def wordnet_definition_text(synset_id: str) -> str:
@@ -410,16 +618,70 @@ def wordnet_definition_text(synset_id: str) -> str:
     alt_names = f", also known as {', '.join(lemmas[1:])}" if len(lemmas) > 1 else ""
 
     # inflect prepends the correct "a"/"an" for the primary lemma's own spelling.
-    name_with_article = _definition_inflect_engine().a(primary_name)
+    name_with_article = _inflect_engine().a(primary_name)
 
     definition = synset.definition()
     return f"{name_with_article.capitalize()}{alt_names}. It is defined as: {definition}."
 
 
-def candidate_vocab_texts(candidate_vocab: List[dict], use_wordnet_definitions: bool = False) -> List[str]:
+def candidate_vocab_texts(candidate_vocab: List[dict], use_wordnet_definitions: bool = False,
+                          use_inflect: bool = False) -> List[str]:
     """Text for each ClipMatch candidate class: the plain OBJECT_TEMPLATE
     phrase by default, or wordnet_definition_text(synset_id) per class when
-    `use_wordnet_definitions` is set (--use_wordnet_definitions_clipmatch)."""
+    `use_wordnet_definitions` is set (--use_wordnet_definitions_clipmatch).
+
+    Single text per class — used for the WordNet-definition variant (a
+    template ensemble doesn't apply to prose) and as the one-template
+    fallback for any dataset without an entry in CLIPMATCH_CANDIDATE_TEMPLATES.
+    For the default templated path on ImageNet/Places, prefer
+    encode_candidate_vocab_ensemble below (mean of 80/15 prompt-template
+    embeddings, not a single text).
+
+    `use_inflect` (see fill_template) only affects the OBJECT_TEMPLATE branch
+    — wordnet_definition_text always inflects its own article regardless,
+    since that's --use_wordnet_definitions_clipmatch's own separate,
+    pre-existing opt-in behavior."""
     if use_wordnet_definitions:
         return [wordnet_definition_text(c["synset_id"]) for c in candidate_vocab]
-    return [OBJECT_TEMPLATE.format(c["class_name"]) for c in candidate_vocab]
+    return [fill_template(OBJECT_TEMPLATE, c["class_name"], use_inflect=use_inflect) for c in candidate_vocab]
+
+
+def candidate_template_texts(candidate_vocab: List[dict], templates: List[str],
+                             use_inflect: bool = False) -> List[List[str]]:
+    """Per-class list of templated texts (one row per candidate class, one
+    column per template) — the raw material for encode_candidate_vocab_ensemble.
+    `use_inflect=True` (see fill_template) corrects the article per template
+    AND per class ("a photo of an airfield", "a photo of badlands"); the
+    default False leaves each template's own hardcoded article as written."""
+    return [[fill_template(t, c["class_name"], use_inflect=use_inflect) for t in templates]
+            for c in candidate_vocab]
+
+
+def encode_candidate_vocab_ensemble(
+    scorer, candidate_vocab: List[dict], templates: List[str],
+    verbose: bool = False, desc: str = "candidate_vocab", use_inflect: bool = False,
+) -> Tuple[np.ndarray, List[str]]:
+    """Encode each ClipMatch candidate class as the MEAN of its `len(templates)`
+    prompt-template embeddings, L2-renormalized afterwards — the OpenAI CLIP
+    "prompt ensembling" recipe (Radford et al., 2021, and the zero-shot
+    notebooks distributed with it). One embedding per class, computed ONCE
+    (candidate classes are constant across the whole evaluation run, unlike
+    the per-image caption/object embeddings) — never recomputed per image.
+
+    `use_inflect` (see fill_template) is off by default — pass
+    --use_inflect_for_clipmatch through to grammar-correct the article in
+    front of every candidate name across all 80/15 templates.
+
+    Returns (candidate_embs [n_classes, dim], flat_texts [n_classes *
+    len(templates)]) — flat_texts is exposed so callers can still run their
+    existing token-length/truncation diagnostics over the actual encoded text.
+    """
+    per_class_texts = candidate_template_texts(candidate_vocab, templates, use_inflect=use_inflect)
+    flat_texts = [t for row in per_class_texts for t in row]
+    flat_embs = scorer.encode_text(flat_texts, verbose=verbose, desc=desc)
+    n_templates = len(templates)
+    embs = flat_embs.reshape(len(candidate_vocab), n_templates, -1).mean(axis=1)
+    norms = np.linalg.norm(embs, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    embs = (embs / norms).astype(np.float32)
+    return embs, flat_texts

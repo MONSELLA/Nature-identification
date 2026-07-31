@@ -29,6 +29,23 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
+def crosses_decile(prev_done, done, total, step=0.1):
+    """Whether progress from `prev_done` to `done` (out of `total`) just
+    crossed into a new `step`-sized fraction of the total, or reached
+    completion. Shared by every batched --verbose progress print in the
+    pipeline (CLIP text/image encoding, BatchProgress.tick, per-image
+    scoring) so all of them log roughly every `step` fraction of the total
+    (10% by default) instead of once per batch regardless of batch size —
+    unthrottled per-batch prints are unusable once batch counts get large
+    (e.g. one line per 77-text CLIP batch across an 80k-text candidate-vocab
+    encode: ~1000 lines for one encode_text call). Always True at/past
+    completion so the final state is never silently skipped.
+    """
+    if total <= 0 or done >= total:
+        return True
+    return int(prev_done / total / step) != int(done / total / step)
+
+
 def format_duration(seconds):
     """Format a duration in seconds as "D-HH:MM:SS" (SLURM-style elapsed-time
     format), e.g. 3725.4 -> "0-01:02:05". Returns None unchanged (so callers
@@ -60,22 +77,33 @@ class BatchProgress:
     more stable estimate of time remaining.
     """
 
-    def __init__(self, num_batches, label="batch", verbose=True):
+    def __init__(self, num_batches, label="batch", verbose=True, report_every=0.1):
         self.num_batches = num_batches
         self.label = label
         self.verbose = verbose
+        self.report_every = report_every
         self._t0 = time.time()
         self._last = self._t0
 
     def tick(self, batch_idx, n_done=None, n_total=None, extra=None):
         """Call once after finishing batch `batch_idx` (0-indexed). No-op when
-        verbose=False, so callers don't need to guard every call site."""
+        verbose=False, so callers don't need to guard every call site.
+
+        Only actually PRINTS every `report_every` fraction of num_batches
+        (default 10%, always including the final batch) — see
+        utils.crosses_decile. Timing bookkeeping (elapsed/avg/ETA) still
+        accumulates every tick regardless, so the numbers in whichever line
+        DOES print are correct running averages, not just stats for the one
+        reported batch.
+        """
         now = time.time()
         batch_seconds = now - self._last
         self._last = now
         if not self.verbose:
             return
         done = batch_idx + 1
+        if not crosses_decile(batch_idx, done, self.num_batches, self.report_every):
+            return
         elapsed = now - self._t0
         avg = elapsed / done
         remaining = avg * (self.num_batches - done)

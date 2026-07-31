@@ -1,16 +1,16 @@
 TAXONOMY REFERENCE: TANGIBILITY AXIS
 
 CATEGORY 1: MATERIAL
-Definition: More-than-human entities, biological or physical processes, substances, and ecosystems that possess physical presence, occupy space, have mass, and can be directly perceived through physical senses in the real world.
+Definition: All more-than-human living entities, non-living natural elements, ecosystems, and their physical derivatives that possess physical presence, occupy space, have mass, and are directly captured by the camera in the real world.
 Inclusion Scope:
-- Real-World Organisms & Ecosystems: Physical plants, animals, fungi, water bodies, geological formations, or green spaces present in the physical environment.
-- Biophysical & Environmental Processes: Observable physical phenomena occurring in reality (e.g., active rainfall, wind moving foliage, physical evaporation, real-time sunsets or eclipses).
-- Physical Substances & Derivatives: Edible solid/liquid items and natural artefacts possessing physical mass (e.g., prepared meals, sugar, coffee, physical wooden or stone surfaces with visible natural texture).
-- Unfiltered Documentary Media: Standard, literal, realistic digital photographs or videos capturing real-world physical landscapes, organisms, or phenomena. A standard camera recording of a real-world entity represents MATERIAL nature.
+- Real-World Organisms and Ecosystems: The physical presence of more-than-human living entities (flora, fauna, fungi, and microorganisms) and the natural or semi-natural environments where they interact when directly captured by the camera (for example, trees, flowers, insects, mammals, mushrooms, bacteria, forests, coral reefs, and beaches).
+- Physical Non-Living Elements: Observable hydrological, atmospheric, meteorological, geological, topographical, and astrophysical elements directly captured by the camera in reality (for example, rivers, oceans, rain, snow, wind, mountains, sand, rocks, mineral oil, and the sun).
+- Substances, Derivatives and Artefacts: Edible solid or liquid items at any processing level, and manufactured objects where the natural material of origin remains visually identifiable, when directly captured by the camera in the real world (for example, salad, coffee, meat, butter, pasta, canned tuna, wool, leather, wooden tables with visible wood grain, and houses made of stone).
 
 CATEGORY 2: IMMATERIAL
-Definition: Concepts, ideas, abstract entities, and fictional, cultural, scientific, or artistic representations of natural elements, processes, or ecosystems. This encompasses depictions across any medium, whether digital, two-dimensional, or physical three-dimensional objects whose primary purpose is representational or symbolic.
+Definition: Stylized, abstract, artistic, scientific, or fictional depictions that represent natural elements, processes, or ecosystems. This explicitly includes indirect captures where the camera takes a picture of a representation of nature rather than the physical natural entity itself (such as a picture of a picture).
 Inclusion Scope:
-- Fictional Representations: Depictions that reimagine, anthropomorphize, or fabricate nature in non-literal forms (e.g., video-game environments, animated cartoons, humanized animals, animal-themed toys and plushies, everyday functional or decorative objects shaped to depict natural entities, synthetic or fake plants, costumes).
-- Artistic & Cultural Representations: Creative, expressive, or symbolic interpretations of nature across any medium (e.g., drawings, paintings, prints on fabric, stylized or artistic photography, three-dimensional figurines, sculptures or models depicting flora and fauna, songs, poems, proverbs, metaphors).
-- Scientific & Digital Mappings: Abstract informational or virtual models of natural features (e.g., infographics, data visualizations, physical geography maps, AI-generated imagery, virtual reality simulations).
+- Indirect and Framed Depictions: A camera capturing a representation of nature displayed on, or printed within, another medium or surface (for example, a picture of a tablet in which a picture of a dog is displayed, a picture of a book cover that contains mountains, or a picture of an advertising panel with a beach on it).
+- Fictional Representations: Depictions that reimagine or fabricate nature in non-literal forms (for example, video game scenes containing forests, mountain ranges or coral reefs, and cartoon animals and plants).
+- Artistic and Abstract Representations: Creative, expressive, stylized, or abstract interpretations of nature (for example, paintings of flora and fauna, and flowers printed on dresses).
+- Physical Representational Objects: Three-dimensional manufactured objects explicitly designed to depict fauna and flora rather than being the natural entities themselves (for example, stuffed animals, stuffed plants, and figurines or statues of fauna and flora).

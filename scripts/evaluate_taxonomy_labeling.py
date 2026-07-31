@@ -36,7 +36,7 @@ import wandb
 
 from src.loaders.excel_loader import TaxonomyGraph
 from src.models.vlm_models import MODEL_REGISTRY, create_vlm
-from src.loaders.dataset_loader import load_dataset
+from src.loaders.dataset_loader import load_dataset, BIG5_DATASETS
 from src.utils import update_results_store, update_dataset_class_stats, compute_class_stats, format_duration, BatchProgress
 # TaxonomyResponse + build_classification_prompt + build_system_prompts live in
 # prompts.py so this calibration eval and the VLM pipeline's fallback path
@@ -60,21 +60,34 @@ def parse_args():
     parser.add_argument("--sheet_name", type=str, default="data corrected")
 
     # Standard Dataset Arguments
-    parser.add_argument("--dataset", type=str, required=True, choices=["coco", "imagenet", "places365", "big5"],
-                        help="Dataset to load and evaluate.")
+    parser.add_argument("--dataset", type=str, required=True,
+                        choices=["coco", "imagenet", "places365", *BIG5_DATASETS],
+                        help="Dataset to load and evaluate. 'big5' pools every configured "
+                             "BIG-5 platform; 'big5_twitter'/'big5_weibo' restrict it to one.")
     parser.add_argument("--data_dir", type=str, help="Path to images directory (for COCO/ImageNet/Places).")
     parser.add_argument("--instances_json", type=str, default="/home/pmonserrat/datasets/coco/annotations/instances_val2017.json", help="Path to instances json (for COCO).")
     parser.add_argument("--places_categories_txt", type=str, help="Path to categories_places365.txt (for Places).", default = "/home/pmonserrat/datasets/places/categories_places365.txt")
 
     # BIG-5 Dataset Arguments
     parser.add_argument("--twitter_en_gt_csv", type=str, default=None,
-                        help="BIG-5 English majority-vote GT CSV (e.g. twitteren6_majority.csv).")
+                        help="BIG-5 Twitter English majority-vote GT CSV (e.g. twitteren6_majority.csv).")
     parser.add_argument("--twitter_es_gt_csv", type=str, default=None,
-                        help="BIG-5 Spanish majority-vote GT CSV (e.g. twitteres6_majority.csv).")
-    parser.add_argument("--big5_images_dir", type=str, default="./big_5_images",
+                        help="BIG-5 Twitter Spanish majority-vote GT CSV (e.g. twitteres6_majority.csv).")
+    parser.add_argument("--weibo_ch0_gt_csv", type=str, default=None,
+                        help="BIG-5 Weibo majority-vote GT CSV, split ch6B0 (e.g. "
+                             "weiboch6B0_majority.csv) — same schema as the Twitter CSVs but "
+                             "with 9 image slots per row instead of 4 (auto-detected).")
+    parser.add_argument("--weibo_ch1_gt_csv", type=str, default=None,
+                        help="BIG-5 Weibo majority-vote GT CSV, split ch6B1.")
+    parser.add_argument("--big_5_twitter_images_dir", "--big5_images_dir", type=str,
+                        default="./big_5_images", dest="big_5_twitter_images_dir",
                         help="Local folder (shared by both languages) already containing every "
-                             "BIG-5 image, named '<platform_id>_<idx>.<ext>' — located by "
-                             "globbing for that stem since the extension isn't fixed.")
+                             "BIG-5 TWITTER image, named '<platform_id>_<idx>.<ext>' — located by "
+                             "globbing for that stem since the extension isn't fixed. "
+                             "--big5_images_dir is kept as an alias.")
+    parser.add_argument("--big_5_weibo_images_dir", type=str, default="./big_5_weibo_images",
+                        help="Local folder (shared by both Weibo splits) containing every BIG-5 "
+                             "WEIBO image, same flat layout as the Twitter folder.")
 
     # Model Arguments
     parser.add_argument("--model_family", type=str, required=True, choices=sorted(MODEL_REGISTRY))
@@ -83,7 +96,18 @@ def parse_args():
     parser.add_argument("--dtype", type=str, default="auto")
     parser.add_argument("--gpu_memory_utilization", type=float, default=0.9)
     parser.add_argument("--max_model_len", type=int, default=None)
+    parser.add_argument("--max_num_seqs", type=int, default=None,
+                        help="Passed straight to vLLM's EngineArgs — caps how many sequences "
+                             "the engine runs (and vision-encodes) concurrently, independent of "
+                             "--batch_size. See run_vlm_pipeline.py's --max_num_seqs help for "
+                             "the full rationale.")
     parser.add_argument("--trust_remote_code", action="store_true")
+    parser.add_argument("--max_image_side", type=int, default=1024,
+                        help="Downscale any image whose longest side exceeds this many pixels "
+                             "before it reaches the VLM (see "
+                             "vlm_models.VLLMBackedVLM._encode_image) — raw social-media images "
+                             "(BIG-5) have no resolution cap otherwise and can OOM the vision "
+                             "encoder. Pass 0 to disable.")
 
     # Generation Arguments
     parser.add_argument("--batch_size", type=int, default=16)
@@ -230,9 +254,12 @@ def main():
         instances_json=args.instances_json,
         places_categories_txt=args.places_categories_txt,
         excel_path=args.excel_path,
-        en_gt=args.twitter_en_gt_csv,
-        es_gt=args.twitter_es_gt_csv,
-        images_dir=args.big5_images_dir,
+        twitter_en_gt=args.twitter_en_gt_csv,
+        twitter_es_gt=args.twitter_es_gt_csv,
+        twitter_images_dir=args.big_5_twitter_images_dir,
+        weibo_ch0_gt=args.weibo_ch0_gt_csv,
+        weibo_ch1_gt=args.weibo_ch1_gt_csv,
+        weibo_images_dir=args.big_5_weibo_images_dir,
     )
 
     # Flatten the dataset into independent evaluation instances
@@ -280,9 +307,12 @@ def main():
     # Every registered family is vLLM-served (see src/models/vlm_models.py's
     # MODEL_REGISTRY) — the HuggingFace-served BLIP family was removed.
     vlm_kwargs = {
-        "dtype": args.dtype, "gpu_memory_utilization": args.gpu_memory_utilization, "trust_remote_code": args.trust_remote_code
+        "dtype": args.dtype, "gpu_memory_utilization": args.gpu_memory_utilization,
+        "trust_remote_code": args.trust_remote_code,
+        "max_image_side": args.max_image_side or None,
     }
     if args.max_model_len is not None: vlm_kwargs["max_model_len"] = args.max_model_len
+    if args.max_num_seqs is not None: vlm_kwargs["max_num_seqs"] = args.max_num_seqs
 
     vlm = create_vlm(args.model_family, args.model_name, **vlm_kwargs)
 

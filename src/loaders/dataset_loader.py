@@ -38,6 +38,7 @@ the BIG-5 taxonomy graph (see src/loaders/excel_loader.py) via
 
 import glob
 import os
+import re
 import pandas as pd
 from pathlib import Path
 
@@ -173,6 +174,102 @@ def _wnid_to_synset(wnid):
         return None
 
 
+def _imagenet_class_names(wnids) -> dict:
+    """Map each ImageNet WNID to a human-readable class name, DISAMBIGUATING
+    any two WNIDs whose naive name (`synset_name.split('.')[0]`) would
+    otherwise collide — a real, documented ImageNet-1k quirk: n02963159
+    ("cardigan", the sweater, cardigan.n.01) and n02113186 ("Cardigan
+    Welsh corgi", a dog breed, cardigan.n.02) are two ENTIRELY DIFFERENT
+    classes that both stringify to "cardigan" under the naive scheme, as do
+    n02012849 (crane the bird, crane.n.05) and n03126707 (crane the
+    machine, crane.n.04).
+
+    WHY THIS MATTERS: class_name is what actually gets embedded as ClipMatch
+    candidate text ("a photo of a {class_name}"). Two DIFFERENT classes
+    sharing IDENTICAL text produce near-identical CLIP embeddings, so
+    ClipMatch's argmax between them degenerates into noise — a genuinely
+    correct "cardigan" prediction can land on the wrong SENSE's synset and
+    get scored as flat-out wrong, even though the model got the right word.
+    (Observed directly: a caption clearly describing a knitted sweater
+    correctly matched candidate text "cardigan", but the candidate_vocab
+    entry that text ambiguously represented could be EITHER cardigan.n.01
+    OR cardigan.n.02 — same text, so ClipMatch's argmax could land on either.)
+
+    Resolution, tried in order, only for WNIDs that actually collide (a
+    unique naive name is returned unchanged):
+      1. The synset's own LONGEST lemma name (most specific known synonym).
+         Fixes cardigan: cardigan.n.02's lemmas are ['Cardigan',
+         'Cardigan_Welsh_corgi'] — the second is unambiguous on its own.
+      2. If every colliding synset's longest lemma is STILL identical (e.g.
+         crane.n.04 and crane.n.05 both have the single lemma "crane", so
+         step 1 changes nothing), qualify with the synset's own immediate
+         hypernym: "crane, a type of lifting device" vs "crane, a type of
+         wading bird".
+      3. Last resort (should not occur in practice — logged if it does):
+         append the synset id itself so the text is at least distinct, e.g.
+         "crane (crane.n.04)".
+    """
+    from collections import defaultdict
+    from nltk.corpus import wordnet as wn
+
+    synset_of = {}
+    for wnid in wnids:
+        name = _wnid_to_synset(wnid)
+        if name is not None:
+            synset_of[wnid] = name
+
+    def naive_name(synset_name):
+        return synset_name.split(".")[0].replace("_", " ")
+
+    groups = defaultdict(list)
+    for wnid, synset_name in synset_of.items():
+        groups[naive_name(synset_name)].append(wnid)
+
+    result = {}
+    for naive, group_wnids in groups.items():
+        if len(group_wnids) == 1:
+            result[group_wnids[0]] = naive
+            continue
+
+        # Real collision — try the longest-lemma disambiguation per WNID.
+        for wnid in group_wnids:
+            synset = wn.synset(synset_of[wnid])
+            longest = max(synset.lemma_names(), key=len).replace("_", " ")
+            result[wnid] = longest if longest.lower() != naive.lower() else naive
+
+        # If longest-lemma didn't separate everyone (e.g. "crane"/"crane"),
+        # qualify the still-colliding subset with their own hypernym.
+        by_name = defaultdict(list)
+        for wnid in group_wnids:
+            by_name[result[wnid]].append(wnid)
+        for name, tied_wnids in by_name.items():
+            if len(tied_wnids) == 1:
+                continue
+            for wnid in tied_wnids:
+                synset = wn.synset(synset_of[wnid])
+                hypernyms = synset.hypernyms()
+                if hypernyms:
+                    qualifier = hypernyms[0].lemma_names()[0].replace("_", " ")
+                    result[wnid] = f"{name}, a type of {qualifier}"
+
+        # Final fallback: if the hypernym qualifier STILL didn't separate
+        # everyone (essentially never happens), fall back to the raw synset
+        # id so at least the text differs, and say so — silently leaving two
+        # different classes indistinguishable is worse than an ugly name.
+        by_name = defaultdict(list)
+        for wnid in group_wnids:
+            by_name[result[wnid]].append(wnid)
+        for name, tied_wnids in by_name.items():
+            if len(tied_wnids) > 1:
+                for wnid in tied_wnids:
+                    print(f"⚠️  ImageNet class-name collision could not be fully resolved "
+                          f"for {name!r} ({[synset_of[w] for w in tied_wnids]}); "
+                          f"appending the synset id to keep candidate text distinct.")
+                    result[wnid] = f"{name} ({synset_of[wnid]})"
+
+    return result
+
+
 def load_imagenet(data_dir, taxonomy_graph):
     """Load ImageNet: one folder per class (named by WordNet id), one label
     per image (single-label classification)."""
@@ -199,6 +296,13 @@ def load_imagenet(data_dir, taxonomy_graph):
     # Precompute EACH CLASS's taxonomy label just once (rather than doing this
     # lookup again for every single image, which could number in the tens of
     # thousands) — then just look up the pre-computed answer per image below.
+    # class_names is DISAMBIGUATED (see _imagenet_class_names) so classes like
+    # "cardigan" (sweater) and "Cardigan Welsh corgi" (dog breed) — same naive
+    # name, entirely different WordNet synsets — get distinct text instead of
+    # colliding, which matters wherever this class_name feeds a CLIP/VLM
+    # prompt (get_candidate_vocab's matching branch below, and the calibration
+    # eval in evaluate_taxonomy_labeling.py).
+    class_names = _imagenet_class_names(idx_to_wnid.values())
     for idx, wnid in idx_to_wnid.items():
         synset_name = _wnid_to_synset(wnid)
         if synset_name is None:
@@ -206,10 +310,7 @@ def load_imagenet(data_dir, taxonomy_graph):
 
         gt = get_gt_from_graph(synset_name, taxonomy_graph)
         if gt:
-            # e.g. "golden_retriever.n.01" -> "golden retriever" (human-readable,
-            # used later as the text fed to the VLM's classification prompt).
-            class_name = synset_name.split('.')[0].replace('_', ' ')
-            class_to_target[idx] = {"class_name": class_name, **gt}
+            class_to_target[idx] = {"class_name": class_names[wnid], **gt}
 
     results = []
     # `dataset.samples` is torchvision's full list of (file_path, class_index)
@@ -403,14 +504,78 @@ def load_places365(data_dir, categories_txt, excel_path, taxonomy_graph):
     return results
 
 
-def load_big5(en_gt, es_gt, images_dir):
-    """Load the BIG-5 social-media dataset itself: human-annotated tweet
-    images (English + Spanish), each with its OWN direct nature/biotic/
-    material annotation — a MAJORITY VOTE across multiple coders (no WordNet
-    class lookup needed — these are already the ground truth).
+# The BIG-5 dataset names accepted by load_dataset/--dataset. "big5" pools
+# every configured platform into one run; the per-platform names restrict it
+# to one, which is what you want when comparing Twitter against Weibo (the
+# results store and the predictions CSV are keyed by dataset name, so a
+# per-platform name keeps the two sets of numbers separate instead of
+# silently averaging them together).
+BIG5_DATASETS = ("big5", "big5_twitter", "big5_weibo")
 
-    IMAGES ARE LOCAL, NOT DOWNLOADED: `images_dir` is one flat folder
-    (shared by both languages) that already contains every image, named
+
+def big5_sources(dataset_name, **kwargs):
+    """Build load_big5's (label, gt_csv, images_dir) triples from the CLI
+    kwargs, restricted to the platform(s) `dataset_name` selects. A split
+    whose GT CSV wasn't supplied is passed through as None and skipped by
+    load_big5, so partial configurations (e.g. Twitter-English only) work."""
+    twitter = [
+        ("twitter_en", kwargs.get("twitter_en_gt"), kwargs.get("twitter_images_dir")),
+        ("twitter_es", kwargs.get("twitter_es_gt"), kwargs.get("twitter_images_dir")),
+    ]
+    weibo = [
+        ("weibo_ch0", kwargs.get("weibo_ch0_gt"), kwargs.get("weibo_images_dir")),
+        ("weibo_ch1", kwargs.get("weibo_ch1_gt"), kwargs.get("weibo_images_dir")),
+    ]
+    if dataset_name == "big5_twitter":
+        return twitter
+    if dataset_name == "big5_weibo":
+        return weibo
+    return twitter + weibo
+
+
+def _big5_slot_count(columns) -> int:
+    """How many per-image annotation slots a BIG-5 majority-vote CSV carries,
+    read off its OWN `nature_visual_<idx>` column names.
+
+    This MUST be detected rather than hardcoded: the Twitter CSVs have 4 slots
+    (nature_visual_0..3) but the Weibo CSVs have 9 (nature_visual_0..8), and a
+    Weibo post can genuinely have all 9. The previous hardcoded `min(4, ...)`
+    silently discarded images 4-8 of every 9-image Weibo post — ~27% of Weibo
+    rows have n_images == 9, so that would have dropped a large fraction of
+    the dataset without any error.
+    """
+    slots = [int(m.group(1)) for c in columns
+             if (m := re.fullmatch(r"nature_visual_(\d+)", str(c)))]
+    return (max(slots) + 1) if slots else 0
+
+
+def load_big5(sources):
+    """Load the BIG-5 social-media dataset: human-annotated social-media
+    images, each with its OWN direct nature/biotic/material annotation — a
+    MAJORITY VOTE across multiple coders (no WordNet class lookup needed —
+    these are already the ground truth).
+
+    `sources` is a list of (label, gt_csv, images_dir) triples, one per
+    majority-vote CSV, so several PLATFORMS and several per-platform splits
+    can be pooled into one dataset. In practice:
+      - Twitter: two splits (English, Spanish), 4 image slots per row, both
+        sharing one images dir.
+      - Weibo:   two splits (ch6B0, ch6B1), 9 image slots per row, sharing a
+        DIFFERENT images dir.
+    Each source carries its own images_dir precisely because the two
+    platforms' images live in separate folders on the cluster. A source whose
+    gt_csv is None is skipped, so a run can enable any subset.
+
+    All splits share one column schema — `platform_id`, `n_images`, and
+    `nature_visual_<idx>` / `nep_materiality_visual_<idx>` /
+    `nep_biological_visual_<idx>` per image slot — differing ONLY in how many
+    slots they have (see _big5_slot_count). `nep_immaterial_specific_visual_<idx>`
+    (the format subcategory: illustration/infographic/videogame/plain_text/
+    other) is deliberately IGNORED — per recap §2b those subcategories are not
+    a classification target for this pipeline.
+
+    IMAGES ARE LOCAL, NOT DOWNLOADED: each images_dir is one flat folder that
+    already contains every image for its platform, named
     "<platform_id>_<idx>.<ext>". The extension is NOT fixed (jpg/jpeg/png all
     appear in practice), so each image is located by GLOBBING for
     "<platform_id>_<idx>.*" rather than assuming one. This replaced an older
@@ -454,33 +619,62 @@ def load_big5(en_gt, es_gt, images_dir):
 
     results = []
 
-    # BIG-5 data comes as one majority-vote GT CSV per language; English and
-    # Spanish are processed identically, just looping over both in turn.
-    for lang, gt_csv in [("en", en_gt), ("es", es_gt)]:
+    # One majority-vote GT CSV per platform-split (twitter en/es, weibo
+    # ch6B0/ch6B1). Every split is processed identically — only the slot
+    # count and the images dir differ.
+    for label, gt_csv, images_dir in sources:
         if not gt_csv:
             continue
-        # dtype=str for platform_id: it's a large integer-looking id, and we
-        # only ever use it to build a filename string — reading it as a
-        # plain string sidesteps any pandas int/float parsing quirks.
+        # dtype=str for platform_id: on Twitter it's a large integer-looking
+        # id and on Weibo an alphanumeric string that can begin with "-" and
+        # contain "_" — reading it as a plain string sidesteps any pandas
+        # int/float parsing quirks and keeps leading characters intact.
         gt = pd.read_csv(gt_csv, dtype={"platform_id": str})
+        n_slots = _big5_slot_count(gt.columns)
+        if n_slots == 0:
+            # No nature_visual_<idx> column matched at all — this CSV's schema
+            # doesn't look like a BIG-5 majority-vote GT file. Every row will
+            # contribute zero images below with no further signal, so raise
+            # here instead of silently returning nothing for this source.
+            raise ValueError(
+                f"BIG-5 source {label!r} ({gt_csv}): no 'nature_visual_<idx>' columns found "
+                f"— got columns {list(gt.columns)[:10]}{'...' if len(gt.columns) > 10 else ''}. "
+                f"Is this the right CSV / has its schema changed?"
+            )
+        n_annotated = n_matched = 0
 
         for _, row in gt.iterrows():
             platform_id = row.get("platform_id")
             if pd.isna(platform_id):
                 continue
+            # Strip a leading apostrophe — Excel's own "force text" marker
+            # (added so a value like "-3NEKN7YEcCmPzGy" isn't reinterpreted as
+            # a formula/number when the sheet is opened), which survives as a
+            # literal "'" character once the sheet is exported to CSV. Seen on
+            # the production Weibo annotation CSVs (not the earlier samples),
+            # where every platform_id came through as "'-3NEKN...". Only ONE
+            # leading apostrophe is ever added by Excel, and it is never part
+            # of the real id, so stripping it is always safe; only the
+            # LEADING one is touched — an apostrophe anywhere else in the
+            # string (were one ever legitimately part of the id) is untouched.
+            platform_id = str(platform_id)
+            if platform_id.startswith("'"):
+                platform_id = platform_id[1:]
             try:
-                # How many images this tweet actually has (0-4). Needed
-                # because nature_visual_1/2/3 etc. are NOT blank for a
+                # How many images this post actually has (0..n_slots). Needed
+                # because nature_visual_1/2/3... are NOT blank for a
                 # nonexistent image slot — they default to "No" the same as
                 # a real non-nature image would — so n_images is the ONLY
-                # reliable way to know how many of the 4 columns are real.
+                # reliable way to know how many of the slot columns are real.
                 n_images = int(row.get("n_images", 0))
             except (TypeError, ValueError):
                 n_images = 0
 
-            for idx in range(min(4, n_images)):
+            for idx in range(min(n_slots, n_images)):
                 nat = map_yn(row.get(f'nature_visual_{idx}'))
                 if nat is None: continue
+
+                n_annotated += 1
 
                 mat_vals = map_mat(row.get(f'nep_materiality_visual_{idx}'))
                 bio_vals = map_bio(row.get(f'nep_biological_visual_{idx}'))
@@ -493,10 +687,16 @@ def load_big5(en_gt, es_gt, images_dir):
                     # pipeline (no biotic/material label when nature is False).
                     mat_vals, bio_vals = [], []
 
-                matches = glob.glob(os.path.join(images_dir, f"{platform_id}_{idx}.*"))
+                # glob.escape the id but NOT the "*": Weibo ids are arbitrary
+                # alphanumeric strings, so a "[" / "]" / "?" in one would
+                # otherwise be read as a glob character class and silently
+                # fail to match its own file.
+                pattern = os.path.join(images_dir, f"{glob.escape(str(platform_id))}_{idx}.*")
+                matches = sorted(glob.glob(pattern))
                 if not matches:
                     continue
                 local_path = matches[0]
+                n_matched += 1
 
                 results.append({
                     "image_path": local_path,
@@ -515,6 +715,22 @@ def load_big5(en_gt, es_gt, images_dir):
                         "gt_material": [v == 1 for v in mat_vals] or None,
                     }]
                 })
+
+        # An annotated CSV that matched ZERO images is almost always a wrong
+        # --big_5_twitter_images_dir/--big_5_weibo_images_dir, not a genuinely
+        # empty dataset — silently returning nothing here is what produces the
+        # unhelpful "No dataset instances loaded" a few frames up the stack.
+        # Surface the actual images_dir that was searched so it's a one-line
+        # fix instead of a debugging session.
+        if n_annotated and not n_matched:
+            print(f"⚠️  BIG-5 source {label!r}: {n_annotated} annotated image slots in "
+                  f"{gt_csv}, but NONE matched a file under images_dir={images_dir!r} "
+                  f"(pattern: '<platform_id>_<idx>.*'). Check that this path is correct "
+                  f"and that it directly contains the image files (not a parent folder).")
+        elif n_annotated and n_matched < n_annotated:
+            print(f"⚠️  BIG-5 source {label!r}: only {n_matched}/{n_annotated} annotated "
+                  f"image slots matched a file under images_dir={images_dir!r} — some images "
+                  f"may be missing from disk.")
     return results
 
 # ============================================================================
@@ -530,8 +746,8 @@ def load_dataset(dataset_name, taxonomy_graph, **kwargs):
         return load_coco(kwargs.get("data_dir"), kwargs.get("instances_json"), taxonomy_graph)
     elif dataset_name == "places365":
         return load_places365(kwargs.get("data_dir"), kwargs.get("places_categories_txt"), kwargs.get("excel_path"), taxonomy_graph)
-    elif dataset_name == "big5":
-        return load_big5(kwargs.get("en_gt"), kwargs.get("es_gt"), kwargs.get("images_dir"))
+    elif dataset_name in BIG5_DATASETS:
+        return load_big5(big5_sources(dataset_name, **kwargs))
     else:
         raise ValueError(f"Unknown dataset: {dataset_name}")
 
@@ -568,6 +784,15 @@ def get_candidate_vocab(dataset_name, taxonomy_graph, **kwargs):
     if dataset_name == "imagenet":
         from torchvision.datasets import ImageFolder
         classes = ImageFolder(kwargs.get("data_dir")).classes  # sorted WNIDs
+        # DISAMBIGUATED class names (see _imagenet_class_names) — without
+        # this, two DIFFERENT ImageNet classes sharing a naive name (e.g.
+        # "cardigan" the sweater vs "Cardigan Welsh corgi" the dog breed,
+        # both -> "cardigan") would get IDENTICAL ClipMatch candidate text
+        # ("a photo of a cardigan" for both entries), making ClipMatch's
+        # argmax between them essentially a coin flip rather than a real
+        # classification, and silently mis-scoring a textually-correct
+        # prediction whenever it lands on the "other" sense's synset.
+        class_names = _imagenet_class_names(classes)
         vocab = []
         seen = set()
         for wnid in classes:
@@ -578,8 +803,7 @@ def get_candidate_vocab(dataset_name, taxonomy_graph, **kwargs):
             if gt is None:
                 continue
             seen.add(synset_name)
-            class_name = synset_name.split('.')[0].replace('_', ' ')
-            vocab.append({"class_name": class_name, "synset_id": synset_name,
+            vocab.append({"class_name": class_names[wnid], "synset_id": synset_name,
                           "gt_nature": gt["gt_nature"], "gt_biotic": gt["gt_biotic"]})
         return vocab
 

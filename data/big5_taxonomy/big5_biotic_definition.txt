@@ -1,19 +1,19 @@
 TAXONOMY REFERENCE: LIFE CATEGORY AXIS
 
 CATEGORY 1: BIOTIC
-Definition: All more-than-human living organisms, ecosystems defined by living communities, and the material or immaterial results and derivatives of biological processes.
+Definition: All more-than-human living entities, the ecosystems and environments in which they exist and interact, and their representations and derivatives.
 Inclusion Scope:
-- Flora & Plant Derivatives: Wild or potted plants, flowers, trees, and plant-derived foods, drinks, or materials (e.g., sugar, coffee, liqueur, wood with visible grain).
-- Fauna & Animal Derivatives: Wild, domesticated, or bred non-human vertebrates, molluscs, and insects, as well as animal-derived products (e.g., butter, honey, meat, eggs).
-- Fungi & Microorganisms: Wild or cultivated mushrooms, moulds, yeasts, and bacteria.
-- Biological Ecosystems: Environments defined by the living communities and biological interactions within them (e.g., nature reserves, urban parks, vegetable gardens, forests).
-- Representations: Fictional, scientific, or artistic depictions of non-human living organisms or biological products (e.g., animated animals, drawings of plants).
+- Flora and its derivatives: Wild or potted plants such as flowers, trees, and vegetables, as well as foods, drinks and materials derived from them (for example, salad, coffee, liqueur, and wood with visible grain).
+- Fauna and its derivatives: Wild, domesticated, or bred more-than-human animals such as mammals, molluscs, and insects, as well as foods and materials derived from them (for example, vegetables, butter, honey, meat, eggs, wool, and leather).
+- Fungi and Microorganisms: Wild or cultivated mushrooms, moulds, yeasts, bacteria and virus.
+- Ecosystems and Environments: Natural or semi-natural environments where the more-than-human living entities exist and interact (for example, forests, coral reefs, nature reserves, urban parks, vegetable gardens, and beaches).
+- Representations: Real, stylized, abstract, artistic, scientific or fictional depictions of the more-than-human living entities (for example, landscape paintings, cartoon or stuffed animals and plants, video-game forests, and figurines or statues of fauna and flora).
 
 CATEGORY 2: ABIOTIC
-Definition: All non-living physical, chemical, geological, topographical, meteorological, or astrophysical elements and processes that characterize or occur within an ecosystem.
+Definition: All non-living physical, chemical, geological, topographical, meteorological, or astrophysical elements that characterize or occur within an ecosystem or natural environment.
 Inclusion Scope:
-- Hydrological Components: Water bodies and fluid flows (e.g., rivers, ponds, lakes, oceans, streams).
-- Atmospheric & Weather Components: Meteorological phenomena and seasonal climatic conditions (e.g., rain, clouds, snow, wind, ambient temperature, winter snowstorms).
-- Geological & Topographical Components: Large-scale landforms, earth structures, natural mineral resources, and soil materials (e.g., mountains, canyons, cliffs, valleys, caves, dunes, rocks, sand, salt, mineral oil).
-- Astrophysical Components & Processes: Celestial bodies and phenomena (e.g., the sun, stars, moon, sunsets, sunrises, eclipses, natural day/night lighting).
-- Representations: Fictional, scientific, or artistic depictions of non-living natural elements, landforms, or phenomena (e.g., paintings of a mountain range or sunset, video-game weather effects).
+- Hydrological: Water bodies and fluid flows (for example, rivers, ponds, lakes, oceans, and streams).
+- Atmospheric and Meteorological: For example, rain, clouds, snow, wind, and sky.
+- Geological and Topographical: Large-scale landforms, earth structures, and soil materials (for example, mountains, canyons, cliffs, valleys, caves, dunes, rocks, land, sand, salt).
+- Astrophysical: Celestial bodies (for example, sun, stars, moon, and planets).
+- Representations: Real, stylized, abstract, artistic, scientific or fictional depictions of the non-living natural elements (for example, a painting or a video-game scene of a mountain range with a blue or cloudy sky).

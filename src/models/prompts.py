@@ -69,28 +69,66 @@ CAPTION_PROMPT = "Describe this image, including any text."
 # run_vlm_pipeline.py's --no_summarize_clipmatch_caption to opt out). Still
 # NOT part of the baseline two-pass pipeline itself — only feeds ClipMatch.
 #
-# ALWAYS asks for BOTH the subject and the setting (not "subject OR setting"
-# — that phrasing handed the model an unconstrained, arbitrary choice with no
-# criterion for which to pick, risking inconsistent behavior across images).
-# ImageNet's candidate classes are object-centric (a discrete figure-in-a-
-# scene, e.g. "golden retriever"); Places365's ARE the scene itself ("airport
-# terminal", "kitchen"). Asking for the subject alone risks the summary
-# fixating on an incidental foreground object (e.g. "a man walking") on a
-# Places image where the SETTING is what ClipMatch actually needs to match
-# (e.g. "restaurant") — asking for both means the setting still gets
-# mentioned even when a person/object is also in frame. One shared prompt
-# across both datasets, not forked per-dataset — simpler to defend
-# methodologically, and not yet validated as a net win vs the original
-# subject-only wording (worth re-checking ClipMatch top-1 on Places
-# specifically after this change, since that's the dataset it targets).
-SUMMARY_CAPTION_PROMPT = (
+# NOW FORKED PER DATASET (superseding the earlier single shared prompt).
+# ClipMatch scores this summary against a FIXED candidate vocabulary, and the
+# two datasets' vocabularies are different KINDS of label:
+#   - ImageNet's classes are OBJECTS — a discrete figure in a scene
+#     ("golden retriever", "sea lion"), so the summary should spend its words
+#     on the objects/entities present and what identifies them.
+#   - Places365's classes ARE the scene ("airport terminal", "kitchen"), so
+#     the summary should describe the setting as a whole; a summary that
+#     fixates on an incidental foreground object buries the one thing
+#     ClipMatch has to match.
+# The previous shared prompt asked for BOTH subject and setting on every
+# image, so each dataset paid for the half it does not want.
+#
+# Both cap at 30 words (down from the shared prompt's 50 — the point is to
+# stay well inside a 77-token CLIP context, and a tighter budget forces the
+# model to lead with the identifying content) and both end with "Output ONLY
+# the summary text." to stop the model prefixing a conversational preamble
+# ("Sure! Here's a summary: ...") that would be embedded as if it were image
+# content. Both keep the "{caption}" placeholder and the grounded-in-the-image
+# framing, and both stay neutral on nature — this feeds ClipMatch only, never
+# the taxonomy axes.
+SUMMARY_CAPTION_PROMPT_IMAGENET = (
     "Here is a detailed description of this image:\n\n"
     "\"{caption}\"\n\n"
-    "Using both the image and this description, write a short summary "
-    "(at most 50 words) capturing both the main subject (if there is one) "
-    "and the setting or scene, along with the most important surrounding "
-    "context."
+    "Using both the image and this description, write a short summary (at most 30 words) "
+    "capturing the key objects in the scene. "
+    "Output ONLY the summary text."
 )
+
+SUMMARY_CAPTION_PROMPT_PLACES = (
+    "Here is a detailed description of this image:\n\n"
+    "\"{caption}\"\n\n"
+    "Using both the image and this description, write a short summary (at most 30 words) "
+    "focusing on the overall scene, environment, or setting. "
+    "Output ONLY the summary text."
+)
+
+# Keyed by the same dataset names as clip_metrics.CLIPMATCH_DATASETS — those
+# are the only two datasets that run ClipMatch, so they are the only two that
+# ever request a summary caption.
+SUMMARY_CAPTION_PROMPTS = {
+    "imagenet": SUMMARY_CAPTION_PROMPT_IMAGENET,
+    "places365": SUMMARY_CAPTION_PROMPT_PLACES,
+}
+
+
+def get_summary_caption_prompt(dataset: str) -> str:
+    """The ClipMatch summary-caption prompt for `dataset` (see
+    SUMMARY_CAPTION_PROMPTS). Raises on an unknown dataset rather than
+    silently falling back to one of the two — a silent fallback would mean
+    scoring Places images with the object-centric prompt (or vice versa) with
+    nothing in the artifact to show it happened."""
+    try:
+        return SUMMARY_CAPTION_PROMPTS[dataset]
+    except KeyError:
+        raise ValueError(
+            f"No summary-caption prompt for dataset {dataset!r}; expected one of "
+            f"{sorted(SUMMARY_CAPTION_PROMPTS)}. Only these datasets run ClipMatch "
+            f"(clip_metrics.CLIPMATCH_DATASETS), so only these need a summary caption."
+        ) from None
 
 # =============================================================================
 # Stage 2 — Object extraction (structured)
@@ -114,9 +152,9 @@ EXTRACTION_PROMPT = """You are an expert computer vision annotator. Below is a b
 Your task is to extract visual entities from the image, keeping the total to a maximum of 12 items to avoid noise.
 
 RULES:
- - Macro Elements (Objective): Extract the overarching scene (e.g., forest, office, restaurant, garden), amorphous elements (e.g., sky, grass, ocean, road), and salient objects (e.g., dog, desk, guitar) objectively.
- - Micro Elements (Nature-Filtered): For tiny details, non-salient items, background objects, or depicted entities (e.g., stars in a night sky, a small orange, a little dog figurine, or a flower printed on a dress), ONLY extract them if they represent nature according to your system instructions. Ignore all other minor details.
- - Use the 'reasoning' field to explicitly state your two-step plan: list the macro elements, then identify any valid nature-related micro elements.
+ - Macro Elements (Objective): Extract the countable Things (salient objects like dog, guitar, desk, tree), uncountable Stuff (amorphous regions like sky, grass, ocean, sand, road), and the overarching Scene (settings like forest, office, restaurant), objectively.
+ - Micro Elements (Nature-Filtered): For tiny details, non-salient items, background objects, or depicted entities (e.g., a distant cat in the background, a little dog figurine, or a flower printed on a dress), ONLY extract them if they represent nature according to your system instructions. Ignore all other minor details.
+ - Use the 'reasoning' field to explicitly state your two-step plan: list the macro elements (things, stuff, and scenes), then identify any valid nature-related micro elements.
  - Format all extracted entities as concise, singular nouns or compound nouns.
  - Place all chosen entities into the single 'objects' list.
  - Do not hallucinate entities not visually present.
@@ -124,29 +162,29 @@ RULES:
 EXAMPLE 1 (Mixed Environment):
 Image: A person sitting in an indoor office chair at a desk with a laptop. On the desk is a little dog figurine and an orange. The person is wearing a shirt with a geometric triangle pattern. In the background, there is a potted plant near a window.
 {{
-  "reasoning": "Step 1: The macro elements are the office, desk, chair, person, window, and laptop. Step 2: For micro elements, the little dog figurine, the orange, and the potted plant represent nature, so they will be extracted. I will ignore the geometric pattern on the shirt as it is a non-nature detail.",
-  "objects": ["office", "desk", "chair", "person", "window", "laptop", "dog figurine", "orange", "potted plant"]
+  "reasoning": "Step 1: Macro elements include things (desk, chair, person, laptop, window), and the scene (office). Step 2: For micro elements, the little dog figurine, the orange, and the potted plant represent nature, so they will be extracted. I will ignore the geometric pattern on the shirt as it is a non-nature detail.",
+  "objects": ["desk", "chair", "person", "laptop", "window", "office", "dog figurine", "orange", "potted plant"]
 }}
 
 EXAMPLE 2 (Pure Nature Space):
 Image: A sunny beach with crashing ocean waves and sand. A surfer carrying a surfboard with a bird logo walks near the water. A small crab is resting on the sand.
 {{
-  "reasoning": "Step 1: The macro elements are the beach, ocean, sand, surfer, and surfboard. Step 2: For micro elements, the small crab and the bird logo represents nature and will be extracted.",
-  "objects": ["beach", "ocean", "sand", "surfer", "surfboard", "crab", "bird logo"]
+  "reasoning": "Step 1: Macro elements include things (surfer, surfboard), stuff (ocean, sand), and the scene (beach). Step 2: For micro elements, the small crab and the bird logo represents nature and will be extracted.",
+  "objects": ["surfer", "surfboard", "ocean", "sand", "beach", "crab", "bird logo"]
 }}
 
 EXAMPLE 3 (Pure No-nature Space):
 Image: A photograph of a brightly lit convenience store in an urban city. Shelves are stocked with snacks and soda bottles. A cashier stands behind the counter.
 {{
-  "reasoning": "Step 1: The macro elements are the store, city, shelf, cashier, and counter. Step 2: For micro elements, there are junk food snacks and soda bottles, but since none of these represent nature, they will be ignored. I will only extract the macro items.",
-  "objects": ["store", "city", "shelf", "cashier", "counter"]
+  "reasoning": "Step 1: Macro elements include things (shelf, cashier, counter) and the scene (store, city). Step 2: For micro elements, there are junk food snacks and soda bottles, but since none of these represent nature, they will be ignored. I will only extract the macro items.",
+  "objects": ["shelf", "cashier", "counter", "store", "city"]
 }}
 
 EXAMPLE 4 (Social Media Text & Depiction):
 Image: A messy indoor bedroom with a desk, a chair and a bed. A person wearing a shirt with a flower print is taking a selfie in the mirror. A teddy bear is laying on the bed. Overlaid on the image is a text banner that says "Save the trees!".
 {{
-  "reasoning": "Step 1: The macro elements are the bedroom, person, mirror, desk, and bed. Step 2: For micro elements, the 'flower' print on the shirt, the 'teddy bear' (depicting an animal), and the word 'trees' from the text overlay all represent nature-related concepts and will be extracted. The rest of the messy room clutter will be ignored.",
-  "objects": ["bedroom", "person", "mirror", "desk", "chair", "bed", "flower", "teddy bear", "tree"]
+  "reasoning": "Step 1: Macro elements include things (person, mirror, desk, chair, bed) and the scene (bedroom). Step 2: For micro elements, the 'flower' print on the shirt, the 'teddy bear' (depicting an animal), and the word 'trees' from the text overlay all represent nature-related concepts and will be extracted. The rest of the messy room clutter will be ignored.",
+  "objects": ["person", "mirror", "desk", "chair", "bed", "bedroom", "flower", "teddy bear", "tree"]
 }}"""
 
 class ObjectExtractionResponse(BaseModel):
@@ -155,10 +193,10 @@ class ObjectExtractionResponse(BaseModel):
     reasoning: str = Field(
         description=(
             "Briefly analyze the image using a two-step process. First, identify the macro elements "
-            "(scene, amorphous stuff, salient objects) objectively. Second, scan for micro elements "
-            "(tiny details, non-salient items, depictions). ONLY extract these micro elements if they "
-            "represent nature according to the system definition. Ignore all other minor details. "
-            "Keep the final list to a maximum of 12 items."
+            "(countable things/objects, uncountable amorphous stuff, and overarching scenes) objectively. "
+            "Second, scan for micro elements (tiny details, non-salient items, depictions). "
+            "ONLY extract these micro elements if they represent nature according to the system definition. "
+            "Ignore all other minor details. Keep the final list to a maximum of 12 items."
         )
     )
     objects: List[str] = Field(
