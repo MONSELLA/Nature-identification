@@ -3,29 +3,29 @@
         "mistral/mistralai/Ministral-3-8B-Instruct-2512-BF16": {
             "dataset": "imagenet",
             "model": "mistral/mistralai/Ministral-3-8B-Instruct-2512-BF16",
-            "n_images": 160,
+            "n_images": 500,
             "diagnostics": {
-                "objects_per_image": 4.20625,
-                "extraction_hit_rate": 0.24375,
-                "extraction_parse_failures": 3,
-                "extraction_parse_failure_rate": 0.01875,
-                "wordnet_mapping_rate": 0.1976225854383358,
-                "vlm_fallback_rate": 0.8023774145616642,
-                "label_vlm_calls": 597,
-                "label_parse_failures": 16,
-                "label_parse_failure_rate": 0.02680067001675042,
-                "label_calls_full": 540,
-                "label_parse_failures_full": 16,
-                "label_parse_failure_rate_full": 0.02962962962962963,
-                "label_calls_material": 57,
+                "objects_per_image": 4.096,
+                "extraction_hit_rate": 0.242,
+                "extraction_parse_failures": 1,
+                "extraction_parse_failure_rate": 0.002,
+                "wordnet_mapping_rate": 0.10400390625,
+                "vlm_fallback_rate": 0.89599609375,
+                "label_vlm_calls": 1980,
+                "label_parse_failures": 1,
+                "label_parse_failure_rate": 0.000505050505050505,
+                "label_calls_full": 1767,
+                "label_parse_failures_full": 1,
+                "label_parse_failure_rate_full": 0.0005659309564233164,
+                "label_calls_material": 213,
                 "label_parse_failures_material": 0,
                 "label_parse_failure_rate_material": 0.0,
-                "label_vlm_call_rate": 0.8870728083209509
+                "label_vlm_call_rate": 0.966796875
             },
             "reference_free": {
-                "clipscore": 0.6269549768418073,
-                "f_clipscore": 0.5393285071934739,
-                "object_clipscore": 0.5094632944092155
+                "clipscore": 0.6236777399182319,
+                "f_clipscore": 0.5408482657513748,
+                "object_clipscore": 0.5214040116071701
             },
             "clip_models": {
                 "reference_free": "longclip",
@@ -35,44 +35,50 @@
                 "use_inflect_for_clipmatch": false
             },
             "nature": {
-                "accuracy": 0.86875,
-                "precision": 0.8674698795180723,
-                "recall": 0.8780487804878049,
-                "f1": 0.8727272727272727,
-                "precision_neg": 0.8701298701298701,
-                "recall_neg": 0.8589743589743589,
-                "f1_neg": 0.864516129032258,
-                "support": 160
+                "accuracy": 0.884,
+                "precision": 0.8477508650519031,
+                "recall": 0.9459459459459459,
+                "f1": 0.8941605839416058,
+                "precision_neg": 0.933649289099526,
+                "recall_neg": 0.8174273858921162,
+                "f1_neg": 0.8716814159292036,
+                "support": 500,
+                "n_pos": 259,
+                "n_neg": 241
             },
             "biotic_matched": {
-                "accuracy": 0.8658536585365854,
-                "precision": 0.9714285714285714,
-                "recall": 0.8831168831168831,
-                "f1": 0.9251700680272109,
-                "precision_neg": 0.25,
-                "recall_neg": 0.6,
-                "f1_neg": 0.35294117647058826,
-                "support": 82
+                "accuracy": 0.9305019305019305,
+                "precision": 1.0,
+                "recall": 0.9285714285714286,
+                "f1": 0.9629629629629629,
+                "precision_neg": 0.28,
+                "recall_neg": 1.0,
+                "f1_neg": 0.4375,
+                "support": 259,
+                "n_pos": 252,
+                "n_neg": 7
             },
             "material_matched": {
-                "accuracy": 0.8780487804878049,
+                "accuracy": 0.9343629343629344,
                 "precision": 1.0,
-                "recall": 0.8780487804878049,
-                "f1": 0.935064935064935,
+                "recall": 0.9343629343629344,
+                "f1": 0.9660678642714571,
                 "precision_neg": 0.0,
                 "recall_neg": 0.0,
                 "f1_neg": 0.0,
-                "support": 82
+                "support": 259,
+                "n_pos": 259,
+                "n_neg": 0
             },
             "axis_scoring_note": "imagenet/places: nature/biotic come from the ClipMatch TOP-1 predicted class's OWN taxonomy position \u2014 ClipMatch predicts the class from a text embedding's CLIP similarity to candidate_vocab (which is restricted to classes mapped into the graph \u2014 see get_candidate_vocab); that text is the VLM's own short summary caption when the artifact was produced with --summarize_clipmatch_caption (measured 0.41 vs 0.34 top-1 against the full caption, with far less CLIP-tokenizer truncation \u2014 see clip_models.clipmatch_primary_source), else the WHOLE raw caption; material is ALWAYS the VLM's own judgment (never mapped), taken from the extracted object most representative of that predicted class. big5 (holistic, one GT label per image): nature is the same image-level OR as always; biotic/material are scored as 'did the model output at least one nature-positive entity matching the GT's own direction' (has_biotic when GT=biotic, has_abiotic when GT=abiotic, symmetrically for material) \u2014 an image can contain both a biotic AND an abiotic entity and still score correctly against a GT of just one of them. coco: image-level nature (OR) + matched-object biotic/material via lexical GT matching (box-IoU is future work, recap \u00a76.4).",
             "material_caveat": "Material GT for imagenet/coco/places is the heuristic gt_material=True default (real photos); only BIG-5 has genuine material GT. Predicted material is always the VLM's judgment (never mapped), so on imagenet/places it is scored against that heuristic GT default \u2014 BIG-5 is the only genuine material benchmark.",
             "clipmatch": {
-                "top1_accuracy": 0.5,
-                "support": 160,
+                "top1_accuracy": 0.51,
+                "support": 500,
                 "truncation_rate": 0.0,
                 "truncated_count": 0,
                 "context_length": 77,
-                "mean_token_length": 19.55
+                "mean_token_length": 19.732
             },
             "clipmatch_candidates": {
                 "n_candidates": 1000,
@@ -83,87 +89,87 @@
                 "context_length": 77
             },
             "hierarchical": {
-                "hp": 0.8162015910753334,
-                "hr": 0.7689114328331625,
-                "hf1": 0.7868250387134217,
-                "wup": 0.7882005339197435,
-                "hp_std": 0.25772118250524667,
-                "hr_std": 0.2586467409861372,
-                "hf1_std": 0.25618368009834747,
-                "wup_std": 0.24686394556726213,
-                "support": 160,
-                "mapping_failure_rate": 0.01875,
-                "mapping_failures": 3
+                "hp": 0.8378293791519796,
+                "hr": 0.7673720719596875,
+                "hf1": 0.7956315843014181,
+                "wup": 0.797410751082503,
+                "hp_std": 0.2467369317023917,
+                "hr_std": 0.2523574586494448,
+                "hf1_std": 0.24818494261421017,
+                "wup_std": 0.2336290863655304,
+                "support": 500,
+                "mapping_failure_rate": 0.008,
+                "mapping_failures": 4
             },
             "hierarchical_mapped": {
-                "hp": 0.8317977998219959,
-                "hr": 0.7836040079828408,
-                "hf1": 0.8018599120646336,
-                "wup": 0.803261690618847,
-                "hp_std": 0.23391556540389846,
-                "hr_std": 0.23804050955873632,
-                "hf1_std": 0.2341544226531158,
-                "wup_std": 0.22362524581874577,
-                "support": 157
+                "hp": 0.8445860676935278,
+                "hr": 0.7735605564109752,
+                "hf1": 0.8020479680457844,
+                "wup": 0.8038414829460716,
+                "hp_std": 0.23593106843406952,
+                "hr_std": 0.24374310743011524,
+                "hf1_std": 0.23863415145854863,
+                "wup_std": 0.22327884542239856,
+                "support": 496
             },
             "hierarchical_by_gt_nature": {
                 "nature": {
-                    "hp": 0.8754534174954395,
-                    "hr": 0.8038370108794105,
-                    "hf1": 0.8339222240479304,
-                    "wup": 0.82839518475758,
-                    "hp_std": 0.2132310927617347,
-                    "hr_std": 0.23542369967620758,
-                    "hf1_std": 0.22511741661687643,
-                    "wup_std": 0.2131153402654856,
-                    "support": 82,
-                    "mapping_failure_rate": 0.0,
-                    "mapping_failures": 0
+                    "hp": 0.8933766892413507,
+                    "hr": 0.7942848141819839,
+                    "hf1": 0.8358642292966681,
+                    "wup": 0.8278779626946202,
+                    "hp_std": 0.22195542004111815,
+                    "hr_std": 0.23514481335434542,
+                    "hf1_std": 0.2281966138672209,
+                    "wup_std": 0.2150635772672307,
+                    "support": 259,
+                    "mapping_failure_rate": 0.007722007722007722,
+                    "mapping_failures": 2
                 },
                 "no_nature": {
-                    "hp": 0.753911209454196,
-                    "hr": 0.7321947995024916,
-                    "hf1": 0.7373126131053481,
-                    "wup": 0.7459446189363764,
-                    "hp_std": 0.28438794678832485,
-                    "hr_std": 0.2762786546337226,
-                    "hf1_std": 0.276705094485091,
-                    "wup_std": 0.27162019067356885,
-                    "support": 78,
-                    "mapping_failure_rate": 0.038461538461538464,
-                    "mapping_failures": 3
+                    "hp": 0.7781333073131947,
+                    "hr": 0.7384492494054365,
+                    "hf1": 0.7523940114641983,
+                    "wup": 0.7646679800968672,
+                    "hp_std": 0.25784092870644115,
+                    "hr_std": 0.26662201221675846,
+                    "hf1_std": 0.2611895467164509,
+                    "wup_std": 0.24792188473828056,
+                    "support": 241,
+                    "mapping_failure_rate": 0.008298755186721992,
+                    "mapping_failures": 2
                 }
             },
             "hierarchical_mapped_by_gt_nature": {
                 "nature": {
-                    "hp": 0.8754534174954395,
-                    "hr": 0.8038370108794105,
-                    "hf1": 0.8339222240479304,
-                    "wup": 0.82839518475758,
-                    "hp_std": 0.2132310927617347,
-                    "hr_std": 0.23542369967620758,
-                    "hf1_std": 0.22511741661687643,
-                    "wup_std": 0.2131153402654856,
-                    "support": 82
+                    "hp": 0.9003290370175481,
+                    "hr": 0.8004660189616103,
+                    "hf1": 0.8423690092911947,
+                    "wup": 0.8343205927545005,
+                    "hp_std": 0.2082983124310835,
+                    "hr_std": 0.2253342744297911,
+                    "hf1_std": 0.2167937089959024,
+                    "wup_std": 0.20306911075608647,
+                    "support": 257
                 },
                 "no_nature": {
-                    "hp": 0.7840676578323638,
-                    "hr": 0.7614825914825912,
-                    "hf1": 0.766805117629562,
-                    "wup": 0.7757824036938314,
-                    "hp_std": 0.24590011915655027,
-                    "hr_std": 0.23891619256688992,
-                    "hf1_std": 0.23877465168162848,
-                    "wup_std": 0.23147570222546057,
-                    "support": 75
+                    "hp": 0.7846448831066105,
+                    "hr": 0.7446287410322603,
+                    "hf1": 0.7586901956605514,
+                    "wup": 0.7710668753278034,
+                    "hp_std": 0.24885538803222512,
+                    "hr_std": 0.25899950407247824,
+                    "hf1_std": 0.25300989028510695,
+                    "wup_std": 0.23884228777350425,
+                    "support": 239
                 }
             },
             "execution_time": {
-                "inference": "0-00:09:10",
-                "scoring": "0-00:06:22",
-                "total": "0-00:15:32"
+                "inference": "0-00:10:37",
+                "scoring": "0-00:02:41",
+                "total": "0-00:13:18"
             },
-            "evaluated_at": "2026-07-31T16:29:41.249759+00:00"
+            "evaluated_at": "2026-07-31T22:06:46.868558+00:00"
         },
         "dataset_class_stats": {
             "160": {
@@ -173,6 +179,15 @@
                 "biotic": 72,
                 "abiotic": 5,
                 "material": 77,
+                "immaterial": 0
+            },
+            "500": {
+                "total_classes": 396,
+                "nature": 203,
+                "no_nature": 193,
+                "biotic": 196,
+                "abiotic": 7,
+                "material": 203,
                 "immaterial": 0
             }
         }

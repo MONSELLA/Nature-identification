@@ -158,6 +158,7 @@ RULES:
  - Format all extracted entities as concise, singular nouns or compound nouns.
  - Place all chosen entities into the single 'objects' list.
  - Do not hallucinate entities not visually present.
+ - Do not repeat the same extracted entity twice.
 
 EXAMPLE 1 (Mixed Environment):
 Image: A person sitting in an indoor office chair at a desk with a laptop. On the desk is a little dog figurine and an orange. The person is wearing a shirt with a geometric triangle pattern. In the background, there is a potted plant near a window.
