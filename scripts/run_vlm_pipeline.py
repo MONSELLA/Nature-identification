@@ -816,7 +816,17 @@ def phase_score(args):
             if lab.get("vlm_called"):
                 n_label_calls += 1
                 image_n_label_calls += 1
-                if fin["mapped"]:
+                # Which schema this call used. Prefer the explicit label_route
+                # written by resolve_hybrid_label; fall back to the old
+                # `mapped` heuristic for artifacts written before that field
+                # existed (back then mapped + vlm_called could ONLY mean the
+                # material-only call, since mapped-non-nature got no call at
+                # all — that equivalence no longer holds, which is exactly why
+                # the explicit field was added).
+                route = fin.get("label_route")
+                is_material_call = (route == "mapped_nature_material" if route is not None
+                                    else bool(fin["mapped"]))
+                if is_material_call:
                     n_label_calls_material += 1
                     if lab.get("parse_failed"):
                         n_parse_fail_material += 1
@@ -1108,6 +1118,10 @@ def phase_score(args):
                 "nature": fin["final_nature"], "biotic": fin["final_biotic"],
                 "material": fin["final_material"],
                 "nature_source": fin["nature_source"], "biotic_source": fin["biotic_source"],
+                # Which labeling route this object took — "human_exclusion"
+                # (no VLM call), "mapped_nature_material" (MaterialResponse),
+                # or "vlm_full" (TaxonomyResponse). None on older artifacts.
+                "label_route": fin.get("label_route"),
                 "parse_failed": lab.get("parse_failed"),
                 # Stage-3 labeling justification (TaxonomyResponse's combined
                 # nature_reasoning+sub_axes_reasoning, or MaterialResponse's own

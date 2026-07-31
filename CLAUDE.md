@@ -125,17 +125,43 @@ evaluating the models.
   not per-call (keeps the string stable for vLLM prefix caching).
 - Taxonomy labeling is a HYBRID, resolved during PHASE-1 INFERENCE (mapping is
   done BEFORE the VLM labeling calls, not deferred to scoring):
-  - nature/no-nature AND biotic/abiotic → WordNet mapping first (when object is
-    in ImageNet/COCO/Places mapped vocab), VLM fallback when unmapped.
+  - nature/no-nature AND biotic/abiotic → WordNet mapping is trusted in ONE
+    DIRECTION ONLY: when the mapped node IS nature. A "not nature" mapping is
+    NEVER authoritative — the VLM decides instead (see below).
   - material/immaterial → ALWAYS VLM, NEVER mapping. Always pass the image to
     the model for this judgment, not just the object string as text.
-- Labeling calls are ROUTED per object (map first, then ask the VLM only what
-  mapping could not answer — saves compute):
-  - unmapped object → ONE full VLM call (nature+biotic+material,
-    `TaxonomyResponse`; system prompt = all three definitions).
-  - mapped-nature object → material-only VLM call (`MaterialResponse`; system
-    prompt = material definition only); nature/biotic come from the mapping.
-  - mapped non-nature object → NO VLM call (nature=False, biotic/material n/a).
+- Labeling calls are ROUTED per object (`vlm_pipeline.label_objects_batch`;
+  the route taken is recorded per object as `label_route` in BOTH the `.jsonl`
+  and the predictions CSV):
+  - HUMAN term (`vlm_pipeline.HUMAN_TERMS`/`is_human_term` — whole normalized
+    phrase or its head noun) → NO VLM call, nature=False outright
+    (`label_route: "human_exclusion"`). The nature definition excludes human
+    beings explicitly, and unlike every other non-nature concept this really
+    is instance-independent. "person" is also the single most-extracted
+    entity, so this is where the saved compute is. Body-part words are
+    DELIBERATELY excluded from the set (a "hand"/"hair"/"eye" may belong to an
+    extracted animal, and a false positive here is uncorrectable).
+  - mapped-NATURE object → material-only VLM call (`MaterialResponse`; system
+    prompt = material definition only); nature/biotic come from the mapping
+    (`label_route: "mapped_nature_material"`).
+  - EVERYTHING ELSE — unmapped OR mapped-NON-nature → ONE full VLM call
+    (nature+biotic+material, `TaxonomyResponse`; system prompt = all three
+    definitions) (`label_route: "vlm_full"`).
+- WHY mapped-non-nature goes to the VLM (CHANGED — it used to get no call at
+  all; do not revert without re-reading this): "is nature" is concept-
+  determined but "is NOT nature" is not. A depicted or stylized tree is still
+  nature (the taxonomy counts "Representations of Nature"), so a nature
+  mapping can't be undone by instance variation — but the "Nature-Based
+  Artefacts" clause admits ANY manufactured object "where the natural material
+  of origin remains visually identifiable by its structure, grain, or
+  texture", and names wooden tables and stone/wood houses as its own examples.
+  A `spatula`/`desk`/`house` node cannot encode whether THIS image shows a
+  plastic one or one with visible wood grain — the same instance-vs-concept
+  argument already accepted for material/immaterial. Under the old routing the
+  mapping could produce only FALSE NEGATIVES on nature, and unfalsifiable ones
+  (every spatula came back no-nature whether or not the model would have seen
+  wood). Measured: 9.9% of extracted object records took that no-call path.
+  Costs ~10% more full `TaxonomyResponse` calls, minus the humans.
 - EVERY extracted object is labeled on all three axes regardless of GT matching.
   "Best-matching" selection happens only at SCORING time (to reduce to one
   prediction per image on single-label datasets); it never restricts labeling.
@@ -340,10 +366,16 @@ evaluating the models.
   returned unchanged — this only touches the WNIDs that actually collide.
 - **Labeling parse-failure rate**: reported over the objects the VLM was
   ACTUALLY asked about (`vlm_called`), never over all extracted objects —
-  mapped non-nature objects get no labeling call at all, so including them
-  silently dilutes the rate. Split `_full` (unmapped → `TaxonomyResponse`,
-  three axes) vs `_material` (mapped-nature → `MaterialResponse`, one axis)
-  since the two use different schemas and can fail differently.
+  human-term objects get no labeling call at all, so including them silently
+  dilutes the rate. Split `_full` (unmapped OR mapped-non-nature →
+  `TaxonomyResponse`, three axes) vs `_material` (mapped-nature →
+  `MaterialResponse`, one axis) since the two use different schemas and can
+  fail differently. Which call an object made is read off `label_route`, NOT
+  off `mapped` — those stopped being equivalent when mapped-non-nature started
+  going to the full call (`mapped` is still True for a node that resolved to
+  non-nature). Scoring falls back to the old `mapped` heuristic only for
+  artifacts written before `label_route` existed. Only `_material` is printed
+  to the console; `_full` stays in the results JSON.
 
 ## Axis scoring (nature/biotic/material accuracy) — per dataset
 - **ImageNet/Places (single-label)**: ClipMatch (PRIMARY text's CLIP embedding

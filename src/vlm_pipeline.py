@@ -328,13 +328,31 @@ def label_objects_batch(
     VLM is only asked what mapping could not already answer (recap §6; saves
     compute vs. always asking all three axes):
 
-      - UNMAPPED object (mapping is None) -> FULL VLM call: nature/biotic/material
-        in one TaxonomyResponse, under the full three-definition system prompt.
+      - HUMAN term (see HUMAN_TERMS)      -> NO VLM call: nature=False outright,
+        biotic/material n/a. A synthetic empty label is recorded.
       - MAPPED-nature object              -> MATERIAL-only VLM call: nature/biotic
         come from WordNet, so only material/immaterial is asked (MaterialResponse,
         material-definition-only system prompt).
-      - MAPPED non-nature object          -> NO VLM call at all: nature=False from
-        WordNet, biotic/material are n/a. A synthetic empty label is recorded.
+      - EVERYTHING ELSE (unmapped OR mapped-NON-nature) -> FULL VLM call:
+        nature/biotic/material in one TaxonomyResponse, under the full
+        three-definition system prompt.
+
+    WHY MAPPED-NON-NATURE NOW GOES TO THE VLM (changed; it used to get no call
+    at all): the mapping is only trustworthy in ONE direction. If WordNet says
+    an object IS nature, no instance variation can undo that — a stylized or
+    depicted tree is still nature, since the taxonomy counts "Representations
+    of Nature" as an inclusion category, so the mapped-nature fast path stays.
+    But "not nature" is NOT concept-determined: the nature definition's
+    "Nature-Based Artefacts" clause admits any manufactured object "where the
+    natural material of origin remains visually identifiable by its structure,
+    grain, or texture", and names wooden tables and stone/wood houses as its
+    own examples. A `spatula`/`desk`/`house` node cannot encode whether THIS
+    image shows a plastic one or one with visible wood grain — the same
+    instance-vs-concept argument the project already accepts for
+    material/immaterial. Skipping the VLM there made the mapping able to
+    produce only FALSE NEGATIVES on the nature axis, and made them
+    unfalsifiable: every spatula came back no-nature whether or not the model
+    would have seen wood. Humans are the one genuine exception (above).
 
     The image is always attached on every VLM call (material judgment needs the
     pixels). Returns, per image, a list of raw label dicts aligned with that
@@ -361,11 +379,11 @@ def label_objects_batch(
 
     for i, (objs, maps) in enumerate(zip(objects_per_image, mappings_per_image)):
         for j, (obj, mp) in enumerate(zip(objs, maps)):
-            if mp is None:
-                full_prompts.append(build_classification_prompt(obj, axes=_FULL_AXES))
-                full_images.append(image_paths[i])
-                full_owner.append((i, j))
-            elif mp["is_nature"]:
+            if is_human_term(obj):
+                # Explicitly excluded from nature by definition — keep the
+                # synthetic (vlm_called=False) label, ask the VLM nothing.
+                continue
+            if mp is not None and mp["is_nature"]:
                 # Tell the model the nature/biotic verdict WordNet already
                 # settled (mp["biotic"] is True/False/None — None only when
                 # the mapped node is nature but carries no biotic/abiotic
@@ -373,7 +391,12 @@ def label_objects_batch(
                 mat_prompts.append(build_material_classification_prompt(obj, biotic=mp["biotic"]))
                 mat_images.append(image_paths[i])
                 mat_owner.append((i, j))
-            # else: mapped & not nature -> keep the synthetic (vlm_called=False) label.
+            else:
+                # Unmapped, OR mapped to a NON-nature node — both now get the
+                # full three-axis call (see the routing note in the docstring).
+                full_prompts.append(build_classification_prompt(obj, axes=_FULL_AXES))
+                full_images.append(image_paths[i])
+                full_owner.append((i, j))
 
     # --- FULL group (unmapped objects): all three axes ---
     if full_prompts:
@@ -652,6 +675,50 @@ def run_inference(
 _ARTICLES = ("a ", "an ", "the ")
 
 
+# Human terms are short-circuited to NON-NATURE without any VLM call, per the
+# nature definition's own explicit exclusion ("Human Beings: Human individuals,
+# human body parts, or groups of people are NOT classified as nature under this
+# taxonomy"). This is the ONE class of mapped-non-nature object where a
+# concept-level answer really is instance-independent — no lighting, framing or
+# material makes a person nature — so unlike every other non-nature concept
+# (see label_objects_batch's routing note) there is nothing for the VLM to add,
+# and "person" is by far the most frequently extracted entity in the corpus
+# (22 of 176 mapped-non-nature records on the spot-check runs), so skipping it
+# is also where most of the saved compute is.
+#
+# DELIBERATELY NOT INCLUDED: body-part words (hand, face, hair, eye, leg...).
+# The definition excludes human body parts, but those words are genuinely
+# ambiguous out of context — "hand"/"hair"/"eye" are just as likely to belong
+# to an extracted animal — and a false positive here is unrecoverable (it
+# forces non-nature with no VLM call to correct it). Whole-person terms carry
+# no such ambiguity. Extend this set rather than reaching for a regex.
+HUMAN_TERMS = frozenset({
+    "person", "persons", "people", "human", "humans", "human being", "human beings",
+    "man", "men", "woman", "women", "child", "children", "kid", "kids",
+    "boy", "boys", "girl", "girls", "baby", "babies", "infant", "infants",
+    "toddler", "toddlers", "adult", "adults", "teenager", "teenagers",
+    "lady", "ladies", "gentleman", "gentlemen", "guy", "guys",
+    "crowd", "crowds", "group of people", "audience", "spectators",
+})
+
+
+def is_human_term(object_str: str) -> bool:
+    """Whether an extracted phrase names a human being (and is therefore
+    excluded from nature outright — see HUMAN_TERMS).
+
+    Matches the normalized whole phrase, or its HEAD NOUN (last word) for a
+    modified phrase like "young woman" / "elderly man". Only the last word is
+    checked because that's the head of an English noun phrase, which keeps
+    "snowman" (one word, never equal to "man") and "sea lion" out of it, while
+    still catching the modified forms a VLM actually writes.
+    """
+    norm = _normalize_object(object_str)
+    if norm in HUMAN_TERMS:
+        return True
+    words = norm.split()
+    return len(words) > 1 and words[-1] in HUMAN_TERMS
+
+
 def _normalize_object(object_str: str) -> str:
     """Lowercase an object phrase, strip diacritics, and strip a single leading
     article, so "A Golden Retriever" and "golden retriever" normalize to the
@@ -743,28 +810,41 @@ def resolve_hybrid_label(object_str: str, vlm_label: Dict[str, Any], tax_graph, 
     if mapping is _UNSET:
         mapping = map_object_to_taxonomy(object_str, tax_graph, max_hops=max_hops)
 
-    if mapping is not None:
-        # This object's phrase matched a known class AND that class resolves
-        # to a labeled taxonomy node — use WordNet's answer for both nature
-        # and biotic. NOTE: biotic is NEVER sourced from the VLM here, even
-        # when the mapped node carries no biotic/abiotic label of its own
-        # (mapping["biotic"] is None in that case) — label_objects_batch's
-        # material-only call for mapped-nature objects never asks the VLM
-        # about biotic at all, so vlm_biotic is unconditionally None on this
-        # path; there is nothing to fall back to.
-        final_nature = mapping["is_nature"]
-        final_biotic = mapping["biotic"] if final_nature else None
-        nature_source = "wordnet"
-        biotic_source = "wordnet"
-        mapped_synset = mapping["synset"]
+    mapped_synset = mapping["synset"] if mapping is not None else None
+
+    if is_human_term(object_str):
+        # Excluded from nature by the definition itself, no VLM call was made
+        # (see label_objects_batch) and none is needed — a person is never
+        # nature regardless of how the image depicts them.
+        final_nature = False
+        final_biotic = None
+        nature_source = biotic_source = "human_exclusion"
+        label_route = "human_exclusion"
+    elif mapping is not None and mapping["is_nature"]:
+        # WordNet says this IS nature — the one direction the mapping can be
+        # trusted in (a depicted/stylized instance is still nature under the
+        # taxonomy's "Representations of Nature" inclusion), so nature and
+        # biotic both come from the mapping and the VLM was only asked about
+        # material. NOTE: biotic is NEVER sourced from the VLM here, even when
+        # the mapped node carries no biotic/abiotic label of its own
+        # (mapping["biotic"] is None in that case) — the material-only call
+        # never asks about biotic, so vlm_biotic is unconditionally None on
+        # this path; there is nothing to fall back to.
+        final_nature = True
+        final_biotic = mapping["biotic"]
+        nature_source = biotic_source = "wordnet"
+        label_route = "mapped_nature_material"
     else:
-        # No usable WordNet mapping at all — fall back entirely to the VLM's
-        # own judgment for both nature and biotic.
+        # Unmapped, OR mapped to a NON-nature node. A "not nature" mapping is
+        # NOT authoritative (the Nature-Based Artefacts clause — see
+        # label_objects_batch's docstring), so in both cases the VLM's own
+        # three-axis judgment decides, and the mapped synset is kept only as a
+        # diagnostic. This is what lets a wooden desk or a wooden spatula come
+        # back as nature when the model can actually see the grain.
         final_nature = vlm_nature
-        nature_source = "vlm"
         final_biotic = vlm_biotic
-        biotic_source = "vlm"
-        mapped_synset = None
+        nature_source = biotic_source = "vlm"
+        label_route = "vlm_full"
 
     # Enforce the schema rule: no downstream labels when the instance is not
     # CONFIRMED nature. Force biotic/material to None whenever final_nature is
@@ -785,6 +865,10 @@ def resolve_hybrid_label(object_str: str, vlm_label: Dict[str, Any], tax_graph, 
 
     return {
         "object": object_str,
+        # Factual "did this phrase resolve to a taxonomy node at all" — still
+        # True for a node that resolved to NON-nature, even though that answer
+        # is no longer used. Read `label_route`/`nature_source`, NOT this, to
+        # tell which path actually produced the label.
         "mapped": mapping is not None,
         "mapped_synset": mapped_synset,
         "final_nature": final_nature,
@@ -793,4 +877,10 @@ def resolve_hybrid_label(object_str: str, vlm_label: Dict[str, Any], tax_graph, 
         "nature_source": nature_source,
         "biotic_source": biotic_source,
         "material_source": "vlm",
+        # Which of label_objects_batch's three routes this object took:
+        # "human_exclusion" (no VLM call) | "mapped_nature_material"
+        # (MaterialResponse) | "vlm_full" (TaxonomyResponse). Absent on
+        # artifacts written before this field existed — callers fall back to
+        # the old `mapped` heuristic there.
+        "label_route": label_route,
     }
