@@ -247,12 +247,19 @@ def extract_objects_batch(
     """Ask the VLM to list every object in each image, using the Stage-1
     caption as extra context alongside a fresh look at the image itself.
 
-    Returns one {"objects": [...], "reasoning": str | None} dict per image —
-    "reasoning" is EXTRACTION_PROMPT's own optional chain-of-thought field
+    Returns one {"objects": [...], "reasoning": str | None,
+    "extraction_parse_failed": bool} dict per image — "reasoning" is
+    EXTRACTION_PROMPT's own optional chain-of-thought field
     (ObjectExtractionResponse may or may not define one, depending on the
     current prompt/schema), captured here so it can be stored in the artifact
     for auditing/qualitative review rather than silently discarded. None
     when the schema has no such field, or on a parse failure.
+    "extraction_parse_failed" distinguishes a genuine "the VLM looked and
+    found nothing" empty list from "the model's structured output didn't
+    parse at all, so this image silently got an empty object list" — without
+    it, both cases are indistinguishable downstream (n_objects=0 either way),
+    which previously made a total extraction failure invisible in the
+    predictions CSV.
     """
     # Fill in each image's own caption into the shared EXTRACTION_PROMPT
     # template (see src/models/prompts.py) — so each per-image prompt is
@@ -271,12 +278,14 @@ def extract_objects_batch(
             # Successful structured output: pull out the "objects" list (or
             # an empty list if that key is somehow missing) and clean it up.
             results.append({"objects": normalize_objects(o.get("objects", [])),
-                             "reasoning": o.get("reasoning")})
+                             "reasoning": o.get("reasoning"),
+                             "extraction_parse_failed": False})
         else:  # parse failure / None
             # The model's output didn't parse into valid JSON matching our
             # schema — treat this image as having zero extracted objects
-            # rather than crashing the whole batch.
-            results.append({"objects": [], "reasoning": None})
+            # rather than crashing the whole batch, but flag it so this is
+            # NOT silently indistinguishable from a genuine "no objects found".
+            results.append({"objects": [], "reasoning": None, "extraction_parse_failed": True})
     return results
 
 
@@ -448,6 +457,10 @@ def run_inference(
           "extraction_reasoning": str | None,  # EXTRACTION_PROMPT's own chain-of-thought
                                                # field, when its schema defines one; None
                                                # otherwise or on a parse failure.
+          "extraction_parse_failed": bool,    # True iff Stage 2's structured output
+                                               # didn't parse at all (objects/reasoning
+                                               # above are then [] / None as a fallback,
+                                               # NOT a genuine "found nothing").
         }
 
     `extraction_max_new_tokens` sets Stage 2's own token budget, independent
@@ -554,6 +567,7 @@ def run_inference(
         )
         objects_per_image = [r["objects"] for r in extraction_results]
         extraction_reasoning_per_image = [r["reasoning"] for r in extraction_results]
+        extraction_parse_failed_per_image = [r["extraction_parse_failed"] for r in extraction_results]
 
         # ImageNet/Places DEFAULT: compress this image's own caption into a
         # short ClipMatch-friendly summary. summary_captions[i] is None for
@@ -600,9 +614,9 @@ def run_inference(
         # GT `targets`), caption, extracted objects, per-object mappings, and
         # per-object raw labels, all aligned by position. Resolve the final
         # hybrid label per object (reusing the precomputed mapping) and yield.
-        for inst, cap, objs, maps, labels, summ, extr_reasoning in zip(
+        for inst, cap, objs, maps, labels, summ, extr_reasoning, extr_failed in zip(
             chunk, captions, objects_per_image, mappings_per_image, labels_per_image,
-            summary_captions, extraction_reasoning_per_image
+            summary_captions, extraction_reasoning_per_image, extraction_parse_failed_per_image
         ):
             finals = [
                 resolve_hybrid_label(obj, lab, tax_graph, mapping=mp)
@@ -617,6 +631,7 @@ def run_inference(
                 "object_finals": finals,
                 "clipmatch_summary_caption": summ,
                 "extraction_reasoning": extr_reasoning,
+                "extraction_parse_failed": extr_failed,
             }
 
         if verbose:

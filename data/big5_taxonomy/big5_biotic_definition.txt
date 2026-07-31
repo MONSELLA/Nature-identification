@@ -3,8 +3,8 @@ TAXONOMY REFERENCE: LIFE CATEGORY AXIS
 CATEGORY 1: BIOTIC
 Definition: All more-than-human living entities, the ecosystems and environments in which they exist and interact, and their representations and derivatives.
 Inclusion Scope:
-- Flora and its derivatives: Wild or potted plants such as flowers, trees, and vegetables, as well as foods, drinks and materials derived from them (for example, salad, coffee, liqueur, and wood with visible grain).
-- Fauna and its derivatives: Wild, domesticated, or bred more-than-human animals such as mammals, molluscs, and insects, as well as foods and materials derived from them (for example, vegetables, butter, honey, meat, eggs, wool, and leather).
+- Flora and its derivatives: Wild or potted plants such as flowers, trees, and vegetables, as well as foods, drinks and materials derived from them (for example, salad, vegetables, coffee, liqueur, and wood with visible grain).
+- Fauna and its derivatives: Wild, domesticated, or bred more-than-human animals such as mammals, molluscs, and insects, as well as foods and materials derived from them (for example, butter, honey, meat, seafood, eggs, wool, and leather).
 - Fungi and Microorganisms: Wild or cultivated mushrooms, moulds, yeasts, bacteria and virus.
 - Ecosystems and Environments: Natural or semi-natural environments where the more-than-human living entities exist and interact (for example, forests, coral reefs, nature reserves, urban parks, vegetable gardens, and beaches).
 - Representations: Real, stylized, abstract, artistic, scientific or fictional depictions of the more-than-human living entities (for example, landscape paintings, cartoon or stuffed animals and plants, video-game forests, and figurines or statues of fauna and flora).

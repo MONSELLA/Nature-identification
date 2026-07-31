@@ -93,16 +93,16 @@ CAPTION_PROMPT = "Describe this image, including any text."
 SUMMARY_CAPTION_PROMPT_IMAGENET = (
     "Here is a detailed description of this image:\n\n"
     "\"{caption}\"\n\n"
-    "Using both the image and this description, write a short summary (at most 30 words) "
-    "capturing the key objects in the scene. "
+    "Using both the image and this description, write a short summary (at most 20 words) "
+    "that exclusively captures the most salient object or objects in the scene. "
     "Output ONLY the summary text."
 )
 
 SUMMARY_CAPTION_PROMPT_PLACES = (
     "Here is a detailed description of this image:\n\n"
     "\"{caption}\"\n\n"
-    "Using both the image and this description, write a short summary (at most 30 words) "
-    "focusing on the overall scene, environment, or setting. "
+    "Using both the image and this description, write a short summary (at most 20 words) "
+    "that exclusively captures the overall scene, environment, or setting. "
     "Output ONLY the summary text."
 )
 

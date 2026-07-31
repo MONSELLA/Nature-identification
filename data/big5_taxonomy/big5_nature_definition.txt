@@ -8,7 +8,7 @@ INCLUSION SCOPE:
   * Atmospheric and Meteorological: For example, rain, clouds, snow, wind, and sky.
   * Geological and Topographical: For example, mountains, canyons, cliffs, valleys, caves, dunes, rocks, sand, salt, mineral oil.
   * Astrophysical: For example, sun, stars, moon, planets.
-- Processed Food and Drinks: Edible solid or liquid elements at any processing level (for example, pasta, cooked meats, canned tuna, butter, milk, and salad).
+- Processed Food and Drinks: Edible solid or liquid elements at any processing level (for example, pasta, seafood, cooked meats, canned tuna, butter, milk, and salad).
 - Nature-Based Artefacts: Crafted or manufactured objects where the natural material of origin remains visually identifiable by its structure, grain, or texture (for example, wooden tables or tools with visible wood grain and houses made of stone or wood where the natural texture of these materials is clearly identifiable).
 - Representations of Nature: Real, stylized, abstract, artistic, scientific or fictional depictions that explicitly reference or depict any of the more-than-human categories above (for example, landscape paintings, cartoon or stuffed animals and plants, video-game forests, and figurines or statues of fauna and flora).
 

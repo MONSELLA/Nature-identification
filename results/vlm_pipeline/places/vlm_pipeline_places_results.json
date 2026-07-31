@@ -1,0 +1,180 @@
+{
+    "places365": {
+        "mistral/mistralai/Ministral-3-8B-Instruct-2512-BF16": {
+            "dataset": "places365",
+            "model": "mistral/mistralai/Ministral-3-8B-Instruct-2512-BF16",
+            "n_images": 160,
+            "diagnostics": {
+                "objects_per_image": 6.85,
+                "extraction_hit_rate": 0.225,
+                "extraction_parse_failures": 5,
+                "extraction_parse_failure_rate": 0.03125,
+                "wordnet_mapping_rate": 0.15054744525547445,
+                "vlm_fallback_rate": 0.8494525547445255,
+                "label_vlm_calls": 996,
+                "label_parse_failures": 17,
+                "label_parse_failure_rate": 0.01706827309236948,
+                "label_calls_full": 931,
+                "label_parse_failures_full": 17,
+                "label_parse_failure_rate_full": 0.018259935553168637,
+                "label_calls_material": 65,
+                "label_parse_failures_material": 0,
+                "label_parse_failure_rate_material": 0.0,
+                "label_vlm_call_rate": 0.9087591240875912
+            },
+            "reference_free": {
+                "clipscore": 0.6202532649040222,
+                "f_clipscore": 0.48443043765794835,
+                "object_clipscore": 0.44571349397301674
+            },
+            "clip_models": {
+                "reference_free": "longclip",
+                "clipmatch": "metaclip2",
+                "clipmatch_primary_source": "summary_caption",
+                "clipmatch_candidate_text": "prompt_ensemble_places365",
+                "use_inflect_for_clipmatch": false
+            },
+            "nature": {
+                "accuracy": 0.84375,
+                "precision": 0.62,
+                "recall": 0.8378378378378378,
+                "f1": 0.7126436781609196,
+                "precision_neg": 0.9454545454545454,
+                "recall_neg": 0.8455284552845529,
+                "f1_neg": 0.8927038626609443,
+                "support": 160
+            },
+            "biotic_matched": {
+                "accuracy": 0.7837837837837838,
+                "precision": 0.7142857142857143,
+                "recall": 0.7142857142857143,
+                "f1": 0.7142857142857143,
+                "precision_neg": 0.8260869565217391,
+                "recall_neg": 0.8260869565217391,
+                "f1_neg": 0.8260869565217391,
+                "support": 37
+            },
+            "material_matched": {
+                "accuracy": 0.8378378378378378,
+                "precision": 1.0,
+                "recall": 0.8378378378378378,
+                "f1": 0.9117647058823529,
+                "precision_neg": 0.0,
+                "recall_neg": 0.0,
+                "f1_neg": 0.0,
+                "support": 37
+            },
+            "axis_scoring_note": "imagenet/places: nature/biotic come from the ClipMatch TOP-1 predicted class's OWN taxonomy position \u2014 ClipMatch predicts the class from a text embedding's CLIP similarity to candidate_vocab (which is restricted to classes mapped into the graph \u2014 see get_candidate_vocab); that text is the VLM's own short summary caption when the artifact was produced with --summarize_clipmatch_caption (measured 0.41 vs 0.34 top-1 against the full caption, with far less CLIP-tokenizer truncation \u2014 see clip_models.clipmatch_primary_source), else the WHOLE raw caption; material is ALWAYS the VLM's own judgment (never mapped), taken from the extracted object most representative of that predicted class. big5 (holistic, one GT label per image): nature is the same image-level OR as always; biotic/material are scored as 'did the model output at least one nature-positive entity matching the GT's own direction' (has_biotic when GT=biotic, has_abiotic when GT=abiotic, symmetrically for material) \u2014 an image can contain both a biotic AND an abiotic entity and still score correctly against a GT of just one of them. coco: image-level nature (OR) + matched-object biotic/material via lexical GT matching (box-IoU is future work, recap \u00a76.4).",
+            "material_caveat": "Material GT for imagenet/coco/places is the heuristic gt_material=True default (real photos); only BIG-5 has genuine material GT. Predicted material is always the VLM's judgment (never mapped), so on imagenet/places it is scored against that heuristic GT default \u2014 BIG-5 is the only genuine material benchmark.",
+            "clipmatch": {
+                "top1_accuracy": 0.4625,
+                "support": 160,
+                "truncation_rate": 0.0,
+                "truncated_count": 0,
+                "context_length": 77,
+                "mean_token_length": 20.48125
+            },
+            "clipmatch_candidates": {
+                "n_candidates": 207,
+                "n_candidate_texts": 3105,
+                "mean_token_length": 10.090821256038648,
+                "truncation_rate": 0.0,
+                "truncated_count": 0,
+                "context_length": 77
+            },
+            "hierarchical": {
+                "hp": 0.6931858939671438,
+                "hr": 0.6436088564213562,
+                "hf1": 0.6599753525875609,
+                "wup": 0.6709293340388542,
+                "hp_std": 0.2974578685067412,
+                "hr_std": 0.3062368544028443,
+                "hf1_std": 0.3025055608068056,
+                "wup_std": 0.2918331415683103,
+                "support": 160,
+                "mapping_failure_rate": 0.0375,
+                "mapping_failures": 6
+            },
+            "hierarchical_mapped": {
+                "hp": 0.7201931365892402,
+                "hr": 0.6686845261520584,
+                "hf1": 0.6856886780130503,
+                "wup": 0.697069437962446,
+                "hp_std": 0.2692175172625785,
+                "hr_std": 0.28401954912627575,
+                "hf1_std": 0.27828688048399003,
+                "wup_std": 0.26507224205295304,
+                "support": 154
+            },
+            "hierarchical_by_gt_nature": {
+                "nature": {
+                    "hp": 0.6692406692406694,
+                    "hr": 0.5859716859716859,
+                    "hf1": 0.611553029200088,
+                    "wup": 0.6352369016455703,
+                    "hp_std": 0.3141786303952178,
+                    "hr_std": 0.3242665548531845,
+                    "hf1_std": 0.32218995276216555,
+                    "wup_std": 0.3044469406351349,
+                    "support": 37,
+                    "mapping_failure_rate": 0.02702702702702703,
+                    "mapping_failures": 1
+                },
+                "no_nature": {
+                    "hp": 0.7003889290474656,
+                    "hr": 0.660946867044428,
+                    "hf1": 0.674541417346394,
+                    "wup": 0.6816660819945576,
+                    "hp_std": 0.29185681145596,
+                    "hr_std": 0.29843175455095305,
+                    "hf1_std": 0.2947763535578759,
+                    "wup_std": 0.28706368987140396,
+                    "support": 123,
+                    "mapping_failure_rate": 0.04065040650406504,
+                    "mapping_failures": 5
+                }
+            },
+            "hierarchical_mapped_by_gt_nature": {
+                "nature": {
+                    "hp": 0.6878306878306879,
+                    "hr": 0.6022486772486773,
+                    "hf1": 0.6285406133445348,
+                    "wup": 0.6528823711357251,
+                    "hp_std": 0.29776386835141105,
+                    "hr_std": 0.31347536121871983,
+                    "hf1_std": 0.30985882149898647,
+                    "wup_std": 0.2893824263706622,
+                    "support": 36
+                },
+                "no_nature": {
+                    "hp": 0.7300664260410022,
+                    "hr": 0.6889530902242766,
+                    "hf1": 0.7031236807932751,
+                    "wup": 0.7105502380112761,
+                    "hp_std": 0.2590814411421506,
+                    "hr_std": 0.27118320561148,
+                    "hf1_std": 0.26547719919994267,
+                    "wup_std": 0.25568277066249656,
+                    "support": 118
+                }
+            },
+            "execution_time": {
+                "inference": "0-00:13:24",
+                "scoring": "0-00:00:38",
+                "total": "0-00:14:02"
+            },
+            "evaluated_at": "2026-07-31T16:28:09.578202+00:00"
+        },
+        "dataset_class_stats": {
+            "160": {
+                "total_classes": 105,
+                "nature": 27,
+                "no_nature": 78,
+                "biotic": 11,
+                "abiotic": 16,
+                "material": 27,
+                "immaterial": 0
+            }
+        }
+    }
+}

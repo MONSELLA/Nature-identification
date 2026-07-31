@@ -197,6 +197,22 @@ def find_matching_object(objects, target):
     return None
 
 
+def _fmt_big5_axis_cell(vals):
+    """Render a BIG-5 gt_biotic/gt_material list (src.loaders.dataset_loader.
+    load_big5 — usually one element, [True, False] when coders genuinely
+    disagreed) as a single flat CSV cell: None when not applicable, the plain
+    bool when there's one value, or "True/False (disagreement)" when both
+    directions apply at once. Used for BOTH the GT list and its
+    direction-aware predicted-value list (same shape, same ordering), so the
+    same helper renders either side of the pair.
+    """
+    if not vals:
+        return None
+    if len(vals) == 1:
+        return bool(vals[0])
+    return "True/False (disagreement)"
+
+
 def image_gt_nature(targets):
     """Image-level GT nature: True if ANY target is nature, False if all targets
     are explicitly non-nature, None if no target carries a nature label."""
@@ -699,6 +715,13 @@ def phase_score(args):
     }
     n_gt_targets = n_extraction_hits = 0
     n_objects_total = n_parse_fail = n_object_records = 0
+    # Stage-2 (whole-image object-list) parse failures — DISTINCT from
+    # n_parse_fail below, which counts per-OBJECT Stage-3 labeling failures.
+    # An extraction failure means the model's structured output didn't parse
+    # AT ALL for this image, so it silently got zero extracted objects; left
+    # unflagged, that's indistinguishable from "the model genuinely found
+    # nothing" (see src.vlm_pipeline.extract_objects_batch).
+    n_extraction_parse_fail = 0
     n_map_nature = n_vlm_nature = 0
     # Labeling-stage parse failures, scoped to the objects the VLM was ACTUALLY
     # asked to label (`vlm_called`). This is NOT the same denominator as
@@ -739,6 +762,9 @@ def phase_score(args):
         objs = rec["objects"]
         finals = rec["object_finals"]
         targets = rec.get("targets", [])
+        extraction_parse_failed = bool(rec.get("extraction_parse_failed"))
+        if extraction_parse_failed:
+            n_extraction_parse_fail += 1
         # Slice this image's own chunk of object embeddings out of the big
         # flat array we built above, using the offsets we remembered.
         obj_slice = slice(offsets[idx], offsets[idx + 1])
@@ -767,6 +793,8 @@ def phase_score(args):
         gt_biotic_val = pred_biotic_val = None
         gt_material_val = pred_material_val = None
         image_gt_nature_val = image_pred_nature_val = None
+        image_gt_biotic_val = image_pred_biotic_val = None
+        image_gt_material_val = image_pred_material_val = None
         target_matches = None
 
         # diagnostics
@@ -986,6 +1014,16 @@ def phase_score(args):
                     pred_biotic_vals.append(pred_b)
                 target_matches[0].update({"gt_biotic": gt_biotic_vals, "pred_biotic": pred_biotic_vals,
                                           "has_biotic_entity": has_biotic, "has_abiotic_entity": has_abiotic})
+                # Flat, top-level mirror of the above (see "image_gt_nature"
+                # just below) — the qualitative-review CSV must carry biotic/
+                # material the same way it already carries nature, not just
+                # buried in the gt_targets JSON blob (see the visualization
+                # app fix in the same change: it only ever rendered gt_nature/
+                # gt_biotic/gt_material as top-level columns, which BIG-5 never
+                # populated, so biotic/material silently never showed up for
+                # BIG-5 rows even though the data existed one level down).
+                image_gt_biotic_val = _fmt_big5_axis_cell(gt_biotic_vals)
+                image_pred_biotic_val = _fmt_big5_axis_cell(pred_biotic_vals)
             gt_material_vals = t0.get("gt_material")
             if gt_material_vals is not None:
                 pred_material_vals = []
@@ -997,6 +1035,8 @@ def phase_score(args):
                     pred_material_vals.append(pred_m)
                 target_matches[0].update({"gt_material": gt_material_vals, "pred_material": pred_material_vals,
                                           "has_material_entity": has_material, "has_immaterial_entity": has_immaterial})
+                image_gt_material_val = _fmt_big5_axis_cell(gt_material_vals)
+                image_pred_material_val = _fmt_big5_axis_cell(pred_material_vals)
         else:
             # --- COCO (multi-label): image-level nature OR + matched-object
             #     biotic/material, via lexical GT matching (find_matching_object) ---
@@ -1117,6 +1157,12 @@ def phase_score(args):
             "model": header.get("model"),
             "caption": rec["caption"],
             "extraction_reasoning": rec.get("extraction_reasoning"),
+            # True iff Stage 2's whole-image object-list call failed to parse
+            # at all (objects/n_objects above are then simply [] / 0 as a
+            # fallback — NOT a genuine "the model found nothing"). Distinct
+            # from any per-object parse_failed below, which is Stage 3
+            # (per-object taxonomy labeling), a completely separate call.
+            "extraction_parse_failed": extraction_parse_failed,
             "objects": objects_json,
             "gt_targets": gt_targets_json,
             "n_objects": len(objs),
@@ -1146,6 +1192,16 @@ def phase_score(args):
             # verdict is the clipmatch_pred_nature column below instead)
             "image_gt_nature": image_gt_nature_val,
             "image_pred_nature": image_pred_nature_val,
+            # image-level biotic/material (BIG-5 only — its GT is one
+            # holistic scene label, never a per-object match; see
+            # _fmt_big5_axis_cell). COCO has no equivalent single scalar here
+            # since its GT is multiple distinct objects with independently
+            # scored biotic/material (see the "gt_targets" JSON's
+            # per-target target_matches instead).
+            "image_gt_biotic": image_gt_biotic_val,
+            "image_pred_biotic": image_pred_biotic_val,
+            "image_gt_material": image_gt_material_val,
+            "image_pred_material": image_pred_material_val,
             # single-label (ImageNet/Places) axis verdicts
             "gt_nature": gt_nature_val, "pred_nature": pred_nature_val,
             "gt_biotic": gt_biotic_val, "pred_biotic": pred_biotic_val,
@@ -1177,6 +1233,12 @@ def phase_score(args):
         "diagnostics": {
             "objects_per_image": (n_objects_total / n_images) if n_images else 0.0,
             "extraction_hit_rate": (n_extraction_hits / n_gt_targets) if n_gt_targets else 0.0,
+            # Stage-2 (whole-image object-list) parse failures — an image
+            # whose structured extraction call never parsed at all, silently
+            # left with an empty object list. Distinct from the label_parse_*
+            # numbers below, which are Stage-3 per-object failures.
+            "extraction_parse_failures": n_extraction_parse_fail,
+            "extraction_parse_failure_rate": (n_extraction_parse_fail / n_images) if n_images else 0.0,
             "wordnet_mapping_rate": (n_map_nature / n_object_records) if n_object_records else 0.0,
             "vlm_fallback_rate": (n_vlm_nature / n_object_records) if n_object_records else 0.0,
             # LABELING-stage schema-parse failures, over the objects the VLM was
@@ -1394,6 +1456,8 @@ def _print_summary(s, run_clipmatch):
     print(f"📊 VLM PIPELINE: {s['model']} on {s['dataset'].upper()}  ({s['n_images']} images)")
     print("=" * 60)
     print(f"Objects/image: {d['objects_per_image']:.2f} | Extraction-hit: {d['extraction_hit_rate']:.1%}")
+    print(f"Extraction parse-fail: {d['extraction_parse_failure_rate']:.1%} "
+          f"({d['extraction_parse_failures']}/{s['n_images']} images)")
     print(f"WordNet-mapping: {d['wordnet_mapping_rate']:.1%} | VLM-fallback: {d['vlm_fallback_rate']:.1%}")
     print(f"Labeling parse-fail: {d['label_parse_failure_rate']:.1%} "
           f"({d['label_parse_failures']}/{d['label_vlm_calls']} VLM calls) — "
@@ -1475,6 +1539,7 @@ def _log_wandb(args, summary, run_clipmatch):
     log = {
         "ObjectsPerImage": summary["diagnostics"]["objects_per_image"],
         "ExtractionHitRate": summary["diagnostics"]["extraction_hit_rate"],
+        "ExtractionParseFailureRate": summary["diagnostics"]["extraction_parse_failure_rate"],
         "WordNetMappingRate": summary["diagnostics"]["wordnet_mapping_rate"],
         "LabelParseFailureRate": summary["diagnostics"]["label_parse_failure_rate"],
         "LabelParseFailureRate/Full": summary["diagnostics"]["label_parse_failure_rate_full"],
