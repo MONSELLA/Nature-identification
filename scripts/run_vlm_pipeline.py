@@ -248,16 +248,23 @@ def _binary_metrics(y_true, y_pred):
     from sklearn.metrics import accuracy_score, precision_recall_fscore_support
     if not y_true:
         return {"accuracy": 0.0, "precision": 0.0, "recall": 0.0, "f1": 0.0,
-                "precision_neg": 0.0, "recall_neg": 0.0, "f1_neg": 0.0, "support": 0}
+                "precision_neg": 0.0, "recall_neg": 0.0, "f1_neg": 0.0, "support": 0,
+                "n_pos": 0, "n_neg": 0}
     acc = accuracy_score(y_true, y_pred)
     p, r, f1, _ = precision_recall_fscore_support(y_true, y_pred, average="binary", pos_label=True, zero_division=0)
     p_neg, r_neg, f1_neg, _ = precision_recall_fscore_support(
         y_true, y_pred, average="binary", pos_label=False, zero_division=0)
+    n_pos = int(sum(1 for v in y_true if v))
     return {
         "accuracy": float(acc),
         "precision": float(p), "recall": float(r), "f1": float(f1),
         "precision_neg": float(p_neg), "recall_neg": float(r_neg), "f1_neg": float(f1_neg),
         "support": len(y_true),
+        # GT-label split of this axis's supported images — e.g. how many of the
+        # material/immaterial-supported images are actually GT-material vs.
+        # GT-immaterial — reported alongside support so a flat support number
+        # doesn't hide a heavily skewed axis.
+        "n_pos": n_pos, "n_neg": len(y_true) - n_pos,
     }
 
 
@@ -1461,17 +1468,19 @@ def _print_summary(s, run_clipmatch):
     print(f"WordNet-mapping: {d['wordnet_mapping_rate']:.1%} | VLM-fallback: {d['vlm_fallback_rate']:.1%}")
     print(f"Labeling parse-fail: {d['label_parse_failure_rate']:.1%} "
           f"({d['label_parse_failures']}/{d['label_vlm_calls']} VLM calls) — "
-          f"full {d['label_parse_failure_rate_full']:.1%} "
-          f"({d['label_parse_failures_full']}/{d['label_calls_full']}) | "
           f"material-only {d['label_parse_failure_rate_material']:.1%} "
           f"({d['label_parse_failures_material']}/{d['label_calls_material']})")
     print(f"CLIPScore: {s['reference_free']['clipscore']:.4f} | "
           f"F-CLIPScore: {s['reference_free']['f_clipscore']:.4f} | "
           f"Object-CLIPScore: {s['reference_free']['object_clipscore']:.4f}")
     neg_labels = {"nature": "no_nature", "biotic_matched": "abiotic", "material_matched": "immaterial"}
+    axis_names = {"nature": "nature", "biotic_matched": "life category (biotic/abiotic)",
+                  "material_matched": "tangibility (material/immaterial)"}
     for axis in ("nature", "biotic_matched", "material_matched"):
         m = s[axis]
         print(f"\n--- {axis} (support {m['support']}) ---")
+        print(f"{m['support']} supported {axis_names[axis]} axis images, of which "
+              f"{m['n_neg']} {neg_labels[axis]} and {m['n_pos']} {axis.split('_')[0]}")
         print(f"Acc {m['accuracy']:.4f}")
         print(f"  {axis.split('_')[0]:<12} (pos) P {m['precision']:.4f} | R {m['recall']:.4f} | F1 {m['f1']:.4f}")
         print(f"  {neg_labels[axis]:<12} (neg) P {m['precision_neg']:.4f} | R {m['recall_neg']:.4f} | F1 {m['f1_neg']:.4f}")
@@ -1542,15 +1551,20 @@ def _log_wandb(args, summary, run_clipmatch):
         "ExtractionParseFailureRate": summary["diagnostics"]["extraction_parse_failure_rate"],
         "WordNetMappingRate": summary["diagnostics"]["wordnet_mapping_rate"],
         "LabelParseFailureRate": summary["diagnostics"]["label_parse_failure_rate"],
-        "LabelParseFailureRate/Full": summary["diagnostics"]["label_parse_failure_rate_full"],
         "LabelParseFailureRate/MaterialOnly": summary["diagnostics"]["label_parse_failure_rate_material"],
         "CLIPScore": summary["reference_free"]["clipscore"],
         "F-CLIPScore": summary["reference_free"]["f_clipscore"],
         "Object-CLIPScore": summary["reference_free"]["object_clipscore"],
         "Nature/F1": summary["nature"]["f1"], "Nature/Accuracy": summary["nature"]["accuracy"],
         "Nature/F1_NoNature": summary["nature"]["f1_neg"],
+        "Nature/Support": summary["nature"]["support"],
+        "Nature/N_Nature": summary["nature"]["n_pos"], "Nature/N_NoNature": summary["nature"]["n_neg"],
         "Biotic/F1": summary["biotic_matched"]["f1"], "Biotic/F1_Abiotic": summary["biotic_matched"]["f1_neg"],
+        "Biotic/Support": summary["biotic_matched"]["support"],
+        "Biotic/N_Biotic": summary["biotic_matched"]["n_pos"], "Biotic/N_Abiotic": summary["biotic_matched"]["n_neg"],
         "Material/F1": summary["material_matched"]["f1"], "Material/F1_Immaterial": summary["material_matched"]["f1_neg"],
+        "Material/Support": summary["material_matched"]["support"],
+        "Material/N_Material": summary["material_matched"]["n_pos"], "Material/N_Immaterial": summary["material_matched"]["n_neg"],
     }
     if run_clipmatch:
         log["ClipMatch/Top1"] = summary["clipmatch"]["top1_accuracy"]
