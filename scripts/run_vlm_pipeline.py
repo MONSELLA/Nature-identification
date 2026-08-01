@@ -116,7 +116,7 @@ from src.models.prompts import build_system_prompts
 from src.models.vlm_models import MODEL_REGISTRY, create_vlm
 from src.vlm_pipeline import run_inference, resolve_hybrid_label, _normalize_object
 from src.evaluation import clip_metrics
-from src.utils import (update_results_store, update_dataset_class_stats, compute_class_stats,
+from src.utils import (update_results_store, update_dataset_image_stats, compute_image_stats,
                        format_duration, crosses_decile)
 
 # Per-model outputs are split by FILE TYPE into these two subfolders of
@@ -430,6 +430,37 @@ def phase_infer(args):
 
     out_path = Path(args.responses_file)
     out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # --- --resume: skip images this artifact already has ---------------------
+    # Inference is by far the expensive half (hours on a full dataset), and a
+    # crash used to mean redoing all of it. The streamed artifact already
+    # contains every completed image, so resuming is just "filter the dataset
+    # down to what's missing and APPEND". The header is only written on a
+    # fresh run; on a resume the existing one is kept (it carries the
+    # candidate_vocab/max_hops/prompt-variant this artifact was built with,
+    # and rewriting it from the current args could silently mix two configs).
+    resume_mode = False
+    if getattr(args, "resume", False) and out_path.exists():
+        done, has_footer, n_bad = _already_inferred_paths(out_path)
+        if has_footer:
+            print(f"✅ [infer] {out_path} already ends in a footer — this run "
+                  f"is complete ({len(done)} images). Nothing to resume; "
+                  f"delete the file or drop --resume to redo it.")
+            return
+        before = len(dataset)
+        dataset = [d for d in dataset if d["image_path"] not in done]
+        resume_mode = True
+        print(f"⏩ [infer] resuming {out_path}: {len(done)} image(s) already done, "
+              f"{len(dataset)} of {before} remaining"
+              + (f" ({n_bad} truncated line(s) dropped — those images redone)" if n_bad else ""))
+        if not dataset:
+            print("⚠️ [infer] nothing left to infer, but the artifact has no footer — "
+                  "appending one so --stage score sees a complete run.")
+            with open(out_path, "a") as f:
+                f.write(json.dumps({"record_type": "footer",
+                                     "inference_time_seconds": None}) + "\n")
+            return
+
     loop_t0 = time.time()
     n = 0
     # "JSON Lines" format: one complete, independent JSON object per line of
@@ -437,8 +468,9 @@ def phase_infer(args):
     # lets us write results incrementally as they're produced (streaming,
     # rather than building one huge in-memory list and writing it all at the
     # end) and lets Phase 2 read them back one line at a time too.
-    with open(out_path, "w") as f:
-        f.write(json.dumps(header) + "\n")
+    with open(out_path, "a" if resume_mode else "w") as f:
+        if not resume_mode:
+            f.write(json.dumps(header) + "\n")
         for rec in run_inference(
             vlm, dataset,
             caption_system_prompt=caption_system,
@@ -476,6 +508,45 @@ def phase_infer(args):
 # =============================================================================
 # PHASE 2 — scoring
 # =============================================================================
+def _already_inferred_paths(path):
+    """Every image_path already present as a completed image record in a
+    partially-written artifact, plus whether that file ends in a footer.
+
+    Used by --resume. Because phase_infer STREAMS one JSON line per image as
+    it goes (rather than buffering and writing at the end), a run killed
+    mid-way — an OOM, a SLURM timeout, the CMYK crash — leaves a file whose
+    every complete line is still valid, finished work. Resuming just means
+    skipping those images and appending the rest.
+
+    Lines are parsed defensively: a hard kill (SIGKILL / CUDA abort) can
+    truncate the FINAL line mid-write, since Python's file buffer isn't
+    flushed per record. Such a line is silently dropped, so that one image is
+    simply re-inferred rather than corrupting the resume set.
+
+    Returns (set_of_image_paths, has_footer, n_bad_lines).
+    """
+    seen, has_footer, bad = set(), False, 0
+    p = Path(path)
+    if not p.exists():
+        return seen, has_footer, bad
+    with open(p) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                bad += 1   # truncated tail line — that image gets redone
+                continue
+            rt = obj.get("record_type")
+            if rt == "footer":
+                has_footer = True
+            elif rt not in ("header", "footer") and obj.get("image_path"):
+                seen.add(obj["image_path"])
+    return seen, has_footer, bad
+
+
 def _read_artifact(path):
     """Read back a JSON-Lines artifact written by phase_infer: the first
     header-tagged line (merged with the footer line's timing info, if
@@ -790,6 +861,7 @@ def phase_score(args):
         # left None wherever a given dataset type has no such value.
         pred_vocab_entry = None
         best_obj_idx = None
+        anchor_similarity = None
         best_final = None
         gt_syn = pred_class_synset = pred_node = None
         hier = {"hp": None, "hr": None, "hf1": None}
@@ -891,6 +963,12 @@ def phase_score(args):
                 if rec_obj_embs_cm.shape[0] > 0:
                     sims_to_pred = rec_obj_embs_cm @ candidate_embs[pred_idx]
                     best_obj_idx = int(sims_to_pred.argmax())
+                    # How strongly the winning entity actually matched the
+                    # predicted class — a LOW value here flags an anchor
+                    # chosen by weak/topical similarity rather than a real
+                    # conceptual match, which is exactly when the axis verdict
+                    # read off that anchor is least trustworthy.
+                    anchor_similarity = float(sims_to_pred[best_obj_idx])
                     
                     # 3. Resolve ONLY the argmax extracted object (best_obj_idx) to a
                     #    WordNet node for hierarchical metrics — no fallback to the
@@ -1241,6 +1319,17 @@ def phase_score(args):
             "clipmatch_summary_caption": summary_texts[idx] if summary_texts is not None else None,
             "clipmatch_summary_caption_token_length": summary_token_counts[idx] if summary_token_counts is not None else None,
             "gt_synset": gt_syn,
+            # The ANCHOR: which extracted entity won the CLIP-similarity
+            # argmax against the ClipMatch-predicted class. This is the object
+            # whose own hybrid label supplies nature/biotic/material on
+            # single-label datasets, AND the only phrase resolve_to_wordnet is
+            # given for hP/hR — so `resolved_pred_synset` alone is not
+            # interpretable without it (a null there could mean either "no
+            # anchor was found" or "this specific phrase didn't resolve", and
+            # you can't tell which, or which phrase was blamed).
+            "anchor_object": objs[best_obj_idx] if best_obj_idx is not None else None,
+            "anchor_object_idx": best_obj_idx,
+            "anchor_object_similarity": anchor_similarity,
             "resolved_pred_synset": pred_node,
             "hierarchical_precision": hier["hp"], "hierarchical_recall": hier["hr"],
             "hierarchical_f1": hier["hf1"],
@@ -1285,9 +1374,15 @@ def phase_score(args):
             "label_vlm_call_rate": (n_label_calls / n_object_records) if n_object_records else 0.0,
         },
         "reference_free": {
+            # Mean AND population std (same convention as the hierarchical
+            # metrics): a mean alone can't distinguish "every image scores
+            # close to this" from a widely-spread or bimodal distribution.
             "clipscore": _mean(clipscore_vals),
+            "clipscore_std": _std(clipscore_vals),
             "f_clipscore": _mean(fclip_vals),
+            "f_clipscore_std": _std(fclip_vals),
             "object_clipscore": _mean(objclip_vals),
+            "object_clipscore_std": _std(objclip_vals),
         },
         "clip_models": {
             "reference_free": args.clipscore_model,
@@ -1438,15 +1533,17 @@ def phase_score(args):
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / Path(args.output_file).name
     update_results_store(out_path, dataset=dataset, model=header.get("model"), metrics=summary)
-    # Distinct-target-class nature/biotic/material composition of THIS run's
-    # sampled dataset (recap: sampling is deterministic — a fixed --max_samples
-    # always yields the same subset — so this is stable across reruns of the
-    # same config). Keyed by --max_samples so different configurations (e.g.
-    # 1000 vs the full dataset) accumulate side by side instead of overwriting.
-    all_targets = [t for rec in records for t in rec.get("targets", [])]
-    class_stats = compute_class_stats(all_targets)
+    # Per-IMAGE nature/biotic/material GT composition of THIS run's sampled
+    # dataset (recap: sampling is deterministic — a fixed --max_samples always
+    # yields the same subset — so this is stable across reruns of the same
+    # config). Keyed by --max_samples so different configurations (e.g. 1000 vs
+    # the full dataset) accumulate side by side instead of overwriting.
+    # IMAGE-level, not distinct-class: BIG-5 has no class vocabulary (every
+    # image shares one holistic "scene" target), so the old class breakdown
+    # collapsed all of BIG-5 to `total_classes: 1`. See compute_image_stats.
+    image_stats = compute_image_stats(records)
     config_key = str(args.max_samples) if args.max_samples is not None else "full"
-    update_dataset_class_stats(out_path, dataset=dataset, config_key=config_key, stats=class_stats)
+    update_dataset_image_stats(out_path, dataset=dataset, config_key=config_key, stats=image_stats)
     if flat_rows:
         # Include dataset + model in the filename — otherwise every model run
         # writes to the same "<stem>_predictions.csv" and each rerun (e.g. a
@@ -1484,9 +1581,10 @@ def _print_summary(s, run_clipmatch):
           f"({d['label_parse_failures']}/{d['label_vlm_calls']} VLM calls) — "
           f"material-only {d['label_parse_failure_rate_material']:.1%} "
           f"({d['label_parse_failures_material']}/{d['label_calls_material']})")
-    print(f"CLIPScore: {s['reference_free']['clipscore']:.4f} | "
-          f"F-CLIPScore: {s['reference_free']['f_clipscore']:.4f} | "
-          f"Object-CLIPScore: {s['reference_free']['object_clipscore']:.4f}")
+    rf = s["reference_free"]
+    print(f"CLIPScore: {rf['clipscore']:.4f}±{rf.get('clipscore_std', 0.0):.4f} | "
+          f"F-CLIPScore: {rf['f_clipscore']:.4f}±{rf.get('f_clipscore_std', 0.0):.4f} | "
+          f"Object-CLIPScore: {rf['object_clipscore']:.4f}±{rf.get('object_clipscore_std', 0.0):.4f}")
     neg_labels = {"nature": "no_nature", "biotic_matched": "abiotic", "material_matched": "immaterial"}
     axis_names = {"nature": "nature", "biotic_matched": "life category", "material_matched": "tangibility"}
     for axis in ("nature", "biotic_matched", "material_matched"):
@@ -1852,6 +1950,20 @@ def build_arg_parser():
                         f"artifact in a '{RESPONSES_SUBDIR}' subfolder; every model's "
                         f"_predictions.csv in a '{PREDICTIONS_SUBDIR}' subfolder. Created if it "
                         "doesn't exist. Default: write directly into --results_dir.")
+    p.add_argument("--resume", action="store_true",
+                   help="--stage infer/all only. If --responses_file already exists and has "
+                        "no footer (i.e. a previous run died part-way), skip every image "
+                        "already recorded in it and APPEND the rest, keeping the existing "
+                        "header. Inference streams one JSON line per image, so everything "
+                        "written before the crash is complete, valid work — this turns a "
+                        "fatal OOM/timeout hours into a run that picks up where it left off "
+                        "instead of restarting from image 0. A truncated final line (hard "
+                        "kill mid-write) is dropped and that one image redone. If the file "
+                        "already ends in a footer the run is complete and this exits "
+                        "immediately rather than redoing anything. NOTE: pair with the SAME "
+                        "--max_samples as the original run — the sampled subset is "
+                        "seed-42 deterministic, so a different value resumes against a "
+                        "different subset.")
     p.add_argument("--max_samples", type=int, default=None)
     p.add_argument("--verbose", action="store_true")
     p.add_argument("--wandb", action="store_true")

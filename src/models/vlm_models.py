@@ -302,15 +302,42 @@ class VLLMBackedVLM(BaseVLM):
         needs_resize = self.max_image_side is not None and max(width, height) > self.max_image_side
 
         if not needs_resize:
-            if isinstance(image, str):
-                with open(image, "rb") as f:
-                    b64 = base64.b64encode(f.read()).decode("utf-8")
-                # Preserve the original file extension (jpg/png/etc.) in the
-                # data URL's MIME type, defaulting to png if there's none.
-                suffix = Path(image).suffix.lstrip(".").lower() or "png"
-                return f"data:image/{suffix};base64,{b64}"
-            # Already a PIL Image and small enough — encode as-is (in-memory
-            # "file" via BytesIO, rather than needing to save to disk first).
+            # The raw-bytes fast path is only safe for images ALREADY in a
+            # mode the vision encoder handles. ImageNet's ILSVRC2012 val set
+            # famously contains a handful of CMYK and grayscale JPEGs; passed
+            # through untouched, one of those made vLLM's Pixtral multimodal
+            # processor emit ZERO image patches, so the chat template's single
+            # <image> placeholder was never filled and the whole batch died
+            # with "Expected there to be 1 prompt placeholders corresponding
+            # to 1 image items, but instead found 0". That is a RuntimeError,
+            # not the ValueError generate_batch_safe's bisection recovers
+            # from, so it killed the engine outright ~140 batches into a run.
+            # The oversized branch below already had this covered (it calls
+            # .convert("RGB") before resizing, for the same channel-count
+            # reason) — only the fast path was exposed, which is precisely the
+            # path essentially every ImageNet image takes.
+            # `pil_image.mode` is read from the header alone (no full decode),
+            # so the RGB check stays as cheap as the original fast path; the
+            # decode/re-encode cost is paid ONLY for the rare non-RGB image.
+            if pil_image.mode == "RGB":
+                if isinstance(image, str):
+                    with open(image, "rb") as f:
+                        b64 = base64.b64encode(f.read()).decode("utf-8")
+                    # Preserve the original file extension (jpg/png/etc.) in the
+                    # data URL's MIME type, defaulting to png if there's none.
+                    suffix = Path(image).suffix.lstrip(".").lower() or "png"
+                    return f"data:image/{suffix};base64,{b64}"
+            else:
+                # Non-RGB (CMYK / grayscale / palette / RGBA) and small enough
+                # to skip resizing — normalize the colour mode only.
+                buffer = BytesIO()
+                pil_image.convert("RGB").save(buffer, format="JPEG", quality=90)
+                b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+                return f"data:image/jpeg;base64,{b64}"
+            # Reached only when the image is ALREADY RGB and was passed as a
+            # PIL Image rather than a path (the str case returned above) —
+            # encode as-is (in-memory "file" via BytesIO, rather than needing
+            # to save to disk first).
             buffer = BytesIO()
             pil_image.save(buffer, format="PNG")
             b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
