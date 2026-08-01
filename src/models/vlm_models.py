@@ -57,6 +57,31 @@ from typing import Any, Dict, List, Optional, Union
 # be installed just to be imported — only actually using an image does.
 ImageInput = Union[str, "PIL.Image.Image", None]  # noqa: F821
 
+# Chat-template variable names different model families use to gate their
+# "thinking"/reasoning mode. Checked against the template TEXT so only names a
+# given template actually reads are ever sent (see
+# VLLMBackedVLM._chat_kwargs). Qwen uses `enable_thinking`; the rest are the
+# other spellings seen in the wild. Add to this list rather than special-casing
+# a family — a name that isn't in a template is simply never sent.
+THINKING_SWITCH_NAMES = (
+    "enable_thinking",
+    "add_thinking",
+    "thinking",
+    "enable_reasoning",
+    "reasoning",
+)
+
+
+def find_thinking_switches(template: str) -> List[str]:
+    """Which THINKING_SWITCH_NAMES a chat template actually references.
+
+    Matched on WORD BOUNDARIES, not as plain substrings: "thinking" occurs
+    inside "enable_thinking", so a naive `in` test reports both for Qwen and
+    sends a redundant second kwarg. Only whole identifiers count."""
+    import re
+    return [n for n in THINKING_SWITCH_NAMES
+            if re.search(rf"(?<![A-Za-z0-9_]){re.escape(n)}(?![A-Za-z0-9_])", template or "")]
+
 
 # =============================================================================
 # Abstract base
@@ -332,21 +357,40 @@ class VLLMBackedVLM(BaseVLM):
         # (i.e. exactly the previous behavior) rather than break startup.
         try:
             template = getattr(self.llm.get_tokenizer(), "chat_template", None) or ""
-            self._supports_thinking_toggle = "enable_thinking" in template
         except Exception:
-            self._supports_thinking_toggle = False
-        if self._supports_thinking_toggle:
-            print(f"🧠 {model_name}: chat template supports thinking mode — "
-                  f"enable_thinking={self.enable_thinking}")
+            template = ""
+        self._thinking_switches = find_thinking_switches(template)
+        self._supports_thinking_toggle = bool(self._thinking_switches)
+        emits_think = "<think>" in template
+        if self._thinking_switches:
+            print(f"🧠 {model_name}: chat template has thinking switch(es) "
+                  f"{self._thinking_switches} — set to {self.enable_thinking}")
+        elif emits_think:
+            # The dangerous case for a cross-family comparison: the template
+            # emits a think block but exposes NO switch to turn it off, so
+            # this model silently gets extra inference-time reasoning the
+            # others don't. Loud, because it invalidates the comparison rather
+            # than just degrading one number.
+            print(f"⚠️ {model_name}: chat template emits '<think>' but exposes NO known "
+                  f"switch to disable it (looked for {THINKING_SWITCH_NAMES}). This model "
+                  f"will reason where non-thinking models cannot — NOT a fair cross-family "
+                  f"comparison. Inspect its template before trusting the results.")
 
     def _chat_kwargs(self) -> Dict[str, Any]:
         """Extra kwargs for `self.llm.chat(...)`. Sends the thinking toggle
         ONLY to templates that declare it, so every other model's rendered
         prompt is byte-identical to before this existed (and stays
-        prefix-cache compatible with artifacts produced then)."""
-        if not self._supports_thinking_toggle:
+        prefix-cache compatible with artifacts produced then).
+
+        Every switch name the template actually mentions is set, because
+        families don't agree on one: Qwen uses `enable_thinking`, others use
+        `thinking`/`add_thinking`/`enable_reasoning`. Passing a name the
+        template never reads would be a silently ignored no-op at best, so
+        only names found in the template text are sent."""
+        if not self._thinking_switches:
             return {}
-        return {"chat_template_kwargs": {"enable_thinking": self.enable_thinking}}
+        return {"chat_template_kwargs": {name: self.enable_thinking
+                                          for name in self._thinking_switches}}
 
     def _is_recoverable_overflow(self, exc: Exception) -> bool:
         """vLLM's `.chat()` raises a ValueError with this exact substring
