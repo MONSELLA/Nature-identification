@@ -72,18 +72,16 @@ THINKING_SWITCH_NAMES = (
 )
 
 
-# Markers that indicate a rendered prompt has OPENED a reasoning block, across
-# the different syntaxes families use. Qwen emits a literal `<think>` tag;
-# Gemma instead opens a CHANNEL — its rendered prompt ends
-# `<|turn>model\n<|channel>thought\n<channel|>` — so a `<think>`-only check
-# reports "no thinking" for a model that is very much thinking. Used for
-# REPORTING only: the authoritative test is whether toggling the switch changes
-# the rendered prompt at all (see check_thinking_mode.py), which is
-# syntax-agnostic and therefore survives a family none of these markers cover.
+# Markers that a rendered prompt REFERENCES a reasoning block, across the
+# different syntaxes families use — Qwen a literal `<think>` tag, Gemma-4 a
+# `<|channel>thought` channel. Presence alone says nothing about whether the
+# model will actually reason: BOTH families emit their marker in the
+# thinking-DISABLED prompt too, just immediately closed. Use
+# opens_unclosed_reasoning_block() for that question.
 THINKING_MARKERS = (
     "<think>",
     "<thought>",
-    "channel>thought",
+    "<|channel>thought",
     "<|thinking|>",
     "<reasoning>",
 )
@@ -99,12 +97,21 @@ def has_thinking_marker(text: str) -> bool:
 
 # Opening marker -> its closing counterpart (None = no known closer, so any
 # occurrence is treated as still open).
+#
+# Gemma-4's pair is `<|channel>` ... `<channel|>` — confirmed from its own
+# template, whose strip_thinking macro splits on '<channel|>' and looks for
+# '<|channel>' inside each part. Its generation prompt emits
+# `<|channel>thought\n<channel|>` under `{%- if not enable_thinking -%}`, i.e.
+# an EMPTY, CLOSED thought channel that SUPPRESSES reasoning — exactly what
+# Qwen does with `<think>\n\n</think>`. Pairing it with None (as this table
+# first did) made that suppressor read as an open block and produced a false
+# "Gemma is still thinking" alarm.
 THINKING_MARKER_PAIRS = (
     ("<think>", "</think>"),
     ("<thought>", "</thought>"),
     ("<reasoning>", "</reasoning>"),
     ("<|thinking|>", "<|/thinking|>"),
-    ("channel>thought", None),
+    ("<|channel>thought", "<channel|>"),
 )
 
 
@@ -123,9 +130,18 @@ def opens_unclosed_reasoning_block(text: str) -> bool:
     naive "is '<think>' present" test flags it as thinking and produces a
     false alarm.
 
-    Contrast Gemma-4, whose prompt ends `<|channel>thought\\n<channel|>` with
-    nothing closing it — generation really does begin inside the reasoning
-    block.
+    Gemma-4 does the SAME THING with different markup: its prompt ends
+    `<|channel>thought\\n<channel|>`, an empty CLOSED channel emitted under
+    `{%- if not enable_thinking -%}` to suppress reasoning. Both are correctly
+    reported as not-open.
+
+    NOTE the inverted semantics this creates for Gemma: the suppressor's
+    PRESENCE means thinking is off, so its ABSENCE (a prompt ending at just
+    `<|turn>model\\n`) is the thinking-ENABLED state and cannot be detected by
+    marker inspection alone. That is fine here because this pipeline always
+    passes enable_thinking=False, and Gemma's template defaults it to false
+    anyway (`enable_thinking | default(false)`) — the state we verify is the
+    one we actually use.
     """
     text = text or ""
     for opener, closer in THINKING_MARKER_PAIRS:
