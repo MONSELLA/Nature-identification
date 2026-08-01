@@ -95,6 +95,13 @@ class BatchProgress:
         accumulates every tick regardless, so the numbers in whichever line
         DOES print are correct running averages, not just stats for the one
         reported batch.
+
+        `report_every=0` (or None) disables the throttle entirely and prints
+        EVERY batch. Used by the VLM inference loop, where one line per batch
+        is what you actually want: batches are minutes long and number only in
+        the hundreds, so per-batch timing/ETA is useful rather than spam —
+        unlike the CLIP-encode loops crosses_decile's default was sized for,
+        which can run ~1000 tiny batches inside a single call.
         """
         now = time.time()
         batch_seconds = now - self._last
@@ -102,7 +109,7 @@ class BatchProgress:
         if not self.verbose:
             return
         done = batch_idx + 1
-        if not crosses_decile(batch_idx, done, self.num_batches, self.report_every):
+        if self.report_every and not crosses_decile(batch_idx, done, self.num_batches, self.report_every):
             return
         elapsed = now - self._t0
         avg = elapsed / done

@@ -546,7 +546,14 @@ def run_inference(
     # partial final batch still gets its own iteration (e.g. 10 images with
     # batch_size=3 needs 4 batches: 3+3+3+1).
     num_batches = (n + batch_size - 1) // batch_size
-    progress = BatchProgress(num_batches, label="[infer] batch", verbose=verbose)
+    # report_every=0 -> print timing/ETA for EVERY batch, not every 10%. A VLM
+    # inference batch takes minutes and a full run is only a few hundred of
+    # them, so per-batch elapsed/ETA is the useful granularity; the 10% default
+    # was sized for the CLIP-encode loops, which run far more, far smaller
+    # batches. At 243 batches the throttle meant a timing line roughly every
+    # 24 batches — long enough to look like it had stopped reporting.
+    progress = BatchProgress(num_batches, label="[infer] batch", verbose=verbose,
+                             report_every=0)
 
     for b in range(num_batches):
         # Slice out this batch's images. Python slicing handles the last,
