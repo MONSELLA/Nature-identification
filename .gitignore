@@ -17,3 +17,5 @@ __pycache__/
 
 # Secrets (e.g. HF_TOKEN)
 .env
+
+results/
