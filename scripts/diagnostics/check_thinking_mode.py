@@ -25,20 +25,28 @@ parse-failure vs <1% for a non-thinking model at identical settings), while the
 free-form caption call has no grammar at all, so chain-of-thought text lands in
 the caption itself.
 
+SYNTAX VARIES BY FAMILY — do not grep for "<think>". Qwen3.5 opens a literal
+tag ('...assistant\n<think>\n'); Gemma-4 opens a CHANNEL instead
+('...model\n<|channel>thought\n<channel|>'), so a <think>-only check calls it
+"no thinking" when it is very much thinking. The authoritative test here is
+therefore whether toggling the switch CHANGES the rendered prompt, which is
+syntax-agnostic; the marker list is only for readable output.
+
 VERDICTS
-  OK (no thinking)   - template never emits <think>; nothing to disable.
-  OK (switched off)  - template emits <think> by default, and a switch this
-                       codebase knows about actually suppresses it.
-  ACTION NEEDED      - template emits <think> with NO switch this codebase
-                       recognizes, or the switch does not change the rendered
-                       prompt. That model would reason where the others cannot,
-                       so the comparison is not fair until it is handled.
+  OK (no thinking)   - no reasoning block opened; nothing to disable.
+  OK (switched off)  - a reasoning block is opened by default, and a switch
+                       this codebase knows about demonstrably closes it.
+  ACTION NEEDED      - a reasoning block is opened with NO switch this codebase
+                       recognizes, or the switch fails to close it. That model
+                       would reason where the others cannot, so the comparison
+                       is not fair until it is handled.
 """
 
 import sys
 
 sys.path.insert(0, ".")
-from src.models.vlm_models import THINKING_SWITCH_NAMES, find_thinking_switches  # noqa: E402
+from src.models.vlm_models import (THINKING_SWITCH_NAMES, find_thinking_switches,  # noqa: E402
+                                   has_thinking_marker)
 
 SAMPLE = [{"role": "user", "content": "Describe this image, including any text."}]
 
@@ -62,26 +70,40 @@ def check(model_name):
             return f"<render failed: {type(e).__name__}: {e}>"
 
     default = render()
-    emits_by_default = "<think>" in default
+    marker_by_default = has_thinking_marker(default)
 
     lines = [f"   {model_name}",
              f"     switches found : {switches or 'none'}",
-             f"     emits <think> by default: {emits_by_default}"]
+             f"     reasoning marker in default prompt: {marker_by_default}",
+             f"     default prompt tail: {default[-90:]!r}"]
 
-    if not emits_by_default and not switches:
+    if not switches:
+        if not marker_by_default:
+            return "✅ OK (no thinking)\n" + "\n".join(lines)
+        lines.append(f"     no known switch (looked for {list(THINKING_SWITCH_NAMES)})")
+        return "🚨 ACTION NEEDED — reasoning block opened, no switch to disable it\n" + "\n".join(lines)
+
+    # AUTHORITATIVE TEST: does turning every switch off actually CHANGE the
+    # rendered prompt? This is syntax-agnostic on purpose — Qwen opens a
+    # `<think>` tag while Gemma opens a `<|channel>thought` channel, and a
+    # future family may use something neither marker list covers. A prompt
+    # that changes when the switch flips is the real evidence the switch
+    # works; the marker check above only makes the report readable.
+    off = render(**{n: False for n in switches})
+    changed = off != default
+    off_marker = has_thinking_marker(off)
+    lines.append(f"     with switch(es) OFF -> prompt changed: {changed}, marker present: {off_marker}")
+    lines.append(f"     off prompt tail    : {off[-90:]!r}")
+
+    if off_marker:
+        return "🚨 ACTION NEEDED — switch did not close the reasoning block\n" + "\n".join(lines)
+    if marker_by_default and changed:
+        return "✅ OK (switched off)\n" + "\n".join(lines)
+    if not marker_by_default and not changed:
+        # Switch exists but is already off (or is a no-op) — nothing opened
+        # either way, which is the state we want.
         return "✅ OK (no thinking)\n" + "\n".join(lines)
-
-    if switches:
-        off = render(**{n: False for n in switches})
-        off_emits = "<think>" in off
-        lines.append(f"     with switch(es) OFF, emits <think>: {off_emits}")
-        lines.append(f"     prompt changed when toggled: {off != default}")
-        if not off_emits:
-            return "✅ OK (switched off)\n" + "\n".join(lines)
-        return "🚨 ACTION NEEDED — switch did not suppress <think>\n" + "\n".join(lines)
-
-    lines.append(f"     no known switch (looked for {list(THINKING_SWITCH_NAMES)})")
-    return "🚨 ACTION NEEDED — thinking on, no switch to disable it\n" + "\n".join(lines)
+    return "✅ OK (switched off)\n" + "\n".join(lines)
 
 
 def main():

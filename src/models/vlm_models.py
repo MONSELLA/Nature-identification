@@ -72,6 +72,29 @@ THINKING_SWITCH_NAMES = (
 )
 
 
+# Markers that indicate a rendered prompt has OPENED a reasoning block, across
+# the different syntaxes families use. Qwen emits a literal `<think>` tag;
+# Gemma instead opens a CHANNEL — its rendered prompt ends
+# `<|turn>model\n<|channel>thought\n<channel|>` — so a `<think>`-only check
+# reports "no thinking" for a model that is very much thinking. Used for
+# REPORTING only: the authoritative test is whether toggling the switch changes
+# the rendered prompt at all (see check_thinking_mode.py), which is
+# syntax-agnostic and therefore survives a family none of these markers cover.
+THINKING_MARKERS = (
+    "<think>",
+    "<thought>",
+    "channel>thought",
+    "<|thinking|>",
+    "<reasoning>",
+)
+
+
+def has_thinking_marker(text: str) -> bool:
+    """Whether a rendered prompt appears to open a reasoning block (any known
+    syntax). Reporting aid — see THINKING_MARKERS."""
+    return any(m in (text or "") for m in THINKING_MARKERS)
+
+
 def find_thinking_switches(template: str) -> List[str]:
     """Which THINKING_SWITCH_NAMES a chat template actually references.
 
@@ -361,7 +384,7 @@ class VLLMBackedVLM(BaseVLM):
             template = ""
         self._thinking_switches = find_thinking_switches(template)
         self._supports_thinking_toggle = bool(self._thinking_switches)
-        emits_think = "<think>" in template
+        emits_think = has_thinking_marker(template)
         if self._thinking_switches:
             print(f"🧠 {model_name}: chat template has thinking switch(es) "
                   f"{self._thinking_switches} — set to {self.enable_thinking}")
@@ -371,8 +394,8 @@ class VLLMBackedVLM(BaseVLM):
             # this model silently gets extra inference-time reasoning the
             # others don't. Loud, because it invalidates the comparison rather
             # than just degrading one number.
-            print(f"⚠️ {model_name}: chat template emits '<think>' but exposes NO known "
-                  f"switch to disable it (looked for {THINKING_SWITCH_NAMES}). This model "
+            print(f"⚠️ {model_name}: chat template opens a reasoning block but exposes NO "
+                  f"known switch to disable it (looked for {THINKING_SWITCH_NAMES}). This model "
                   f"will reason where non-thinking models cannot — NOT a fair cross-family "
                   f"comparison. Inspect its template before trusting the results.")
 
