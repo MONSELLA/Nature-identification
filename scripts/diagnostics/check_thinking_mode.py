@@ -46,7 +46,7 @@ import sys
 
 sys.path.insert(0, ".")
 from src.models.vlm_models import (THINKING_SWITCH_NAMES, find_thinking_switches,  # noqa: E402
-                                   has_thinking_marker)
+                                   opens_unclosed_reasoning_block)
 
 SAMPLE = [{"role": "user", "content": "Describe this image, including any text."}]
 
@@ -70,11 +70,11 @@ def check(model_name):
             return f"<render failed: {type(e).__name__}: {e}>"
 
     default = render()
-    marker_by_default = has_thinking_marker(default)
+    marker_by_default = opens_unclosed_reasoning_block(default)
 
     lines = [f"   {model_name}",
              f"     switches found : {switches or 'none'}",
-             f"     reasoning marker in default prompt: {marker_by_default}",
+             f"     reasoning block OPEN in default prompt: {marker_by_default}",
              f"     default prompt tail: {default[-90:]!r}"]
 
     if not switches:
@@ -91,8 +91,8 @@ def check(model_name):
     # works; the marker check above only makes the report readable.
     off = render(**{n: False for n in switches})
     changed = off != default
-    off_marker = has_thinking_marker(off)
-    lines.append(f"     with switch(es) OFF -> prompt changed: {changed}, marker present: {off_marker}")
+    off_marker = opens_unclosed_reasoning_block(off)
+    lines.append(f"     with switch(es) OFF -> prompt changed: {changed}, block still OPEN: {off_marker}")
     lines.append(f"     off prompt tail    : {off[-90:]!r}")
 
     if off_marker:

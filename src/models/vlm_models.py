@@ -90,9 +90,53 @@ THINKING_MARKERS = (
 
 
 def has_thinking_marker(text: str) -> bool:
-    """Whether a rendered prompt appears to open a reasoning block (any known
-    syntax). Reporting aid — see THINKING_MARKERS."""
+    """Whether a rendered prompt mentions a reasoning block at all (any known
+    syntax), OPEN OR CLOSED. Reporting aid — see THINKING_MARKERS. Use
+    opens_unclosed_reasoning_block() to decide whether the model will actually
+    generate reasoning."""
     return any(m in (text or "") for m in THINKING_MARKERS)
+
+
+# Opening marker -> its closing counterpart (None = no known closer, so any
+# occurrence is treated as still open).
+THINKING_MARKER_PAIRS = (
+    ("<think>", "</think>"),
+    ("<thought>", "</thought>"),
+    ("<reasoning>", "</reasoning>"),
+    ("<|thinking|>", "<|/thinking|>"),
+    ("channel>thought", None),
+)
+
+
+def opens_unclosed_reasoning_block(text: str) -> bool:
+    """Whether a rendered prompt leaves a reasoning block OPEN, so generation
+    begins inside it.
+
+    The presence of a marker is NOT enough, which is the whole point of this
+    function. Qwen's `enable_thinking=False` still emits a think block — it
+    just opens and immediately CLOSES it with an empty body:
+
+        ...assistant\\n<think>\\n\\n</think>\\n\\n
+
+    That is the correct non-thinking prompt: the closed pair tells the model
+    reasoning is finished, and generation starts in normal answer mode. A
+    naive "is '<think>' present" test flags it as thinking and produces a
+    false alarm.
+
+    Contrast Gemma-4, whose prompt ends `<|channel>thought\\n<channel|>` with
+    nothing closing it — generation really does begin inside the reasoning
+    block.
+    """
+    text = text or ""
+    for opener, closer in THINKING_MARKER_PAIRS:
+        last_open = text.rfind(opener)
+        if last_open == -1:
+            continue
+        if closer is None:
+            return True  # no known closer — assume still open
+        if text.rfind(closer) < last_open:
+            return True  # opened after the last close
+    return False
 
 
 def find_thinking_switches(template: str) -> List[str]:
@@ -384,8 +428,18 @@ class VLLMBackedVLM(BaseVLM):
             template = ""
         self._thinking_switches = find_thinking_switches(template)
         self._supports_thinking_toggle = bool(self._thinking_switches)
-        emits_think = has_thinking_marker(template)
-        if self._thinking_switches:
+        # Render a probe prompt: whether a block is left OPEN can only be
+        # seen in a RENDERED prompt, not in the raw template text.
+        emits_think = False
+        try:
+            tok = self.llm.get_tokenizer()
+            probe = tok.apply_chat_template([{"role": "user", "content": "hi"}],
+                                            tokenize=False, add_generation_prompt=True,
+                                            **{n: False for n in self._thinking_switches})
+            emits_think = opens_unclosed_reasoning_block(probe)
+        except Exception:
+            emits_think = False
+        if self._thinking_switches and not emits_think:
             print(f"🧠 {model_name}: chat template has thinking switch(es) "
                   f"{self._thinking_switches} — set to {self.enable_thinking}")
         elif emits_think:
