@@ -396,7 +396,12 @@ def phase_infer(args):
                   # 0 is the CLI's "disabled" spelling (argparse can't default
                   # an int flag to None while still accepting a positive int);
                   # VLLMBackedVLM.__init__ itself expects None for "disabled".
-                  "max_image_side": args.max_image_side or None}
+                  "max_image_side": args.max_image_side or None,
+                  # Off by default — see VLLMBackedVLM.__init__ for why
+                  # (guided decoding + an already-open <think> block is a
+                  # broken combination, and the caption call has no grammar
+                  # to stop chain-of-thought leaking into the caption text).
+                  "enable_thinking": args.enable_thinking}
     if args.max_model_len is not None:
         vlm_kwargs["max_model_len"] = args.max_model_len
     if args.max_num_seqs is not None:
@@ -1841,6 +1846,20 @@ def build_arg_parser():
                         "parse-failure signal, showing up only as a suspiciously low "
                         "objects-per-image diagnostic.")
     p.add_argument("--max_new_tokens_label", type=int, default=248)
+    p.add_argument("--enable_thinking", action="store_true",
+                   help="Turn the model's chat-template thinking/reasoning mode back ON. "
+                        "OFF BY DEFAULT, and only sent to templates that actually declare "
+                        "the switch (so non-thinking models are unaffected). Qwen3.5's "
+                        "template enables it by default and renders a prompt already ending "
+                        "in an open '<think>' block, which breaks this pipeline two ways: "
+                        "structured calls run under guided decoding, so the model is forced "
+                        "into JSON from inside an unterminated think block (measured: ~10% "
+                        "extraction parse-failure on Qwen3.5-9B vs <1% on Ministral-3-8B at "
+                        "identical settings), and the free-form caption call has no grammar "
+                        "at all, so chain-of-thought text lands in the caption itself. This "
+                        "pipeline's schemas already carry their own explicit reasoning "
+                        "fields, so template-level thinking is redundant here. Pass this "
+                        "only to run thinking-mode as a deliberate, labeled ablation.")
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--no_summarize_clipmatch_caption", action="store_true",
                    help="On ImageNet/Places, --stage infer asks the VLM for an extra short "

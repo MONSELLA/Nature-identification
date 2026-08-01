@@ -253,8 +253,45 @@ class VLLMBackedVLM(BaseVLM):
     chat API (`self.llm.chat(...)`) that internally handles GPU scheduling,
     KV-cache management, and batching for us."""
 
-    def __init__(self, model_name: str, max_image_side: Optional[int] = 1024, **kwargs: Any) -> None:
+    def __init__(self, model_name: str, max_image_side: Optional[int] = 1024,
+                 enable_thinking: bool = False, **kwargs: Any) -> None:
         super().__init__(model_name, **kwargs)
+        # `enable_thinking` — like max_image_side, an EXPLICIT named parameter
+        # so it is never forwarded to vLLM's LLM(...) constructor. Controls the
+        # model's own chat-template "thinking"/reasoning mode via
+        # chat_template_kwargs on every .chat() call.
+        #
+        # DEFAULT IS FALSE, and that is a deliberate fix, not a preference.
+        # Qwen3.5's chat template turns thinking ON by default and renders a
+        # prompt that ENDS with an already-open "<think>\n" block:
+        #     '<|im_start|>assistant\n<think>\n'
+        # That interacts badly with this pipeline in two separate ways:
+        #   1. STRUCTURED calls (extraction/labeling) run under guided
+        #      decoding, which constrains generation to the JSON schema from
+        #      the very first generated token — so the model can emit neither
+        #      its reasoning nor the closing </think>. It is forced straight
+        #      into JSON from inside an unterminated think block, a state it
+        #      never saw in training. Measured effect: Qwen3.5-9B hit a ~10%
+        #      extraction parse-failure rate where Ministral-3-8B (no thinking
+        #      mode) stayed under 1% on the identical prompt, schema, dataset
+        #      and token budget.
+        #   2. FREE-FORM calls (the baseline caption) have no grammar to
+        #      constrain them, so the model DOES emit chain-of-thought — and
+        #      _parse_response returns free-form text verbatim, with no
+        #      <think> stripping. The "caption" then contains reasoning text,
+        #      or is consumed entirely by it before the real description
+        #      starts, silently degrading everything downstream (extraction
+        #      context, ClipMatch summary, CLIPScore).
+        # The pipeline's schemas already carry their OWN explicit reasoning
+        # fields (ObjectExtractionResponse.reasoning, TaxonomyResponse's
+        # two-step nature_reasoning/sub_axes_reasoning), so template-level
+        # thinking is redundant here even where it works.
+        self.enable_thinking = enable_thinking
+        # Only send chat_template_kwargs to templates that actually declare
+        # the switch — passing an unknown kwarg to a template that doesn't
+        # use it is at best ignored and at worst an error, and models without
+        # a thinking mode (Mistral, LLaVA) must stay byte-identical to before.
+        self._supports_thinking_toggle = False
         # `max_image_side` is an EXPLICIT named parameter (not swept into
         # **kwargs) specifically so it never gets forwarded to LLM(...)
         # below — vLLM's own constructor has no such argument and would
@@ -288,6 +325,28 @@ class VLLMBackedVLM(BaseVLM):
         # take a while and use a lot of VRAM — see unload_vlm() further down
         # for how we later release this memory).
         self.llm = LLM(model=model_name, **kwargs)
+        # Does THIS model's chat template actually understand the thinking
+        # switch? Read the template once here rather than per call. Wrapped
+        # defensively: get_tokenizer() is not part of vLLM's guaranteed public
+        # surface, and a missing/odd tokenizer must degrade to "no toggle"
+        # (i.e. exactly the previous behavior) rather than break startup.
+        try:
+            template = getattr(self.llm.get_tokenizer(), "chat_template", None) or ""
+            self._supports_thinking_toggle = "enable_thinking" in template
+        except Exception:
+            self._supports_thinking_toggle = False
+        if self._supports_thinking_toggle:
+            print(f"🧠 {model_name}: chat template supports thinking mode — "
+                  f"enable_thinking={self.enable_thinking}")
+
+    def _chat_kwargs(self) -> Dict[str, Any]:
+        """Extra kwargs for `self.llm.chat(...)`. Sends the thinking toggle
+        ONLY to templates that declare it, so every other model's rendered
+        prompt is byte-identical to before this existed (and stays
+        prefix-cache compatible with artifacts produced then)."""
+        if not self._supports_thinking_toggle:
+            return {}
+        return {"chat_template_kwargs": {"enable_thinking": self.enable_thinking}}
 
     def _is_recoverable_overflow(self, exc: Exception) -> bool:
         """vLLM's `.chat()` raises a ValueError with this exact substring
@@ -483,7 +542,8 @@ class VLLMBackedVLM(BaseVLM):
         # `self.llm.chat([messages], ...)` takes a LIST of conversations (here
         # just one) and returns a list of results — we pull out the single
         # generated text from the first (and only) result.
-        outputs = self.llm.chat([messages], sampling_params=sampling_params, use_tqdm=False)
+        outputs = self.llm.chat([messages], sampling_params=sampling_params, use_tqdm=False,
+                                 **self._chat_kwargs())
         text = outputs[0].outputs[0].text or ""
         return self._parse_response(text, output_mode)
 
@@ -515,7 +575,8 @@ class VLLMBackedVLM(BaseVLM):
             temperature=temperature, max_new_tokens=max_new_tokens,
             output_mode=output_mode, schema=schema, **kwargs
         )
-        outputs = self.llm.chat(conversations, sampling_params=sampling_params, use_tqdm=len(prompts) > 1)
+        outputs = self.llm.chat(conversations, sampling_params=sampling_params,
+                                 use_tqdm=len(prompts) > 1, **self._chat_kwargs())
         return [self._parse_response(o.outputs[0].text or "", output_mode) for o in outputs]
 
 
