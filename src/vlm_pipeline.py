@@ -617,11 +617,26 @@ def run_inference(
         ]
 
         if verbose:
-            n_full = sum(1 for maps in mappings_per_image for m in maps if m is None)
-            n_mat = sum(1 for maps in mappings_per_image for m in maps if m is not None and m["is_nature"])
+            # MUST mirror label_objects_batch's routing exactly, or this line
+            # misreports how much work the call is about to do. It previously
+            # counted only UNMAPPED objects as full calls, which silently went
+            # stale when mapped-NON-nature objects started taking the full
+            # call too (and human terms stopped taking any) — the printed
+            # count then undercounted vLLM's own "Rendering conversations"
+            # total by exactly the mapped-non-nature objects.
+            n_full = n_mat = n_skip = 0
+            for objs_i, maps_i in zip(objects_per_image, mappings_per_image):
+                for obj, m in zip(objs_i, maps_i):
+                    if is_human_term(obj):
+                        n_skip += 1
+                    elif m is not None and m["is_nature"]:
+                        n_mat += 1
+                    else:
+                        n_full += 1
             print(f"[infer] batch {b + 1}/{num_batches}: label_objects_batch "
                   f"(structured; {n_full} full/TaxonomyResponse calls, "
-                  f"{n_mat} material-only/MaterialResponse calls)...", flush=True)
+                  f"{n_mat} material-only/MaterialResponse calls, "
+                  f"{n_skip} human-term objects skipped)...", flush=True)
         # Stage 3: mapping-aware labeling (full for unmapped, material-only for
         # mapped-nature, skipped for mapped non-nature).
         labels_per_image = label_objects_batch(
