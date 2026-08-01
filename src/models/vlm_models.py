@@ -131,6 +131,13 @@ class BaseVLM(ABC):
         re-raises everything, identical to plain `generate_batch`."""
         return False
 
+    def _is_recoverable_bad_image(self, exc: Exception) -> bool:
+        """Hook for subclasses: does `exc` mean "one IMAGE in this batch could
+        not be turned into vision tokens" (a corrupt/degenerate file), as
+        opposed to a genuine engine failure? Base default is False, same
+        safe no-op rationale as `_is_recoverable_overflow` above."""
+        return False
+
     def generate_batch_safe(
         self,
         prompts: List[str],
@@ -139,16 +146,26 @@ class BaseVLM(ABC):
         item_labels: Optional[List[str]] = None,
         **kwargs: Any,
     ) -> List[Union[str, Dict[str, Any], None]]:
-        """Like `generate_batch`, but tolerant of a single-prompt context-
-        window overflow WITHOUT sacrificing batching for the rest of the
-        batch. A batched call (e.g. vLLM's single `.chat()` covering every
-        conversation) fails ENTIRELY if even one prompt overflows, with no
-        indication of which one — so on a `_is_recoverable_overflow` failure
-        we BISECT the batch in half and recurse, each half still generated as
-        one batched call. This isolates the oversized prompt(s) down to
-        single-item granularity (returned as None, aligned with input order)
-        while every other sample stays batched together, instead of
-        degrading the whole batch to one-at-a-time generation.
+        """Like `generate_batch`, but tolerant of a single BAD ITEM in the
+        batch WITHOUT sacrificing batching for the rest of it. A batched call
+        (e.g. vLLM's single `.chat()` covering every conversation) fails
+        ENTIRELY if even one item is bad, with no indication of which one —
+        so on a recoverable failure we BISECT the batch in half and recurse,
+        each half still generated as one batched call. This isolates the
+        offending item(s) down to single-item granularity (returned as None,
+        aligned with input order) while every other sample stays batched
+        together, instead of degrading the whole batch to one-at-a-time
+        generation.
+
+        TWO failure kinds are recoverable, both isolated the same way:
+          * `_is_recoverable_overflow` — a prompt longer than max_model_len.
+          * `_is_recoverable_bad_image` — an image vLLM's multimodal
+            processor turned into zero vision tokens (corrupt/degenerate
+            file). Raised during prompt RENDERING, before the GPU is
+            involved, so the engine survives and the rest of the batch is
+            still fine.
+        Anything else (notably a CUDA OOM, which kills EngineCore outright
+        and leaves nothing to recover into) is re-raised untouched.
 
         `item_labels` (optional, same length as prompts) is used purely for
         the warning message identifying which item was skipped; falls back
@@ -162,14 +179,17 @@ class BaseVLM(ABC):
         try:
             return self.generate_batch(prompts=prompts, images=images, **kwargs)
         except Exception as e:
-            if not self._is_recoverable_overflow(e):
+            overflow = self._is_recoverable_overflow(e)
+            bad_image = self._is_recoverable_bad_image(e)
+            if not (overflow or bad_image):
                 raise
+            reason = "prompt too long for max_model_len" if overflow else "unusable image (no vision tokens produced)"
             if n == 1:
                 name = item_labels[0] if item_labels else "item"
-                print(f"⚠️ Skipping {name} ({label}): prompt too long for max_model_len ({e}).")
+                print(f"⚠️ Skipping {name} ({label}): {reason} ({e}).")
                 return [None]
             mid = n // 2
-            print(f"⚠️ {label}: a prompt exceeded max_model_len — bisecting "
+            print(f"⚠️ {label}: {reason} — bisecting "
                   f"{n} instances into two sub-batches to isolate it.")
             left_labels = item_labels[:mid] if item_labels else None
             right_labels = item_labels[mid:] if item_labels else None
@@ -275,6 +295,31 @@ class VLLMBackedVLM(BaseVLM):
         max_model_len — the specific, bisectable overflow case
         `generate_batch_safe` knows how to recover from."""
         return isinstance(exc, ValueError) and "longer than the maximum model length" in str(exc)
+
+    def _is_recoverable_bad_image(self, exc: Exception) -> bool:
+        """vLLM raises this RuntimeError when its multimodal processor turned
+        an image into ZERO vision tokens, so the chat template's `<image>`
+        placeholder was never substituted:
+
+            "Expected there to be 1 prompt placeholders corresponding to
+             1 image items, but instead found 0 prompt placeholders!"
+
+        In practice that means ONE unusable image in the batch — corrupt or
+        truncated pixel data, or a degenerate size that yields no patches.
+
+        CRITICAL detail that makes this recoverable at all: it is raised
+        during vLLM's PROMPT RENDERING (`_render_and_add_requests` ->
+        `_process_multimodal`), i.e. before anything is submitted to the GPU,
+        so the engine is still perfectly healthy — unlike a CUDA OOM, which
+        kills EngineCore and leaves nothing to recover into. Bisecting the
+        batch therefore isolates the offending image and lets every other
+        image in it proceed normally.
+
+        Worth the specificity: this exact error killed two multi-hour ImageNet
+        runs outright (~batch 149 of 391, then again on the same image after a
+        --resume), because a RuntimeError isn't the ValueError the overflow
+        path catches, so nothing recovered from it."""
+        return isinstance(exc, RuntimeError) and "prompt placeholders" in str(exc)
 
     def _encode_image(self, image: ImageInput) -> str:
         """Convert an image (file path or PIL Image) into a "data URL" string
