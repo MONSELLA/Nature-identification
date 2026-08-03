@@ -170,6 +170,7 @@ class CLIPScorer:
         batch_size: int = 64,
         torch_dtype: Optional[str] = "auto",
         trust_remote_code: bool = False,
+        longclip_repo_path: Optional[str] = None,
         **kwargs
     ) -> None:
         import torch
@@ -177,28 +178,33 @@ class CLIPScorer:
         self.batch_size = batch_size
         self._torch = torch
         self.repo_id = CLIP_PRESETS.get(model_name, model_name)
-        
+
         # ---------------------------------------------------------------------
         # PATH 1: LOCAL PURE-PYTORCH ROUTE (Long-CLIP ECCV 2024)
         # ---------------------------------------------------------------------
         if self.repo_id == "longclip":
             import sys
             import os
-            
-            # Dynamically inject the external repo into Python's path without 
+
+            # Falls back to the project-default path (LONG_CLIP_REPO_PATH)
+            # when not overridden, so existing callers/environments keep
+            # working unchanged.
+            repo_path = longclip_repo_path or LONG_CLIP_REPO_PATH
+
+            # Dynamically inject the external repo into Python's path without
             # polluting the local project folder.
-            if LONG_CLIP_REPO_PATH not in sys.path:
-                sys.path.insert(0, LONG_CLIP_REPO_PATH)
-            
+            if repo_path not in sys.path:
+                sys.path.insert(0, repo_path)
+
             try:
                 from model import longclip
             except ImportError:
                 raise ImportError(
                     f"Could not import Long-CLIP. Ensure the repo is cloned at "
-                    f"'{LONG_CLIP_REPO_PATH}' and dependencies (ftfy, regex) are installed."
+                    f"'{repo_path}' and dependencies (ftfy, regex) are installed."
                 )
 
-            ckpt_path = os.path.join(LONG_CLIP_REPO_PATH, "checkpoints", "longclip-L.pt")
+            ckpt_path = os.path.join(repo_path, "checkpoints", "longclip-L.pt")
             if not os.path.exists(ckpt_path):
                 raise FileNotFoundError(f"Missing weights: Download longclip-L.pt into {ckpt_path}")
 
