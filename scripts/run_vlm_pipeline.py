@@ -393,6 +393,7 @@ def phase_infer(args):
     # MODEL_REGISTRY) — the HuggingFace-served BLIP family was removed.
     vlm_kwargs = {"dtype": args.dtype, "gpu_memory_utilization": args.gpu_memory_utilization,
                   "trust_remote_code": args.trust_remote_code,
+                  "tensor_parallel_size": args.tensor_parallel_size,
                   # 0 is the CLI's "disabled" spelling (argparse can't default
                   # an int flag to None while still accepting a positive int);
                   # VLLMBackedVLM.__init__ itself expects None for "disabled".
@@ -1820,6 +1821,10 @@ def build_arg_parser():
                         "SIMULTANEOUSLY, without lowering --batch_size (still submitted/queued "
                         "at full size) or --max_image_side (image quality untouched). Default "
                         "None leaves vLLM's own default (unset — no change from prior behavior).")
+    p.add_argument("--tensor_parallel_size", "--tensor-parallel-size", type=int, default=1,
+                   help="Passed straight to vLLM's own EngineArgs (LLM(tensor_parallel_size=...)) "
+                        "— shards the model across this many GPUs. Default 1 (single GPU, no "
+                        "change from prior behavior).")
     p.add_argument("--trust_remote_code", action="store_true")
     p.add_argument("--max_image_side", type=int, default=1024,
                    help="Downscale (preserving aspect ratio) any image whose longest side "
