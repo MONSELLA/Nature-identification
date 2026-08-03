@@ -2246,7 +2246,12 @@ def _run_stage_subprocess(args, parser, stage):
 
 def main():
     args = parse_args()
-    args = _resolve_responses_file(args)
+    # --dataset_task resolves its OWN --responses_file per task (each task has
+    # its own run_name/output_file/dataset) — resolving one here too would
+    # just create a stray, unused '<results_dir>/responses/' directory off a
+    # meaningless (task-less) run_name.
+    if not args.dataset_task:
+        args = _resolve_responses_file(args)
 
     if args.stage == "infer":
         if args.dataset_task:
@@ -2288,6 +2293,7 @@ def main():
         # payoff to keeping a scorer resident across datasets, and per-task
         # subprocess isolation matches the plain single-dataset --stage all
         # behavior (never let two datasets' scoring state coexist).
+        retained_paths = []
         for i, overrides in enumerate(json.loads(t) for t in args.dataset_task):
             task_args = argparse.Namespace(**vars(args))
             for key, value in overrides.items():
@@ -2296,8 +2302,14 @@ def main():
             task_args.responses_file = None
             task_args = _resolve_responses_file(task_args)
             _run_stage_subprocess(task_args, parser, "score")
-        print(f"💾 [all] retained inference artifact(s) under "
-              f"{args.results_dir}/{args.run_name or ''}/{RESPONSES_SUBDIR}")
+            retained_paths.append(task_args.responses_file)
+        # Each task has its own run_name/output_file, so (unlike the plain
+        # single-dataset path below) there's no single shared artifact path
+        # to report — list every task's, in the same order --dataset_task
+        # was given.
+        print("💾 [all] retained inference artifact(s):")
+        for path in retained_paths:
+            print(f"    {path}")
     else:
         _run_stage_subprocess(args, parser, "score")
         # --responses_file is ALWAYS retained (never deleted here, under any
