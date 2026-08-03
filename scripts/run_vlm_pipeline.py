@@ -465,7 +465,12 @@ def phase_infer(args, vlm=None):
             print(f"✅ [infer] {out_path} already ends in a footer — this run "
                   f"is complete ({len(done)} images). Nothing to resume; "
                   f"delete the file or drop --resume to redo it.")
-            return
+            # Return the (possibly already-loaded) `vlm` unchanged, not None —
+            # phase_infer_multi chains this return value into the NEXT
+            # dataset's call so its shared VLM survives a dataset that turns
+            # out to be already-complete. A bare `return` here would silently
+            # force phase_infer_multi to reload the model on the next task.
+            return vlm
         before = len(dataset)
         dataset = [d for d in dataset if d["image_path"] not in done]
         resume_mode = True
@@ -478,7 +483,8 @@ def phase_infer(args, vlm=None):
             with open(out_path, "a") as f:
                 f.write(json.dumps({"record_type": "footer",
                                      "inference_time_seconds": None}) + "\n")
-            return
+            # See the has_footer branch above — must return `vlm`, not None.
+            return vlm
 
     loop_t0 = time.time()
     n = 0
