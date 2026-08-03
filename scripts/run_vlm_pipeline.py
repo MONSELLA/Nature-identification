@@ -116,7 +116,7 @@ from src.models.prompts import build_system_prompts
 from src.models.vlm_models import MODEL_REGISTRY, create_vlm
 from src.vlm_pipeline import run_inference, resolve_hybrid_label, _normalize_object
 from src.evaluation import clip_metrics
-from src.utils import (update_results_store, update_dataset_class_stats, compute_class_stats,
+from src.utils import (update_results_store, update_dataset_image_stats, compute_image_stats,
                        format_duration, crosses_decile)
 
 # Per-model outputs are split by FILE TYPE into these two subfolders of
@@ -248,16 +248,23 @@ def _binary_metrics(y_true, y_pred):
     from sklearn.metrics import accuracy_score, precision_recall_fscore_support
     if not y_true:
         return {"accuracy": 0.0, "precision": 0.0, "recall": 0.0, "f1": 0.0,
-                "precision_neg": 0.0, "recall_neg": 0.0, "f1_neg": 0.0, "support": 0}
+                "precision_neg": 0.0, "recall_neg": 0.0, "f1_neg": 0.0, "support": 0,
+                "n_pos": 0, "n_neg": 0}
     acc = accuracy_score(y_true, y_pred)
     p, r, f1, _ = precision_recall_fscore_support(y_true, y_pred, average="binary", pos_label=True, zero_division=0)
     p_neg, r_neg, f1_neg, _ = precision_recall_fscore_support(
         y_true, y_pred, average="binary", pos_label=False, zero_division=0)
+    n_pos = int(sum(1 for v in y_true if v))
     return {
         "accuracy": float(acc),
         "precision": float(p), "recall": float(r), "f1": float(f1),
         "precision_neg": float(p_neg), "recall_neg": float(r_neg), "f1_neg": float(f1_neg),
         "support": len(y_true),
+        # GT-label split of this axis's supported images — e.g. how many of the
+        # material/immaterial-supported images are actually GT-material vs.
+        # GT-immaterial — reported alongside support so a flat support number
+        # doesn't hide a heavily skewed axis.
+        "n_pos": n_pos, "n_neg": len(y_true) - n_pos,
     }
 
 
@@ -389,7 +396,12 @@ def phase_infer(args):
                   # 0 is the CLI's "disabled" spelling (argparse can't default
                   # an int flag to None while still accepting a positive int);
                   # VLLMBackedVLM.__init__ itself expects None for "disabled".
-                  "max_image_side": args.max_image_side or None}
+                  "max_image_side": args.max_image_side or None,
+                  # Off by default — see VLLMBackedVLM.__init__ for why
+                  # (guided decoding + an already-open <think> block is a
+                  # broken combination, and the caption call has no grammar
+                  # to stop chain-of-thought leaking into the caption text).
+                  "enable_thinking": args.enable_thinking}
     if args.max_model_len is not None:
         vlm_kwargs["max_model_len"] = args.max_model_len
     if args.max_num_seqs is not None:
@@ -423,6 +435,37 @@ def phase_infer(args):
 
     out_path = Path(args.responses_file)
     out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # --- --resume: skip images this artifact already has ---------------------
+    # Inference is by far the expensive half (hours on a full dataset), and a
+    # crash used to mean redoing all of it. The streamed artifact already
+    # contains every completed image, so resuming is just "filter the dataset
+    # down to what's missing and APPEND". The header is only written on a
+    # fresh run; on a resume the existing one is kept (it carries the
+    # candidate_vocab/max_hops/prompt-variant this artifact was built with,
+    # and rewriting it from the current args could silently mix two configs).
+    resume_mode = False
+    if getattr(args, "resume", False) and out_path.exists():
+        done, has_footer, n_bad = _already_inferred_paths(out_path)
+        if has_footer:
+            print(f"✅ [infer] {out_path} already ends in a footer — this run "
+                  f"is complete ({len(done)} images). Nothing to resume; "
+                  f"delete the file or drop --resume to redo it.")
+            return
+        before = len(dataset)
+        dataset = [d for d in dataset if d["image_path"] not in done]
+        resume_mode = True
+        print(f"⏩ [infer] resuming {out_path}: {len(done)} image(s) already done, "
+              f"{len(dataset)} of {before} remaining"
+              + (f" ({n_bad} truncated line(s) dropped — those images redone)" if n_bad else ""))
+        if not dataset:
+            print("⚠️ [infer] nothing left to infer, but the artifact has no footer — "
+                  "appending one so --stage score sees a complete run.")
+            with open(out_path, "a") as f:
+                f.write(json.dumps({"record_type": "footer",
+                                     "inference_time_seconds": None}) + "\n")
+            return
+
     loop_t0 = time.time()
     n = 0
     # "JSON Lines" format: one complete, independent JSON object per line of
@@ -430,8 +473,9 @@ def phase_infer(args):
     # lets us write results incrementally as they're produced (streaming,
     # rather than building one huge in-memory list and writing it all at the
     # end) and lets Phase 2 read them back one line at a time too.
-    with open(out_path, "w") as f:
-        f.write(json.dumps(header) + "\n")
+    with open(out_path, "a" if resume_mode else "w") as f:
+        if not resume_mode:
+            f.write(json.dumps(header) + "\n")
         for rec in run_inference(
             vlm, dataset,
             caption_system_prompt=caption_system,
@@ -469,6 +513,45 @@ def phase_infer(args):
 # =============================================================================
 # PHASE 2 — scoring
 # =============================================================================
+def _already_inferred_paths(path):
+    """Every image_path already present as a completed image record in a
+    partially-written artifact, plus whether that file ends in a footer.
+
+    Used by --resume. Because phase_infer STREAMS one JSON line per image as
+    it goes (rather than buffering and writing at the end), a run killed
+    mid-way — an OOM, a SLURM timeout, the CMYK crash — leaves a file whose
+    every complete line is still valid, finished work. Resuming just means
+    skipping those images and appending the rest.
+
+    Lines are parsed defensively: a hard kill (SIGKILL / CUDA abort) can
+    truncate the FINAL line mid-write, since Python's file buffer isn't
+    flushed per record. Such a line is silently dropped, so that one image is
+    simply re-inferred rather than corrupting the resume set.
+
+    Returns (set_of_image_paths, has_footer, n_bad_lines).
+    """
+    seen, has_footer, bad = set(), False, 0
+    p = Path(path)
+    if not p.exists():
+        return seen, has_footer, bad
+    with open(p) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                bad += 1   # truncated tail line — that image gets redone
+                continue
+            rt = obj.get("record_type")
+            if rt == "footer":
+                has_footer = True
+            elif rt not in ("header", "footer") and obj.get("image_path"):
+                seen.add(obj["image_path"])
+    return seen, has_footer, bad
+
+
 def _read_artifact(path):
     """Read back a JSON-Lines artifact written by phase_infer: the first
     header-tagged line (merged with the footer line's timing info, if
@@ -783,6 +866,7 @@ def phase_score(args):
         # left None wherever a given dataset type has no such value.
         pred_vocab_entry = None
         best_obj_idx = None
+        anchor_similarity = None
         best_final = None
         gt_syn = pred_class_synset = pred_node = None
         hier = {"hp": None, "hr": None, "hf1": None}
@@ -809,7 +893,17 @@ def phase_score(args):
             if lab.get("vlm_called"):
                 n_label_calls += 1
                 image_n_label_calls += 1
-                if fin["mapped"]:
+                # Which schema this call used. Prefer the explicit label_route
+                # written by resolve_hybrid_label; fall back to the old
+                # `mapped` heuristic for artifacts written before that field
+                # existed (back then mapped + vlm_called could ONLY mean the
+                # material-only call, since mapped-non-nature got no call at
+                # all — that equivalence no longer holds, which is exactly why
+                # the explicit field was added).
+                route = fin.get("label_route")
+                is_material_call = (route == "mapped_nature_material" if route is not None
+                                    else bool(fin["mapped"]))
+                if is_material_call:
                     n_label_calls_material += 1
                     if lab.get("parse_failed"):
                         n_parse_fail_material += 1
@@ -874,6 +968,12 @@ def phase_score(args):
                 if rec_obj_embs_cm.shape[0] > 0:
                     sims_to_pred = rec_obj_embs_cm @ candidate_embs[pred_idx]
                     best_obj_idx = int(sims_to_pred.argmax())
+                    # How strongly the winning entity actually matched the
+                    # predicted class — a LOW value here flags an anchor
+                    # chosen by weak/topical similarity rather than a real
+                    # conceptual match, which is exactly when the axis verdict
+                    # read off that anchor is least trustworthy.
+                    anchor_similarity = float(sims_to_pred[best_obj_idx])
                     
                     # 3. Resolve ONLY the argmax extracted object (best_obj_idx) to a
                     #    WordNet node for hierarchical metrics — no fallback to the
@@ -1101,6 +1201,10 @@ def phase_score(args):
                 "nature": fin["final_nature"], "biotic": fin["final_biotic"],
                 "material": fin["final_material"],
                 "nature_source": fin["nature_source"], "biotic_source": fin["biotic_source"],
+                # Which labeling route this object took — "human_exclusion"
+                # (no VLM call), "mapped_nature_material" (MaterialResponse),
+                # or "vlm_full" (TaxonomyResponse). None on older artifacts.
+                "label_route": fin.get("label_route"),
                 "parse_failed": lab.get("parse_failed"),
                 # Stage-3 labeling justification (TaxonomyResponse's combined
                 # nature_reasoning+sub_axes_reasoning, or MaterialResponse's own
@@ -1220,6 +1324,17 @@ def phase_score(args):
             "clipmatch_summary_caption": summary_texts[idx] if summary_texts is not None else None,
             "clipmatch_summary_caption_token_length": summary_token_counts[idx] if summary_token_counts is not None else None,
             "gt_synset": gt_syn,
+            # The ANCHOR: which extracted entity won the CLIP-similarity
+            # argmax against the ClipMatch-predicted class. This is the object
+            # whose own hybrid label supplies nature/biotic/material on
+            # single-label datasets, AND the only phrase resolve_to_wordnet is
+            # given for hP/hR — so `resolved_pred_synset` alone is not
+            # interpretable without it (a null there could mean either "no
+            # anchor was found" or "this specific phrase didn't resolve", and
+            # you can't tell which, or which phrase was blamed).
+            "anchor_object": objs[best_obj_idx] if best_obj_idx is not None else None,
+            "anchor_object_idx": best_obj_idx,
+            "anchor_object_similarity": anchor_similarity,
             "resolved_pred_synset": pred_node,
             "hierarchical_precision": hier["hp"], "hierarchical_recall": hier["hr"],
             "hierarchical_f1": hier["hf1"],
@@ -1264,9 +1379,15 @@ def phase_score(args):
             "label_vlm_call_rate": (n_label_calls / n_object_records) if n_object_records else 0.0,
         },
         "reference_free": {
+            # Mean AND population std (same convention as the hierarchical
+            # metrics): a mean alone can't distinguish "every image scores
+            # close to this" from a widely-spread or bimodal distribution.
             "clipscore": _mean(clipscore_vals),
+            "clipscore_std": _std(clipscore_vals),
             "f_clipscore": _mean(fclip_vals),
+            "f_clipscore_std": _std(fclip_vals),
             "object_clipscore": _mean(objclip_vals),
+            "object_clipscore_std": _std(objclip_vals),
         },
         "clip_models": {
             "reference_free": args.clipscore_model,
@@ -1417,15 +1538,17 @@ def phase_score(args):
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / Path(args.output_file).name
     update_results_store(out_path, dataset=dataset, model=header.get("model"), metrics=summary)
-    # Distinct-target-class nature/biotic/material composition of THIS run's
-    # sampled dataset (recap: sampling is deterministic — a fixed --max_samples
-    # always yields the same subset — so this is stable across reruns of the
-    # same config). Keyed by --max_samples so different configurations (e.g.
-    # 1000 vs the full dataset) accumulate side by side instead of overwriting.
-    all_targets = [t for rec in records for t in rec.get("targets", [])]
-    class_stats = compute_class_stats(all_targets)
+    # Per-IMAGE nature/biotic/material GT composition of THIS run's sampled
+    # dataset (recap: sampling is deterministic — a fixed --max_samples always
+    # yields the same subset — so this is stable across reruns of the same
+    # config). Keyed by --max_samples so different configurations (e.g. 1000 vs
+    # the full dataset) accumulate side by side instead of overwriting.
+    # IMAGE-level, not distinct-class: BIG-5 has no class vocabulary (every
+    # image shares one holistic "scene" target), so the old class breakdown
+    # collapsed all of BIG-5 to `total_classes: 1`. See compute_image_stats.
+    image_stats = compute_image_stats(records)
     config_key = str(args.max_samples) if args.max_samples is not None else "full"
-    update_dataset_class_stats(out_path, dataset=dataset, config_key=config_key, stats=class_stats)
+    update_dataset_image_stats(out_path, dataset=dataset, config_key=config_key, stats=image_stats)
     if flat_rows:
         # Include dataset + model in the filename — otherwise every model run
         # writes to the same "<stem>_predictions.csv" and each rerun (e.g. a
@@ -1461,17 +1584,19 @@ def _print_summary(s, run_clipmatch):
     print(f"WordNet-mapping: {d['wordnet_mapping_rate']:.1%} | VLM-fallback: {d['vlm_fallback_rate']:.1%}")
     print(f"Labeling parse-fail: {d['label_parse_failure_rate']:.1%} "
           f"({d['label_parse_failures']}/{d['label_vlm_calls']} VLM calls) — "
-          f"full {d['label_parse_failure_rate_full']:.1%} "
-          f"({d['label_parse_failures_full']}/{d['label_calls_full']}) | "
           f"material-only {d['label_parse_failure_rate_material']:.1%} "
           f"({d['label_parse_failures_material']}/{d['label_calls_material']})")
-    print(f"CLIPScore: {s['reference_free']['clipscore']:.4f} | "
-          f"F-CLIPScore: {s['reference_free']['f_clipscore']:.4f} | "
-          f"Object-CLIPScore: {s['reference_free']['object_clipscore']:.4f}")
+    rf = s["reference_free"]
+    print(f"CLIPScore: {rf['clipscore']:.4f}±{rf.get('clipscore_std', 0.0):.4f} | "
+          f"F-CLIPScore: {rf['f_clipscore']:.4f}±{rf.get('f_clipscore_std', 0.0):.4f} | "
+          f"Object-CLIPScore: {rf['object_clipscore']:.4f}±{rf.get('object_clipscore_std', 0.0):.4f}")
     neg_labels = {"nature": "no_nature", "biotic_matched": "abiotic", "material_matched": "immaterial"}
+    axis_names = {"nature": "nature", "biotic_matched": "life category", "material_matched": "tangibility"}
     for axis in ("nature", "biotic_matched", "material_matched"):
         m = s[axis]
-        print(f"\n--- {axis} (support {m['support']}) ---")
+        pos_label = axis.split('_')[0]
+        print(f"\n--- {axis_names[axis]} (support {m['support']} | "
+              f"{m['n_pos']} {pos_label} | {m['n_neg']} {neg_labels[axis]}) ---")
         print(f"Acc {m['accuracy']:.4f}")
         print(f"  {axis.split('_')[0]:<12} (pos) P {m['precision']:.4f} | R {m['recall']:.4f} | F1 {m['f1']:.4f}")
         print(f"  {neg_labels[axis]:<12} (neg) P {m['precision_neg']:.4f} | R {m['recall_neg']:.4f} | F1 {m['f1_neg']:.4f}")
@@ -1542,15 +1667,20 @@ def _log_wandb(args, summary, run_clipmatch):
         "ExtractionParseFailureRate": summary["diagnostics"]["extraction_parse_failure_rate"],
         "WordNetMappingRate": summary["diagnostics"]["wordnet_mapping_rate"],
         "LabelParseFailureRate": summary["diagnostics"]["label_parse_failure_rate"],
-        "LabelParseFailureRate/Full": summary["diagnostics"]["label_parse_failure_rate_full"],
         "LabelParseFailureRate/MaterialOnly": summary["diagnostics"]["label_parse_failure_rate_material"],
         "CLIPScore": summary["reference_free"]["clipscore"],
         "F-CLIPScore": summary["reference_free"]["f_clipscore"],
         "Object-CLIPScore": summary["reference_free"]["object_clipscore"],
         "Nature/F1": summary["nature"]["f1"], "Nature/Accuracy": summary["nature"]["accuracy"],
         "Nature/F1_NoNature": summary["nature"]["f1_neg"],
+        "Nature/Support": summary["nature"]["support"],
+        "Nature/N_Nature": summary["nature"]["n_pos"], "Nature/N_NoNature": summary["nature"]["n_neg"],
         "Biotic/F1": summary["biotic_matched"]["f1"], "Biotic/F1_Abiotic": summary["biotic_matched"]["f1_neg"],
+        "Biotic/Support": summary["biotic_matched"]["support"],
+        "Biotic/N_Biotic": summary["biotic_matched"]["n_pos"], "Biotic/N_Abiotic": summary["biotic_matched"]["n_neg"],
         "Material/F1": summary["material_matched"]["f1"], "Material/F1_Immaterial": summary["material_matched"]["f1_neg"],
+        "Material/Support": summary["material_matched"]["support"],
+        "Material/N_Material": summary["material_matched"]["n_pos"], "Material/N_Immaterial": summary["material_matched"]["n_neg"],
     }
     if run_clipmatch:
         log["ClipMatch/Top1"] = summary["clipmatch"]["top1_accuracy"]
@@ -1716,6 +1846,20 @@ def build_arg_parser():
                         "parse-failure signal, showing up only as a suspiciously low "
                         "objects-per-image diagnostic.")
     p.add_argument("--max_new_tokens_label", type=int, default=248)
+    p.add_argument("--enable_thinking", action="store_true",
+                   help="Turn the model's chat-template thinking/reasoning mode back ON. "
+                        "OFF BY DEFAULT, and only sent to templates that actually declare "
+                        "the switch (so non-thinking models are unaffected). Qwen3.5's "
+                        "template enables it by default and renders a prompt already ending "
+                        "in an open '<think>' block, which breaks this pipeline two ways: "
+                        "structured calls run under guided decoding, so the model is forced "
+                        "into JSON from inside an unterminated think block (measured: ~10% "
+                        "extraction parse-failure on Qwen3.5-9B vs <1% on Ministral-3-8B at "
+                        "identical settings), and the free-form caption call has no grammar "
+                        "at all, so chain-of-thought text lands in the caption itself. This "
+                        "pipeline's schemas already carry their own explicit reasoning "
+                        "fields, so template-level thinking is redundant here. Pass this "
+                        "only to run thinking-mode as a deliberate, labeled ablation.")
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--no_summarize_clipmatch_caption", action="store_true",
                    help="On ImageNet/Places, --stage infer asks the VLM for an extra short "
@@ -1825,6 +1969,20 @@ def build_arg_parser():
                         f"artifact in a '{RESPONSES_SUBDIR}' subfolder; every model's "
                         f"_predictions.csv in a '{PREDICTIONS_SUBDIR}' subfolder. Created if it "
                         "doesn't exist. Default: write directly into --results_dir.")
+    p.add_argument("--resume", action="store_true",
+                   help="--stage infer/all only. If --responses_file already exists and has "
+                        "no footer (i.e. a previous run died part-way), skip every image "
+                        "already recorded in it and APPEND the rest, keeping the existing "
+                        "header. Inference streams one JSON line per image, so everything "
+                        "written before the crash is complete, valid work — this turns a "
+                        "fatal OOM/timeout hours into a run that picks up where it left off "
+                        "instead of restarting from image 0. A truncated final line (hard "
+                        "kill mid-write) is dropped and that one image redone. If the file "
+                        "already ends in a footer the run is complete and this exits "
+                        "immediately rather than redoing anything. NOTE: pair with the SAME "
+                        "--max_samples as the original run — the sampled subset is "
+                        "seed-42 deterministic, so a different value resumes against a "
+                        "different subset.")
     p.add_argument("--max_samples", type=int, default=None)
     p.add_argument("--verbose", action="store_true")
     p.add_argument("--wandb", action="store_true")

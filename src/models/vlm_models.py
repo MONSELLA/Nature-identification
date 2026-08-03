@@ -57,6 +57,114 @@ from typing import Any, Dict, List, Optional, Union
 # be installed just to be imported — only actually using an image does.
 ImageInput = Union[str, "PIL.Image.Image", None]  # noqa: F821
 
+# Chat-template variable names different model families use to gate their
+# "thinking"/reasoning mode. Checked against the template TEXT so only names a
+# given template actually reads are ever sent (see
+# VLLMBackedVLM._chat_kwargs). Qwen uses `enable_thinking`; the rest are the
+# other spellings seen in the wild. Add to this list rather than special-casing
+# a family — a name that isn't in a template is simply never sent.
+THINKING_SWITCH_NAMES = (
+    "enable_thinking",
+    "add_thinking",
+    "thinking",
+    "enable_reasoning",
+    "reasoning",
+)
+
+
+# Markers that a rendered prompt REFERENCES a reasoning block, across the
+# different syntaxes families use — Qwen a literal `<think>` tag, Gemma-4 a
+# `<|channel>thought` channel. Presence alone says nothing about whether the
+# model will actually reason: BOTH families emit their marker in the
+# thinking-DISABLED prompt too, just immediately closed. Use
+# opens_unclosed_reasoning_block() for that question.
+THINKING_MARKERS = (
+    "<think>",
+    "<thought>",
+    "<|channel>thought",
+    "<|thinking|>",
+    "<reasoning>",
+)
+
+
+def has_thinking_marker(text: str) -> bool:
+    """Whether a rendered prompt mentions a reasoning block at all (any known
+    syntax), OPEN OR CLOSED. Reporting aid — see THINKING_MARKERS. Use
+    opens_unclosed_reasoning_block() to decide whether the model will actually
+    generate reasoning."""
+    return any(m in (text or "") for m in THINKING_MARKERS)
+
+
+# Opening marker -> its closing counterpart (None = no known closer, so any
+# occurrence is treated as still open).
+#
+# Gemma-4's pair is `<|channel>` ... `<channel|>` — confirmed from its own
+# template, whose strip_thinking macro splits on '<channel|>' and looks for
+# '<|channel>' inside each part. Its generation prompt emits
+# `<|channel>thought\n<channel|>` under `{%- if not enable_thinking -%}`, i.e.
+# an EMPTY, CLOSED thought channel that SUPPRESSES reasoning — exactly what
+# Qwen does with `<think>\n\n</think>`. Pairing it with None (as this table
+# first did) made that suppressor read as an open block and produced a false
+# "Gemma is still thinking" alarm.
+THINKING_MARKER_PAIRS = (
+    ("<think>", "</think>"),
+    ("<thought>", "</thought>"),
+    ("<reasoning>", "</reasoning>"),
+    ("<|thinking|>", "<|/thinking|>"),
+    ("<|channel>thought", "<channel|>"),
+)
+
+
+def opens_unclosed_reasoning_block(text: str) -> bool:
+    """Whether a rendered prompt leaves a reasoning block OPEN, so generation
+    begins inside it.
+
+    The presence of a marker is NOT enough, which is the whole point of this
+    function. Qwen's `enable_thinking=False` still emits a think block — it
+    just opens and immediately CLOSES it with an empty body:
+
+        ...assistant\\n<think>\\n\\n</think>\\n\\n
+
+    That is the correct non-thinking prompt: the closed pair tells the model
+    reasoning is finished, and generation starts in normal answer mode. A
+    naive "is '<think>' present" test flags it as thinking and produces a
+    false alarm.
+
+    Gemma-4 does the SAME THING with different markup: its prompt ends
+    `<|channel>thought\\n<channel|>`, an empty CLOSED channel emitted under
+    `{%- if not enable_thinking -%}` to suppress reasoning. Both are correctly
+    reported as not-open.
+
+    NOTE the inverted semantics this creates for Gemma: the suppressor's
+    PRESENCE means thinking is off, so its ABSENCE (a prompt ending at just
+    `<|turn>model\\n`) is the thinking-ENABLED state and cannot be detected by
+    marker inspection alone. That is fine here because this pipeline always
+    passes enable_thinking=False, and Gemma's template defaults it to false
+    anyway (`enable_thinking | default(false)`) — the state we verify is the
+    one we actually use.
+    """
+    text = text or ""
+    for opener, closer in THINKING_MARKER_PAIRS:
+        last_open = text.rfind(opener)
+        if last_open == -1:
+            continue
+        if closer is None:
+            return True  # no known closer — assume still open
+        if text.rfind(closer) < last_open:
+            return True  # opened after the last close
+    return False
+
+
+def find_thinking_switches(template: str) -> List[str]:
+    """Which THINKING_SWITCH_NAMES a chat template actually references.
+
+    Matched on WORD BOUNDARIES, not as plain substrings: "thinking" occurs
+    inside "enable_thinking", so a naive `in` test reports both for Qwen and
+    sends a redundant second kwarg. Only whole identifiers count."""
+    import re
+    return [n for n in THINKING_SWITCH_NAMES
+            if re.search(rf"(?<![A-Za-z0-9_]){re.escape(n)}(?![A-Za-z0-9_])", template or "")]
+
 
 # =============================================================================
 # Abstract base
@@ -131,6 +239,13 @@ class BaseVLM(ABC):
         re-raises everything, identical to plain `generate_batch`."""
         return False
 
+    def _is_recoverable_bad_image(self, exc: Exception) -> bool:
+        """Hook for subclasses: does `exc` mean "one IMAGE in this batch could
+        not be turned into vision tokens" (a corrupt/degenerate file), as
+        opposed to a genuine engine failure? Base default is False, same
+        safe no-op rationale as `_is_recoverable_overflow` above."""
+        return False
+
     def generate_batch_safe(
         self,
         prompts: List[str],
@@ -139,16 +254,26 @@ class BaseVLM(ABC):
         item_labels: Optional[List[str]] = None,
         **kwargs: Any,
     ) -> List[Union[str, Dict[str, Any], None]]:
-        """Like `generate_batch`, but tolerant of a single-prompt context-
-        window overflow WITHOUT sacrificing batching for the rest of the
-        batch. A batched call (e.g. vLLM's single `.chat()` covering every
-        conversation) fails ENTIRELY if even one prompt overflows, with no
-        indication of which one — so on a `_is_recoverable_overflow` failure
-        we BISECT the batch in half and recurse, each half still generated as
-        one batched call. This isolates the oversized prompt(s) down to
-        single-item granularity (returned as None, aligned with input order)
-        while every other sample stays batched together, instead of
-        degrading the whole batch to one-at-a-time generation.
+        """Like `generate_batch`, but tolerant of a single BAD ITEM in the
+        batch WITHOUT sacrificing batching for the rest of it. A batched call
+        (e.g. vLLM's single `.chat()` covering every conversation) fails
+        ENTIRELY if even one item is bad, with no indication of which one —
+        so on a recoverable failure we BISECT the batch in half and recurse,
+        each half still generated as one batched call. This isolates the
+        offending item(s) down to single-item granularity (returned as None,
+        aligned with input order) while every other sample stays batched
+        together, instead of degrading the whole batch to one-at-a-time
+        generation.
+
+        TWO failure kinds are recoverable, both isolated the same way:
+          * `_is_recoverable_overflow` — a prompt longer than max_model_len.
+          * `_is_recoverable_bad_image` — an image vLLM's multimodal
+            processor turned into zero vision tokens (corrupt/degenerate
+            file). Raised during prompt RENDERING, before the GPU is
+            involved, so the engine survives and the rest of the batch is
+            still fine.
+        Anything else (notably a CUDA OOM, which kills EngineCore outright
+        and leaves nothing to recover into) is re-raised untouched.
 
         `item_labels` (optional, same length as prompts) is used purely for
         the warning message identifying which item was skipped; falls back
@@ -162,14 +287,17 @@ class BaseVLM(ABC):
         try:
             return self.generate_batch(prompts=prompts, images=images, **kwargs)
         except Exception as e:
-            if not self._is_recoverable_overflow(e):
+            overflow = self._is_recoverable_overflow(e)
+            bad_image = self._is_recoverable_bad_image(e)
+            if not (overflow or bad_image):
                 raise
+            reason = "prompt too long for max_model_len" if overflow else "unusable image (no vision tokens produced)"
             if n == 1:
                 name = item_labels[0] if item_labels else "item"
-                print(f"⚠️ Skipping {name} ({label}): prompt too long for max_model_len ({e}).")
+                print(f"⚠️ Skipping {name} ({label}): {reason} ({e}).")
                 return [None]
             mid = n // 2
-            print(f"⚠️ {label}: a prompt exceeded max_model_len — bisecting "
+            print(f"⚠️ {label}: {reason} — bisecting "
                   f"{n} instances into two sub-batches to isolate it.")
             left_labels = item_labels[:mid] if item_labels else None
             right_labels = item_labels[mid:] if item_labels else None
@@ -233,8 +361,45 @@ class VLLMBackedVLM(BaseVLM):
     chat API (`self.llm.chat(...)`) that internally handles GPU scheduling,
     KV-cache management, and batching for us."""
 
-    def __init__(self, model_name: str, max_image_side: Optional[int] = 1024, **kwargs: Any) -> None:
+    def __init__(self, model_name: str, max_image_side: Optional[int] = 1024,
+                 enable_thinking: bool = False, **kwargs: Any) -> None:
         super().__init__(model_name, **kwargs)
+        # `enable_thinking` — like max_image_side, an EXPLICIT named parameter
+        # so it is never forwarded to vLLM's LLM(...) constructor. Controls the
+        # model's own chat-template "thinking"/reasoning mode via
+        # chat_template_kwargs on every .chat() call.
+        #
+        # DEFAULT IS FALSE, and that is a deliberate fix, not a preference.
+        # Qwen3.5's chat template turns thinking ON by default and renders a
+        # prompt that ENDS with an already-open "<think>\n" block:
+        #     '<|im_start|>assistant\n<think>\n'
+        # That interacts badly with this pipeline in two separate ways:
+        #   1. STRUCTURED calls (extraction/labeling) run under guided
+        #      decoding, which constrains generation to the JSON schema from
+        #      the very first generated token — so the model can emit neither
+        #      its reasoning nor the closing </think>. It is forced straight
+        #      into JSON from inside an unterminated think block, a state it
+        #      never saw in training. Measured effect: Qwen3.5-9B hit a ~10%
+        #      extraction parse-failure rate where Ministral-3-8B (no thinking
+        #      mode) stayed under 1% on the identical prompt, schema, dataset
+        #      and token budget.
+        #   2. FREE-FORM calls (the baseline caption) have no grammar to
+        #      constrain them, so the model DOES emit chain-of-thought — and
+        #      _parse_response returns free-form text verbatim, with no
+        #      <think> stripping. The "caption" then contains reasoning text,
+        #      or is consumed entirely by it before the real description
+        #      starts, silently degrading everything downstream (extraction
+        #      context, ClipMatch summary, CLIPScore).
+        # The pipeline's schemas already carry their OWN explicit reasoning
+        # fields (ObjectExtractionResponse.reasoning, TaxonomyResponse's
+        # two-step nature_reasoning/sub_axes_reasoning), so template-level
+        # thinking is redundant here even where it works.
+        self.enable_thinking = enable_thinking
+        # Only send chat_template_kwargs to templates that actually declare
+        # the switch — passing an unknown kwarg to a template that doesn't
+        # use it is at best ignored and at worst an error, and models without
+        # a thinking mode (Mistral, LLaVA) must stay byte-identical to before.
+        self._supports_thinking_toggle = False
         # `max_image_side` is an EXPLICIT named parameter (not swept into
         # **kwargs) specifically so it never gets forwarded to LLM(...)
         # below — vLLM's own constructor has no such argument and would
@@ -268,6 +433,57 @@ class VLLMBackedVLM(BaseVLM):
         # take a while and use a lot of VRAM — see unload_vlm() further down
         # for how we later release this memory).
         self.llm = LLM(model=model_name, **kwargs)
+        # Does THIS model's chat template actually understand the thinking
+        # switch? Read the template once here rather than per call. Wrapped
+        # defensively: get_tokenizer() is not part of vLLM's guaranteed public
+        # surface, and a missing/odd tokenizer must degrade to "no toggle"
+        # (i.e. exactly the previous behavior) rather than break startup.
+        try:
+            template = getattr(self.llm.get_tokenizer(), "chat_template", None) or ""
+        except Exception:
+            template = ""
+        self._thinking_switches = find_thinking_switches(template)
+        self._supports_thinking_toggle = bool(self._thinking_switches)
+        # Render a probe prompt: whether a block is left OPEN can only be
+        # seen in a RENDERED prompt, not in the raw template text.
+        emits_think = False
+        try:
+            tok = self.llm.get_tokenizer()
+            probe = tok.apply_chat_template([{"role": "user", "content": "hi"}],
+                                            tokenize=False, add_generation_prompt=True,
+                                            **{n: False for n in self._thinking_switches})
+            emits_think = opens_unclosed_reasoning_block(probe)
+        except Exception:
+            emits_think = False
+        if self._thinking_switches and not emits_think:
+            print(f"🧠 {model_name}: chat template has thinking switch(es) "
+                  f"{self._thinking_switches} — set to {self.enable_thinking}")
+        elif emits_think:
+            # The dangerous case for a cross-family comparison: the template
+            # emits a think block but exposes NO switch to turn it off, so
+            # this model silently gets extra inference-time reasoning the
+            # others don't. Loud, because it invalidates the comparison rather
+            # than just degrading one number.
+            print(f"⚠️ {model_name}: chat template opens a reasoning block but exposes NO "
+                  f"known switch to disable it (looked for {THINKING_SWITCH_NAMES}). This model "
+                  f"will reason where non-thinking models cannot — NOT a fair cross-family "
+                  f"comparison. Inspect its template before trusting the results.")
+
+    def _chat_kwargs(self) -> Dict[str, Any]:
+        """Extra kwargs for `self.llm.chat(...)`. Sends the thinking toggle
+        ONLY to templates that declare it, so every other model's rendered
+        prompt is byte-identical to before this existed (and stays
+        prefix-cache compatible with artifacts produced then).
+
+        Every switch name the template actually mentions is set, because
+        families don't agree on one: Qwen uses `enable_thinking`, others use
+        `thinking`/`add_thinking`/`enable_reasoning`. Passing a name the
+        template never reads would be a silently ignored no-op at best, so
+        only names found in the template text are sent."""
+        if not self._thinking_switches:
+            return {}
+        return {"chat_template_kwargs": {name: self.enable_thinking
+                                          for name in self._thinking_switches}}
 
     def _is_recoverable_overflow(self, exc: Exception) -> bool:
         """vLLM's `.chat()` raises a ValueError with this exact substring
@@ -275,6 +491,31 @@ class VLLMBackedVLM(BaseVLM):
         max_model_len — the specific, bisectable overflow case
         `generate_batch_safe` knows how to recover from."""
         return isinstance(exc, ValueError) and "longer than the maximum model length" in str(exc)
+
+    def _is_recoverable_bad_image(self, exc: Exception) -> bool:
+        """vLLM raises this RuntimeError when its multimodal processor turned
+        an image into ZERO vision tokens, so the chat template's `<image>`
+        placeholder was never substituted:
+
+            "Expected there to be 1 prompt placeholders corresponding to
+             1 image items, but instead found 0 prompt placeholders!"
+
+        In practice that means ONE unusable image in the batch — corrupt or
+        truncated pixel data, or a degenerate size that yields no patches.
+
+        CRITICAL detail that makes this recoverable at all: it is raised
+        during vLLM's PROMPT RENDERING (`_render_and_add_requests` ->
+        `_process_multimodal`), i.e. before anything is submitted to the GPU,
+        so the engine is still perfectly healthy — unlike a CUDA OOM, which
+        kills EngineCore and leaves nothing to recover into. Bisecting the
+        batch therefore isolates the offending image and lets every other
+        image in it proceed normally.
+
+        Worth the specificity: this exact error killed two multi-hour ImageNet
+        runs outright (~batch 149 of 391, then again on the same image after a
+        --resume), because a RuntimeError isn't the ValueError the overflow
+        path catches, so nothing recovered from it."""
+        return isinstance(exc, RuntimeError) and "prompt placeholders" in str(exc)
 
     def _encode_image(self, image: ImageInput) -> str:
         """Convert an image (file path or PIL Image) into a "data URL" string
@@ -302,15 +543,42 @@ class VLLMBackedVLM(BaseVLM):
         needs_resize = self.max_image_side is not None and max(width, height) > self.max_image_side
 
         if not needs_resize:
-            if isinstance(image, str):
-                with open(image, "rb") as f:
-                    b64 = base64.b64encode(f.read()).decode("utf-8")
-                # Preserve the original file extension (jpg/png/etc.) in the
-                # data URL's MIME type, defaulting to png if there's none.
-                suffix = Path(image).suffix.lstrip(".").lower() or "png"
-                return f"data:image/{suffix};base64,{b64}"
-            # Already a PIL Image and small enough — encode as-is (in-memory
-            # "file" via BytesIO, rather than needing to save to disk first).
+            # The raw-bytes fast path is only safe for images ALREADY in a
+            # mode the vision encoder handles. ImageNet's ILSVRC2012 val set
+            # famously contains a handful of CMYK and grayscale JPEGs; passed
+            # through untouched, one of those made vLLM's Pixtral multimodal
+            # processor emit ZERO image patches, so the chat template's single
+            # <image> placeholder was never filled and the whole batch died
+            # with "Expected there to be 1 prompt placeholders corresponding
+            # to 1 image items, but instead found 0". That is a RuntimeError,
+            # not the ValueError generate_batch_safe's bisection recovers
+            # from, so it killed the engine outright ~140 batches into a run.
+            # The oversized branch below already had this covered (it calls
+            # .convert("RGB") before resizing, for the same channel-count
+            # reason) — only the fast path was exposed, which is precisely the
+            # path essentially every ImageNet image takes.
+            # `pil_image.mode` is read from the header alone (no full decode),
+            # so the RGB check stays as cheap as the original fast path; the
+            # decode/re-encode cost is paid ONLY for the rare non-RGB image.
+            if pil_image.mode == "RGB":
+                if isinstance(image, str):
+                    with open(image, "rb") as f:
+                        b64 = base64.b64encode(f.read()).decode("utf-8")
+                    # Preserve the original file extension (jpg/png/etc.) in the
+                    # data URL's MIME type, defaulting to png if there's none.
+                    suffix = Path(image).suffix.lstrip(".").lower() or "png"
+                    return f"data:image/{suffix};base64,{b64}"
+            else:
+                # Non-RGB (CMYK / grayscale / palette / RGBA) and small enough
+                # to skip resizing — normalize the colour mode only.
+                buffer = BytesIO()
+                pil_image.convert("RGB").save(buffer, format="JPEG", quality=90)
+                b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+                return f"data:image/jpeg;base64,{b64}"
+            # Reached only when the image is ALREADY RGB and was passed as a
+            # PIL Image rather than a path (the str case returned above) —
+            # encode as-is (in-memory "file" via BytesIO, rather than needing
+            # to save to disk first).
             buffer = BytesIO()
             pil_image.save(buffer, format="PNG")
             b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
@@ -411,7 +679,8 @@ class VLLMBackedVLM(BaseVLM):
         # `self.llm.chat([messages], ...)` takes a LIST of conversations (here
         # just one) and returns a list of results — we pull out the single
         # generated text from the first (and only) result.
-        outputs = self.llm.chat([messages], sampling_params=sampling_params, use_tqdm=False)
+        outputs = self.llm.chat([messages], sampling_params=sampling_params, use_tqdm=False,
+                                 **self._chat_kwargs())
         text = outputs[0].outputs[0].text or ""
         return self._parse_response(text, output_mode)
 
@@ -443,7 +712,8 @@ class VLLMBackedVLM(BaseVLM):
             temperature=temperature, max_new_tokens=max_new_tokens,
             output_mode=output_mode, schema=schema, **kwargs
         )
-        outputs = self.llm.chat(conversations, sampling_params=sampling_params, use_tqdm=len(prompts) > 1)
+        outputs = self.llm.chat(conversations, sampling_params=sampling_params,
+                                 use_tqdm=len(prompts) > 1, **self._chat_kwargs())
         return [self._parse_response(o.outputs[0].text or "", output_mode) for o in outputs]
 
 

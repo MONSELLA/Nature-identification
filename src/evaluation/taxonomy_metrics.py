@@ -340,7 +340,7 @@ def resolve_to_wordnet(
     candidate_scores: List[float],
     pred_synset_id: str,
     candidate_strings: List[str],
-    threshold: float = 0.0,
+    threshold: Optional[float] = None,
 ) -> Optional[str]:
     """
     Map the SINGLE best-scoring free-text object phrase to a canonical WordNet
@@ -398,7 +398,18 @@ def resolve_to_wordnet(
     # Take only the single highest-scoring candidate (ties broken by whichever
     # max() finds first). `zip` pairs scores/strings positionally.
     best_score, top_candidate = max(zip(candidate_scores, candidate_strings), key=lambda p: p[0])
-    if best_score <= threshold:
+    # `threshold` is OPT-IN (None = no score gate at all), because the only
+    # caller (run_vlm_pipeline.py's single-label branch) already picked the
+    # argmax object itself and passes that ONE candidate here — so a gate can
+    # only ever DROP that object, never choose between candidates. It used to
+    # default to 0.0, which silently turned any non-positive CLIP similarity
+    # into a hierarchical MAPPING FAILURE (hP/hR/hF1/Wu-Palmer scored 0.0)
+    # even when the phrase resolved in WordNet perfectly well. Observed
+    # object-vs-candidate similarities stay comfortably positive (min 0.136
+    # across the imagenet/places spot-check runs), so this was latent rather
+    # than active — but at 50k images the tail is a real risk, and the gate
+    # bought nothing at this call site.
+    if threshold is not None and best_score <= threshold:
         return None
 
     # Resolve each alternation branch down to at most one synset.
