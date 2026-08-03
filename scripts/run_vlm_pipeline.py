@@ -612,7 +612,8 @@ def phase_score(args):
     # CLIP has the GPU memory to itself.
     scorer = clip_metrics.CLIPScorer(model_name=args.clipscore_model, device=args.device,
                                      batch_size=args.clip_batch_size,
-                                     trust_remote_code=args.clipscore_trust_remote_code)
+                                     trust_remote_code=args.clipscore_trust_remote_code,
+                                     longclip_repo_path=args.longclip_repo_path)
 
     if args.verbose: print(f"{args.clipscore_model} loaded. Handles a context length of {scorer.context_length} tokens!\n")
 
@@ -632,7 +633,8 @@ def phase_score(args):
                           or clipmatch_trust_remote_code != args.clipscore_trust_remote_code):
         cm_scorer = clip_metrics.CLIPScorer(model_name=clipmatch_model_name, device=args.device,
                                             batch_size=args.clip_batch_size,
-                                            trust_remote_code=clipmatch_trust_remote_code)
+                                            trust_remote_code=clipmatch_trust_remote_code,
+                                            longclip_repo_path=args.longclip_repo_path)
         if args.verbose:
             print(f"{clipmatch_model_name} (ClipMatch) loaded. Handles a context length of "
                   f"{cm_scorer.context_length} tokens!\n")
@@ -1934,6 +1936,11 @@ def build_arg_parser():
                         "checkpoints that don't need it (e.g. the original OpenAI CLIP, "
                         "SigLIP2). Pass --clipscore_trust_remote_code false to disable.")
     p.add_argument("--clip_batch_size", type=int, default=77)
+    p.add_argument("--longclip_repo_path", type=str, default=None,
+                   help="Local path to the cloned Long-CLIP repo (https://github.com/beichenzbc/Long-CLIP), "
+                        "used only when --clipscore_model and/or --clipmatch_model resolves to the "
+                        "'longclip' preset. Defaults to clip_metrics.LONG_CLIP_REPO_PATH "
+                        "(the project's fixed BSC path) when not set.")
     p.add_argument("--clipmatch_model", type=str, default=None,
                    help="CLIP checkpoint used for ClipMatch + hP/hR/hF1 (ImageNet + Places "
                         "only) — kept independently selectable from --clipscore_model since the two "
