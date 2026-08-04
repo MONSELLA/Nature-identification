@@ -198,8 +198,8 @@ evaluating the models.
   recall, and the actual `detection_matches` (GT class vs predicted entity,
   both boxes, IoU, exact-match AND hierarchical verdicts), plus
   `detection_false_positives` / `detection_excluded_predictions` /
-  `detection_missed_gt` — so a disagreement is reviewable without opening
-  the `.jsonl`.
+  `detection_missed_gt` / `detection_nature_on_non_nature` — so a
+  disagreement is reviewable without opening the `.jsonl`.
 - SAM3 (`facebook/sam3`) via plain transformers AutoModel/AutoProcessor. Read
   `outputs.semantic_seg` (concept-level pixel coverage) for the relevance
   score on EVERY dataset. The instance-level `pred_masks`/`pred_boxes`/
@@ -498,6 +498,20 @@ never replacing them. Two summary dicts, deliberately never merged:
 - `iscrowd` regions: not detection targets, but still suppress FPs (IoA over
   the PREDICTION's area ≥ 0.5, not IoU — a crowd box dwarfs any one
   prediction). COCO's own convention.
+- TAXONOMY-DISAGREEMENT DIAGNOSTIC (`summary["detection_nature_on_non_nature"]`,
+  a THIRD dict, never merged into the other two): a grounded NATURE box
+  overlapping (IoU ≥ threshold) a GT box whose COCO class maps to NON-nature.
+  Can never be a TP (non-nature GT is filtered before matching) and is NOT
+  charged as an FP either — these predictions stay in whichever bucket the
+  normal rules gave them (nearly always `excluded`), so precision/recall are
+  identical with or without this diagnostic. Exists because otherwise the case
+  vanishes into `excluded`, indistinguishable from a box over empty
+  background. It is the Nature-Based Artefacts clause made measurable: COCO's
+  `dining table` node is non-nature, but a wooden table with visible grain IS
+  nature under the taxonomy, and a class node can't encode which one THIS
+  image shows — so a hit is often the concept-vs-instance gap, not an error.
+  Read `by_gt_class` to tell them apart (wood/stone furniture dominating =
+  that clause firing; a flat spread of unrelated classes = loose boxes).
 - NO TRUE NEGATIVES, so no accuracy is reported — unlike the axis metrics,
   detection has no finite negative class. Don't add one.
 - AP@0.5 and AP@[.50:.95] (101-point interpolated, class-agnostic) over the

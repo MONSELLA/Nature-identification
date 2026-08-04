@@ -95,6 +95,7 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")   # avoids the fork/par
 import argparse
 import csv
 import json
+from collections import Counter
 import logging
 import random
 import subprocess
@@ -257,16 +258,24 @@ def coco_detection_gt_boxes(rec, gt_boxes_by_file):
     rather than dropped: they are not detection targets, but they still
     suppress false positives (COCO's own convention).
 
-    Returns `(targets, crowd_boxes)`.
+    The NON-NATURE boxes are returned too, not discarded. They are never
+    matching targets, but they are what makes the taxonomy-disagreement
+    diagnostic possible: a prediction landing squarely on one is a case where
+    the VLM called something nature that the taxonomy node says is not, and
+    without keeping these boxes that prediction is indistinguishable from one
+    over empty background. See `score_image_detection`.
+
+    Returns `(targets, crowd_boxes, non_nature_boxes)`.
     """
     boxes = rec.get("gt_boxes")
     if boxes is None and gt_boxes_by_file is not None:
         boxes = gt_boxes_by_file.get(os.path.basename(rec["image_path"]))
     if not boxes:
-        return None, []
+        return None, [], []
     nature = [b for b in boxes if b.get("gt_nature") is True]
     return ([b for b in nature if not b.get("iscrowd")],
-            [b["bbox"] for b in nature if b.get("iscrowd")])
+            [b["bbox"] for b in nature if b.get("iscrowd")],
+            [b for b in boxes if b.get("gt_nature") is not True])
 
 
 def collect_predicted_boxes(rec):
@@ -343,7 +352,7 @@ def score_image_detection(rec, gt_boxes_by_file, eval_vocab_terms, graph, iou_th
     protocol — would throw away every cow/bull pair before the hierarchical
     metrics could see it.
     """
-    gt_targets, crowd_boxes = coco_detection_gt_boxes(rec, gt_boxes_by_file)
+    gt_targets, crowd_boxes, non_nature_gt = coco_detection_gt_boxes(rec, gt_boxes_by_file)
     if not gt_targets:
         return None
 
@@ -383,6 +392,41 @@ def score_image_detection(rec, gt_boxes_by_file, eval_vocab_terms, graph, iou_th
         preds, unmatched_pred, crowd_boxes, eval_vocab_terms, fp_rows, excluded_rows,
         counted_flag=counted_flag)
 
+    # TAXONOMY-DISAGREEMENT DIAGNOSTIC: an unmatched prediction sitting on a GT
+    # box of a NON-nature class. This can never be a true positive by
+    # construction (non-nature GT is filtered out before matching), and without
+    # this check it would vanish into `excluded` — indistinguishable from a
+    # prediction over empty background, which is a very different thing.
+    #
+    # It is the "Nature-Based Artefacts" boundary made measurable: a wooden
+    # table with visible grain IS nature under the taxonomy's own inclusion
+    # clause, but COCO's `dining table` NODE resolves to non-nature, because a
+    # class node cannot encode whether THIS instance shows wood grain or
+    # painted MDF. So a hit here is not necessarily a model error at all — it
+    # is the concept-vs-instance gap the hybrid labeling routing already
+    # accepts elsewhere. Reported, never scored.
+    #
+    # Deliberately does NOT alter tp/fp/fn: these predictions stay in whichever
+    # bucket the normal rules put them (almost always `excluded`, since the
+    # eval vocabulary is nature-only), so precision/recall keep the exact same
+    # definition they have with this diagnostic switched off, and runs stay
+    # comparable. The disagreements are surfaced as their own list instead.
+    nature_on_non_nature = []
+    for pi in unmatched_pred:
+        best = None
+        for gt in non_nature_gt:
+            iou = detection_metrics.box_iou(preds[pi]["bbox"], gt["bbox"])
+            if iou >= iou_threshold and (best is None or iou > best["iou"]):
+                best = {"pred_object": preds[pi]["object"],
+                        "pred_bbox": preds[pi]["bbox"],
+                        "pred_score": preds[pi]["score"],
+                        "gt_class": gt["class_name"],
+                        "gt_synset": gt.get("synset_id"),
+                        "gt_bbox": gt["bbox"],
+                        "iou": iou}
+        if best is not None:
+            nature_on_non_nature.append(best)
+
     # AP ladder: re-match the SAME boxes at each of COCO's ten IoU thresholds
     # (a pair clearing 0.5 need not clear 0.75, so each rung needs its own
     # assignment) and record (score, is_tp) for every prediction that counts.
@@ -407,6 +451,7 @@ def score_image_detection(rec, gt_boxes_by_file, eval_vocab_terms, graph, iou_th
         "n_gt": len(gt_targets), "n_pred": len(preds),
         "tp": len(matches), "fp": n_fp, "fn": len(unmatched_gt),
         "excluded_pred": n_excluded, "crowd_suppressed": n_crowd,
+        "nature_on_non_nature": nature_on_non_nature,
         "pairs": pair_rows, "false_positives": fp_rows, "excluded": excluded_rows,
         "missed_gt": [{"gt_class": gt_targets[i]["class_name"],
                        "gt_bbox": gt_targets[i]["bbox"]} for i in unmatched_gt],
@@ -1183,6 +1228,12 @@ def phase_score(args):
                   # accumulated separately from the headline counters above.
                   "ap_records": {t: [] for t in detection_metrics.COCO_AP_IOU_THRESHOLDS}}
     det_label_records = []
+    # Taxonomy-disagreement diagnostic (see score_image_detection): which
+    # NON-nature COCO classes a grounded nature entity most often lands on.
+    # The per-class breakdown is the useful part — a long tail of one-offs
+    # reads very differently from "dining table" and "bench" dominating, which
+    # would be the Nature-Based Artefacts clause showing up in the data.
+    det_nature_on_non_nature = []
     det_gt_boxes_by_file = None
     det_eval_vocab = {}
     if run_detection:
@@ -1584,6 +1635,7 @@ def phase_score(args):
             for t, recs in det["ap_records"].items():
                 det_counts["ap_records"][t].extend(recs)
             det_label_records.extend(det["label_records"])
+            det_nature_on_non_nature.extend(det["nature_on_non_nature"])
 
         # One CSV row PER IMAGE (not per object) — everything needed to
         # spot-check a single image's whole prediction lives on one line:
@@ -1704,6 +1756,14 @@ def phase_score(args):
             "detection_false_positives": json.dumps(det["false_positives"]) if det else None,
             "detection_excluded_predictions": json.dumps(det["excluded"]) if det else None,
             "detection_missed_gt": json.dumps(det["missed_gt"]) if det else None,
+            # Taxonomy disagreements on THIS image: nature entities whose box
+            # landed on a non-nature GT class. Carries the GT class and the IoU
+            # so the "is this the Nature-Based Artefacts clause or a loose box"
+            # question can be answered by eye, per image, from the CSV alone.
+            "detection_nature_on_non_nature": (json.dumps(det["nature_on_non_nature"])
+                                               if det else None),
+            "detection_nature_on_non_nature_count_image": (len(det["nature_on_non_nature"])
+                                                           if det else None),
             # Label quality over THIS image's matched pairs — the two views
             # side by side, which is the whole point of scoring both: a row
             # where exact-match is 0 but hF1 is high is a naming miss on the
@@ -1887,6 +1947,38 @@ def phase_score(args):
         summary["detection"]["instance_score_threshold"] = \
             header["grounding"].get("instance_score_threshold")
         summary["detection_labels"] = detection_metrics.label_summary(det_label_records)
+        # Third dict, and again never merged into the other two: these are
+        # neither localization successes nor naming successes, they are
+        # TAXONOMY DISAGREEMENTS — a grounded nature entity landing on a GT box
+        # whose COCO class resolves to non-nature. Counted and broken down by
+        # class, never scored (see score_image_detection on why this is often
+        # the concept-vs-instance gap rather than a model error).
+        by_class = Counter(d["gt_class"] for d in det_nature_on_non_nature)
+        by_entity = Counter(_normalize_object(d["pred_object"])
+                            for d in det_nature_on_non_nature)
+        summary["detection_nature_on_non_nature"] = {
+            "count": len(det_nature_on_non_nature),
+            # Denominator is the predictions that COULD have hit one: matched
+            # predictions are already accounted for against nature GT.
+            "rate_over_unmatched": (len(det_nature_on_non_nature) /
+                                    (det_counts["fp"] + det_counts["excluded_pred"]))
+                                   if (det_counts["fp"] + det_counts["excluded_pred"]) else 0.0,
+            "by_gt_class": dict(by_class.most_common()),
+            "by_predicted_entity": dict(by_entity.most_common(25)),
+            "note": ("A grounded NATURE entity whose box overlaps (IoU >= "
+                     f"{args.detection_iou_threshold}) a GT box of a COCO class the taxonomy "
+                     "maps to NON-nature. Can never be a true positive — non-nature GT is "
+                     "filtered out before matching — and is NOT counted as a false positive "
+                     "either; these predictions stay in whichever bucket the normal rules gave "
+                     "them (nearly always 'excluded', since the evaluated vocabulary is "
+                     "nature-only), so precision/recall are unaffected by this diagnostic. "
+                     "A hit is not automatically a model error: COCO's 'dining table' node "
+                     "resolves to non-nature, but the taxonomy's Nature-Based Artefacts clause "
+                     "counts a wooden table with visible grain AS nature, and a class node "
+                     "cannot encode which one THIS image shows. Read by_gt_class to tell the "
+                     "two apart — wood/stone furniture classes dominating suggests that clause "
+                     "is firing, a flat spread of unrelated classes suggests loose boxes."),
+        }
         summary["detection_note"] = (
             "COCO box-IoU evaluation of SAM3 instance boxes against COCO's per-instance GT. "
             "Assignment is CLASS-AGNOSTIC (Hungarian, one-to-one, IoU >= "
@@ -2105,6 +2197,14 @@ def _print_summary(s, run_clipmatch):
         print(f"Excluded predictions (named no evaluated COCO class): "
               f"{det['excluded_predictions']} | crowd-suppressed: "
               f"{det['crowd_suppressed_predictions']}")
+        nn = s.get("detection_nature_on_non_nature")
+        if nn is not None:
+            print(f"Nature box on a NON-nature GT class: {nn['count']} "
+                  f"({nn['rate_over_unmatched']:.1%} of unmatched predictions) — "
+                  f"taxonomy disagreement, not scored either way")
+            top = list(nn["by_gt_class"].items())[:5]
+            if top:
+                print("  top GT classes: " + ", ".join(f"{c} ({n})" for c, n in top))
         dl = s.get("detection_labels", {})
         if dl.get("support"):
             print(f"[naming, over the {dl['support']} matched pairs]  "
@@ -2235,6 +2335,12 @@ def _log_wandb(args, summary, run_clipmatch):
         if "ap_50" in det:
             log["Detection/AP50"] = det["ap_50"]
             log["Detection/AP50_95"] = det["ap_50_95"]
+        nn = summary.get("detection_nature_on_non_nature")
+        if nn is not None:
+            # Own namespace, like the localization/naming split: this is a
+            # third kind of outcome, not a component of either score.
+            log["DetectionTaxonomyDisagreement/Count"] = nn["count"]
+            log["DetectionTaxonomyDisagreement/RateOverUnmatched"] = nn["rate_over_unmatched"]
         dl = summary.get("detection_labels", {})
         if dl.get("support"):
             log["DetectionLabels/ExactMatch"] = dl["exact_match_accuracy"]
