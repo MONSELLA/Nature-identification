@@ -106,13 +106,46 @@ def _scan_artifact(path):
 
 
 def _count_csv_rows(path):
+    """(row_count, nul_byte_count) for a predictions CSV.
+
+    The NUL check matters as much here as it does for the .jsonl artifacts —
+    arguably more, since the predictions CSV is the file that's actually read
+    for tables and qualitative review, and it can outlive a damaged artifact
+    (confirmed: qwen/imagenet's 50,000-row CSV survived while its artifact
+    was down to 28,960 records). The same storage fault that zeroed an
+    artifact can zero a CSV, and a NUL-filled CSV would otherwise be reported
+    here as simply "unreadable" with no hint as to why.
+
+    Both passes STREAM rather than reading the file whole: a 50,000-image
+    predictions CSV carries per-object JSON blobs and mask RLEs and can run
+    to hundreds of MB, which is not something an audit should pull into
+    memory. Rows are counted with csv.reader rather than by counting
+    newlines, because quoted fields (captions, JSON) legitimately contain
+    embedded newlines — counting '\\n' would badly overcount.
+
+    csv.reader raises _csv.Error("line contains NUL") on a corrupted file,
+    which the previous version did not catch (it caught only OSError), so a
+    single NUL-damaged CSV would have crashed the whole audit run."""
+    p = Path(path)
+    n_nulls = 0
     try:
-        with open(path, newline="") as f:
+        with open(p, "rb") as f:
+            while True:
+                chunk = f.read(8 << 20)
+                if not chunk:
+                    break
+                n_nulls += chunk.count(b"\x00")
+    except OSError:
+        return None, None
+    n_rows = None
+    try:
+        with open(p, newline="", errors="replace") as f:
             reader = csv.reader(f)
             next(reader, None)  # header row
-            return sum(1 for _ in reader)
-    except OSError:
-        return None
+            n_rows = sum(1 for _ in reader)
+    except (OSError, csv.Error):
+        n_rows = None  # corrupted beyond parsing; n_nulls explains why
+    return n_rows, n_nulls
 
 
 def _load_results_json_counts(path):
@@ -169,7 +202,8 @@ def main():
         csv_matches = []
         if pred_dir.is_dir() and info.get("dataset") and model_slug:
             csv_matches = sorted(pred_dir.glob(f"*_{info['dataset']}_{model_slug}_predictions.csv"))
-        csv_rows = _count_csv_rows(csv_matches[0]) if csv_matches else None
+        csv_rows, csv_nulls = (_count_csv_rows(csv_matches[0]) if csv_matches
+                               else (None, None))
 
         # Find any results-store JSON directly in run_dir and pull its
         # recorded n_images for this (dataset, model), if present.
@@ -192,6 +226,7 @@ def main():
             "n_bad_lines": info.get("n_bad_lines"),
             "predictions_csv": str(csv_matches[0]) if csv_matches else None,
             "predictions_csv_rows": csv_rows,
+            "predictions_csv_nulls": csv_nulls,
             "results_json_n_images": summary_n_images,
             "size_bytes": info.get("size_bytes"),
             "n_nulls": info.get("n_nulls"),
@@ -237,8 +272,23 @@ def main():
                 and r["results_json_n_images"] != r["artifact_n_images"]):
             flags.append(f"MISMATCH: results JSON says {r['results_json_n_images']} "
                          f"but artifact has {r['artifact_n_images']}")
-        if r["predictions_csv_rows"] is not None and r["predictions_csv_rows"] != r["artifact_n_images"]:
-            flags.append(f"csv rows ({r['predictions_csv_rows']}) != artifact records")
+        # The predictions CSV is the file actually used for tables and
+        # qualitative review, so its own integrity is reported separately from
+        # the artifact's — it can survive a damaged artifact, and can be
+        # damaged while the artifact survives.
+        if r.get("predictions_csv_nulls"):
+            flags.append(f"⛔ PREDICTIONS CSV NUL-CORRUPTED "
+                         f"({r['predictions_csv_nulls']:,} NUL bytes)")
+        elif r["predictions_csv_rows"] is not None and r["predictions_csv_rows"] != r["artifact_n_images"]:
+            # NOT necessarily bad: a CSV with MORE rows than the artifact means
+            # scoring ran when the artifact was still intact and the artifact
+            # was damaged afterwards — i.e. the CSV is the surviving copy of a
+            # completed run, which is exactly the case worth keeping.
+            more = r["predictions_csv_rows"] > (r["artifact_n_images"] or 0)
+            flags.append(
+                f"csv has {r['predictions_csv_rows']} rows vs artifact's "
+                f"{r['artifact_n_images']}"
+                + (" — CSV PRESERVES a completed run the artifact lost" if more else ""))
         print(f"{str(r['dataset']):<14} {str(r['model']):<45} "
               f"{str(r['artifact_n_images']):>9} "
               f"{'Y' if r['has_header'] else 'N':>4} "
@@ -247,6 +297,39 @@ def main():
               f"{str(r['predictions_csv_rows']):>9} "
               f"{str(r['results_json_n_images']):>14}  "
               f"{', '.join(flags)}")
+
+    # --- Predictions-CSV inventory ------------------------------------------
+    # Printed as its own section because it answers a DIFFERENT question from
+    # the table above. The table is about artifacts (can this be resumed /
+    # re-scored?); this is about the predictions CSV, which is what actually
+    # gets read for results tables and qualitative review. A CSV can be intact
+    # while its artifact is destroyed — in which case that run's per-image
+    # results are NOT lost, whatever the artifact column says.
+    intact = [r for r in rows
+              if r.get("predictions_csv_rows") and not r.get("predictions_csv_nulls")]
+    damaged = [r for r in rows if r.get("predictions_csv_nulls")]
+    absent = [r for r in rows if not r.get("predictions_csv_rows")
+              and not r.get("predictions_csv_nulls")]
+    print()
+    print("=" * 70)
+    print("PREDICTIONS CSVs — the files used for results tables / qualitative review")
+    print("=" * 70)
+    print(f"INTACT ({len(intact)}):")
+    for r in sorted(intact, key=lambda r: (str(r["dataset"]), str(r["model"]))):
+        note = ""
+        if r["artifact_n_images"] and r["predictions_csv_rows"] > r["artifact_n_images"]:
+            note = "   <- survives a damaged artifact"
+        print(f"   {str(r['dataset']):<14} {str(r['model']):<48} "
+              f"{r['predictions_csv_rows']:>7,} rows{note}")
+    if damaged:
+        print(f"\nNUL-CORRUPTED ({len(damaged)}):")
+        for r in damaged:
+            print(f"   {str(r['dataset']):<14} {str(r['model']):<48} "
+                  f"{r['predictions_csv_nulls']:,} NUL bytes")
+    if absent:
+        print(f"\nNO CSV ({len(absent)}) — scoring never completed for these:")
+        for r in absent:
+            print(f"   {str(r['dataset']):<14} {str(r['model']):<48}")
 
     if n_corrupt:
         print()
