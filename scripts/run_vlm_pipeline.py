@@ -97,6 +97,7 @@ import csv
 import json
 import logging
 import random
+import shutil
 import subprocess
 import sys
 import time
@@ -398,30 +399,6 @@ def phase_infer(args, vlm=None):
     summarize_for_clipmatch = (args.dataset in clip_metrics.CLIPMATCH_DATASETS
                                 and not args.no_summarize_clipmatch_caption)
 
-    # Every registered family is vLLM-served (see src/models/vlm_models.py's
-    # MODEL_REGISTRY) — the HuggingFace-served BLIP family was removed.
-    # Skipped entirely when a `vlm` was already passed in (phase_infer_multi's
-    # whole point) — these are all engine-construction kwargs, meaningless
-    # once the engine already exists.
-    if vlm is None:
-        vlm_kwargs = {"dtype": args.dtype, "gpu_memory_utilization": args.gpu_memory_utilization,
-                      "trust_remote_code": args.trust_remote_code,
-                      "tensor_parallel_size": args.tensor_parallel_size,
-                      # 0 is the CLI's "disabled" spelling (argparse can't default
-                      # an int flag to None while still accepting a positive int);
-                      # VLLMBackedVLM.__init__ itself expects None for "disabled".
-                      "max_image_side": args.max_image_side or None,
-                      # Off by default — see VLLMBackedVLM.__init__ for why
-                      # (guided decoding + an already-open <think> block is a
-                      # broken combination, and the caption call has no grammar
-                      # to stop chain-of-thought leaking into the caption text).
-                      "enable_thinking": args.enable_thinking}
-        if args.max_model_len is not None:
-            vlm_kwargs["max_model_len"] = args.max_model_len
-        if args.max_num_seqs is not None:
-            vlm_kwargs["max_num_seqs"] = args.max_num_seqs
-        vlm = create_vlm(args.model_family, args.model_name, **vlm_kwargs)
-
     # The very first line written to the output file is a special "header"
     # record (distinguished by record_type="header") carrying metadata that
     # applies to the WHOLE run, not any single image — Phase 2 reads this
@@ -450,38 +427,52 @@ def phase_infer(args, vlm=None):
     out_path = Path(args.responses_file)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # --- --resume: skip images this artifact already has ---------------------
+    # --- --resume: repair the header, then skip images this artifact has -----
     # Inference is by far the expensive half (hours on a full dataset), and a
     # crash used to mean redoing all of it. The streamed artifact already
     # contains every completed image, so resuming is just "filter the dataset
-    # down to what's missing and APPEND". The header is only written on a
-    # fresh run; on a resume the existing one is kept (it carries the
-    # candidate_vocab/max_hops/prompt-variant this artifact was built with,
-    # and rewriting it from the current args could silently mix two configs).
+    # down to what's missing and APPEND".
+    #
+    # --resume also GUARANTEES the finished artifact has a header. Normally the
+    # header is written only on a fresh run and a resume keeps the existing one
+    # (it carries the candidate_vocab/max_hops/prompt-variant this artifact was
+    # built with, and rewriting it from the current args could silently mix two
+    # configs). But an artifact can legitimately exist with NO header at all —
+    # a first run killed before its buffered header line ever reached disk
+    # leaves a 0-byte file, and a plain resume onto that would append thousands
+    # of image records while never writing a header (resume mode skips that
+    # write unconditionally), producing an artifact _read_artifact and
+    # grounding_pipeline.stream_artifact can NEVER parse — discovered only
+    # after the whole multi-hour run finishes. So when the existing file has no
+    # header, one is reconstructed from THIS invocation's args and prepended
+    # before anything else happens.
     resume_mode = False
-    if getattr(args, "resume", False) and out_path.exists() and not _artifact_has_header(out_path):
-        # A pre-existing file with no header at all — e.g. an empty stray
-        # file, or a run killed before its first write ever flushed — is not
-        # something we can safely append to (resume_mode never writes a
-        # header, so appending here would produce an artifact that
-        # _read_artifact can NEVER parse, discovered only after however long
-        # this run takes). Treat it as if it didn't exist: fall through to
-        # the fresh-run path below, which opens in "w" mode and always
-        # writes a header first.
-        print(f"⚠️ [infer] --resume requested but {out_path} exists with no header line "
-              f"(empty/corrupt/stray file) — ignoring it and starting a fresh run instead "
-              f"of appending, so the artifact always gets a header.")
-    elif getattr(args, "resume", False) and out_path.exists():
+    if getattr(args, "resume", False) and out_path.exists():
+        if not _artifact_has_header(out_path):
+            # NOTE the config caveat: this header is built from the CURRENT
+            # args, not recovered from the (never-written) original. It is
+            # correct only insofar as this invocation's dataset/model/
+            # max_hops/summary-prompt flags match the run that produced the
+            # records already in the file — hence the loud warning rather than
+            # a silent fix.
+            print(f"⚠️ [infer] {out_path} exists but has NO header line — reconstructing "
+                  f"one from this run's args (dataset='{args.dataset}', "
+                  f"model='{args.model_family}/{args.model_name}', max_hops={args.max_hops}) "
+                  f"and prepending it. Verify those match the run that wrote the existing "
+                  f"records; a mismatch would mislabel the artifact's config.")
+            _prepend_header(out_path, header)
         done, has_footer, n_bad = _already_inferred_paths(out_path)
         if has_footer:
             print(f"✅ [infer] {out_path} already ends in a footer — this run "
                   f"is complete ({len(done)} images). Nothing to resume; "
                   f"delete the file or drop --resume to redo it.")
-            # Return the (possibly already-loaded) `vlm` unchanged, not None —
-            # phase_infer_multi chains this return value into the NEXT
-            # dataset's call so its shared VLM survives a dataset that turns
-            # out to be already-complete. A bare `return` here would silently
-            # force phase_infer_multi to reload the model on the next task.
+            # Returns whatever `vlm` was passed IN (None on a plain
+            # single-dataset run, since the model is deliberately not loaded
+            # until after this block — an already-complete dataset, or one
+            # that only needed its header repaired, should cost no model load
+            # at all). phase_infer_multi chains this return value into the
+            # NEXT dataset's call, so a VLM handed to us by a previous task
+            # survives a task that turns out to be already-complete.
             return vlm
         before = len(dataset)
         dataset = [d for d in dataset if d["image_path"] not in done]
@@ -497,6 +488,34 @@ def phase_infer(args, vlm=None):
                                      "inference_time_seconds": None}) + "\n")
             # See the has_footer branch above — must return `vlm`, not None.
             return vlm
+
+    # Every registered family is vLLM-served (see src/models/vlm_models.py's
+    # MODEL_REGISTRY) — the HuggingFace-served BLIP family was removed.
+    # Skipped entirely when a `vlm` was already passed in (phase_infer_multi's
+    # whole point) — these are all engine-construction kwargs, meaningless
+    # once the engine already exists.
+    # DELIBERATELY AFTER the --resume block above: loading the model is
+    # minutes and GBs of VRAM, and a resume that finds nothing left to do (or
+    # that only needed its header repaired) returns without ever reaching
+    # here, so that case costs no GPU at all.
+    if vlm is None:
+        vlm_kwargs = {"dtype": args.dtype, "gpu_memory_utilization": args.gpu_memory_utilization,
+                      "trust_remote_code": args.trust_remote_code,
+                      "tensor_parallel_size": args.tensor_parallel_size,
+                      # 0 is the CLI's "disabled" spelling (argparse can't default
+                      # an int flag to None while still accepting a positive int);
+                      # VLLMBackedVLM.__init__ itself expects None for "disabled".
+                      "max_image_side": args.max_image_side or None,
+                      # Off by default — see VLLMBackedVLM.__init__ for why
+                      # (guided decoding + an already-open <think> block is a
+                      # broken combination, and the caption call has no grammar
+                      # to stop chain-of-thought leaking into the caption text).
+                      "enable_thinking": args.enable_thinking}
+        if args.max_model_len is not None:
+            vlm_kwargs["max_model_len"] = args.max_model_len
+        if args.max_num_seqs is not None:
+            vlm_kwargs["max_num_seqs"] = args.max_num_seqs
+        vlm = create_vlm(args.model_family, args.model_name, **vlm_kwargs)
 
     loop_t0 = time.time()
     n = 0
@@ -629,11 +648,11 @@ def _already_inferred_paths(path):
 
 def _artifact_has_header(path):
     """Whether `path` already contains a record_type="header" line. Used by
-    --resume to decide whether appending is actually safe — a pre-existing
-    file that exists but was never given a header (empty file from a stray
-    `touch`/mkdir, or a run killed before its first write flushed) would
+    --resume to decide whether the artifact needs its header reconstructed — a
+    pre-existing file that exists but was never given a header (0-byte file
+    from a run killed before its buffered header line reached disk) would
     otherwise silently accumulate image records with NO header ever written
-    (resume_mode skips the header write unconditionally), leaving an artifact
+    (resume mode skips the header write unconditionally), leaving an artifact
     _read_artifact can never parse ("has no header line") after potentially
     hours of re-inference. Lines are parsed defensively, same as
     _already_inferred_paths, since a truncated tail line is expected on a
@@ -653,6 +672,38 @@ def _artifact_has_header(path):
             if obj.get("record_type") == "header":
                 return True
     return False
+
+
+def _prepend_header(path, header):
+    """Rewrite `path` with `header` as its FIRST line, preserving every
+    existing line after it.
+
+    The header genuinely has to be line 1, not merely present somewhere:
+    grounding_pipeline.stream_artifact raises "does not start with a header
+    line" if the first non-empty line isn't one (it stops scanning there so it
+    can stream the rest lazily). So this can't be an append — the file is
+    rewritten.
+
+    Done via a temp file in the SAME directory followed by os.replace (atomic
+    on POSIX when both are on one filesystem), so an interruption mid-rewrite
+    leaves the original artifact untouched rather than half-copied — the whole
+    point being that the records already in this file may represent many hours
+    of inference. Costs one full read+write of the artifact and, transiently,
+    its size again in free disk."""
+    p = Path(path)
+    tmp = p.with_name(p.name + ".headerfix.tmp")
+    try:
+        with open(tmp, "w") as out:
+            out.write(json.dumps(header) + "\n")
+            with open(p) as src:
+                shutil.copyfileobj(src, out)
+        os.replace(tmp, p)
+    except BaseException:
+        # Never leave a stray half-written .headerfix.tmp behind on failure
+        # (including KeyboardInterrupt/SIGTERM, hence BaseException) — the
+        # original file is still intact, so a retry starts from a clean slate.
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def _read_artifact(path):
@@ -2141,7 +2192,15 @@ def build_arg_parser():
                         "instead of restarting from image 0. A truncated final line (hard "
                         "kill mid-write) is dropped and that one image redone. If the file "
                         "already ends in a footer the run is complete and this exits "
-                        "immediately rather than redoing anything. NOTE: pair with the SAME "
+                        "immediately rather than redoing anything (without loading the "
+                        "model at all). ALSO REPAIRS A MISSING HEADER: if the existing file "
+                        "has no header line — a run killed before its buffered header ever "
+                        "reached disk leaves a 0-byte file, and resuming onto that would "
+                        "otherwise append every record with no header ever written, leaving "
+                        "an artifact --stage score and the grounding pipeline can never "
+                        "read — one is rebuilt from THIS invocation's args and prepended, "
+                        "so pass the same dataset/model/--max_hops flags as the original "
+                        "run. NOTE: pair with the SAME "
                         "--max_samples as the original run — the sampled subset is "
                         "seed-42 deterministic, so a different value resumes against a "
                         "different subset.")
