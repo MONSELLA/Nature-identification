@@ -77,6 +77,7 @@ I run this script", start reading at `main()` near the bottom and work
 backward through phase_infer/phase_score.
 """
 
+import fcntl
 import os
 
 # Quiet a couple of low-value third-party STARTUP notices by default — neither
@@ -101,6 +102,7 @@ import shutil
 import subprocess
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -427,138 +429,174 @@ def phase_infer(args, vlm=None):
     out_path = Path(args.responses_file)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # --- --resume: repair the header, then skip images this artifact has -----
-    # Inference is by far the expensive half (hours on a full dataset), and a
-    # crash used to mean redoing all of it. The streamed artifact already
-    # contains every completed image, so resuming is just "filter the dataset
-    # down to what's missing and APPEND".
-    #
-    # --resume also GUARANTEES the finished artifact has a header. Normally the
-    # header is written only on a fresh run and a resume keeps the existing one
-    # (it carries the candidate_vocab/max_hops/prompt-variant this artifact was
-    # built with, and rewriting it from the current args could silently mix two
-    # configs). But an artifact can legitimately exist with NO header at all —
-    # a first run killed before its buffered header line ever reached disk
-    # leaves a 0-byte file, and a plain resume onto that would append thousands
-    # of image records while never writing a header (resume mode skips that
-    # write unconditionally), producing an artifact _read_artifact and
-    # grounding_pipeline.stream_artifact can NEVER parse — discovered only
-    # after the whole multi-hour run finishes. So when the existing file has no
-    # header, one is reconstructed from THIS invocation's args and prepended
-    # before anything else happens.
-    resume_mode = False
-    if getattr(args, "resume", False) and out_path.exists():
-        if not _artifact_has_header(out_path):
-            # NOTE the config caveat: this header is built from the CURRENT
-            # args, not recovered from the (never-written) original. It is
-            # correct only insofar as this invocation's dataset/model/
-            # max_hops/summary-prompt flags match the run that produced the
-            # records already in the file — hence the loud warning rather than
-            # a silent fix.
-            print(f"⚠️ [infer] {out_path} exists but has NO header line — reconstructing "
-                  f"one from this run's args (dataset='{args.dataset}', "
-                  f"model='{args.model_family}/{args.model_name}', max_hops={args.max_hops}) "
-                  f"and prepending it. Verify those match the run that wrote the existing "
-                  f"records; a mismatch would mislabel the artifact's config.")
-            _prepend_header(out_path, header)
-        done, has_footer, n_bad = _already_inferred_paths(out_path)
-        if has_footer:
-            print(f"✅ [infer] {out_path} already ends in a footer — this run "
-                  f"is complete ({len(done)} images). Nothing to resume; "
-                  f"delete the file or drop --resume to redo it.")
-            # Returns whatever `vlm` was passed IN (None on a plain
-            # single-dataset run, since the model is deliberately not loaded
-            # until after this block — an already-complete dataset, or one
-            # that only needed its header repaired, should cost no model load
-            # at all). phase_infer_multi chains this return value into the
-            # NEXT dataset's call, so a VLM handed to us by a previous task
-            # survives a task that turns out to be already-complete.
-            return vlm
-        before = len(dataset)
-        dataset = [d for d in dataset if d["image_path"] not in done]
-        resume_mode = True
-        print(f"⏩ [infer] resuming {out_path}: {len(done)} image(s) already done, "
-              f"{len(dataset)} of {before} remaining"
-              + (f" ({n_bad} truncated line(s) dropped — those images redone)" if n_bad else ""))
-        if not dataset:
-            print("⚠️ [infer] nothing left to infer, but the artifact has no footer — "
-                  "appending one so --stage score sees a complete run.")
-            with open(out_path, "a") as f:
-                f.write(json.dumps({"record_type": "footer",
-                                     "inference_time_seconds": None}) + "\n")
-            # See the has_footer branch above — must return `vlm`, not None.
-            return vlm
+    # Exclusive lock on this artifact for the REST of this function — see
+    # _ArtifactLock's docstring. Acquired BEFORE the resume decision is even
+    # read (not just around the final write), because the resume decision
+    # itself reads the file's current state; a second process reading/writing
+    # concurrently could see a torn state or race the header repair below.
+    # Held through every branch, including every early return, via try/finally.
+    # ArtifactLockHeld is deliberately left to propagate — a caller (main(),
+    # phase_infer_multi) should treat "another process already owns this
+    # artifact" as fatal, never as something to silently work around.
+    lock = _ArtifactLock(out_path)
+    lock.acquire()
+    try:
+        # --- --resume: repair the header, then skip images this artifact has -
+        # Inference is by far the expensive half (hours on a full dataset), and
+        # a crash used to mean redoing all of it. The streamed artifact already
+        # contains every completed image, so resuming is just "filter the
+        # dataset down to what's missing and APPEND".
+        #
+        # --resume also GUARANTEES the finished artifact has a header. Normally
+        # the header is written only on a fresh run and a resume keeps the
+        # existing one (it carries the candidate_vocab/max_hops/prompt-variant
+        # this artifact was built with, and rewriting it from the current args
+        # could silently mix two configs). But an artifact can legitimately
+        # exist with NO header at all — a first run killed before its buffered
+        # header line ever reached disk leaves a 0-byte file, and a plain
+        # resume onto that would append thousands of image records while never
+        # writing a header (resume mode skips that write unconditionally),
+        # producing an artifact _read_artifact and
+        # grounding_pipeline.stream_artifact can NEVER parse — discovered only
+        # after the whole multi-hour run finishes. So when the existing file
+        # has no header, one is reconstructed from THIS invocation's args and
+        # prepended before anything else happens.
+        resume_mode = False
+        if getattr(args, "resume", False) and out_path.exists():
+            if not _artifact_has_header(out_path):
+                # NOTE the config caveat: this header is built from the CURRENT
+                # args, not recovered from the (never-written) original. It is
+                # correct only insofar as this invocation's dataset/model/
+                # max_hops/summary-prompt flags match the run that produced the
+                # records already in the file — hence the loud warning rather
+                # than a silent fix.
+                print(f"⚠️ [infer] {out_path} exists but has NO header line — reconstructing "
+                      f"one from this run's args (dataset='{args.dataset}', "
+                      f"model='{args.model_family}/{args.model_name}', max_hops={args.max_hops}) "
+                      f"and prepending it. Verify those match the run that wrote the existing "
+                      f"records; a mismatch would mislabel the artifact's config.")
+                _prepend_header(out_path, header)
+            done, has_footer, n_bad = _already_inferred_paths(out_path)
+            if has_footer:
+                print(f"✅ [infer] {out_path} already ends in a footer — this run "
+                      f"is complete ({len(done)} images). Nothing to resume; "
+                      f"delete the file or drop --resume to redo it.")
+                # Returns whatever `vlm` was passed IN (None on a plain
+                # single-dataset run, since the model is deliberately not
+                # loaded until after this block — an already-complete dataset,
+                # or one that only needed its header repaired, should cost no
+                # model load at all). phase_infer_multi chains this return
+                # value into the NEXT dataset's call, so a VLM handed to us by
+                # a previous task survives a task that turns out to be
+                # already-complete.
+                return vlm
+            before = len(dataset)
+            dataset = [d for d in dataset if d["image_path"] not in done]
+            resume_mode = True
+            print(f"⏩ [infer] resuming {out_path}: {len(done)} image(s) already done, "
+                  f"{len(dataset)} of {before} remaining"
+                  + (f" ({n_bad} truncated line(s) dropped — those images redone)" if n_bad else ""))
+            if not dataset:
+                print("⚠️ [infer] nothing left to infer, but the artifact has no footer — "
+                      "appending one so --stage score sees a complete run.")
+                with open(out_path, "a") as f:
+                    f.write(json.dumps({"record_type": "footer",
+                                         "inference_time_seconds": None}) + "\n")
+                # See the has_footer branch above — must return `vlm`, not None.
+                return vlm
 
-    # Every registered family is vLLM-served (see src/models/vlm_models.py's
-    # MODEL_REGISTRY) — the HuggingFace-served BLIP family was removed.
-    # Skipped entirely when a `vlm` was already passed in (phase_infer_multi's
-    # whole point) — these are all engine-construction kwargs, meaningless
-    # once the engine already exists.
-    # DELIBERATELY AFTER the --resume block above: loading the model is
-    # minutes and GBs of VRAM, and a resume that finds nothing left to do (or
-    # that only needed its header repaired) returns without ever reaching
-    # here, so that case costs no GPU at all.
-    if vlm is None:
-        vlm_kwargs = {"dtype": args.dtype, "gpu_memory_utilization": args.gpu_memory_utilization,
-                      "trust_remote_code": args.trust_remote_code,
-                      "tensor_parallel_size": args.tensor_parallel_size,
-                      # 0 is the CLI's "disabled" spelling (argparse can't default
-                      # an int flag to None while still accepting a positive int);
-                      # VLLMBackedVLM.__init__ itself expects None for "disabled".
-                      "max_image_side": args.max_image_side or None,
-                      # Off by default — see VLLMBackedVLM.__init__ for why
-                      # (guided decoding + an already-open <think> block is a
-                      # broken combination, and the caption call has no grammar
-                      # to stop chain-of-thought leaking into the caption text).
-                      "enable_thinking": args.enable_thinking}
-        if args.max_model_len is not None:
-            vlm_kwargs["max_model_len"] = args.max_model_len
-        if args.max_num_seqs is not None:
-            vlm_kwargs["max_num_seqs"] = args.max_num_seqs
-        vlm = create_vlm(args.model_family, args.model_name, **vlm_kwargs)
+        # --- Never silently clobber an existing non-empty artifact ----------
+        # resume_mode is False here means the write loop below opens in "w"
+        # (truncate/fresh) mode. That's correct for a genuinely fresh run
+        # (--resume not passed, or nothing existed yet). But if out_path
+        # already has real content at this point — a forgotten --resume flag,
+        # a script bug, a human re-running the wrong command — "w" mode would
+        # silently DESTROY however much completed work is already there with
+        # zero error, zero warning, discovered only much later. Move it aside
+        # to a timestamped backup instead of ever truncating existing data
+        # out from under the artifact lock.
+        if not resume_mode and out_path.exists() and out_path.stat().st_size > 0:
+            backup_path = out_path.with_name(
+                out_path.name + f".bak-{datetime.now():%Y%m%dT%H%M%S}")
+            print(f"⚠️ [infer] {out_path} already exists ({out_path.stat().st_size} bytes) "
+                  f"and this is a FRESH run (--resume not in effect for it) — refusing to "
+                  f"silently overwrite it. Moving the existing file aside to {backup_path} "
+                  f"first. If this run was actually supposed to resume, stop it now and "
+                  f"re-run with --resume against {backup_path} instead.")
+            shutil.move(str(out_path), str(backup_path))
 
-    loop_t0 = time.time()
-    n = 0
-    # "JSON Lines" format: one complete, independent JSON object per line of
-    # the file (as opposed to one giant JSON array for the whole file). This
-    # lets us write results incrementally as they're produced (streaming,
-    # rather than building one huge in-memory list and writing it all at the
-    # end) and lets Phase 2 read them back one line at a time too.
-    with open(out_path, "a" if resume_mode else "w") as f:
-        if not resume_mode:
-            f.write(json.dumps(header) + "\n")
-        for rec in run_inference(
-            vlm, dataset,
-            caption_system_prompt=caption_system,
-            label_system_full=label_system_full,
-            label_system_material=label_system_material,
-            tax_graph=graph, max_hops=args.max_hops,
-            batch_size=args.batch_size,
-            caption_max_new_tokens=args.max_new_tokens_caption,
-            extraction_max_new_tokens=args.max_new_tokens_extraction,
-            label_max_new_tokens=args.max_new_tokens_label,
-            temperature=args.temperature, verbose=args.verbose,
-            summarize_for_clipmatch=summarize_for_clipmatch,
-            summary_max_new_tokens=args.summary_max_new_tokens,
-            # Dataset NAME (not the loaded instances in the positional arg
-            # above) — picks the object-centric vs scene-centric summary
-            # prompt, see prompts.get_summary_caption_prompt.
-            dataset=args.dataset,
-        ):
-            rec["record_type"] = "image"
-            f.write(json.dumps(rec) + "\n")
-            n += 1
-        # The header (written above, before dataset loading finished vs the
-        # inference loop) can't carry the total elapsed time since it's
-        # written before that time is known — so a "footer" record (last line
-        # of the file) carries it instead. Includes dataset-load + VLM-creation
-        # time (phase_t0), not just the generation loop, since that's the full
-        # wall-clock cost of "this model finishing this run".
-        footer = {"record_type": "footer", "inference_time_seconds": time.time() - phase_t0}
-        f.write(json.dumps(footer) + "\n")
-    print(f"💾 [infer] wrote {n} image records to {out_path} in {time.time()-loop_t0:.1f}s "
-          f"(total inference phase: {footer['inference_time_seconds']:.1f}s)")
-    return vlm
+        # Every registered family is vLLM-served (see src/models/vlm_models.py's
+        # MODEL_REGISTRY) — the HuggingFace-served BLIP family was removed.
+        # Skipped entirely when a `vlm` was already passed in (phase_infer_multi's
+        # whole point) — these are all engine-construction kwargs, meaningless
+        # once the engine already exists.
+        # DELIBERATELY AFTER the --resume block above: loading the model is
+        # minutes and GBs of VRAM, and a resume that finds nothing left to do
+        # (or that only needed its header repaired) returns without ever
+        # reaching here, so that case costs no GPU at all.
+        if vlm is None:
+            vlm_kwargs = {"dtype": args.dtype, "gpu_memory_utilization": args.gpu_memory_utilization,
+                          "trust_remote_code": args.trust_remote_code,
+                          "tensor_parallel_size": args.tensor_parallel_size,
+                          # 0 is the CLI's "disabled" spelling (argparse can't default
+                          # an int flag to None while still accepting a positive int);
+                          # VLLMBackedVLM.__init__ itself expects None for "disabled".
+                          "max_image_side": args.max_image_side or None,
+                          # Off by default — see VLLMBackedVLM.__init__ for why
+                          # (guided decoding + an already-open <think> block is a
+                          # broken combination, and the caption call has no grammar
+                          # to stop chain-of-thought leaking into the caption text).
+                          "enable_thinking": args.enable_thinking}
+            if args.max_model_len is not None:
+                vlm_kwargs["max_model_len"] = args.max_model_len
+            if args.max_num_seqs is not None:
+                vlm_kwargs["max_num_seqs"] = args.max_num_seqs
+            vlm = create_vlm(args.model_family, args.model_name, **vlm_kwargs)
+
+        loop_t0 = time.time()
+        n = 0
+        # "JSON Lines" format: one complete, independent JSON object per line of
+        # the file (as opposed to one giant JSON array for the whole file). This
+        # lets us write results incrementally as they're produced (streaming,
+        # rather than building one huge in-memory list and writing it all at the
+        # end) and lets Phase 2 read them back one line at a time too.
+        with open(out_path, "a" if resume_mode else "w") as f:
+            if not resume_mode:
+                f.write(json.dumps(header) + "\n")
+            for rec in run_inference(
+                vlm, dataset,
+                caption_system_prompt=caption_system,
+                label_system_full=label_system_full,
+                label_system_material=label_system_material,
+                tax_graph=graph, max_hops=args.max_hops,
+                batch_size=args.batch_size,
+                caption_max_new_tokens=args.max_new_tokens_caption,
+                extraction_max_new_tokens=args.max_new_tokens_extraction,
+                label_max_new_tokens=args.max_new_tokens_label,
+                temperature=args.temperature, verbose=args.verbose,
+                summarize_for_clipmatch=summarize_for_clipmatch,
+                summary_max_new_tokens=args.summary_max_new_tokens,
+                # Dataset NAME (not the loaded instances in the positional arg
+                # above) — picks the object-centric vs scene-centric summary
+                # prompt, see prompts.get_summary_caption_prompt.
+                dataset=args.dataset,
+            ):
+                rec["record_type"] = "image"
+                f.write(json.dumps(rec) + "\n")
+                n += 1
+            # The header (written above, before dataset loading finished vs the
+            # inference loop) can't carry the total elapsed time since it's
+            # written before that time is known — so a "footer" record (last
+            # line of the file) carries it instead. Includes dataset-load +
+            # VLM-creation time (phase_t0), not just the generation loop, since
+            # that's the full wall-clock cost of "this model finishing this run".
+            footer = {"record_type": "footer", "inference_time_seconds": time.time() - phase_t0}
+            f.write(json.dumps(footer) + "\n")
+        print(f"💾 [infer] wrote {n} image records to {out_path} in {time.time()-loop_t0:.1f}s "
+              f"(total inference phase: {footer['inference_time_seconds']:.1f}s)")
+        return vlm
+    finally:
+        lock.release()
 
 
 def phase_infer_multi(args):
@@ -602,6 +640,85 @@ def phase_infer_multi(args):
         print(f"=== [infer-multi] task {i + 1}/{len(tasks)}: dataset='{task_args.dataset}' "
               f"({'reusing already-loaded VLM' if vlm is not None else 'loading VLM'}) ===")
         vlm = phase_infer(task_args, vlm=vlm)
+
+
+# =============================================================================
+# Artifact concurrency safety — shared by phase_infer (Phase 1) and
+# phase_score (Phase 2)
+# =============================================================================
+class ArtifactLockHeld(RuntimeError):
+    """Raised when another process already holds the lock on an artifact
+    (see _ArtifactLock) — i.e. two invocations targeting the exact same
+    --responses_file overlapped in time. That race is exactly what silently
+    truncated a real 21000-record artifact down to 256 records in production
+    (2026-08-04): whichever process opened the file in "w" (fresh) mode last
+    won, discarding the other's already-completed work with no error at all.
+    A caller catching this should treat it as fatal, never as "fall back to
+    proceeding anyway" — the whole point is refusing to guess which of two
+    concurrent writers is safe to let through."""
+
+
+class _ArtifactLock:
+    """Exclusive advisory lock (POSIX flock) on `<responses_file>.lock`, held
+    for the ENTIRE lifetime of a phase_infer call that might read-or-write the
+    artifact — from before the resume decision is even made, through the
+    whole write loop, to the function's return. A second phase_infer call
+    against the SAME --responses_file (a duplicate SLURM submission, an
+    accidental double-launch, a stale job that didn't fully exit) fails fast
+    with ArtifactLockHeld instead of racing the first one — no interleaved
+    writes, no "last one to open('w') wins and silently destroys the other's
+    completed records", which is the exact failure this class exists to rule
+    out.
+
+    Uses a SEPARATE `.lock` sidecar file, not a lock on the artifact itself:
+    flock is advisory and tied to an open file DESCRIPTOR, and the artifact
+    itself gets closed/reopened/renamed (--resume's header repair rewrites it
+    via a temp file + os.replace) during the locked section — locking a
+    dedicated sidecar avoids "renaming the file out from under an active
+    lock" ambiguity entirely. The lock file is created but never meaningfully
+    read; it just carries the holder's PID for a human to inspect if a stale
+    lock is ever suspected.
+
+    NOT reentrant and NOT thread-safe (one process, one lock attempt) —
+    doesn't need to be, given this project's subprocess-per-stage model.
+    flock is per-process-independent, so THIS process re-acquiring its own
+    lock would still deadlock; that's fine, phase_infer only acquires once."""
+
+    def __init__(self, artifact_path):
+        self.lock_path = Path(str(artifact_path) + ".lock")
+        self._fh = None
+
+    def acquire(self):
+        self._fh = open(self.lock_path, "w")
+        try:
+            fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            self._fh.close()
+            self._fh = None
+            raise ArtifactLockHeld(
+                f"Another process already holds the lock on {self.lock_path} — "
+                f"i.e. is already running against this exact --responses_file "
+                f"({self.lock_path.with_suffix('')}). Refusing to start a second "
+                f"one against the same artifact; running two at once is exactly "
+                f"what silently destroyed a completed run's data before this "
+                f"lock existed. Check `squeue`/`ps aux | grep run_vlm_pipeline` "
+                f"for a duplicate job, let it finish or kill it, then retry.")
+        self._fh.write(f"pid={os.getpid()} time={datetime.now().isoformat()}\n")
+        self._fh.flush()
+        return self
+
+    def release(self):
+        if self._fh is not None:
+            fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+            self._fh.close()
+            self._fh = None
+
+    def __enter__(self):
+        return self.acquire()
+
+    def __exit__(self, *exc_info):
+        self.release()
+        return False
 
 
 # =============================================================================
@@ -743,6 +860,20 @@ def phase_score(args):
     """
     print(f"📊 [score] reading {args.responses_file}")
     phase_t0 = time.time()
+    # Refuse to read while phase_infer might still be writing this exact
+    # artifact — a plain read (no lock of our own) could otherwise see a
+    # torn/partial file mid-write, or worse, mid-header-repair (the temp-file
+    # rewrite in _prepend_header). Acquire-then-immediately-release rather
+    # than holding it for the whole scoring run: scoring doesn't itself
+    # mutate the artifact, so it only needs to confirm no writer is ACTIVE
+    # right now, not to lock other readers out.
+    try:
+        _ArtifactLock(args.responses_file).acquire().release()
+    except ArtifactLockHeld as e:
+        raise ArtifactLockHeld(
+            f"{e} (raised from --stage score: a phase_infer for this exact "
+            f"artifact appears to still be running — scoring a file mid-write "
+            f"would read a torn/partial result.)") from e
     header, records = _read_artifact(args.responses_file)
     dataset = header["dataset"]
     candidate_vocab = header.get("candidate_vocab")
