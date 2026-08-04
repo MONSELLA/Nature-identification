@@ -23,6 +23,8 @@ runs. Rerunning the same (dataset, model) pair overwrites just that entry
 with the newest results.
 """
 
+import contextlib
+import fcntl
 import json
 import time
 from datetime import datetime, timezone
@@ -124,21 +126,63 @@ class BatchProgress:
         print(msg, flush=True)
 
 
+@contextlib.contextmanager
+def _locked_results_store(path):
+    """Exclusive advisory lock (flock) on `<path>.lock`, held across an ENTIRE
+    read-modify-write cycle on the shared results-store JSON at `path`.
+
+    Without this, update_results_store/update_dataset_image_stats were a
+    textbook unlocked read-modify-write: json.load the whole file, mutate the
+    in-memory dict, json.dump the whole file back. Every model sharing one
+    dataset's --output_file (the SLURM array launcher runs several models
+    against the same run_name/output_file — see the "not locked" warning
+    already in scripts/run_vlm_pipeline.sbatch's own header comment) calls
+    this at the end of its own multi-hour run. If process B's json.load
+    happens before process A's json.dump lands, B's own later json.dump
+    silently overwrites the whole file with a copy that never saw A's entry
+    at all — not a crash, not a warning, just a vanished model result. This
+    is exactly what happened in production (2026-08-05): three ImageNet runs
+    (mistral/qwen/gemma) each completed successfully end-to-end, screenshots
+    and all, but only mistral's entry survived in the results JSON.
+
+    Blocking (LOCK_EX, no _NB/timeout) is deliberate and different from
+    _ArtifactLock in run_vlm_pipeline.py: this critical section is a small
+    JSON file (read + merge + write, milliseconds), not an hours-long
+    inference run, so a second process should simply wait its short turn
+    rather than fail outright — unlike racing a multi-hour VLM run, queuing
+    briefly here costs nothing meaningful."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name(path.name + ".lock")
+    with open(lock_path, "w") as lockf:
+        fcntl.flock(lockf.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lockf.fileno(), fcntl.LOCK_UN)
+
+
 def update_results_store(path, dataset, model, metrics):
     """Merge `metrics` into results_store[dataset][model] at `path`, creating
-    or updating the file on disk, and return the full updated store."""
+    or updating the file on disk, and return the full updated store.
+
+    The read, merge, and write all happen under ONE held lock (see
+    _locked_results_store) so this whole function is atomic with respect to
+    any other process — including update_dataset_image_stats below — doing
+    the same against the same path."""
     path = Path(path)
-    store = {}
-    if path.exists():
-        with open(path) as f:
-            store = json.load(f)
+    with _locked_results_store(path):
+        store = {}
+        if path.exists():
+            with open(path) as f:
+                store = json.load(f)
 
-    entry = dict(metrics)
-    entry["evaluated_at"] = datetime.now(timezone.utc).isoformat()
-    store.setdefault(dataset, {})[model] = entry
+        entry = dict(metrics)
+        entry["evaluated_at"] = datetime.now(timezone.utc).isoformat()
+        store.setdefault(dataset, {})[model] = entry
 
-    with open(path, "w") as f:
-        json.dump(store, f, indent=4)
+        with open(path, "w") as f:
+            json.dump(store, f, indent=4)
 
     return store
 
@@ -213,16 +257,24 @@ def update_dataset_image_stats(path, dataset, config_key, stats):
     Writes under "dataset_image_stats" — the old "dataset_class_stats" key is
     deliberately NOT reused, so an existing results store keeps its old
     (class-based) numbers under the old key instead of silently mixing two
-    different definitions under one name."""
+    different definitions under one name.
+
+    Same lock as update_results_store (see _locked_results_store) and for the
+    identical reason: this writes the SAME shared per-dataset JSON file, so an
+    unlocked read-modify-write here could just as easily clobber a concurrent
+    model's entry — or have ITS OWN update clobbered by one."""
     path = Path(path)
-    store = {}
-    if path.exists():
-        with open(path) as f:
-            store = json.load(f)
+    with _locked_results_store(path):
+        store = {}
+        if path.exists():
+            with open(path) as f:
+                store = json.load(f)
 
-    store.setdefault(dataset, {}).setdefault("dataset_image_stats", {})[config_key] = stats
+        store.setdefault(dataset, {}).setdefault("dataset_image_stats", {})[config_key] = stats
 
-    with open(path, "w") as f:
-        json.dump(store, f, indent=4)
+        with open(path, "w") as f:
+            json.dump(store, f, indent=4)
+
+    return store
 
     return store
