@@ -39,33 +39,57 @@ def _scan_artifact(path):
     has_footer = False
     dataset = model = model_name = None
     n_bad_lines = 0
+    n_nulls = 0
+    # Read as BYTES, not text: NUL-byte corruption (storage-level data loss —
+    # see scripts/diagnose_artifact.py) is invisible to a line count, because
+    # NULs contain no newlines. A 170 MB artifact whose interior was zeroed
+    # reports a few hundred "lines" and looks merely incomplete, while
+    # actually being a destroyed full-size file — a completely different
+    # problem with a completely different fix (storage/quota, not the
+    # pipeline). Counting NULs here is what tells those two apart across
+    # every artifact at once.
     try:
-        with open(path) as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                except json.JSONDecodeError:
-                    n_bad_lines += 1
-                    continue
-                rt = obj.get("record_type")
-                if rt == "header":
-                    has_header = True
-                    dataset = obj.get("dataset")
-                    model = obj.get("model")
-                    model_name = obj.get("model_name")
-                elif rt == "footer":
-                    has_footer = True
-                else:
-                    n_images += 1
+        raw = Path(path).read_bytes()
     except OSError as e:
         return {"error": str(e)}
+    n_nulls = raw.count(b"\x00")
+    for bline in raw.split(b"\n"):
+        bline = bline.strip()
+        if not bline:
+            continue
+        try:
+            obj = json.loads(bline)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            n_bad_lines += 1
+            continue
+        if not isinstance(obj, dict):
+            n_bad_lines += 1
+            continue
+        rt = obj.get("record_type")
+        if rt == "header":
+            has_header = True
+            dataset = obj.get("dataset")
+            model = obj.get("model")
+            model_name = obj.get("model_name")
+        elif rt == "footer":
+            has_footer = True
+        else:
+            n_images += 1
     # Mirrors _model_slug's own preference (model_name over the full
     # family/name "model" string) so the slug used here to find a matching
     # predictions CSV agrees with the one phase_score actually wrote it with.
     model_slug = (model_name or model or "").replace("/", "_")
+    size_bytes = len(raw)
+    # Estimate how many records this file's SIZE could hold, from the average
+    # size of the records that DID survive. When NULs are present, the gap
+    # between that estimate and n_images is the amount of finished work the
+    # storage lost — the number that actually matters when deciding whether
+    # to re-run.
+    implied_records = None
+    if n_nulls and n_images:
+        bytes_per_rec = (size_bytes - n_nulls) / n_images
+        if bytes_per_rec > 0:
+            implied_records = int(size_bytes / bytes_per_rec)
     return {
         "n_images": n_images,
         "has_header": has_header,
@@ -74,7 +98,10 @@ def _scan_artifact(path):
         "model": model,
         "model_slug": model_slug,
         "n_bad_lines": n_bad_lines,
-        "size_bytes": Path(path).stat().st_size,
+        "size_bytes": size_bytes,
+        "n_nulls": n_nulls,
+        "null_fraction": (n_nulls / size_bytes) if size_bytes else 0.0,
+        "implied_records": implied_records,
     }
 
 
@@ -166,6 +193,10 @@ def main():
             "predictions_csv": str(csv_matches[0]) if csv_matches else None,
             "predictions_csv_rows": csv_rows,
             "results_json_n_images": summary_n_images,
+            "size_bytes": info.get("size_bytes"),
+            "n_nulls": info.get("n_nulls"),
+            "null_fraction": info.get("null_fraction"),
+            "implied_records": info.get("implied_records"),
         })
 
     if args.json:
@@ -179,14 +210,28 @@ def main():
     print(f"{'dataset':<14} {'model':<45} {'artifact':>9} {'hdr':>4} {'ftr':>4} "
           f"{'bad':>4} {'csv_rows':>9} {'json_n_images':>14}  flags")
     print("-" * 130)
+    n_corrupt = 0
     for r in rows:
         flags = []
+        # NUL corruption FIRST and loudest: it changes what every other flag
+        # on this row means. "INCOMPLETE(no footer)" on a NUL-corrupted file
+        # doesn't mean inference stopped early — it means inference very
+        # likely FINISHED and the storage ate the result, including the
+        # footer. Reporting them the other way round sends you off re-running
+        # jobs when the real problem is the filesystem.
+        if r.get("n_nulls"):
+            n_corrupt += 1
+            implied = r.get("implied_records")
+            est = (f", size implies ~{implied:,} records were written"
+                   if implied else "")
+            flags.append(f"⛔ NUL-CORRUPTED: {r['null_fraction']:.0%} of "
+                         f"{r['size_bytes'] / 1e6:.0f}MB is zero bytes{est}")
         if not r["has_header"]:
             flags.append("NO-HEADER")
         if not r["has_footer"]:
             flags.append("INCOMPLETE(no footer)")
         if r["n_bad_lines"]:
-            flags.append(f"{r['n_bad_lines']} truncated line(s)")
+            flags.append(f"{r['n_bad_lines']} unparseable line(s)")
         if (r["results_json_n_images"] is not None
                 and r["artifact_n_images"] is not None
                 and r["results_json_n_images"] != r["artifact_n_images"]):
@@ -202,6 +247,20 @@ def main():
               f"{str(r['predictions_csv_rows']):>9} "
               f"{str(r['results_json_n_images']):>14}  "
               f"{', '.join(flags)}")
+
+    if n_corrupt:
+        print()
+        print(f"⛔ {n_corrupt} of {len(rows)} artifact(s) contain NUL bytes — "
+              f"STORAGE-LEVEL data loss, not a pipeline bug.")
+        print("   These files kept their full size on disk while their contents were")
+        print("   replaced by zeros, which is what happens when written data never")
+        print("   reaches the disk (node crash before writeback, NFS/cache fault, or")
+        print("   a quota/disk-full condition hit at flush time). No amount of file")
+        print("   locking in this codebase can prevent or undo it.")
+        print("   NEXT: check your quota (`quota -s`, `df -h` on the results")
+        print("   filesystem) and report the affected paths to your cluster admins")
+        print("   BEFORE re-running — a re-run onto unhealthy storage loses the")
+        print("   compute again. See scripts/diagnose_artifact.py for per-file detail.")
 
 
 if __name__ == "__main__":
