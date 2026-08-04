@@ -12,6 +12,12 @@ source ~/miniconda3/etc/profile.d/conda.sh
 conda activate tfm
 
 mkdir -p ../logs
-cd "$(dirname "$0")"
+# NOT `cd "$(dirname "$0")"` — SLURM copies the submitted script into its own
+# spool dir before running it, so $0 points at
+# /var/spool/slurm/.../job<id>/run_audit.sbatch, not the real repo checkout.
+# dirname on that resolves to the spool dir, which has no audit_artifacts.py
+# in it at all ("No such file or directory"). Use the real absolute path
+# instead.
+cd /home/pmonserrat/code/scripts
 
 python audit_artifacts.py --results_dir /home/pmonserrat/code/results
