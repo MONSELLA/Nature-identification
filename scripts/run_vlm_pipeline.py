@@ -827,22 +827,54 @@ def _read_artifact(path):
     """Read back a JSON-Lines artifact written by phase_infer: the first
     header-tagged line (merged with the footer line's timing info, if
     present — older artifacts written before footers existed simply won't
-    have it), plus every per-image record line, as plain Python dicts."""
+    have it), plus every per-image record line, as plain Python dicts.
+
+    Tolerates a corrupted individual line instead of raising and losing the
+    ENTIRE run over it — mirrors _already_inferred_paths' own defensive
+    handling of a truncated resume-time line, which this function used NOT
+    to have: one bad line used to take down scoring for every other good
+    record in the file. Confirmed in production (2026-08-04): a single
+    NULL-byte line (json.loads('\\x00') raises the exact reported
+    "Expecting value: line 1 column 1 (char 0)" — `.strip()` does not treat a
+    control byte as whitespace, so it isn't caught by the blank-line skip
+    below) crashed --stage score on an otherwise-complete, ~21000-record
+    artifact. A stray null/control-byte line is the classic signature of two
+    writers touching one file (one process's in-flight write landing past a
+    concurrent truncation point, sparse-filled with zeros by the
+    filesystem) — see _ArtifactLock's docstring for the writer-side guard
+    against that; this is the READ-side complement, for whatever corruption
+    still gets through (a stale pre-lock process, a filesystem hiccup, or
+    any other cause) rather than assuming the lock makes this impossible."""
     header = None
     footer = None
     records = []
+    n_bad_lines = 0
+    bad_line_numbers = []
     with open(path) as f:
-        for line in f:
+        for lineno, line in enumerate(f, start=1):
             line = line.strip()
             if not line:
                 continue
-            obj = json.loads(line)
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                n_bad_lines += 1
+                bad_line_numbers.append(lineno)
+                continue
             if obj.get("record_type") == "header":
                 header = obj
             elif obj.get("record_type") == "footer":
                 footer = obj
             else:
                 records.append(obj)
+    if n_bad_lines:
+        shown = bad_line_numbers[:10]
+        more = f" (+{n_bad_lines - len(shown)} more)" if n_bad_lines > len(shown) else ""
+        print(f"⚠️ [score] {path}: skipped {n_bad_lines} corrupted line(s) that failed to "
+              f"parse as JSON (file line(s) {shown}{more}) — scoring proceeds over the "
+              f"{len(records)} good record(s). If this count is more than a handful, treat "
+              f"it as a signal the artifact may be more broadly damaged and worth "
+              f"re-inferring rather than trusting outright.")
     if header is None:
         raise ValueError(f"Artifact {path} has no header line.")
     if footer:
