@@ -330,14 +330,23 @@ def _clip_token_stats(scorer, texts):
 # =============================================================================
 # PHASE 1 — inference
 # =============================================================================
-def phase_infer(args):
+def phase_infer(args, vlm=None):
     """
     Runs the ENTIRE inference half of the pipeline: load the dataset and the
-    taxonomy graph, create the VLM, run caption -> extraction -> labeling over
-    every image (src.vlm_pipeline.run_inference), and stream the results out to
+    taxonomy graph, create the VLM (unless one is already passed in — see
+    `vlm` below), run caption -> extraction -> labeling over every image
+    (src.vlm_pipeline.run_inference), and stream the results out to
     --responses_file as they're produced (rather than holding them all in
-    memory). Returns the created `vlm` object (unused by --stage all now, which
-    reclaims VRAM by exiting the infer subprocess — see main()).
+    memory). Returns the `vlm` object (unused by plain --stage all, which
+    reclaims VRAM by exiting the infer subprocess — see main() — but reused
+    across datasets by phase_infer_multi, which is the whole point of that
+    function: load the model ONCE, not once per dataset).
+
+    `vlm`: pass an already-constructed VLM (from a previous phase_infer call)
+    to skip loading the model again — used by phase_infer_multi to amortize
+    the (often minutes-long, GB-scale) model load across several datasets
+    instead of paying it per dataset. None (default) preserves the original
+    single-dataset behavior: build the VLM from `args` here.
     """
     print(f"🚀 [infer] dataset='{args.dataset}', model='{args.model_family}/{args.model_name}' "
           f"-> responses_file='{args.responses_file}'")
@@ -391,22 +400,27 @@ def phase_infer(args):
 
     # Every registered family is vLLM-served (see src/models/vlm_models.py's
     # MODEL_REGISTRY) — the HuggingFace-served BLIP family was removed.
-    vlm_kwargs = {"dtype": args.dtype, "gpu_memory_utilization": args.gpu_memory_utilization,
-                  "trust_remote_code": args.trust_remote_code,
-                  # 0 is the CLI's "disabled" spelling (argparse can't default
-                  # an int flag to None while still accepting a positive int);
-                  # VLLMBackedVLM.__init__ itself expects None for "disabled".
-                  "max_image_side": args.max_image_side or None,
-                  # Off by default — see VLLMBackedVLM.__init__ for why
-                  # (guided decoding + an already-open <think> block is a
-                  # broken combination, and the caption call has no grammar
-                  # to stop chain-of-thought leaking into the caption text).
-                  "enable_thinking": args.enable_thinking}
-    if args.max_model_len is not None:
-        vlm_kwargs["max_model_len"] = args.max_model_len
-    if args.max_num_seqs is not None:
-        vlm_kwargs["max_num_seqs"] = args.max_num_seqs
-    vlm = create_vlm(args.model_family, args.model_name, **vlm_kwargs)
+    # Skipped entirely when a `vlm` was already passed in (phase_infer_multi's
+    # whole point) — these are all engine-construction kwargs, meaningless
+    # once the engine already exists.
+    if vlm is None:
+        vlm_kwargs = {"dtype": args.dtype, "gpu_memory_utilization": args.gpu_memory_utilization,
+                      "trust_remote_code": args.trust_remote_code,
+                      "tensor_parallel_size": args.tensor_parallel_size,
+                      # 0 is the CLI's "disabled" spelling (argparse can't default
+                      # an int flag to None while still accepting a positive int);
+                      # VLLMBackedVLM.__init__ itself expects None for "disabled".
+                      "max_image_side": args.max_image_side or None,
+                      # Off by default — see VLLMBackedVLM.__init__ for why
+                      # (guided decoding + an already-open <think> block is a
+                      # broken combination, and the caption call has no grammar
+                      # to stop chain-of-thought leaking into the caption text).
+                      "enable_thinking": args.enable_thinking}
+        if args.max_model_len is not None:
+            vlm_kwargs["max_model_len"] = args.max_model_len
+        if args.max_num_seqs is not None:
+            vlm_kwargs["max_num_seqs"] = args.max_num_seqs
+        vlm = create_vlm(args.model_family, args.model_name, **vlm_kwargs)
 
     # The very first line written to the output file is a special "header"
     # record (distinguished by record_type="header") carrying metadata that
@@ -451,7 +465,12 @@ def phase_infer(args):
             print(f"✅ [infer] {out_path} already ends in a footer — this run "
                   f"is complete ({len(done)} images). Nothing to resume; "
                   f"delete the file or drop --resume to redo it.")
-            return
+            # Return the (possibly already-loaded) `vlm` unchanged, not None —
+            # phase_infer_multi chains this return value into the NEXT
+            # dataset's call so its shared VLM survives a dataset that turns
+            # out to be already-complete. A bare `return` here would silently
+            # force phase_infer_multi to reload the model on the next task.
+            return vlm
         before = len(dataset)
         dataset = [d for d in dataset if d["image_path"] not in done]
         resume_mode = True
@@ -464,7 +483,8 @@ def phase_infer(args):
             with open(out_path, "a") as f:
                 f.write(json.dumps({"record_type": "footer",
                                      "inference_time_seconds": None}) + "\n")
-            return
+            # See the has_footer branch above — must return `vlm`, not None.
+            return vlm
 
     loop_t0 = time.time()
     n = 0
@@ -508,6 +528,49 @@ def phase_infer(args):
     print(f"💾 [infer] wrote {n} image records to {out_path} in {time.time()-loop_t0:.1f}s "
           f"(total inference phase: {footer['inference_time_seconds']:.1f}s)")
     return vlm
+
+
+def phase_infer_multi(args):
+    """Runs phase_infer once per --dataset_task, loading the VLM ONE time and
+    reusing it across every task — the actual fix for "reload the model per
+    dataset", which is what a plain multi-job array (one job per (model,
+    dataset) pair) does today. Model weights are the expensive part of this
+    pipeline to load (minutes, GBs, for the 8-12B models this project runs);
+    reloading them once per dataset when the model itself never changes is
+    pure waste.
+
+    Each --dataset_task value is a JSON object of CLI-flag overrides (dest
+    names, i.e. underscores not dashes — e.g. {"dataset": "places365",
+    "data_dir": "...", "run_name": "...", "output_file": "...",
+    "batch_size": 64}) layered on top of this invocation's own `args` for
+    that one task. Only fields that can legitimately vary PER DATASET should
+    be overridden this way — dataset name/paths/run_name/output_file/
+    batch_size and the like. Engine-construction flags (dtype,
+    gpu_memory_utilization, tensor_parallel_size, max_model_len,
+    max_num_seqs, trust_remote_code, max_image_side, enable_thinking,
+    model_family, model_name) are baked into the VLM at the FIRST task and
+    silently ignored by any override in a later task, because the engine
+    already exists by then — those must be set once, in the shared/base
+    invocation, not per --dataset_task.
+    """
+    tasks = [json.loads(t) for t in args.dataset_task]
+    vlm = None
+    for i, overrides in enumerate(tasks):
+        task_args = argparse.Namespace(**vars(args))
+        for key, value in overrides.items():
+            if not hasattr(task_args, key):
+                raise ValueError(f"--dataset_task[{i}] has unknown field {key!r} "
+                                  f"(no such CLI flag dest on this parser)")
+            setattr(task_args, key, value)
+        # Each task's responses_file must be recomputed from ITS OWN
+        # run_name/output_file/dataset, not inherited from a previous task
+        # (or the base args) via the "already resolved, leave it alone" path
+        # in _resolve_responses_file.
+        task_args.responses_file = None
+        task_args = _resolve_responses_file(task_args)
+        print(f"=== [infer-multi] task {i + 1}/{len(tasks)}: dataset='{task_args.dataset}' "
+              f"({'reusing already-loaded VLM' if vlm is not None else 'loading VLM'}) ===")
+        vlm = phase_infer(task_args, vlm=vlm)
 
 
 # =============================================================================
@@ -1574,6 +1637,27 @@ def phase_score(args):
         _log_wandb(args, summary, run_clipmatch)
 
 
+def phase_score_multi(args):
+    """Runs phase_score once per --dataset_task — the scoring-side counterpart
+    to phase_infer_multi. Scoring doesn't hold a multi-GB model resident the
+    way inference does (CLIP is comparatively cheap to (re)load), so unlike
+    phase_infer_multi there's no shared, reused model here: this just saves
+    having to invoke the script once per dataset by hand when re-scoring a
+    batch of already-produced --dataset_task artifacts."""
+    tasks = [json.loads(t) for t in args.dataset_task]
+    for i, overrides in enumerate(tasks):
+        task_args = argparse.Namespace(**vars(args))
+        for key, value in overrides.items():
+            if not hasattr(task_args, key):
+                raise ValueError(f"--dataset_task[{i}] has unknown field {key!r} "
+                                  f"(no such CLI flag dest on this parser)")
+            setattr(task_args, key, value)
+        task_args.responses_file = None
+        task_args = _resolve_responses_file(task_args)
+        print(f"=== [score-multi] task {i + 1}/{len(tasks)}: dataset='{task_args.dataset}' ===")
+        phase_score(task_args)
+
+
 def _print_summary(s, run_clipmatch):
     """Pretty-print the final metrics summary to the console."""
     d = s["diagnostics"]
@@ -1739,8 +1823,35 @@ def build_arg_parser():
     # / "big5_weibo" restrict it to one. Since the results store and the
     # predictions CSV are keyed by dataset name, the per-platform names are
     # what keep Twitter and Weibo numbers separate rather than pooled.
-    p.add_argument("--dataset", required=True,
-                   choices=["coco", "imagenet", "places365", *BIG5_DATASETS])
+    p.add_argument("--dataset", required=False,
+                   choices=["coco", "imagenet", "places365", *BIG5_DATASETS],
+                   help="Required unless --dataset_task is used instead (see below).")
+    p.add_argument("--dataset_task", action="append", default=None,
+                   help="Repeatable. Each value is a JSON object of CLI-flag "
+                        "overrides (dest names, e.g. "
+                        '\'{"dataset": "places365", "data_dir": "...", '
+                        '"run_name": "...", "output_file": "...", '
+                        '"batch_size": 64}\') for ONE dataset run, layered on '
+                        "top of this invocation's own flags. When given, "
+                        "--dataset itself is not required and is ignored for "
+                        "the infer stage. Runs the listed datasets in "
+                        "sequence, loading the VLM ONCE and reusing it across "
+                        "all of them (phase_infer_multi) instead of reloading "
+                        "per dataset — the point being to charge a model's "
+                        "load cost once per SLURM job instead of once per "
+                        "(model, dataset) pair. Only fields that legitimately "
+                        "vary per dataset should be overridden this way "
+                        "(dataset/data_dir/paths/run_name/output_file/"
+                        "batch_size/...); engine-construction flags (dtype, "
+                        "gpu_memory_utilization, tensor_parallel_size, "
+                        "max_model_len, max_num_seqs, trust_remote_code, "
+                        "max_image_side, enable_thinking, model_family, "
+                        "model_name) are fixed at the first task's VLM load "
+                        "and any later override of them is silently ignored "
+                        "— set those once in the shared invocation instead. "
+                        "With --stage all, the score half still runs once per "
+                        "task as its own subprocess (CLIP reload is cheap "
+                        "relative to the VLM, so no need to keep it resident).")
     p.add_argument("--responses_file", type=str, default=None,
                    help="Intermediate artifact: written by infer, read by score. Default: "
                         f"'vlm_responses_<model_slug>.jsonl' inside --results_dir/--run_name/"
@@ -1820,6 +1931,10 @@ def build_arg_parser():
                         "SIMULTANEOUSLY, without lowering --batch_size (still submitted/queued "
                         "at full size) or --max_image_side (image quality untouched). Default "
                         "None leaves vLLM's own default (unset — no change from prior behavior).")
+    p.add_argument("--tensor_parallel_size", "--tensor-parallel-size", type=int, default=1,
+                   help="Passed straight to vLLM's own EngineArgs (LLM(tensor_parallel_size=...)) "
+                        "— shards the model across this many GPUs. Default 1 (single GPU, no "
+                        "change from prior behavior).")
     p.add_argument("--trust_remote_code", action="store_true")
     p.add_argument("--max_image_side", type=int, default=1024,
                    help="Downscale (preserving aspect ratio) any image whose longest side "
@@ -2013,6 +2128,17 @@ def parse_args():
         # argparse itself would produce.
         if not args.model_family or not args.model_name:
             p.error("--model_family and --model_name are required for the infer stage.")
+    # --dataset is normally required, but --dataset_task is the alternative
+    # multi-dataset entry point (phase_infer_multi) and supplies its own
+    # per-task "dataset" override instead — see --dataset_task's help.
+    if not args.dataset and not args.dataset_task:
+        p.error("--dataset is required (or use --dataset_task for a multi-dataset run).")
+    if args.dataset_task:
+        for i, t in enumerate(args.dataset_task):
+            try:
+                json.loads(t)
+            except json.JSONDecodeError as e:
+                p.error(f"--dataset_task[{i}] is not valid JSON: {e}")
     return args
 
 
@@ -2095,6 +2221,13 @@ def _args_to_cli(args, parser, stage=None):
                 argv.append(flag)
         elif value is None:
             continue
+        elif isinstance(action, argparse._AppendAction):
+            # e.g. --dataset_task: `value` is a list accumulated across
+            # however many times the flag was passed — re-emit the flag once
+            # per item rather than str()-ing the whole list into one
+            # (unparseable) argument.
+            for item in value:
+                argv.extend([flag, str(item)])
         else:
             argv.extend([flag, str(value)])
     return argv
@@ -2113,13 +2246,24 @@ def _run_stage_subprocess(args, parser, stage):
 
 def main():
     args = parse_args()
-    args = _resolve_responses_file(args)
+    # --dataset_task resolves its OWN --responses_file per task (each task has
+    # its own run_name/output_file/dataset) — resolving one here too would
+    # just create a stray, unused '<results_dir>/responses/' directory off a
+    # meaningless (task-less) run_name.
+    if not args.dataset_task:
+        args = _resolve_responses_file(args)
 
     if args.stage == "infer":
-        phase_infer(args)
+        if args.dataset_task:
+            phase_infer_multi(args)
+        else:
+            phase_infer(args)
         return
     if args.stage == "score":
-        phase_score(args)
+        if args.dataset_task:
+            phase_score_multi(args)
+        else:
+            phase_score(args)
         return
 
     # --stage all: run each half as its OWN separate OS subprocess (see the
@@ -2136,14 +2280,44 @@ def main():
         args.wandb_run_id = wandb.util.generate_id()
 
     parser = build_arg_parser()
+    # The infer subprocess sees --dataset_task itself (it's just another CLI
+    # flag reconstructed by _args_to_cli) and loops internally via
+    # phase_infer_multi, loading the VLM exactly once for every task in the
+    # list — that's the whole feature. It exits (freeing the VLM's VRAM)
+    # before any scoring starts, same as the plain single-dataset path.
     _run_stage_subprocess(args, parser, "infer")
-    _run_stage_subprocess(args, parser, "score")
 
-    # --responses_file is ALWAYS retained (never deleted here, under any
-    # --stage) — it carries every raw VLM response plus the resolved
-    # per-object labels, which the Grounding pipeline consumes downstream, so
-    # it's a first-class output of this run, not a disposable handoff.
-    print(f"💾 [all] retained inference artifact at {args.responses_file}")
+    if args.dataset_task:
+        # Scoring is still done per task, each its own subprocess — CLIP
+        # reload is cheap relative to the VLM, so there's no equivalent
+        # payoff to keeping a scorer resident across datasets, and per-task
+        # subprocess isolation matches the plain single-dataset --stage all
+        # behavior (never let two datasets' scoring state coexist).
+        retained_paths = []
+        for i, overrides in enumerate(json.loads(t) for t in args.dataset_task):
+            task_args = argparse.Namespace(**vars(args))
+            for key, value in overrides.items():
+                setattr(task_args, key, value)
+            task_args.dataset_task = None
+            task_args.responses_file = None
+            task_args = _resolve_responses_file(task_args)
+            _run_stage_subprocess(task_args, parser, "score")
+            retained_paths.append(task_args.responses_file)
+        # Each task has its own run_name/output_file, so (unlike the plain
+        # single-dataset path below) there's no single shared artifact path
+        # to report — list every task's, in the same order --dataset_task
+        # was given.
+        print("💾 [all] retained inference artifact(s):")
+        for path in retained_paths:
+            print(f"    {path}")
+    else:
+        _run_stage_subprocess(args, parser, "score")
+        # --responses_file is ALWAYS retained (never deleted here, under any
+        # --stage) — it carries every raw VLM response plus the resolved
+        # per-object labels, which the Grounding pipeline consumes
+        # downstream, so it's a first-class output of this run, not a
+        # disposable handoff.
+        print(f"💾 [all] retained inference artifact at {args.responses_file}")
 
 
 if __name__ == "__main__":
