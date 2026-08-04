@@ -462,6 +462,32 @@ def phase_infer(args, vlm=None):
         # has no header, one is reconstructed from THIS invocation's args and
         # prepended before anything else happens.
         resume_mode = False
+        # --- NUL-corruption guard, BEFORE any resume decision --------------
+        # Resuming onto a NUL-corrupted artifact would be the worst possible
+        # outcome: _already_inferred_paths skips the unparseable region, so
+        # resume would count only the surviving records, append the missing
+        # images after them, write a footer, and hand back a file that looks
+        # COMPLETE while still carrying the corrupt hole permanently in its
+        # middle — and every image whose record was inside that hole would be
+        # silently absent from scoring forever. Since a NUL can never appear
+        # in a legitimately-written artifact (see _count_null_bytes), treat
+        # its presence as "this file is not resumable", move it aside intact
+        # for forensics, and start clean.
+        if getattr(args, "resume", False) and out_path.exists():
+            n_nulls = _count_null_bytes(out_path)
+            if n_nulls:
+                size = out_path.stat().st_size
+                corrupt_path = out_path.with_name(
+                    out_path.name + f".corrupt-{datetime.now():%Y%m%dT%H%M%S}")
+                print(f"⛔ [infer] {out_path} contains {n_nulls:,} NUL bytes "
+                      f"({n_nulls / size:.0%} of {size / 1e6:.0f} MB) — this artifact was "
+                      f"damaged BELOW the application (nothing in this pipeline can write "
+                      f"a NUL). It is NOT resumable: resuming would bury the corrupt "
+                      f"region inside a file that then looks complete. Moving it to "
+                      f"{corrupt_path.name} and starting this dataset FRESH. Investigate "
+                      f"the storage before trusting this run — see "
+                      f"scripts/diagnose_artifact.py and scripts/test_storage_integrity.py.")
+                shutil.move(str(out_path), str(corrupt_path))
         if getattr(args, "resume", False) and out_path.exists():
             if not _artifact_has_header(out_path):
                 # NOTE the config caveat: this header is built from the CURRENT
@@ -719,6 +745,27 @@ class _ArtifactLock:
     def __exit__(self, *exc_info):
         self.release()
         return False
+
+
+def _count_null_bytes(path, chunk_size=8 << 20):
+    """How many NUL bytes the artifact contains, read in chunks so a 400 MB
+    ImageNet artifact isn't slurped into memory whole.
+
+    A JSON-Lines artifact written by this pipeline can NEVER legitimately
+    contain a raw NUL: json.dumps escapes one inside a string as the six
+    characters \\u0000, and nothing here writes binary. So a single NUL is
+    proof the file was damaged BELOW the application — confirmed in
+    production (2026-08-05): a places365 artifact was found at its full
+    170 MB with 97% of its interior replaced by one contiguous run of zeros,
+    its size still implying the ~21000 records the run's log said it wrote.
+    See scripts/diagnose_artifact.py for the full forensic breakdown."""
+    n = 0
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                return n
+            n += chunk.count(b"\x00")
 
 
 # =============================================================================
