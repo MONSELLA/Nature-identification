@@ -459,7 +459,19 @@ def phase_infer(args, vlm=None):
     # candidate_vocab/max_hops/prompt-variant this artifact was built with,
     # and rewriting it from the current args could silently mix two configs).
     resume_mode = False
-    if getattr(args, "resume", False) and out_path.exists():
+    if getattr(args, "resume", False) and out_path.exists() and not _artifact_has_header(out_path):
+        # A pre-existing file with no header at all — e.g. an empty stray
+        # file, or a run killed before its first write ever flushed — is not
+        # something we can safely append to (resume_mode never writes a
+        # header, so appending here would produce an artifact that
+        # _read_artifact can NEVER parse, discovered only after however long
+        # this run takes). Treat it as if it didn't exist: fall through to
+        # the fresh-run path below, which opens in "w" mode and always
+        # writes a header first.
+        print(f"⚠️ [infer] --resume requested but {out_path} exists with no header line "
+              f"(empty/corrupt/stray file) — ignoring it and starting a fresh run instead "
+              f"of appending, so the artifact always gets a header.")
+    elif getattr(args, "resume", False) and out_path.exists():
         done, has_footer, n_bad = _already_inferred_paths(out_path)
         if has_footer:
             print(f"✅ [infer] {out_path} already ends in a footer — this run "
@@ -613,6 +625,34 @@ def _already_inferred_paths(path):
             elif rt not in ("header", "footer") and obj.get("image_path"):
                 seen.add(obj["image_path"])
     return seen, has_footer, bad
+
+
+def _artifact_has_header(path):
+    """Whether `path` already contains a record_type="header" line. Used by
+    --resume to decide whether appending is actually safe — a pre-existing
+    file that exists but was never given a header (empty file from a stray
+    `touch`/mkdir, or a run killed before its first write flushed) would
+    otherwise silently accumulate image records with NO header ever written
+    (resume_mode skips the header write unconditionally), leaving an artifact
+    _read_artifact can never parse ("has no header line") after potentially
+    hours of re-inference. Lines are parsed defensively, same as
+    _already_inferred_paths, since a truncated tail line is expected on a
+    killed run and must not raise here."""
+    p = Path(path)
+    if not p.exists():
+        return False
+    with open(p) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if obj.get("record_type") == "header":
+                return True
+    return False
 
 
 def _read_artifact(path):
