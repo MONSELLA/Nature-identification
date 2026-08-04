@@ -17,7 +17,7 @@ and phase_score, RESPONSES_SUBDIR/PREDICTIONS_SUBDIR):
     <results_dir>/<run_name>/predictions/<stem>_<dataset>_<model>_predictions.csv
 
 Usage:
-    python scripts/audit_artifacts.py --results_dir /home/pmonserrat/code/results
+    python scripts/audit_artifacts.py --results_dir /home/pmonserrat/code/results/vlm_pipeline/baseline/imagenet/responses
     python scripts/audit_artifacts.py --results_dir results --json   # machine-readable
 """
 import argparse
