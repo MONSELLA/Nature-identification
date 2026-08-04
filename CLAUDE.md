@@ -193,10 +193,35 @@ evaluating the models.
   but whose mask never crossed `--mask_threshold` — `grounded: false`, not
   `null`), and `grounding_confirmation_rate_image`. The run summary/console/
   W&B also report a dataset-wide `confirmation_rate` (recap §9: agreement
-  with SAM3, an INDEPENDENT model, never ground truth).
+  with SAM3, an INDEPENDENT model, never ground truth). On COCO the CSV also
+  mirrors the per-image detection results — counts, per-image precision/
+  recall, and the actual `detection_matches` (GT class vs predicted entity,
+  both boxes, IoU, exact-match AND hierarchical verdicts), plus
+  `detection_false_positives` / `detection_excluded_predictions` /
+  `detection_missed_gt` — so a disagreement is reviewable without opening
+  the `.jsonl`.
 - SAM3 (`facebook/sam3`) via plain transformers AutoModel/AutoProcessor. Read
-  `outputs.semantic_seg` (concept-level pixel coverage), NOT the instance-level
-  `pred_masks`/`pred_boxes`/`pred_logits`.
+  `outputs.semantic_seg` (concept-level pixel coverage) for the relevance
+  score on EVERY dataset. The instance-level `pred_masks`/`pred_boxes`/
+  `pred_logits` are read ONLY for COCO's box-IoU evaluation (see below) —
+  never for the relevance score, which is about pixel coverage of a concept,
+  not how many instances of it there are.
+- INSTANCE GROUNDING (COCO only; `--instance_grounding auto|on|off`, auto =
+  on for COCO artifacts, read from the artifact's own header). Adds
+  `object_instances` — aligned index-for-index with `objects` like every other
+  parallel list — each `{object, prompt, is_nature, attempted, instances:[
+  {score, bbox, sam3_bbox, mask_rle, pixel_count}]}`. `attempted: false` is
+  the instance-side twin of `grounded: null` (SAM3 never ran for this entity).
+  `bbox` is the TIGHT box of the instance mask (`grounding_pipeline.mask_to_bbox`,
+  xyxy, far edge EXCLUSIVE so a 1px mask has area 1, not 0) — that is the box
+  the metrics score, because it is guaranteed consistent with the mask stored
+  beside it; `sam3_bbox` carries SAM3's own regressed box unchanged for
+  comparison. NOT a second forward pass: `semantic_seg` and the instance
+  tensors are fields of the SAME `Sam3ImageSegmentationOutput`
+  (`SAM3Grounder.segment_pairs_full`), so this costs post-processing only and
+  leaves `object_groundings` and both relevance scores bit-for-bit unchanged.
+  `--instance_score_threshold` (default 0.3, SAM3's own) gates instance
+  CONFIDENCE — a separate knob from `--mask_threshold`, which binarizes pixels.
 - `semantic_seg` is RAW LOGITS (unbounded), verified in the transformers source
   — sigmoid is required. Use `processor.post_process_semantic_segmentation(...)`,
   which does sigmoid → resize to original size → binarize at 0.5 (SAM3's own
@@ -442,8 +467,57 @@ evaluating the models.
   that axis's accuracy/precision/recall table instead of one.
 - **COCO**: image-level nature = OR over extracted objects; biotic/material
   scored on the matched GT object via lexical matching (`find_matching_object`).
-  Evaluated separately via the Grounding pipeline going forward — box-IoU
-  matching (Hungarian, IoU≥0.5) remains FUTURE WORK gated on that pipeline.
+
+## COCO box-IoU detection evaluation (`src/evaluation/detection_metrics.py`)
+IMPLEMENTED. Runs in `--stage score` when the artifact is COCO **and** was
+grounded with instance grounding; it runs ALONGSIDE the axis metrics above,
+never replacing them. Two summary dicts, deliberately never merged:
+`summary["detection"]` (localization) and `summary["detection_labels"]`
+(naming). Console + W&B (`Detection/*`, `DetectionLabels/*`) report both.
+- GT is per-INSTANCE (`load_coco` now stores `gt_boxes` alongside the
+  class-collapsed `targets`; `dataset_loader.coco_gt_boxes` back-fills them at
+  scoring time from `--instances_json` so pre-existing artifacts need NO
+  re-inference). Boxes are xyxy, converted from COCO's native xywh once, in
+  `_coco_box_xyxy`.
+- MATCHING IS CLASS-AGNOSTIC — Hungarian (not greedy), one-to-one, maximizing
+  total IoU, threshold `--detection_iou_threshold` (default 0.5). This is the
+  whole point: matching on class first (the standard detection protocol) would
+  discard every cow/bull pair as FP+FN before the hierarchical metrics could
+  see it. CONSEQUENCE: precision/recall/F1/AP here measure LOCALIZATION only;
+  the naming side is `detection_labels`. Do not describe them as "detection
+  accuracy" without that qualifier.
+- GT restricted to NATURE-mapped COCO classes, because only nature-labeled
+  entities are grounded — a `car` box could never be matched, so counting it
+  as a miss would measure the protocol, not the model.
+- UNMATCHED PREDICTION → false positive ONLY if its own phrase names a class
+  in that evaluated vocabulary; otherwise EXCLUDED and reported as
+  `excluded_predictions` (COCO annotates 80 curated classes, so a correctly
+  detected tree is not a hallucination). `build_coco_eval_vocab` MUST filter
+  to nature exactly as the box filter does — the two agreeing is what makes
+  the rule fair.
+- `iscrowd` regions: not detection targets, but still suppress FPs (IoA over
+  the PREDICTION's area ≥ 0.5, not IoU — a crowd box dwarfs any one
+  prediction). COCO's own convention.
+- NO TRUE NEGATIVES, so no accuracy is reported — unlike the axis metrics,
+  detection has no finite negative class. Don't add one.
+- AP@0.5 and AP@[.50:.95] (101-point interpolated, class-agnostic) over the
+  full COCO IoU ladder, re-matching at each rung off ONE cached IoU matrix.
+  Excluded/crowd-suppressed predictions are kept OUT of the AP ranking.
+- LABEL SCORING, per matched pair only: `exact_match` (same
+  `phrase_matches_terms`/`gt_match_terms` test the extraction-hit diagnostic
+  uses) AND hP/hR/hF1 + Wu-Palmer against the GT synset, so "bull" for "cow"
+  gets partial credit (~0.94 hF1) instead of a flat zero. Reported pooled
+  (resolution failures as 0.0) and `_resolved`-only, both mean ± population
+  std — same convention as the ImageNet/Places hierarchical block.
+- NO GT LEAKAGE: the predicted phrase resolves via
+  `taxonomy_metrics.resolve_phrase_to_wordnet(phrase, anchor_synset_id=None)`.
+  The anchor is deliberately withheld — the only one available is the GT class,
+  and steering sense disambiguation with it would inflate the very hP/hR it
+  feeds. (`resolve_to_wordnet`'s own anchored use is safe: there the anchor is
+  ClipMatch's PREDICTION, so a wrong anchor drags the score down.) Anchorless
+  falls back to most-frequent-sense, with WordNet INSTANCE synsets (proper
+  nouns) deprioritized — bare MFS resolves "crane" to Stephen Crane the
+  writer. That filter is GT-independent, so it introduces no leakage.
 - **Extraction-hit rate** (exact-match: was the GT object mentioned) is a
   REPORTING-ONLY diagnostic; it no longer gates or feeds the axis scores.
 
@@ -476,7 +550,11 @@ mapping-routed labeling → hybrid resolution → metrics: F-CLIPScore,
 Object-CLIPScore, per-axis acc/P/R/F1, ClipMatch + hP/hR on ImageNet/Places).
 Grounding pipeline is IMPLEMENTED end-to-end (SAM3 semantic segmentation of
 nature entities → RLE masks → nature relevance score), enriching the same
-artifact. Next: spot-check both pipelines on Qwen3.5-0.8B + a real SAM3 run
+artifact. COCO's box-IoU detection evaluation is IMPLEMENTED (SAM3 instance
+boxes vs COCO GT boxes, class-agnostic Hungarian matching, then exact-match +
+hierarchical label scoring on the matched pairs) — NOT yet run on real data:
+the numbers it produces are unvalidated until a real SAM3 COCO run exists.
+Next: spot-check both pipelines on Qwen3.5-0.8B + a real SAM3 run
 (confirm the semantic_seg range empirically with --debug_semantic_range and
 tune --max_pairs_per_forward to the GPU), hand off to Ramin for the BSC infra
 check, then the sequential ablations (recap §7).

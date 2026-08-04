@@ -10,6 +10,15 @@ numpy>=1.24
 pandas>=2.0
 openpyxl>=3.1          # engine pandas needs to read the .xlsx taxonomy workbook (pd.read_excel)
 scikit-learn>=1.3      # accuracy/precision/recall/F1, average_precision_score
+scipy>=1.10            # linear_sum_assignment — the Hungarian one-to-one box
+                       # assignment behind COCO's detection evaluation
+                       # (src/evaluation/detection_metrics.py). Already pulled in
+                       # transitively by scikit-learn, but listed explicitly
+                       # because this codebase now imports it directly. That
+                       # module degrades to a greedy matcher if it is missing
+                       # rather than crashing, so an absent scipy would show up
+                       # as slightly worse recall on crowded images, not an
+                       # error — which is exactly why it is pinned here.
 networkx>=3.0          # the WordNet taxonomy DAG (src/loaders/excel_loader.py)
 nltk>=3.8               # WordNet corpus access (synsets, hypernyms, wup_similarity)
 tqdm>=4.65              # progress bars in baseline/*.py specifically (the active VLM/Grounding

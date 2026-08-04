@@ -1,4 +1,4 @@
-BIG-5 VLM PIPELINE — DESIGN RECAP (v20)
+BIG-5 VLM PIPELINE — DESIGN RECAP (v21)
 (v4: the VLM pipeline is now IMPLEMENTED — this doc records both the original
 design rationale AND, in "IMPLEMENTED:" notes, how the shipped code actually
 does it where the two differ. v5: ClipMatch switched to the caption-based
@@ -105,7 +105,15 @@ load_big5 before it's used to build the glob pattern or the image path.
 Verified against a reproduction of the exact failure (CSV ids with a
 leading "'", real files on disk without it) plus the double-hyphen edge
 case ("--45DiodCcnzt0Xa") to confirm only the apostrophe is touched, not
-genuine leading hyphens. See Section 6.)
+genuine leading hyphens. See Section 6. v21: COCO's box-IoU detection
+evaluation — listed as FUTURE WORK in Section 8 since v1 and as an explicit
+TODO in run_vlm_pipeline.py — is now IMPLEMENTED, on SAM3's instance head
+rather than the Grounding DINO the original design assumed (that detector was
+dropped along with the whole thing/stuff split; SAM3 covers both). The design
+differs from the v1 sketch in one substantive way beyond the model swap:
+matching is CLASS-AGNOSTIC, because the point of the exercise is to score the
+predicted label hierarchically against the GT label, which a class-first
+protocol makes impossible. See Section 8g and RESOLVED IN v21.)
 
 ===============================================================
 0. IMPLEMENTATION STATUS (NEW in v4)
@@ -137,9 +145,10 @@ Key implemented shape (details in the sections below):
     for nature/biotic + VLM material of the best-matching object;
     COCO/BIG-5 use image-level nature (OR) + matched-object axes.
 
-STILL DESIGN-ONLY (not built): the Grounding pipeline (Section 9, and
-the COCO box-IoU matching noted in Section 8), and the ablations
-(Section 7).
+STALE AS WRITTEN — the Grounding pipeline IS built (src/grounding_pipeline.py,
+scripts/run_grounding_pipeline.py, scripts/run_pipeline.py), and so is the
+COCO box-IoU matching noted in Section 8 (v21 — Section 8g). Neither has been
+run at scale yet. STILL DESIGN-ONLY: the ablations (Section 7).
 
 ===============================================================
 1. TWO SEPARATE PIPELINES (KEY TERMINOLOGY)
@@ -692,6 +701,125 @@ f) Hierarchical Precision / Recall (hP/hR) + Wu-Palmer, per
        are then the ancestral-closure overlap of GT node vs. predicted
        node (compute_hierarchical_metrics).
 
+g) COCO BOX-IoU DETECTION EVALUATION (NEW in v21, IMPLEMENTED) —
+   src/evaluation/detection_metrics.py, driven from run_vlm_pipeline.py's
+   --stage score. COCO ONLY, and only on an artifact the Grounding pipeline
+   enriched with INSTANCE grounding. Runs ALONGSIDE the lexical axis metrics
+   in the IMPLEMENTED block below, never replacing them.
+
+   WHY THE INSTANCE HEAD. Everything else in the Grounding pipeline reads
+   SAM3's semantic_seg, which is concept-level: one mask for "cow", however
+   many cows. COCO's GT is instance-level (one box per annotated object), so
+   evaluating against it needs pred_masks/pred_boxes/pred_logits instead.
+   Every COCO target class is a "thing" (countable, boundable), which is what
+   makes the instance head appropriate there — the semantic head stays the
+   right one for the relevance score everywhere, COCO included. Both come off
+   the SAME forward pass, so this is a post-processing cost, not a second run.
+   Predicted boxes are the TIGHT box of each instance MASK, not SAM3's own
+   regressed pred_boxes — chosen so the scored box always agrees with the
+   mask stored beside it for review; pred_boxes is carried along as
+   "sam3_bbox" for comparison rather than discarded.
+
+   MATCHING IS CLASS-AGNOSTIC — the one substantive departure from the v1
+   design sketch, and the reason the whole thing is worth building. Standard
+   detection evaluation only pairs a prediction with a GT box when their
+   CLASSES already agree. Under that protocol a predicted "bull" against a GT
+   "cow" is counted as a false positive AND a false negative, and the pair
+   never reaches the label metrics at all — which throws away exactly the
+   granularity-mismatch case hP/hR exist to measure (see f, above, and the
+   Yu et al. fine-grained finding in the SOTA review). So assignment uses box
+   overlap only (Hungarian, one-to-one, maximizing total IoU, IoU >= 0.5 by
+   default), and the class comparison happens afterwards, on the pairs the
+   geometry produced. CONSEQUENCE TO STATE WHEN REPORTING: precision/recall/
+   F1/AP from this block measure LOCALIZATION alone. They are NOT "detected
+   the right thing" — that half is the label metrics, reported separately and
+   never merged into one number, for the same reason §9 keeps GT-recovery and
+   verified-extra-content separate.
+
+   Hungarian rather than the usual greedy highest-IoU-first loop: greedy can
+   strand a GT box whose only above-threshold partner was claimed by a
+   marginally better earlier pairing, understating recall on crowded images,
+   which COCO has many of.
+
+   WHAT IS SCORED AGAINST WHAT:
+     - GT is restricted to NATURE-mapped COCO classes, because the Grounding
+       pipeline only ever grounds nature-labeled entities. A "car" GT box
+       could not be matched by any pipeline behavior whatsoever, so counting
+       it as a false negative would measure the protocol, not the model.
+     - An UNMATCHED PREDICTION is a false positive only when its own phrase
+       names a class in that evaluated vocabulary; otherwise it is EXCLUDED —
+       counted and reported as excluded_predictions, but not charged against
+       precision. This is the v1 design's own rule ("COCO's 80 classes are a
+       curated subset, so an extra real object is not a hallucination"),
+       tightened: the original said exclude ALL unmatched predictions, which
+       would also excuse a genuinely hallucinated "dog" on a dog-free image.
+       The vocabulary tested against is the EVALUATED one (nature-mapped),
+       not all 80, and it must be filtered identically to the GT boxes — the
+       two agreeing is what makes the rule symmetric rather than a loophole.
+     - iscrowd regions are neither required to be detected nor charged as
+       false positives when a prediction lands inside one (COCO's own
+       convention). Suppression uses intersection over the PREDICTION's area,
+       not IoU — a crowd box dwarfs any single prediction, so IoU would stay
+       near zero even for a prediction sitting entirely inside it.
+     - NO TRUE NEGATIVES, therefore no accuracy. Detection has no finite
+       negative class to be correct about; the space of boxes not predicted
+       is unbounded. This is a deliberate departure from the axis metrics,
+       which do report accuracy because their negative class is real.
+     - AP@0.50 and AP@[.50:.95] (101-point interpolated, class-agnostic),
+       re-matching at each rung of COCO's IoU ladder off one cached IoU
+       matrix. Excluded and crowd-suppressed predictions are kept OUT of the
+       AP ranking — feeding them in as negatives would reimpose precisely the
+       penalty the exclusion rule removes.
+
+   LABEL SCORING (per matched pair only — naming quality is undefined where
+   nothing was localized): BOTH views, as this document has argued for
+   EM/Contains vs hP/hR throughout.
+     - EXACT MATCH, using the same surface-form test as the extraction-hit
+       diagnostic (class name or any WordNet lemma of its synset, whole
+       phrase or trailing head noun), so "named it correctly" means one thing
+       across the whole codebase.
+     - HIERARCHICAL: hP/hR/hF1 + Wu-Palmer between the GT synset and the
+       predicted phrase's synset. Measured: "bull" against a GT "cow" scores
+       hF1 ~0.94 and Wu-Palmer ~0.94, versus 0.27 against "airplane" — the
+       graded credit the exact-match view scores as flat zero. Reported
+       pooled (resolution failures counted as 0.0) and resolved-only, each
+       mean ± population std, matching the ImageNet/Places convention in f.
+
+   NO GT LEAKAGE — the part most easily got wrong. Resolving the predicted
+   phrase to a WordNet node needs word-sense disambiguation, and the one
+   anchor available here is the GT class of the box it was matched to. Using
+   it would resolve an ambiguous phrase toward whichever sense the GT happens
+   to be, inflating the very hP/hR it feeds. (Contrast resolve_to_wordnet's
+   own anchored use in f: there the anchor is ClipMatch's PREDICTION, so a
+   wrong anchor drags the score down, not up — which is why that one is
+   safe.) So the anchor is deliberately withheld
+   (resolve_phrase_to_wordnet(phrase, anchor_synset_id=None)) and senses fall
+   back to WordNet's most-frequent-sense ordering. ONE correction to bare MFS,
+   found while testing and worth recording because it would have been a silent
+   quality problem rather than a visible bug: WordNet's first two senses of
+   "crane" are the writers Stephen and Hart Crane, so an entity a segmenter
+   found in a photograph would have resolved to a dead American poet and been
+   scored against that branch of the tree. INSTANCE synsets (proper nouns,
+   identifiable by having instance_hypernyms) are therefore deprioritized on
+   the anchorless path — a GT-independent test, so still no leakage, and it
+   only reorders, never empties, so a genuine proper noun still resolves.
+
+   GT PLUMBING: load_coco now stores per-instance gt_boxes (xyxy, converted
+   once from COCO's native xywh) alongside the existing class-collapsed
+   targets — the two views answer different questions and neither replaces
+   the other. dataset_loader.coco_gt_boxes back-fills them at SCORING time
+   from --instances_json, keyed by file name, so an artifact produced before
+   this existed can be scored without paying for COCO-scale inference again.
+
+   NOT YET VALIDATED ON REAL DATA. The logic is covered by 82 checks over
+   synthetic boxes/records (geometry, Hungarian vs greedy, the crowd and
+   curated-vocabulary rules, AP edge cases, mask->bbox exclusivity, the
+   anchorless-resolution regressions, and the cow/bull case end to end), but
+   no real SAM3 COCO run has been scored with it. Treat the first real
+   numbers as a calibration exercise: --instance_score_threshold in
+   particular (SAM3's own 0.3 default) directly trades detection precision
+   against recall and has not been tuned on this data.
+
 Report BOTH EM/Contains (strict) and hP/hR (graded closeness) per
 dataset — they answer different questions; together they give a
 richer results table (exact-match rate + how far off misses were)
@@ -712,13 +840,17 @@ SPLIT BY DATASET TYPE:
   - COCO (multi-label) + BIG-5 (holistic scene): image-level nature =
     OR over extracted objects; biotic/material scored on the matched
     GT object (lexical class-name/synonym match).
-    FUTURE WORK (needs the Grounding pipeline): replace COCO's lexical
-    matching with Hungarian box-IoU assignment (IoU>=0.5) once
-    Grounding DINO 1.5 gives predicted boxes — matched GT boxes score
-    as usual; unmatched GT boxes penalized as wrong; unmatched
-    PREDICTED boxes EXCLUDED not penalized (COCO's 80 classes are a
-    curated subset, so an extra real object is not a hallucination).
-    A TODO to this effect is left in run_vlm_pipeline.py.
+    DONE IN v21 (this was the "FUTURE WORK (needs the Grounding pipeline)"
+    item, and the TODO that sat in run_vlm_pipeline.py): box-IoU assignment
+    now EXISTS — see Section 8g for the built design, which differs from the
+    sketch this paragraph used to contain in three ways worth noting. (1) The
+    boxes come from SAM3's instance head, not Grounding DINO 1.5 (dropped
+    with the thing/stuff split). (2) It does NOT replace the lexical matching
+    here; it runs alongside it, because lexical matching is all a VLM-only
+    COCO artifact can support and the two answer different questions.
+    (3) Matching is class-agnostic and the "unmatched predictions excluded"
+    rule is narrowed to predictions naming no evaluated class — the blanket
+    version would also excuse a genuinely hallucinated "dog".
   - "extraction-hit rate" (exact-match: was the GT object mentioned)
     is kept as a REPORTING-ONLY diagnostic; it no longer gates or
     feeds any axis score.
@@ -835,6 +967,34 @@ RESOLVED IN v6 (decided after repeated integration failures):
   clip_metrics.CLIPScorer's class docstring) were PROPOSED as
   replacements here, but neither was actually added to CLIP_PRESETS at
   the time — see RESOLVED IN v8 below for what's actually wired in.
+
+RESOLVED IN v21 (built per Pau's spec):
+- COCO can now be evaluated with BOTH pipelines together, which is what this
+  version is for. Full design + rationale in Section 8g; the decisions Pau
+  made explicitly, recorded here so they are not silently revisited:
+    (a) On COCO, SAM3 still grounds NATURE entities only — not every
+        extracted entity. The detection evaluation is therefore scoped to the
+        nature-mapped subset of COCO's 80 classes, which keeps it on-thesis
+        and costs nothing extra in SAM3 time.
+    (b) An unmatched predicted box is a false positive only if its class is
+        in COCO's (evaluated) vocabulary, and excluded otherwise — the middle
+        path between the recap's original blanket exclusion and plain
+        detection convention.
+    (c) Boxes are derived from each INSTANCE MASK, with SAM3's own pred_boxes
+        stored alongside for comparison rather than used directly.
+    (d) Instance results go in a NEW parallel artifact field
+        (object_instances); object_groundings, the semantic masks, and both
+        nature relevance scores are untouched, so BIG-5/ImageNet/Places runs
+        are unaffected and COCO's relevance score is still computed the same
+        way as every other dataset's.
+- Two things were flagged back and accepted rather than built as asked:
+  detection has NO true negatives (so TP/FP/FN + P/R/F1 + AP are reported and
+  accuracy is not — it is undefined here), and hierarchical resolution of the
+  predicted phrase must NOT be anchored on the GT synset (leakage). Both are
+  documented at the point of use, not just here.
+- NOT YET RUN ON REAL DATA — 82 synthetic checks pass, no real SAM3 COCO run
+  has been scored. --instance_score_threshold especially wants calibrating
+  against real output before any number from this block is reported.
 
 RESOLVED IN v18 (decided per Pau):
 - FIXED a real vision-encoder OOM that occurred on BIG-5 (Twitter) at

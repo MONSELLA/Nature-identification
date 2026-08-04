@@ -70,6 +70,7 @@ logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 
 from src.grounding_pipeline import (
     DEFAULT_CENTER_SIGMA,
+    DEFAULT_INSTANCE_SCORE_THRESHOLD,
     DEFAULT_MASK_THRESHOLD,
     SAM3_MODEL_ID,
     SAM3Grounder,
@@ -110,9 +111,23 @@ def phase_ground(args):
     if args.max_samples is not None:
         records = _take(records, args.max_samples)
 
+    # Instance grounding (SAM3's per-instance masks/boxes, on top of the
+    # concept-level semantic map) is what COCO's box-IoU evaluation needs and
+    # nothing else currently consumes — so "auto" turns it on for COCO
+    # artifacts and leaves every other dataset exactly as it was. Resolved
+    # from the artifact's OWN header rather than a CLI --dataset, so grounding
+    # can't disagree with the run it is enriching. It reads off the same
+    # forward pass (see SAM3Grounder.segment_pairs_full), so the cost is
+    # post-processing, not a second pass.
+    if args.instance_grounding == "auto":
+        instance_grounding = str(header.get("dataset", "")).lower() == "coco"
+    else:
+        instance_grounding = args.instance_grounding == "on"
+
     grounder = SAM3Grounder(
         model_name=args.sam3_model, device=args.device, dtype=args.dtype,
         mask_threshold=args.mask_threshold,
+        instance_score_threshold=args.instance_score_threshold,
         debug_semantic_range=args.debug_semantic_range,
         hf_token=args.hf_token,
     )
@@ -128,10 +143,15 @@ def phase_ground(args):
         "sam3_model": args.sam3_model,
         "mask_threshold": args.mask_threshold,
         "center_sigma": args.center_sigma,
+        "instance_grounding": instance_grounding,
+        # Only meaningful when instance_grounding is on, but recorded either
+        # way so two artifacts are always comparable field-for-field.
+        "instance_score_threshold": args.instance_score_threshold,
         "source_artifact": str(in_path),
     }
 
-    counts = {"objects_total": 0, "nature_entities": 0, "grounded_entities": 0}
+    counts = {"objects_total": 0, "nature_entities": 0, "grounded_entities": 0,
+              "instances_total": 0}
     n_images = 0
     out_path.parent.mkdir(parents=True, exist_ok=True)
     # Write to a temporary sibling first and move it into place at the end, so a
@@ -145,6 +165,7 @@ def phase_ground(args):
             batch_size=args.batch_size,
             max_pairs_per_forward=args.max_pairs_per_forward,
             center_sigma=args.center_sigma,
+            instance_grounding=instance_grounding,
             n_total=args.max_samples,
             verbose=args.verbose,
         ):
@@ -153,6 +174,8 @@ def phase_ground(args):
             counts["objects_total"] += len(groundings)
             counts["nature_entities"] += sum(1 for g in groundings if g["is_nature"])
             counts["grounded_entities"] += sum(1 for g in groundings if g["grounded"])
+            counts["instances_total"] += sum(len(e["instances"])
+                                             for e in rec.get("object_instances", []))
             rec["record_type"] = "image"
             f.write(json.dumps(rec) + "\n")
 
@@ -194,6 +217,11 @@ def _print_summary(args, header, d, elapsed, out_path):
     # AGREEMENT WITH AN INDEPENDENT MODEL, not ground truth).
     print(f"Grounding-confirmation rate: {d['grounding_confirmation_rate']:.1%} "
           f"({d['grounded_entities']}/{d['nature_entities']} nature entities confirmed)")
+    if header.get("grounding", {}).get("instance_grounding"):
+        print(f"Instances (SAM3 instance head, score > {args.instance_score_threshold}): "
+              f"{d['instances_total']} "
+              f"({d['instances_per_grounded_entity']:.2f} per grounded entity) — "
+              f"scored against COCO GT boxes by run_vlm_pipeline.py --stage score")
     print(f"Elapsed (D-HH:MM:SS): {format_duration(elapsed)}")
     print(f"💾 wrote {out_path}")
     print("=" * 60)
@@ -291,6 +319,22 @@ def build_arg_parser():
                         f"{DEFAULT_MASK_THRESHOLD}, the model's own stated default). "
                         "semantic_seg is raw LOGITS; the sigmoid is applied before this "
                         "threshold — see src/grounding_pipeline.py's module docstring.")
+    p.add_argument("--instance_grounding", type=str, default="auto",
+                   choices=["auto", "on", "off"],
+                   help="Also read SAM3's INSTANCE head (per-instance masks + boxes) "
+                        "into 'object_instances', which is what COCO's box-IoU "
+                        "detection evaluation scores against. 'auto' (default) turns "
+                        "it on only for COCO artifacts, read from the artifact's own "
+                        "header. It comes off the SAME forward pass as the semantic "
+                        "map, so it costs post-processing only — no second pass — and "
+                        "leaves object_groundings and both relevance scores unchanged.")
+    p.add_argument("--instance_score_threshold", type=float,
+                   default=DEFAULT_INSTANCE_SCORE_THRESHOLD,
+                   help="Confidence gate for SAM3's instance head (SAM3's own default: "
+                        f"{DEFAULT_INSTANCE_SCORE_THRESHOLD}). Distinct from "
+                        "--mask_threshold, which binarizes PIXELS; this one decides "
+                        "which instance queries count as detections at all. Lower it "
+                        "to trade detection precision for recall.")
     p.add_argument("--debug_semantic_range", action="store_true",
                    help="Print the RAW (pre-sigmoid) semantic_seg min/max for the first two "
                         "forward passes, to re-confirm on real data that the map is "

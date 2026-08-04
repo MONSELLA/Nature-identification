@@ -109,9 +109,10 @@ import numpy as np
 # needed. (Setting HF_TOKEN is the real fix and also lifts rate limits.)
 logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 
-from src.evaluation import taxonomy_metrics
+from src.evaluation import detection_metrics, taxonomy_metrics
 from src.loaders.excel_loader import TaxonomyGraph
-from src.loaders.dataset_loader import load_dataset, get_candidate_vocab, BIG5_DATASETS
+from src.loaders.dataset_loader import (load_dataset, get_candidate_vocab, coco_gt_boxes,
+                                        BIG5_DATASETS)
 from src.models.prompts import build_system_prompts
 from src.models.vlm_models import MODEL_REGISTRY, create_vlm
 from src.vlm_pipeline import run_inference, resolve_hybrid_label, _normalize_object
@@ -177,6 +178,22 @@ def gt_match_terms(target):
     return {t for t in terms if t}
 
 
+def phrase_matches_terms(phrase, terms):
+    """True if an extracted object phrase names one of `terms` (a normalized
+    surface-form set, e.g. from `gt_match_terms`).
+
+    Matches the whole normalized phrase, or just its TRAILING word — so
+    extracted "big dog" matches the GT term "dog". Factored out of
+    `find_matching_object` so the detection evaluation's label comparison
+    applies the exact same notion of "names the same thing" that the axis
+    metrics already do, instead of quietly inventing a second one.
+    """
+    norm = _normalize_object(phrase)
+    if norm in terms:
+        return True
+    return " " in norm and norm.split()[-1] in terms
+
+
 def find_matching_object(objects, target):
     """Return the index of the first extracted object matching the GT target
     (by normalized class-name / synonym, full phrase or trailing head noun), or
@@ -185,16 +202,270 @@ def find_matching_object(objects, target):
     if not terms:
         return None
     for i, obj in enumerate(objects):
-        norm = _normalize_object(obj)
-        if norm in terms:
-            return i
-        # Also accept a match on just the LAST word of a multi-word extracted
-        # phrase, e.g. extracted "brown golden retriever" matching GT term
-        # "golden retriever"... actually the reverse: extracted "big dog"
-        # matching GT term "dog" via its trailing word.
-        if " " in norm and norm.split()[-1] in terms:
+        if phrase_matches_terms(obj, terms):
             return i
     return None
+
+
+# =============================================================================
+# COCO box-IoU detection evaluation (Grounding pipeline; recap §8/§9)
+# =============================================================================
+def build_coco_eval_vocab(gt_boxes_by_image):
+    """Surface-form lookup for the COCO classes this run actually evaluates:
+    `{normalized_term: class_name}`.
+
+    Built from the GT boxes that survive filtering (see
+    `coco_detection_gt_boxes`), so it is the NATURE-mapped subset of COCO's 80
+    rather than all of them — which is the vocabulary the curated-vocabulary
+    false-positive rule must test against (see
+    detection_metrics.classify_unmatched_prediction for why).
+
+    Terms come from `gt_match_terms`, i.e. each class's COCO name plus every
+    WordNet lemma of its synset, so a predicted "sofa" is recognized as naming
+    COCO's "couch" class.
+    """
+    vocab = {}
+    for boxes in gt_boxes_by_image.values():
+        for box in boxes or []:
+            # Filtered to nature exactly as `coco_detection_gt_boxes` filters
+            # the boxes themselves — the two MUST agree. A non-nature class
+            # left in here would make an unmatched "car" prediction a false
+            # positive while no car box was ever a detection target, which is
+            # the precise unfairness the exclusion rule exists to prevent.
+            if box.get("gt_nature") is not True:
+                continue
+            for term in gt_match_terms(box):
+                vocab.setdefault(term, box["class_name"])
+    return vocab
+
+
+def coco_detection_gt_boxes(rec, gt_boxes_by_file):
+    """The GT boxes this image is evaluated against, or None if it has none.
+
+    Two sources, in order: the record's own `gt_boxes` (written by
+    dataset_loader.load_coco through the artifact), falling back to
+    `gt_boxes_by_file` — a backfill keyed by image FILE NAME, loaded straight
+    from --instances_json at scoring time. The fallback is what lets an
+    artifact produced BEFORE per-instance boxes existed be scored without
+    re-running inference, which at COCO's scale is the difference between a
+    re-score and a re-run.
+
+    Filtered to NATURE-mapped classes, because only nature-labeled entities are
+    grounded (src/grounding_pipeline.py) — a GT car box could never be matched
+    no matter how good the pipeline was, so counting it as a false negative
+    would measure the protocol, not the model. Crowd boxes are split out
+    rather than dropped: they are not detection targets, but they still
+    suppress false positives (COCO's own convention).
+
+    Returns `(targets, crowd_boxes)`.
+    """
+    boxes = rec.get("gt_boxes")
+    if boxes is None and gt_boxes_by_file is not None:
+        boxes = gt_boxes_by_file.get(os.path.basename(rec["image_path"]))
+    if not boxes:
+        return None, []
+    nature = [b for b in boxes if b.get("gt_nature") is True]
+    return ([b for b in nature if not b.get("iscrowd")],
+            [b["bbox"] for b in nature if b.get("iscrowd")])
+
+
+def collect_predicted_boxes(rec):
+    """Flatten this image's `object_instances` into one list of predicted-box
+    dicts: `{"bbox", "score", "object", "object_idx", "mask_pixel_count"}`.
+
+    Every instance carries the phrase of the ENTITY it came from — that phrase
+    is the "predicted label" the label metrics score, so it has to survive the
+    flattening. Returns [] when the artifact has no instance grounding (i.e.
+    the Grounding pipeline ran without --instance_grounding, or never ran).
+    """
+    out = []
+    for oi, entry in enumerate(rec.get("object_instances") or []):
+        for inst in entry.get("instances", []):
+            out.append({
+                "bbox": inst["bbox"],
+                "score": float(inst.get("score", 0.0)),
+                "object": entry["object"],
+                "object_idx": oi,
+                "mask_pixel_count": inst.get("pixel_count", 0),
+            })
+    return out
+
+
+def score_label_agreement(phrase, gt_box, graph):
+    """Compare a matched pair's PREDICTED entity phrase against the GT box's
+    class, both strictly and hierarchically.
+
+    Returns `{"exact_match", "pred_synset", "resolved", "hp", "hr", "hf1", "wup"}`.
+
+    EXACT MATCH uses the same surface-form test as the extraction-hit
+    diagnostic (`phrase_matches_terms` over `gt_match_terms`), so "correct
+    name" means the same thing everywhere in this codebase.
+
+    HIERARCHICAL resolves the phrase to a WordNet node and scores ancestral-
+    closure overlap with the GT synset — this is what gives a predicted "bull"
+    against a GT "cow" the partial credit an exact-match check scores as flat
+    zero. The resolution deliberately passes NO anchor synset: the only one
+    available here is the GT class itself, and steering sense disambiguation
+    with it would be leakage that inflates the very number it feeds (see
+    taxonomy_metrics.resolve_phrase_to_wordnet).
+
+    A phrase that resolves to nothing scores 0.0 across the hierarchical keys
+    and is flagged `resolved: False`, so the aggregate can report both the
+    "failures as error" and "resolved only" views (detection_metrics.label_summary).
+    """
+    terms = gt_match_terms(gt_box)
+    exact = phrase_matches_terms(phrase, terms) if terms else False
+    gt_synset = gt_box.get("synset_id")
+    pred_synset = taxonomy_metrics.resolve_phrase_to_wordnet(phrase, anchor_synset_id=None)
+
+    if pred_synset is None or not gt_synset:
+        return {"exact_match": exact, "pred_synset": pred_synset, "resolved": False,
+                "hp": 0.0, "hr": 0.0, "hf1": 0.0, "wup": 0.0}
+
+    perfect = pred_synset == gt_synset
+    hier = taxonomy_metrics.compute_hierarchical_metrics(
+        graph, gt_synset, pred_synset, perfect_match=perfect)
+    wup = taxonomy_metrics.compute_wup_similarity(gt_synset, pred_synset, perfect_match=perfect)
+    return {"exact_match": exact, "pred_synset": pred_synset, "resolved": True,
+            "hp": hier["hp"], "hr": hier["hr"], "hf1": hier["hf1"], "wup": wup}
+
+
+def score_image_detection(rec, gt_boxes_by_file, eval_vocab_terms, graph, iou_threshold):
+    """Full detection + label evaluation for ONE image.
+
+    Returns None when the image has nothing to evaluate (no nature GT boxes),
+    so it is skipped entirely rather than scored as an all-miss.
+
+    The order of operations is the whole design (see
+    src/evaluation/detection_metrics.py's docstring): assign boxes by IoU
+    CLASS-AGNOSTICALLY first, then compare labels on the pairs that assignment
+    produced. Doing it the other way round — the standard per-class detection
+    protocol — would throw away every cow/bull pair before the hierarchical
+    metrics could see it.
+    """
+    gt_targets, crowd_boxes = coco_detection_gt_boxes(rec, gt_boxes_by_file)
+    if not gt_targets:
+        return None
+
+    preds = collect_predicted_boxes(rec)
+    gt_bboxes = [t["bbox"] for t in gt_targets]
+    pred_bboxes = [p["bbox"] for p in preds]
+    # Computed ONCE and reused by the headline threshold and every rung of the
+    # AP ladder below — the geometry is the same, only the cut-off changes.
+    ious = detection_metrics.iou_matrix(gt_bboxes, pred_bboxes)
+    matches, unmatched_gt, unmatched_pred = detection_metrics.match_boxes(
+        gt_bboxes, pred_bboxes, iou_threshold=iou_threshold, ious=ious)
+
+    pair_rows, label_records = [], []
+    for gi, pi, iou in matches:
+        agreement = score_label_agreement(preds[pi]["object"], gt_targets[gi], graph)
+        label_records.append(agreement)
+        pair_rows.append({
+            "gt_class": gt_targets[gi]["class_name"],
+            "gt_synset": gt_targets[gi].get("synset_id"),
+            "gt_bbox": gt_targets[gi]["bbox"],
+            "pred_object": preds[pi]["object"],
+            "pred_bbox": preds[pi]["bbox"],
+            "pred_score": preds[pi]["score"],
+            "iou": iou,
+            **agreement,
+        })
+
+    # Unmatched predictions: false positive only if the entity names a class in
+    # the evaluated vocabulary, and not already explained by a crowd region.
+    fp_rows, excluded_rows = [], []
+    # Matched predictions are true positives, so they enter the AP ranking
+    # already flagged as counted before the unmatched ones are classified.
+    counted_flag = [False] * len(preds)
+    for _, pi, _ in matches:
+        counted_flag[pi] = True
+    n_fp, n_excluded, n_crowd, is_fp_flag, counted_flag = _classify_unmatched(
+        preds, unmatched_pred, crowd_boxes, eval_vocab_terms, fp_rows, excluded_rows,
+        counted_flag=counted_flag)
+
+    # AP ladder: re-match the SAME boxes at each of COCO's ten IoU thresholds
+    # (a pair clearing 0.5 need not clear 0.75, so each rung needs its own
+    # assignment) and record (score, is_tp) for every prediction that counts.
+    ap_records = {}
+    for t in detection_metrics.COCO_AP_IOU_THRESHOLDS:
+        if t == iou_threshold:
+            t_fp_flag, t_counted, t_unmatched = is_fp_flag, counted_flag, unmatched_pred
+            t_matches = matches
+        else:
+            t_matches, _, t_unmatched = detection_metrics.match_boxes(
+                gt_bboxes, pred_bboxes, iou_threshold=t, ious=ious)
+            t_counted = [False] * len(preds)
+            for _, pi, _ in t_matches:
+                t_counted[pi] = True
+            _, _, _, t_fp_flag, t_counted = _classify_unmatched(
+                preds, t_unmatched, crowd_boxes, eval_vocab_terms, None, None,
+                counted_flag=t_counted)
+        ap_records[t] = [(preds[pi]["score"], not t_fp_flag[pi])
+                         for pi in range(len(preds)) if t_counted[pi]]
+
+    return {
+        "n_gt": len(gt_targets), "n_pred": len(preds),
+        "tp": len(matches), "fp": n_fp, "fn": len(unmatched_gt),
+        "excluded_pred": n_excluded, "crowd_suppressed": n_crowd,
+        "pairs": pair_rows, "false_positives": fp_rows, "excluded": excluded_rows,
+        "missed_gt": [{"gt_class": gt_targets[i]["class_name"],
+                       "gt_bbox": gt_targets[i]["bbox"]} for i in unmatched_gt],
+        "label_records": label_records,
+        # {iou_threshold: [(score, is_tp), ...]} for every prediction that
+        # COUNTS toward AP. Excluded and crowd-suppressed predictions are left
+        # out on purpose — feeding them in as negatives would reimpose exactly
+        # the penalty the curated-vocabulary rule removes.
+        "ap_records": ap_records,
+        "preds": preds, "gt_targets": gt_targets, "crowd_boxes": crowd_boxes,
+    }
+
+
+def _classify_unmatched(preds, unmatched_pred, crowd_boxes, eval_vocab_terms,
+                        fp_rows, excluded_rows, is_fp_flag=None, counted_flag=None):
+    """Apply the crowd-suppression and curated-vocabulary rules to a set of
+    unmatched predictions.
+
+    Returns `(n_fp, n_excluded, n_crowd, is_fp_flag, counted_flag)`. `fp_rows`
+    / `excluded_rows` collect the per-prediction detail for the CSV and may be
+    None when the caller only needs the counters (the AP sweep re-runs this
+    at ten thresholds and wants no duplicated detail rows).
+    """
+    if is_fp_flag is None:
+        is_fp_flag = [False] * len(preds)
+    if counted_flag is None:
+        counted_flag = [False] * len(preds)
+    n_fp = n_excluded = n_crowd = 0
+    for pi in unmatched_pred:
+        if detection_metrics.crowd_suppressed(preds[pi]["bbox"], crowd_boxes):
+            n_crowd += 1
+            continue
+        named = detection_metrics.classify_unmatched_prediction(
+            _pred_label_terms(preds[pi]["object"]), eval_vocab_terms)
+        if named is None:
+            n_excluded += 1
+            if excluded_rows is not None:
+                excluded_rows.append({"pred_object": preds[pi]["object"],
+                                      "pred_bbox": preds[pi]["bbox"],
+                                      "pred_score": preds[pi]["score"]})
+            continue
+        n_fp += 1
+        is_fp_flag[pi] = True
+        counted_flag[pi] = True
+        if fp_rows is not None:
+            fp_rows.append({"pred_object": preds[pi]["object"], "named_class": named,
+                            "pred_bbox": preds[pi]["bbox"], "pred_score": preds[pi]["score"]})
+    return n_fp, n_excluded, n_crowd, is_fp_flag, counted_flag
+
+
+def _pred_label_terms(phrase):
+    """Normalized surface forms for a predicted entity phrase — the phrase
+    itself plus its trailing head noun ("brown cow" -> {"brown cow", "cow"}),
+    the same two forms `phrase_matches_terms` tests in the other direction."""
+    norm = _normalize_object(phrase)
+    terms = {norm}
+    if " " in norm:
+        terms.add(norm.split()[-1])
+    return {t for t in terms if t}
 
 
 def _fmt_big5_axis_cell(vals):
@@ -895,6 +1166,52 @@ def phase_score(args):
     # independent model", never a ground-truth signal).
     run_grounding = bool(header.get("grounding"))
     n_grounding_attempted = n_grounding_confirmed = 0
+    # --- COCO box-IoU detection evaluation (Grounding pipeline) ---
+    # Runs only when the artifact is COCO AND the Grounding pipeline recorded
+    # instance grounding, since it is SAM3's instance boxes that get matched
+    # against COCO's GT boxes. A COCO artifact grounded semantically only
+    # (or not grounded at all) scores exactly as it did before — every other
+    # COCO metric is untouched by this block.
+    run_detection = (dataset == "coco"
+                     and bool(header.get("grounding", {}).get("instance_grounding")))
+    det_counts = {"tp": 0, "fp": 0, "fn": 0, "excluded_pred": 0, "crowd_suppressed": 0,
+                  "n_gt_boxes": 0, "n_pred_boxes": 0,
+                  "iou_threshold": args.detection_iou_threshold,
+                  # AP is swept over COCO's own IoU ladder. Each threshold needs
+                  # its OWN matching pass (a pair that clears 0.5 need not clear
+                  # 0.75), so the per-threshold (score, is_tp) lists are
+                  # accumulated separately from the headline counters above.
+                  "ap_records": {t: [] for t in detection_metrics.COCO_AP_IOU_THRESHOLDS}}
+    det_label_records = []
+    det_gt_boxes_by_file = None
+    det_eval_vocab = {}
+    if run_detection:
+        # Backfill: artifacts written before load_coco carried per-instance
+        # boxes have no "gt_boxes" on their records. Loading them here from
+        # --instances_json makes those artifacts scoreable without paying for
+        # inference again (see coco_detection_gt_boxes).
+        needs_backfill = not any(r.get("gt_boxes") for r in records)
+        if needs_backfill:
+            if not args.instances_json:
+                print("⚠️  COCO detection evaluation needs GT boxes, but this artifact "
+                      "predates them and --instances_json was not given — skipping the "
+                      "detection metrics. Re-run --stage score with --instances_json "
+                      "pointing at the same annotations file used for inference.")
+                run_detection = False
+            else:
+                print(f"📦 [score] artifact has no per-instance GT boxes — backfilling "
+                      f"from {args.instances_json}")
+                det_gt_boxes_by_file = coco_gt_boxes(args.instances_json, graph)
+    if run_detection:
+        # The evaluated vocabulary (nature-mapped COCO classes) has to be built
+        # from ALL images' GT, not per image — an unmatched "dog" prediction on
+        # a beach photo still names a COCO class even though that photo has no
+        # dog box.
+        if det_gt_boxes_by_file is not None:
+            det_eval_vocab = build_coco_eval_vocab(det_gt_boxes_by_file)
+        else:
+            det_eval_vocab = build_coco_eval_vocab(
+                {r["image_path"]: r.get("gt_boxes") or [] for r in records})
     clipmatch_top1 = 0
     clipmatch_support = 0
     flat_rows = []  # one row per stored IMAGE for the output CSV (see below)
@@ -1205,14 +1522,14 @@ def phase_score(args):
         else:
             # --- COCO (multi-label): image-level nature OR + matched-object
             #     biotic/material, via lexical GT matching (find_matching_object) ---
-            # TODO(grounding-pipeline, recap §6.4): replace this lexical
-            # matching with Hungarian box-IoU assignment (IoU>=0.5) once
-            # Grounding DINO 1.5 provides predicted boxes — matched GT boxes
-            # score bio/material/nature as usual; unmatched GT boxes are
-            # penalized as wrong; unmatched PREDICTED boxes are excluded, NOT
-            # penalized (COCO's 80 classes are a curated subset, so an extra
-            # real object is not a hallucination). Not implementable until the
-            # Grounding pipeline exists.
+            # The box-IoU detection evaluation the old TODO here asked for now
+            # EXISTS (score_image_detection, below) and runs alongside this
+            # block rather than replacing it: it needs SAM3 instance boxes, so
+            # it is only available on a grounded artifact, while these
+            # lexically-matched axis scores are what a VLM-only COCO run can
+            # still report. The two answer different questions — "is the label
+            # right for the classes present" vs "did a box land on the object"
+            # — and are reported separately, never merged.
             g_nat = image_gt_nature(targets)
             if g_nat is not None:
                 image_gt_nature_val = bool(g_nat)
@@ -1249,6 +1566,24 @@ def phase_score(args):
                     mat_pred.append(pred_m)
                     match_info["gt_material"], match_info["pred_material"] = gt_m, pred_m
                 target_matches.append(match_info)
+
+        # --- COCO box-IoU detection evaluation (grounded artifacts only) ---
+        # Deliberately OUTSIDE the single_label/BIG-5/COCO if-chain above: it
+        # is an additional, independent evaluation of the same image, not an
+        # alternative to the axis scoring, and it is the only place SAM3's
+        # instance boxes are used.
+        det = None
+        if run_detection:
+            det = score_image_detection(rec, det_gt_boxes_by_file, det_eval_vocab,
+                                        graph, args.detection_iou_threshold)
+        if det is not None:
+            for key in ("tp", "fp", "fn", "excluded_pred", "crowd_suppressed"):
+                det_counts[key] += det[key]
+            det_counts["n_gt_boxes"] += det["n_gt"]
+            det_counts["n_pred_boxes"] += det["n_pred"]
+            for t, recs in det["ap_records"].items():
+                det_counts["ap_records"][t].extend(recs)
+            det_label_records.extend(det["label_records"])
 
         # One CSV row PER IMAGE (not per object) — everything needed to
         # spot-check a single image's whole prediction lives on one line:
@@ -1346,6 +1681,40 @@ def phase_score(args):
             "grounding_confirmed_image": image_n_confirmed,
             "grounding_confirmation_rate_image": (image_n_confirmed / image_n_attempted)
                                                   if image_n_attempted else None,
+            # --- COCO box-IoU detection (blank on every other dataset, and on
+            # a COCO artifact without instance grounding). Per the project's
+            # "the predictions CSV alone must be enough to spot-check a run"
+            # rule, this carries not just the counts but the actual matched
+            # pairs — GT class vs predicted entity, both boxes, the IoU, and
+            # both the exact-match and hierarchical verdicts — plus the boxes
+            # that missed in either direction, so a disagreement can be
+            # understood without opening the .jsonl.
+            "detection_n_gt_boxes_image": det["n_gt"] if det else None,
+            "detection_n_pred_boxes_image": det["n_pred"] if det else None,
+            "detection_tp_image": det["tp"] if det else None,
+            "detection_fp_image": det["fp"] if det else None,
+            "detection_fn_image": det["fn"] if det else None,
+            "detection_excluded_pred_image": det["excluded_pred"] if det else None,
+            "detection_crowd_suppressed_image": det["crowd_suppressed"] if det else None,
+            "detection_precision_image": (det["tp"] / (det["tp"] + det["fp"]))
+                                          if det and (det["tp"] + det["fp"]) else None,
+            "detection_recall_image": (det["tp"] / (det["tp"] + det["fn"]))
+                                       if det and (det["tp"] + det["fn"]) else None,
+            "detection_matches": json.dumps(det["pairs"]) if det else None,
+            "detection_false_positives": json.dumps(det["false_positives"]) if det else None,
+            "detection_excluded_predictions": json.dumps(det["excluded"]) if det else None,
+            "detection_missed_gt": json.dumps(det["missed_gt"]) if det else None,
+            # Label quality over THIS image's matched pairs — the two views
+            # side by side, which is the whole point of scoring both: a row
+            # where exact-match is 0 but hF1 is high is a naming miss on the
+            # right kind of thing ("bull" for "cow"), not a detection failure.
+            "detection_exact_match_rate_image": (
+                float(np.mean([p["exact_match"] for p in det["pairs"]]))
+                if det and det["pairs"] else None),
+            "detection_hf1_image": (float(np.mean([p["hf1"] for p in det["pairs"]]))
+                                    if det and det["pairs"] else None),
+            "detection_wup_image": (float(np.mean([p["wup"] for p in det["pairs"]]))
+                                    if det and det["pairs"] else None),
             "wordnet_mapping_rate_image": (image_n_map_nature / (image_n_map_nature + image_n_vlm_nature))
                                            if (image_n_map_nature + image_n_vlm_nature) else None,
             "parse_failure_count_image": image_n_parse_fail,
@@ -1484,8 +1853,10 @@ def phase_score(args):
                               "has_abiotic when GT=abiotic, symmetrically for material) — an image "
                               "can contain both a biotic AND an abiotic entity and still score "
                               "correctly against a GT of just one of them. coco: image-level nature "
-                              "(OR) + matched-object biotic/material via lexical GT matching (box-IoU "
-                              "is future work, recap §6.4)."),
+                              "(OR) + matched-object biotic/material via lexical GT matching. On a "
+                              "COCO artifact enriched with SAM3 INSTANCE grounding, the separate "
+                              "box-IoU detection evaluation in summary['detection'] runs alongside "
+                              "these (never replacing them) — see its own note."),
         "material_caveat": ("Material GT for imagenet/coco/places is the heuristic "
                             "gt_material=True default (real photos); only BIG-5 has genuine "
                             "material GT. Predicted material is always the VLM's judgment "
@@ -1505,6 +1876,32 @@ def phase_score(args):
             "sam3_model": header["grounding"].get("sam3_model"),
             "mask_threshold": header["grounding"].get("mask_threshold"),
         }
+    if run_detection:
+        # TWO dicts, never merged into one score. "detection" is pure
+        # LOCALIZATION (did a box land on an annotated object) under
+        # class-agnostic matching; "detection_labels" is how well the entity
+        # that produced each matched box was NAMED. See
+        # src/evaluation/detection_metrics.py's docstring for why the two are
+        # kept apart and why matching ignores the class.
+        summary["detection"] = detection_metrics.detection_summary(det_counts)
+        summary["detection"]["instance_score_threshold"] = \
+            header["grounding"].get("instance_score_threshold")
+        summary["detection_labels"] = detection_metrics.label_summary(det_label_records)
+        summary["detection_note"] = (
+            "COCO box-IoU evaluation of SAM3 instance boxes against COCO's per-instance GT. "
+            "Assignment is CLASS-AGNOSTIC (Hungarian, one-to-one, IoU >= "
+            f"{args.detection_iou_threshold}) so a predicted 'bull' can still be paired with a "
+            "GT 'cow' and scored hierarchically instead of being thrown away as a false "
+            "positive — precision/recall/F1/AP here therefore measure LOCALIZATION only, and "
+            "the naming side lives in detection_labels. GT is restricted to NATURE-mapped COCO "
+            "classes because only nature-labeled entities are grounded, so a non-nature GT box "
+            "could never be matched and counting it as a miss would measure the protocol rather "
+            "than the model. An unmatched prediction is a false positive only when its own "
+            "phrase names a class in that evaluated vocabulary; otherwise it is EXCLUDED (COCO "
+            "annotates 80 curated classes, so a correctly-detected tree is not a hallucination) "
+            "and reported as excluded_predictions. iscrowd regions are neither required to be "
+            "detected nor charged as false positives, per COCO's own convention. NO accuracy is "
+            "reported: detection has no true negatives to count.")
     if run_clipmatch:
         # Token stats for whichever text is PRIMARY this run: the summary
         # caption when the artifact has one, else the raw caption itself
@@ -1692,6 +2089,35 @@ def _print_summary(s, run_clipmatch):
               f"(nature entities attempted {g['nature_entities_attempted']}) ---")
         print(f"Confirmation rate: {g['confirmation_rate']:.1%} "
               f"({g['confirmed']}/{g['nature_entities_attempted']}) — agreement with SAM3, not ground truth")
+    det = s.get("detection")
+    if det is not None:
+        print(f"\n--- COCO detection [box IoU >= {det['iou_threshold']}, instance score > "
+              f"{det.get('instance_score_threshold')}] "
+              f"({det['n_gt_boxes']} nature GT boxes, {det['n_pred_boxes']} predicted) ---")
+        print(f"[localization, class-agnostic matching]  P {det['precision']:.4f} | "
+              f"R {det['recall']:.4f} | F1 {det['f1']:.4f}   "
+              f"(TP {det['tp']} | FP {det['fp']} | FN {det['fn']})")
+        if "ap_50" in det:
+            print(f"AP@0.50 {det['ap_50']:.4f} | AP@[.50:.95] {det['ap_50_95']:.4f}")
+        # Always printed next to precision: these are the predictions the
+        # curated-vocabulary rule let off, so the reader can see how large the
+        # exemption is rather than taking precision at face value.
+        print(f"Excluded predictions (named no evaluated COCO class): "
+              f"{det['excluded_predictions']} | crowd-suppressed: "
+              f"{det['crowd_suppressed_predictions']}")
+        dl = s.get("detection_labels", {})
+        if dl.get("support"):
+            print(f"[naming, over the {dl['support']} matched pairs]  "
+                  f"Exact-match {dl['exact_match_accuracy']:.4f}")
+            print(f"  [failures as error]  hP {dl['hp']:.4f}±{dl['hp_std']:.4f} | "
+                  f"hR {dl['hr']:.4f}±{dl['hr_std']:.4f} | hF1 {dl['hf1']:.4f}±{dl['hf1_std']:.4f} "
+                  f"| Wu-Palmer {dl['wup']:.4f}±{dl['wup_std']:.4f}")
+            print(f"  [resolved only, support {dl['support_resolved']}]  "
+                  f"hP {dl['hp_resolved']:.4f}±{dl['hp_resolved_std']:.4f} | "
+                  f"hR {dl['hr_resolved']:.4f}±{dl['hr_resolved_std']:.4f} | "
+                  f"hF1 {dl['hf1_resolved']:.4f}±{dl['hf1_resolved_std']:.4f} "
+                  f"| Wu-Palmer {dl['wup_resolved']:.4f}±{dl['wup_resolved_std']:.4f}")
+            print(f"  WordNet resolution-failure rate: {dl['resolution_failure_rate']:.1%}")
     if run_clipmatch:
         primary_label = "summary-caption" if s["clip_models"]["clipmatch_primary_source"] == "summary_caption" else "caption-based"
         cm = s["clipmatch"]
@@ -1797,6 +2223,26 @@ def _log_wandb(args, summary, run_clipmatch):
         log["Grounding/ConfirmationRate"] = summary["grounding"]["confirmation_rate"]
         log["Grounding/NatureEntitiesAttempted"] = summary["grounding"]["nature_entities_attempted"]
         log["Grounding/Confirmed"] = summary["grounding"]["confirmed"]
+    if summary.get("detection") is not None:
+        det = summary["detection"]
+        # Localization and naming stay in SEPARATE W&B namespaces for the same
+        # reason they stay separate in the summary — a sweep that optimizes one
+        # should never silently be reading the other.
+        for key in ("precision", "recall", "f1", "tp", "fp", "fn",
+                    "excluded_predictions", "crowd_suppressed_predictions",
+                    "n_gt_boxes", "n_pred_boxes"):
+            log[f"Detection/{key}"] = det[key]
+        if "ap_50" in det:
+            log["Detection/AP50"] = det["ap_50"]
+            log["Detection/AP50_95"] = det["ap_50_95"]
+        dl = summary.get("detection_labels", {})
+        if dl.get("support"):
+            log["DetectionLabels/ExactMatch"] = dl["exact_match_accuracy"]
+            log["DetectionLabels/Support"] = dl["support"]
+            log["DetectionLabels/ResolutionFailureRate"] = dl["resolution_failure_rate"]
+            for key in ("hp", "hr", "hf1", "wup"):
+                log[f"DetectionLabels/{key}"] = dl[key]
+                log[f"DetectionLabels/{key}_ResolvedOnly"] = dl[f"{key}_resolved"]
     wandb.log(log)
     wandb.finish()
 
@@ -2016,6 +2462,19 @@ def build_arg_parser():
                         "`inflect` package. Has no effect together with "
                         "--use_wordnet_definitions_clipmatch (that path always inflects its own "
                         "article regardless, as its own separate pre-existing behavior).")
+    p.add_argument("--detection_iou_threshold", type=float,
+                   default=detection_metrics.DEFAULT_IOU_THRESHOLD,
+                   help="--stage score, COCO only: box IoU at which a predicted SAM3 instance "
+                        "box counts as landing on a GT box. Matching is CLASS-AGNOSTIC (so a "
+                        "predicted 'bull' can pair with a GT 'cow' and be scored hierarchically "
+                        "rather than discarded), and this threshold sets the headline "
+                        "precision/recall/F1 operating point only — AP is always swept over "
+                        "COCO's full 0.50:0.05:0.95 ladder regardless. Ignored unless the "
+                        "artifact is COCO AND was grounded with SAM3 instance grounding "
+                        "(run_grounding_pipeline.py --instance_grounding). Note --instances_json "
+                        "is also needed here for artifacts written before per-instance GT boxes "
+                        "were stored, so the boxes can be back-filled without re-running "
+                        "inference.")
     p.add_argument("--max_hops", type=int, default=0,
                    help="Maximum WordNet hop distance allowed when mapping an EXTRACTED "
                         "object onto the labeled taxonomy (map_object_to_taxonomy -> "

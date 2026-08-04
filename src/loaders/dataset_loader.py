@@ -327,9 +327,86 @@ def load_imagenet(data_dir, taxonomy_graph):
     return results
 
 
+def _coco_box_xyxy(ann):
+    """COCO's own `bbox` is [x, y, width, height]; convert to the
+    [x1, y1, x2, y2] convention SAM3's instance head returns
+    (Sam3ImageProcessor.post_process_instance_segmentation -> "boxes"), so GT
+    and predicted boxes are directly IoU-comparable without a per-call-site
+    conversion that could silently be forgotten in one of them."""
+    x, y, w, h = ann["bbox"]
+    return [float(x), float(y), float(x) + float(w), float(y) + float(h)]
+
+
+def coco_gt_boxes(instances_json, taxonomy_graph, images_dir=None):
+    """Per-INSTANCE COCO ground truth, keyed by image FILE NAME:
+    `{file_name: [box_dict, ...]}`.
+
+    Distinct from `load_coco`'s `targets`, which deliberately collapses an
+    image's annotations down to the set of CLASSES present (three annotated
+    people become one "person" target) because the axis metrics only ask
+    which classes are in the image. Box-IoU detection evaluation needs the
+    opposite: every instance kept separate, because three people are three
+    boxes to detect.
+
+    Each box dict is:
+        {"class_name", "synset_id", "category_id", "gt_nature", "gt_biotic",
+         "gt_material", "bbox": [x1,y1,x2,y2], "area", "iscrowd"}
+
+    Keyed by file name rather than full path so a predictions artifact written
+    against a DIFFERENT `images_dir` (a copy of val2017 on another machine,
+    say) still joins correctly — COCO file names are unique within a split.
+    `images_dir` is accepted for symmetry with `load_coco` but is not needed
+    for the join and may be omitted.
+    """
+    from pycocotools.coco import COCO
+
+    coco = COCO(instances_json)
+    cat_to_target = {}
+    for cat_id, synset_str in COCO_TO_WNSYNSET.items():
+        gt = get_gt_from_graph(synset_str, taxonomy_graph)
+        if gt:
+            class_name = COCO_LABELS.get(cat_id, synset_str.split('.')[0].replace('_', ' '))
+            cat_to_target[cat_id] = {"class_name": class_name, **gt}
+
+    by_file = {}
+    for img_id in coco.getImgIds():
+        info = coco.loadImgs(img_id)[0]
+        boxes = []
+        for ann in coco.loadAnns(coco.getAnnIds(imgIds=img_id)):
+            target = cat_to_target.get(ann["category_id"])
+            if target is None:
+                # Category didn't resolve onto the taxonomy at all — per the
+                # project's "GT-unmapped instances are excluded" convention,
+                # it is neither a detection target nor a miss.
+                continue
+            boxes.append({
+                **target,
+                "category_id": int(ann["category_id"]),
+                "bbox": _coco_box_xyxy(ann),
+                "area": float(ann.get("area", 0.0)),
+                # COCO's crowd regions annotate a GROUP with one loose box
+                # (a whole flock of birds). Standard COCO evaluation neither
+                # requires them to be detected nor counts a prediction landing
+                # inside one as a false positive — carried through here so the
+                # matcher can apply that same rule rather than scoring a
+                # crowd box as an ordinary instance.
+                "iscrowd": bool(ann.get("iscrowd", 0)),
+            })
+        if boxes:
+            by_file[info["file_name"]] = boxes
+    return by_file
+
+
 def load_coco(images_dir, instances_json, taxonomy_graph):
     """Load COCO: one JSON annotation file describing possibly MULTIPLE
-    labeled objects per image (multi-label, unlike ImageNet/Places)."""
+    labeled objects per image (multi-label, unlike ImageNet/Places).
+
+    Each image record carries BOTH views of the annotations: `targets` (one
+    entry per distinct CLASS present, what the axis metrics score against) and
+    `gt_boxes` (one entry per ANNOTATED INSTANCE, with its bounding box — what
+    the Grounding pipeline's box-IoU detection evaluation scores against). See
+    `coco_gt_boxes` for why the two can't be the same list.
+    """
     from pycocotools.coco import COCO
     # pycocotools' COCO class parses the (often huge) instances_*.json
     # annotation file and gives us convenient lookup methods (getImgIds,
@@ -360,10 +437,20 @@ def load_coco(images_dir, instances_json, taxonomy_graph):
         # gather every annotated object whose category resolved to a taxonomy
         # label.
         targets = []
+        gt_boxes = []
         for ann in coco.loadAnns(coco.getAnnIds(imgIds=img_id)):
             cat_id = ann["category_id"]
             if cat_id in cat_to_target:
                 targets.append(cat_to_target[cat_id])
+                # Same annotation, kept UNCOLLAPSED with its box for the
+                # detection evaluation (see coco_gt_boxes' docstring).
+                gt_boxes.append({
+                    **cat_to_target[cat_id],
+                    "category_id": int(cat_id),
+                    "bbox": _coco_box_xyxy(ann),
+                    "area": float(ann.get("area", 0.0)),
+                    "iscrowd": bool(ann.get("iscrowd", 0)),
+                })
 
         if targets:
             # Remove duplicate classes per image
@@ -376,7 +463,8 @@ def load_coco(images_dir, instances_json, taxonomy_graph):
             unique_targets = {t["class_name"]: t for t in targets}.values()
             results.append({
                 "image_path": path,
-                "targets": list(unique_targets)
+                "targets": list(unique_targets),
+                "gt_boxes": gt_boxes,
             })
     return results
 
