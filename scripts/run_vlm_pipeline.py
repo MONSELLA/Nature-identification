@@ -77,6 +77,7 @@ I run this script", start reading at `main()` near the bottom and work
 backward through phase_infer/phase_score.
 """
 
+import errno
 import fcntl
 import os
 
@@ -610,6 +611,11 @@ def phase_infer(args, vlm=None):
                 rec["record_type"] = "image"
                 f.write(json.dumps(rec) + "\n")
                 n += 1
+                # Commit to stable storage periodically (see _durable_write):
+                # bounds how much finished inference an abrupt kill can lose to
+                # --fsync_every records, and makes a storage failure raise HERE
+                # rather than being discovered days later in a corrupt artifact.
+                _durable_write(f, n, args.fsync_every)
             # The header (written above, before dataset loading finished vs the
             # inference loop) can't carry the total elapsed time since it's
             # written before that time is known — so a "footer" record (last
@@ -618,6 +624,14 @@ def phase_infer(args, vlm=None):
             # that's the full wall-clock cost of "this model finishing this run".
             footer = {"record_type": "footer", "inference_time_seconds": time.time() - phase_t0}
             f.write(json.dumps(footer) + "\n")
+            # ALWAYS fsync the footer, regardless of --fsync_every (including 0).
+            # The footer is what marks this run complete — every consumer
+            # (--stage score, --resume, the grounding pipeline, the audit)
+            # treats its presence as "this artifact is finished". Claiming
+            # success while the record proving it is still sitting in a cache
+            # is precisely the state that produced a "completed" run whose
+            # artifact later came back truncated.
+            _durable_write(f, n, args.fsync_every, force=True)
         print(f"💾 [infer] wrote {n} image records to {out_path} in {time.time()-loop_t0:.1f}s "
               f"(total inference phase: {footer['inference_time_seconds']:.1f}s)")
         return vlm
@@ -718,7 +732,22 @@ class _ArtifactLock:
         self._fh = open(self.lock_path, "w")
         try:
             fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
+        except OSError as e:
+            # "Locking isn't supported here" is NOT "someone else holds it".
+            # Some filesystems (notably certain NFS exports) return ENOLCK /
+            # EOPNOTSUPP / EINVAL for flock. Treating those as contention
+            # would make EVERY job on such a mount refuse to start, claiming a
+            # duplicate that doesn't exist — turning a safety feature into a
+            # total outage. Warn and proceed unlocked instead: no worse than
+            # before this lock existed, and the alternative is running nothing
+            # at all. Only genuine contention (EWOULDBLOCK/EAGAIN/EACCES)
+            # raises.
+            if e.errno in (errno.ENOLCK, errno.EOPNOTSUPP, errno.EINVAL, errno.ENOSYS):
+                print(f"⚠️ [lock] {self.lock_path.parent} does not support flock "
+                      f"({e.strerror}) — continuing WITHOUT an artifact lock. Nothing "
+                      f"will stop a second job writing this same artifact, so make "
+                      f"sure only one runs at a time (`squeue`).")
+                return self
             self._fh.close()
             self._fh = None
             raise ArtifactLockHeld(
@@ -745,6 +774,93 @@ class _ArtifactLock:
     def __exit__(self, *exc_info):
         self.release()
         return False
+
+
+def _durable_write(f, n_written, fsync_every, force=False):
+    """Push `f`'s buffered writes all the way to stable storage every
+    `fsync_every` records (and unconditionally when `force`).
+
+    WHY THIS EXISTS. Writing a record with f.write() puts it in Python's
+    ~8 KB userspace buffer; flushing that only hands it to the OS page
+    cache. Neither is durable, and NEITHER REPORTS AN ERROR if the data
+    never reaches the disk — which is exactly how two multi-day runs were
+    lost (2026-08): the pipeline logged "wrote 21000 image records", the
+    file was the right size, and its contents were zeros.
+
+    fsync() is the only call that (a) forces the data down and (b) RAISES
+    if the filesystem cannot commit it. So its real value here is as much
+    early failure detection as durability: a storage fault surfaces on the
+    record it happens at, in the job's own log, instead of silently
+    two days later when scoring reads back a corrupt artifact.
+
+    `fsync_every=0` disables the periodic call; `force=True` still fsyncs,
+    so the footer (which marks the run complete) is always committed before
+    the process claims success.
+    """
+    if not force and (not fsync_every or n_written % fsync_every):
+        return
+    f.flush()
+    os.fsync(f.fileno())
+
+
+class _StreamingCSVWriter:
+    """Append-as-you-go writer for the predictions CSV.
+
+    REPLACES accumulating every row in a list and writing once at the end.
+    That old shape had two failure modes, both hit in practice:
+      * a scoring run that died at 99% produced NO CSV AT ALL — the reason
+        three of this project's places365 models have no predictions file
+        despite their inference having completed;
+      * peak memory scaled with the dataset, holding every row (each
+        carrying objects/gt-targets/groundings JSON, including mask RLEs)
+        for the whole run — untenable at the 2M-image BIG-5 scale this
+        project is ultimately aimed at.
+    Streaming fixes both: a crash leaves a valid partial CSV of everything
+    scored so far, and memory stays flat.
+
+    Columns are fixed from the FIRST row (the file is opened lazily, so no
+    empty CSV is created for a run with zero rows). Later rows are written
+    with restval=""/extrasaction="ignore" and a one-time warning rather
+    than an exception: every row here is built from one dict literal so the
+    keys are structurally identical, and if that assumption ever breaks,
+    losing a column beats aborting a completed multi-hour scoring pass at
+    the final step.
+    """
+
+    def __init__(self, path, fsync_every=0):
+        self.path = Path(path)
+        self.fsync_every = fsync_every
+        self._f = None
+        self._w = None
+        self._fields = None
+        self._warned = False
+        self.n_written = 0
+
+    def write(self, row):
+        if self._w is None:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self._fields = list(row.keys())
+            self._f = open(self.path, "w", newline="")
+            self._w = csv.DictWriter(self._f, fieldnames=self._fields,
+                                     restval="", extrasaction="ignore")
+            self._w.writeheader()
+        elif not self._warned and set(row.keys()) != set(self._fields):
+            self._warned = True
+            missing = set(self._fields) - set(row.keys())
+            extra = set(row.keys()) - set(self._fields)
+            print(f"⚠️ [score] predictions-CSV columns changed mid-run "
+                  f"(missing={sorted(missing)}, extra={sorted(extra)}); keeping the "
+                  f"first row's columns, blank-filling missing and dropping extra. "
+                  f"This shouldn't happen — the row dict is built from one literal.")
+        self._w.writerow(row)
+        self.n_written += 1
+        _durable_write(self._f, self.n_written, self.fsync_every)
+
+    def close(self):
+        if self._f is not None:
+            _durable_write(self._f, self.n_written, self.fsync_every, force=True)
+            self._f.close()
+            self._f = None
 
 
 def _count_null_bytes(path, chunk_size=8 << 20):
@@ -1198,7 +1314,27 @@ def phase_score(args):
     n_grounding_attempted = n_grounding_confirmed = 0
     clipmatch_top1 = 0
     clipmatch_support = 0
-    flat_rows = []  # one row per stored IMAGE for the output CSV (see below)
+    # The predictions CSV is STREAMED, one row per image as it's scored, not
+    # accumulated and dumped at the end — see _StreamingCSVWriter. Its path is
+    # therefore resolved HERE, before the loop, rather than after it.
+    # Include dataset + model in the filename — otherwise every model run
+    # writes to the same "<stem>_predictions.csv" and each rerun (e.g. a
+    # different VLM on the same dataset) silently overwrites the previous
+    # model's predictions. Grouped into PREDICTIONS_SUBDIR (separate from
+    # RESPONSES_SUBDIR, where that model's .jsonl artifact lives — see
+    # _resolve_responses_file), not next to the shared results JSON.
+    # model_slug uses ONLY the model NAME (see _model_slug's rationale),
+    # falling back to the full family/name "model" string for older artifacts
+    # written before the header carried "model_name" separately.
+    out_dir = Path(args.results_dir)
+    if args.run_name:
+        out_dir = out_dir / args.run_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / Path(args.output_file).name
+    _model_slug_csv = (header.get("model_name") or header.get("model", "unknown_model")).replace("/", "_")
+    csv_path = (out_dir / PREDICTIONS_SUBDIR
+                / f"{out_path.stem}_{dataset}_{_model_slug_csv}_predictions.csv")
+    csv_writer = _StreamingCSVWriter(csv_path, fsync_every=args.fsync_every)
 
     for idx, rec in enumerate(records):
         if args.verbose:
@@ -1621,7 +1757,7 @@ def phase_score(args):
             image_n_confirmed = sum(1 for g in object_groundings if g["grounded"] is True)
             n_grounding_attempted += image_n_attempted
             n_grounding_confirmed += image_n_confirmed
-        flat_rows.append({
+        csv_writer.write({
             "image_path": rec["image_path"],
             "dataset": dataset,
             "model": header.get("model"),
@@ -1706,6 +1842,12 @@ def phase_score(args):
             "hierarchical_f1": hier["hf1"],
             "wup_similarity": wup_sim,
         })
+
+    # Every row is on disk by here. Closed explicitly (rather than left to
+    # garbage collection) so the final fsync happens BEFORE the summary below
+    # is computed and reported — the CSV must be durable before anything
+    # claims the scoring run succeeded.
+    csv_writer.close()
 
     # ---- Assemble summary ----
     n_images = len(records)
@@ -1898,11 +2040,8 @@ def phase_score(args):
     # type one level down — the predictions CSV here goes in
     # PREDICTIONS_SUBDIR, the .jsonl artifact from _resolve_responses_file
     # goes in RESPONSES_SUBDIR.
-    out_dir = Path(args.results_dir)
-    if args.run_name:
-        out_dir = out_dir / args.run_name
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / Path(args.output_file).name
+    # out_dir/out_path were resolved before the scoring loop (the streaming
+    # predictions CSV needs its path up front) — reused here, not recomputed.
     update_results_store(out_path, dataset=dataset, model=header.get("model"), metrics=summary)
     # Per-IMAGE nature/biotic/material GT composition of THIS run's sampled
     # dataset (recap: sampling is deterministic — a fixed --max_samples always
@@ -1915,24 +2054,11 @@ def phase_score(args):
     image_stats = compute_image_stats(records)
     config_key = str(args.max_samples) if args.max_samples is not None else "full"
     update_dataset_image_stats(out_path, dataset=dataset, config_key=config_key, stats=image_stats)
-    if flat_rows:
-        # Include dataset + model in the filename — otherwise every model run
-        # writes to the same "<stem>_predictions.csv" and each rerun (e.g. a
-        # different VLM on the same dataset) silently overwrites the previous
-        # model's predictions. Grouped into PREDICTIONS_SUBDIR (separate from
-        # RESPONSES_SUBDIR, where that model's .jsonl artifact lives — see
-        # _resolve_responses_file), not next to the shared results JSON.
-        # model_slug uses ONLY the model NAME (see _model_slug's rationale),
-        # falling back to the full family/name "model" string for older
-        # artifacts written before the header carried "model_name" separately.
-        predictions_dir = out_dir / PREDICTIONS_SUBDIR
-        predictions_dir.mkdir(parents=True, exist_ok=True)
-        model_slug = (header.get("model_name") or header.get("model", "unknown_model")).replace("/", "_")
-        csv_path = predictions_dir / f"{out_path.stem}_{dataset}_{model_slug}_predictions.csv"
-        with open(csv_path, "w", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=list(flat_rows[0].keys()))
-            w.writeheader(); w.writerows(flat_rows)
-        print(f"💾 [score] wrote {out_path} and {csv_path} ({len(flat_rows)} images stored)")
+    # The predictions CSV was written and fsync'd row-by-row during the loop
+    # above (see _StreamingCSVWriter) — nothing left to write here, just report.
+    if csv_writer.n_written:
+        print(f"💾 [score] wrote {out_path} and {csv_path} "
+              f"({csv_writer.n_written} images stored)")
 
     if args.wandb:
         _log_wandb(args, summary, run_clipmatch)
@@ -2392,6 +2518,22 @@ def build_arg_parser():
                         f"artifact in a '{RESPONSES_SUBDIR}' subfolder; every model's "
                         f"_predictions.csv in a '{PREDICTIONS_SUBDIR}' subfolder. Created if it "
                         "doesn't exist. Default: write directly into --results_dir.")
+    p.add_argument("--fsync_every", type=int, default=50,
+                   help="Force written records all the way to stable storage (fsync) "
+                        "every N records, for BOTH the .jsonl artifact (--stage infer) "
+                        "and the predictions CSV (--stage score). 0 disables the "
+                        "periodic call; the artifact's footer and the CSV's final row "
+                        "are fsync'd regardless, so a run never reports success while "
+                        "the data proving it is still only in a cache. Default 50 "
+                        "bounds an abrupt kill's loss to ~50 images while costing ~1 "
+                        "fsync per 50 images (negligible against ~10s/image of VLM "
+                        "compute). The point is as much EARLY FAILURE DETECTION as "
+                        "durability: fsync raises if the filesystem cannot commit, so "
+                        "storage trouble surfaces in this job's log at the record it "
+                        "occurs — rather than silently, days later, as an artifact "
+                        "that reads back full-size and full of zeros. Lower it on "
+                        "storage you don't trust; raise it if fsync latency dominates "
+                        "on a very fast model.")
     p.add_argument("--resume", action="store_true",
                    help="--stage infer/all only. If --responses_file already exists and has "
                         "no footer (i.e. a previous run died part-way), skip every image "
