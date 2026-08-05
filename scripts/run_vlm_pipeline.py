@@ -77,6 +77,8 @@ I run this script", start reading at `main()` near the bottom and work
 backward through phase_infer/phase_score.
 """
 
+import errno
+import fcntl
 import os
 
 # Quiet a couple of low-value third-party STARTUP notices by default — neither
@@ -97,9 +99,11 @@ import csv
 import json
 import logging
 import random
+import shutil
 import subprocess
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -398,30 +402,6 @@ def phase_infer(args, vlm=None):
     summarize_for_clipmatch = (args.dataset in clip_metrics.CLIPMATCH_DATASETS
                                 and not args.no_summarize_clipmatch_caption)
 
-    # Every registered family is vLLM-served (see src/models/vlm_models.py's
-    # MODEL_REGISTRY) — the HuggingFace-served BLIP family was removed.
-    # Skipped entirely when a `vlm` was already passed in (phase_infer_multi's
-    # whole point) — these are all engine-construction kwargs, meaningless
-    # once the engine already exists.
-    if vlm is None:
-        vlm_kwargs = {"dtype": args.dtype, "gpu_memory_utilization": args.gpu_memory_utilization,
-                      "trust_remote_code": args.trust_remote_code,
-                      "tensor_parallel_size": args.tensor_parallel_size,
-                      # 0 is the CLI's "disabled" spelling (argparse can't default
-                      # an int flag to None while still accepting a positive int);
-                      # VLLMBackedVLM.__init__ itself expects None for "disabled".
-                      "max_image_side": args.max_image_side or None,
-                      # Off by default — see VLLMBackedVLM.__init__ for why
-                      # (guided decoding + an already-open <think> block is a
-                      # broken combination, and the caption call has no grammar
-                      # to stop chain-of-thought leaking into the caption text).
-                      "enable_thinking": args.enable_thinking}
-        if args.max_model_len is not None:
-            vlm_kwargs["max_model_len"] = args.max_model_len
-        if args.max_num_seqs is not None:
-            vlm_kwargs["max_num_seqs"] = args.max_num_seqs
-        vlm = create_vlm(args.model_family, args.model_name, **vlm_kwargs)
-
     # The very first line written to the output file is a special "header"
     # record (distinguished by record_type="header") carrying metadata that
     # applies to the WHOLE run, not any single image — Phase 2 reads this
@@ -450,84 +430,213 @@ def phase_infer(args, vlm=None):
     out_path = Path(args.responses_file)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # --- --resume: skip images this artifact already has ---------------------
-    # Inference is by far the expensive half (hours on a full dataset), and a
-    # crash used to mean redoing all of it. The streamed artifact already
-    # contains every completed image, so resuming is just "filter the dataset
-    # down to what's missing and APPEND". The header is only written on a
-    # fresh run; on a resume the existing one is kept (it carries the
-    # candidate_vocab/max_hops/prompt-variant this artifact was built with,
-    # and rewriting it from the current args could silently mix two configs).
-    resume_mode = False
-    if getattr(args, "resume", False) and out_path.exists():
-        done, has_footer, n_bad = _already_inferred_paths(out_path)
-        if has_footer:
-            print(f"✅ [infer] {out_path} already ends in a footer — this run "
-                  f"is complete ({len(done)} images). Nothing to resume; "
-                  f"delete the file or drop --resume to redo it.")
-            # Return the (possibly already-loaded) `vlm` unchanged, not None —
-            # phase_infer_multi chains this return value into the NEXT
-            # dataset's call so its shared VLM survives a dataset that turns
-            # out to be already-complete. A bare `return` here would silently
-            # force phase_infer_multi to reload the model on the next task.
-            return vlm
-        before = len(dataset)
-        dataset = [d for d in dataset if d["image_path"] not in done]
-        resume_mode = True
-        print(f"⏩ [infer] resuming {out_path}: {len(done)} image(s) already done, "
-              f"{len(dataset)} of {before} remaining"
-              + (f" ({n_bad} truncated line(s) dropped — those images redone)" if n_bad else ""))
-        if not dataset:
-            print("⚠️ [infer] nothing left to infer, but the artifact has no footer — "
-                  "appending one so --stage score sees a complete run.")
-            with open(out_path, "a") as f:
-                f.write(json.dumps({"record_type": "footer",
-                                     "inference_time_seconds": None}) + "\n")
-            # See the has_footer branch above — must return `vlm`, not None.
-            return vlm
+    # Exclusive lock on this artifact for the REST of this function — see
+    # _ArtifactLock's docstring. Acquired BEFORE the resume decision is even
+    # read (not just around the final write), because the resume decision
+    # itself reads the file's current state; a second process reading/writing
+    # concurrently could see a torn state or race the header repair below.
+    # Held through every branch, including every early return, via try/finally.
+    # ArtifactLockHeld is deliberately left to propagate — a caller (main(),
+    # phase_infer_multi) should treat "another process already owns this
+    # artifact" as fatal, never as something to silently work around.
+    lock = _ArtifactLock(out_path)
+    lock.acquire()
+    try:
+        # --- --resume: repair the header, then skip images this artifact has -
+        # Inference is by far the expensive half (hours on a full dataset), and
+        # a crash used to mean redoing all of it. The streamed artifact already
+        # contains every completed image, so resuming is just "filter the
+        # dataset down to what's missing and APPEND".
+        #
+        # --resume also GUARANTEES the finished artifact has a header. Normally
+        # the header is written only on a fresh run and a resume keeps the
+        # existing one (it carries the candidate_vocab/max_hops/prompt-variant
+        # this artifact was built with, and rewriting it from the current args
+        # could silently mix two configs). But an artifact can legitimately
+        # exist with NO header at all — a first run killed before its buffered
+        # header line ever reached disk leaves a 0-byte file, and a plain
+        # resume onto that would append thousands of image records while never
+        # writing a header (resume mode skips that write unconditionally),
+        # producing an artifact _read_artifact and
+        # grounding_pipeline.stream_artifact can NEVER parse — discovered only
+        # after the whole multi-hour run finishes. So when the existing file
+        # has no header, one is reconstructed from THIS invocation's args and
+        # prepended before anything else happens.
+        resume_mode = False
+        # --- NUL-corruption guard, BEFORE any resume decision --------------
+        # Resuming onto a NUL-corrupted artifact would be the worst possible
+        # outcome: _already_inferred_paths skips the unparseable region, so
+        # resume would count only the surviving records, append the missing
+        # images after them, write a footer, and hand back a file that looks
+        # COMPLETE while still carrying the corrupt hole permanently in its
+        # middle — and every image whose record was inside that hole would be
+        # silently absent from scoring forever. Since a NUL can never appear
+        # in a legitimately-written artifact (see _count_null_bytes), treat
+        # its presence as "this file is not resumable", move it aside intact
+        # for forensics, and start clean.
+        if getattr(args, "resume", False) and out_path.exists():
+            n_nulls = _count_null_bytes(out_path)
+            if n_nulls:
+                size = out_path.stat().st_size
+                corrupt_path = out_path.with_name(
+                    out_path.name + f".corrupt-{datetime.now():%Y%m%dT%H%M%S}")
+                print(f"⛔ [infer] {out_path} contains {n_nulls:,} NUL bytes "
+                      f"({n_nulls / size:.0%} of {size / 1e6:.0f} MB) — this artifact was "
+                      f"damaged BELOW the application (nothing in this pipeline can write "
+                      f"a NUL). It is NOT resumable: resuming would bury the corrupt "
+                      f"region inside a file that then looks complete. Moving it to "
+                      f"{corrupt_path.name} and starting this dataset FRESH. Investigate "
+                      f"the storage before trusting this run — see "
+                      f"scripts/diagnose_artifact.py and scripts/test_storage_integrity.py.")
+                shutil.move(str(out_path), str(corrupt_path))
+        if getattr(args, "resume", False) and out_path.exists():
+            if not _artifact_has_header(out_path):
+                # NOTE the config caveat: this header is built from the CURRENT
+                # args, not recovered from the (never-written) original. It is
+                # correct only insofar as this invocation's dataset/model/
+                # max_hops/summary-prompt flags match the run that produced the
+                # records already in the file — hence the loud warning rather
+                # than a silent fix.
+                print(f"⚠️ [infer] {out_path} exists but has NO header line — reconstructing "
+                      f"one from this run's args (dataset='{args.dataset}', "
+                      f"model='{args.model_family}/{args.model_name}', max_hops={args.max_hops}) "
+                      f"and prepending it. Verify those match the run that wrote the existing "
+                      f"records; a mismatch would mislabel the artifact's config.")
+                _prepend_header(out_path, header)
+            done, has_footer, n_bad = _already_inferred_paths(out_path)
+            if has_footer:
+                print(f"✅ [infer] {out_path} already ends in a footer — this run "
+                      f"is complete ({len(done)} images). Nothing to resume; "
+                      f"delete the file or drop --resume to redo it.")
+                # Returns whatever `vlm` was passed IN (None on a plain
+                # single-dataset run, since the model is deliberately not
+                # loaded until after this block — an already-complete dataset,
+                # or one that only needed its header repaired, should cost no
+                # model load at all). phase_infer_multi chains this return
+                # value into the NEXT dataset's call, so a VLM handed to us by
+                # a previous task survives a task that turns out to be
+                # already-complete.
+                return vlm
+            before = len(dataset)
+            dataset = [d for d in dataset if d["image_path"] not in done]
+            resume_mode = True
+            print(f"⏩ [infer] resuming {out_path}: {len(done)} image(s) already done, "
+                  f"{len(dataset)} of {before} remaining"
+                  + (f" ({n_bad} truncated line(s) dropped — those images redone)" if n_bad else ""))
+            if not dataset:
+                print("⚠️ [infer] nothing left to infer, but the artifact has no footer — "
+                      "appending one so --stage score sees a complete run.")
+                with open(out_path, "a") as f:
+                    f.write(json.dumps({"record_type": "footer",
+                                         "inference_time_seconds": None}) + "\n")
+                # See the has_footer branch above — must return `vlm`, not None.
+                return vlm
 
-    loop_t0 = time.time()
-    n = 0
-    # "JSON Lines" format: one complete, independent JSON object per line of
-    # the file (as opposed to one giant JSON array for the whole file). This
-    # lets us write results incrementally as they're produced (streaming,
-    # rather than building one huge in-memory list and writing it all at the
-    # end) and lets Phase 2 read them back one line at a time too.
-    with open(out_path, "a" if resume_mode else "w") as f:
-        if not resume_mode:
-            f.write(json.dumps(header) + "\n")
-        for rec in run_inference(
-            vlm, dataset,
-            caption_system_prompt=caption_system,
-            label_system_full=label_system_full,
-            label_system_material=label_system_material,
-            tax_graph=graph, max_hops=args.max_hops,
-            batch_size=args.batch_size,
-            caption_max_new_tokens=args.max_new_tokens_caption,
-            extraction_max_new_tokens=args.max_new_tokens_extraction,
-            label_max_new_tokens=args.max_new_tokens_label,
-            temperature=args.temperature, verbose=args.verbose,
-            summarize_for_clipmatch=summarize_for_clipmatch,
-            summary_max_new_tokens=args.summary_max_new_tokens,
-            # Dataset NAME (not the loaded instances in the positional arg
-            # above) — picks the object-centric vs scene-centric summary
-            # prompt, see prompts.get_summary_caption_prompt.
-            dataset=args.dataset,
-        ):
-            rec["record_type"] = "image"
-            f.write(json.dumps(rec) + "\n")
-            n += 1
-        # The header (written above, before dataset loading finished vs the
-        # inference loop) can't carry the total elapsed time since it's
-        # written before that time is known — so a "footer" record (last line
-        # of the file) carries it instead. Includes dataset-load + VLM-creation
-        # time (phase_t0), not just the generation loop, since that's the full
-        # wall-clock cost of "this model finishing this run".
-        footer = {"record_type": "footer", "inference_time_seconds": time.time() - phase_t0}
-        f.write(json.dumps(footer) + "\n")
-    print(f"💾 [infer] wrote {n} image records to {out_path} in {time.time()-loop_t0:.1f}s "
-          f"(total inference phase: {footer['inference_time_seconds']:.1f}s)")
-    return vlm
+        # --- Never silently clobber an existing non-empty artifact ----------
+        # resume_mode is False here means the write loop below opens in "w"
+        # (truncate/fresh) mode. That's correct for a genuinely fresh run
+        # (--resume not passed, or nothing existed yet). But if out_path
+        # already has real content at this point — a forgotten --resume flag,
+        # a script bug, a human re-running the wrong command — "w" mode would
+        # silently DESTROY however much completed work is already there with
+        # zero error, zero warning, discovered only much later. Move it aside
+        # to a timestamped backup instead of ever truncating existing data
+        # out from under the artifact lock.
+        if not resume_mode and out_path.exists() and out_path.stat().st_size > 0:
+            backup_path = out_path.with_name(
+                out_path.name + f".bak-{datetime.now():%Y%m%dT%H%M%S}")
+            print(f"⚠️ [infer] {out_path} already exists ({out_path.stat().st_size} bytes) "
+                  f"and this is a FRESH run (--resume not in effect for it) — refusing to "
+                  f"silently overwrite it. Moving the existing file aside to {backup_path} "
+                  f"first. If this run was actually supposed to resume, stop it now and "
+                  f"re-run with --resume against {backup_path} instead.")
+            shutil.move(str(out_path), str(backup_path))
+
+        # Every registered family is vLLM-served (see src/models/vlm_models.py's
+        # MODEL_REGISTRY) — the HuggingFace-served BLIP family was removed.
+        # Skipped entirely when a `vlm` was already passed in (phase_infer_multi's
+        # whole point) — these are all engine-construction kwargs, meaningless
+        # once the engine already exists.
+        # DELIBERATELY AFTER the --resume block above: loading the model is
+        # minutes and GBs of VRAM, and a resume that finds nothing left to do
+        # (or that only needed its header repaired) returns without ever
+        # reaching here, so that case costs no GPU at all.
+        if vlm is None:
+            vlm_kwargs = {"dtype": args.dtype, "gpu_memory_utilization": args.gpu_memory_utilization,
+                          "trust_remote_code": args.trust_remote_code,
+                          "tensor_parallel_size": args.tensor_parallel_size,
+                          # 0 is the CLI's "disabled" spelling (argparse can't default
+                          # an int flag to None while still accepting a positive int);
+                          # VLLMBackedVLM.__init__ itself expects None for "disabled".
+                          "max_image_side": args.max_image_side or None,
+                          # Off by default — see VLLMBackedVLM.__init__ for why
+                          # (guided decoding + an already-open <think> block is a
+                          # broken combination, and the caption call has no grammar
+                          # to stop chain-of-thought leaking into the caption text).
+                          "enable_thinking": args.enable_thinking}
+            if args.max_model_len is not None:
+                vlm_kwargs["max_model_len"] = args.max_model_len
+            if args.max_num_seqs is not None:
+                vlm_kwargs["max_num_seqs"] = args.max_num_seqs
+            vlm = create_vlm(args.model_family, args.model_name, **vlm_kwargs)
+
+        loop_t0 = time.time()
+        n = 0
+        # "JSON Lines" format: one complete, independent JSON object per line of
+        # the file (as opposed to one giant JSON array for the whole file). This
+        # lets us write results incrementally as they're produced (streaming,
+        # rather than building one huge in-memory list and writing it all at the
+        # end) and lets Phase 2 read them back one line at a time too.
+        with open(out_path, "a" if resume_mode else "w") as f:
+            if not resume_mode:
+                f.write(json.dumps(header) + "\n")
+            for rec in run_inference(
+                vlm, dataset,
+                caption_system_prompt=caption_system,
+                label_system_full=label_system_full,
+                label_system_material=label_system_material,
+                tax_graph=graph, max_hops=args.max_hops,
+                batch_size=args.batch_size,
+                caption_max_new_tokens=args.max_new_tokens_caption,
+                extraction_max_new_tokens=args.max_new_tokens_extraction,
+                label_max_new_tokens=args.max_new_tokens_label,
+                temperature=args.temperature, verbose=args.verbose,
+                summarize_for_clipmatch=summarize_for_clipmatch,
+                summary_max_new_tokens=args.summary_max_new_tokens,
+                # Dataset NAME (not the loaded instances in the positional arg
+                # above) — picks the object-centric vs scene-centric summary
+                # prompt, see prompts.get_summary_caption_prompt.
+                dataset=args.dataset,
+            ):
+                rec["record_type"] = "image"
+                f.write(json.dumps(rec) + "\n")
+                n += 1
+                # Commit to stable storage periodically (see _durable_write):
+                # bounds how much finished inference an abrupt kill can lose to
+                # --fsync_every records, and makes a storage failure raise HERE
+                # rather than being discovered days later in a corrupt artifact.
+                _durable_write(f, n, args.fsync_every)
+            # The header (written above, before dataset loading finished vs the
+            # inference loop) can't carry the total elapsed time since it's
+            # written before that time is known — so a "footer" record (last
+            # line of the file) carries it instead. Includes dataset-load +
+            # VLM-creation time (phase_t0), not just the generation loop, since
+            # that's the full wall-clock cost of "this model finishing this run".
+            footer = {"record_type": "footer", "inference_time_seconds": time.time() - phase_t0}
+            f.write(json.dumps(footer) + "\n")
+            # ALWAYS fsync the footer, regardless of --fsync_every (including 0).
+            # The footer is what marks this run complete — every consumer
+            # (--stage score, --resume, the grounding pipeline, the audit)
+            # treats its presence as "this artifact is finished". Claiming
+            # success while the record proving it is still sitting in a cache
+            # is precisely the state that produced a "completed" run whose
+            # artifact later came back truncated.
+            _durable_write(f, n, args.fsync_every, force=True)
+        print(f"💾 [infer] wrote {n} image records to {out_path} in {time.time()-loop_t0:.1f}s "
+              f"(total inference phase: {footer['inference_time_seconds']:.1f}s)")
+        return vlm
+    finally:
+        lock.release()
 
 
 def phase_infer_multi(args):
@@ -574,6 +683,208 @@ def phase_infer_multi(args):
 
 
 # =============================================================================
+# Artifact concurrency safety — shared by phase_infer (Phase 1) and
+# phase_score (Phase 2)
+# =============================================================================
+class ArtifactLockHeld(RuntimeError):
+    """Raised when another process already holds the lock on an artifact
+    (see _ArtifactLock) — i.e. two invocations targeting the exact same
+    --responses_file overlapped in time. That race is exactly what silently
+    truncated a real 21000-record artifact down to 256 records in production
+    (2026-08-04): whichever process opened the file in "w" (fresh) mode last
+    won, discarding the other's already-completed work with no error at all.
+    A caller catching this should treat it as fatal, never as "fall back to
+    proceeding anyway" — the whole point is refusing to guess which of two
+    concurrent writers is safe to let through."""
+
+
+class _ArtifactLock:
+    """Exclusive advisory lock (POSIX flock) on `<responses_file>.lock`, held
+    for the ENTIRE lifetime of a phase_infer call that might read-or-write the
+    artifact — from before the resume decision is even made, through the
+    whole write loop, to the function's return. A second phase_infer call
+    against the SAME --responses_file (a duplicate SLURM submission, an
+    accidental double-launch, a stale job that didn't fully exit) fails fast
+    with ArtifactLockHeld instead of racing the first one — no interleaved
+    writes, no "last one to open('w') wins and silently destroys the other's
+    completed records", which is the exact failure this class exists to rule
+    out.
+
+    Uses a SEPARATE `.lock` sidecar file, not a lock on the artifact itself:
+    flock is advisory and tied to an open file DESCRIPTOR, and the artifact
+    itself gets closed/reopened/renamed (--resume's header repair rewrites it
+    via a temp file + os.replace) during the locked section — locking a
+    dedicated sidecar avoids "renaming the file out from under an active
+    lock" ambiguity entirely. The lock file is created but never meaningfully
+    read; it just carries the holder's PID for a human to inspect if a stale
+    lock is ever suspected.
+
+    NOT reentrant and NOT thread-safe (one process, one lock attempt) —
+    doesn't need to be, given this project's subprocess-per-stage model.
+    flock is per-process-independent, so THIS process re-acquiring its own
+    lock would still deadlock; that's fine, phase_infer only acquires once."""
+
+    def __init__(self, artifact_path):
+        self.lock_path = Path(str(artifact_path) + ".lock")
+        self._fh = None
+
+    def acquire(self):
+        self._fh = open(self.lock_path, "w")
+        try:
+            fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as e:
+            # "Locking isn't supported here" is NOT "someone else holds it".
+            # Some filesystems (notably certain NFS exports) return ENOLCK /
+            # EOPNOTSUPP / EINVAL for flock. Treating those as contention
+            # would make EVERY job on such a mount refuse to start, claiming a
+            # duplicate that doesn't exist — turning a safety feature into a
+            # total outage. Warn and proceed unlocked instead: no worse than
+            # before this lock existed, and the alternative is running nothing
+            # at all. Only genuine contention (EWOULDBLOCK/EAGAIN/EACCES)
+            # raises.
+            if e.errno in (errno.ENOLCK, errno.EOPNOTSUPP, errno.EINVAL, errno.ENOSYS):
+                print(f"⚠️ [lock] {self.lock_path.parent} does not support flock "
+                      f"({e.strerror}) — continuing WITHOUT an artifact lock. Nothing "
+                      f"will stop a second job writing this same artifact, so make "
+                      f"sure only one runs at a time (`squeue`).")
+                return self
+            self._fh.close()
+            self._fh = None
+            raise ArtifactLockHeld(
+                f"Another process already holds the lock on {self.lock_path} — "
+                f"i.e. is already running against this exact --responses_file "
+                f"({self.lock_path.with_suffix('')}). Refusing to start a second "
+                f"one against the same artifact; running two at once is exactly "
+                f"what silently destroyed a completed run's data before this "
+                f"lock existed. Check `squeue`/`ps aux | grep run_vlm_pipeline` "
+                f"for a duplicate job, let it finish or kill it, then retry.")
+        self._fh.write(f"pid={os.getpid()} time={datetime.now().isoformat()}\n")
+        self._fh.flush()
+        return self
+
+    def release(self):
+        if self._fh is not None:
+            fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+            self._fh.close()
+            self._fh = None
+
+    def __enter__(self):
+        return self.acquire()
+
+    def __exit__(self, *exc_info):
+        self.release()
+        return False
+
+
+def _durable_write(f, n_written, fsync_every, force=False):
+    """Push `f`'s buffered writes all the way to stable storage every
+    `fsync_every` records (and unconditionally when `force`).
+
+    WHY THIS EXISTS. Writing a record with f.write() puts it in Python's
+    ~8 KB userspace buffer; flushing that only hands it to the OS page
+    cache. Neither is durable, and NEITHER REPORTS AN ERROR if the data
+    never reaches the disk — which is exactly how two multi-day runs were
+    lost (2026-08): the pipeline logged "wrote 21000 image records", the
+    file was the right size, and its contents were zeros.
+
+    fsync() is the only call that (a) forces the data down and (b) RAISES
+    if the filesystem cannot commit it. So its real value here is as much
+    early failure detection as durability: a storage fault surfaces on the
+    record it happens at, in the job's own log, instead of silently
+    two days later when scoring reads back a corrupt artifact.
+
+    `fsync_every=0` disables the periodic call; `force=True` still fsyncs,
+    so the footer (which marks the run complete) is always committed before
+    the process claims success.
+    """
+    if not force and (not fsync_every or n_written % fsync_every):
+        return
+    f.flush()
+    os.fsync(f.fileno())
+
+
+class _StreamingCSVWriter:
+    """Append-as-you-go writer for the predictions CSV.
+
+    REPLACES accumulating every row in a list and writing once at the end.
+    That old shape had two failure modes, both hit in practice:
+      * a scoring run that died at 99% produced NO CSV AT ALL — the reason
+        three of this project's places365 models have no predictions file
+        despite their inference having completed;
+      * peak memory scaled with the dataset, holding every row (each
+        carrying objects/gt-targets/groundings JSON, including mask RLEs)
+        for the whole run — untenable at the 2M-image BIG-5 scale this
+        project is ultimately aimed at.
+    Streaming fixes both: a crash leaves a valid partial CSV of everything
+    scored so far, and memory stays flat.
+
+    Columns are fixed from the FIRST row (the file is opened lazily, so no
+    empty CSV is created for a run with zero rows). Later rows are written
+    with restval=""/extrasaction="ignore" and a one-time warning rather
+    than an exception: every row here is built from one dict literal so the
+    keys are structurally identical, and if that assumption ever breaks,
+    losing a column beats aborting a completed multi-hour scoring pass at
+    the final step.
+    """
+
+    def __init__(self, path, fsync_every=0):
+        self.path = Path(path)
+        self.fsync_every = fsync_every
+        self._f = None
+        self._w = None
+        self._fields = None
+        self._warned = False
+        self.n_written = 0
+
+    def write(self, row):
+        if self._w is None:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self._fields = list(row.keys())
+            self._f = open(self.path, "w", newline="")
+            self._w = csv.DictWriter(self._f, fieldnames=self._fields,
+                                     restval="", extrasaction="ignore")
+            self._w.writeheader()
+        elif not self._warned and set(row.keys()) != set(self._fields):
+            self._warned = True
+            missing = set(self._fields) - set(row.keys())
+            extra = set(row.keys()) - set(self._fields)
+            print(f"⚠️ [score] predictions-CSV columns changed mid-run "
+                  f"(missing={sorted(missing)}, extra={sorted(extra)}); keeping the "
+                  f"first row's columns, blank-filling missing and dropping extra. "
+                  f"This shouldn't happen — the row dict is built from one literal.")
+        self._w.writerow(row)
+        self.n_written += 1
+        _durable_write(self._f, self.n_written, self.fsync_every)
+
+    def close(self):
+        if self._f is not None:
+            _durable_write(self._f, self.n_written, self.fsync_every, force=True)
+            self._f.close()
+            self._f = None
+
+
+def _count_null_bytes(path, chunk_size=8 << 20):
+    """How many NUL bytes the artifact contains, read in chunks so a 400 MB
+    ImageNet artifact isn't slurped into memory whole.
+
+    A JSON-Lines artifact written by this pipeline can NEVER legitimately
+    contain a raw NUL: json.dumps escapes one inside a string as the six
+    characters \\u0000, and nothing here writes binary. So a single NUL is
+    proof the file was damaged BELOW the application — confirmed in
+    production (2026-08-05): a places365 artifact was found at its full
+    170 MB with 97% of its interior replaced by one contiguous run of zeros,
+    its size still implying the ~21000 records the run's log said it wrote.
+    See scripts/diagnose_artifact.py for the full forensic breakdown."""
+    n = 0
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                return n
+            n += chunk.count(b"\x00")
+
+
+# =============================================================================
 # PHASE 2 — scoring
 # =============================================================================
 def _already_inferred_paths(path):
@@ -615,26 +926,118 @@ def _already_inferred_paths(path):
     return seen, has_footer, bad
 
 
-def _read_artifact(path):
-    """Read back a JSON-Lines artifact written by phase_infer: the first
-    header-tagged line (merged with the footer line's timing info, if
-    present — older artifacts written before footers existed simply won't
-    have it), plus every per-image record line, as plain Python dicts."""
-    header = None
-    footer = None
-    records = []
-    with open(path) as f:
+def _artifact_has_header(path):
+    """Whether `path` already contains a record_type="header" line. Used by
+    --resume to decide whether the artifact needs its header reconstructed — a
+    pre-existing file that exists but was never given a header (0-byte file
+    from a run killed before its buffered header line reached disk) would
+    otherwise silently accumulate image records with NO header ever written
+    (resume mode skips the header write unconditionally), leaving an artifact
+    _read_artifact can never parse ("has no header line") after potentially
+    hours of re-inference. Lines are parsed defensively, same as
+    _already_inferred_paths, since a truncated tail line is expected on a
+    killed run and must not raise here."""
+    p = Path(path)
+    if not p.exists():
+        return False
+    with open(p) as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
-            obj = json.loads(line)
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if obj.get("record_type") == "header":
+                return True
+    return False
+
+
+def _prepend_header(path, header):
+    """Rewrite `path` with `header` as its FIRST line, preserving every
+    existing line after it.
+
+    The header genuinely has to be line 1, not merely present somewhere:
+    grounding_pipeline.stream_artifact raises "does not start with a header
+    line" if the first non-empty line isn't one (it stops scanning there so it
+    can stream the rest lazily). So this can't be an append — the file is
+    rewritten.
+
+    Done via a temp file in the SAME directory followed by os.replace (atomic
+    on POSIX when both are on one filesystem), so an interruption mid-rewrite
+    leaves the original artifact untouched rather than half-copied — the whole
+    point being that the records already in this file may represent many hours
+    of inference. Costs one full read+write of the artifact and, transiently,
+    its size again in free disk."""
+    p = Path(path)
+    tmp = p.with_name(p.name + ".headerfix.tmp")
+    try:
+        with open(tmp, "w") as out:
+            out.write(json.dumps(header) + "\n")
+            with open(p) as src:
+                shutil.copyfileobj(src, out)
+        os.replace(tmp, p)
+    except BaseException:
+        # Never leave a stray half-written .headerfix.tmp behind on failure
+        # (including KeyboardInterrupt/SIGTERM, hence BaseException) — the
+        # original file is still intact, so a retry starts from a clean slate.
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def _read_artifact(path):
+    """Read back a JSON-Lines artifact written by phase_infer: the first
+    header-tagged line (merged with the footer line's timing info, if
+    present — older artifacts written before footers existed simply won't
+    have it), plus every per-image record line, as plain Python dicts.
+
+    Tolerates a corrupted individual line instead of raising and losing the
+    ENTIRE run over it — mirrors _already_inferred_paths' own defensive
+    handling of a truncated resume-time line, which this function used NOT
+    to have: one bad line used to take down scoring for every other good
+    record in the file. Confirmed in production (2026-08-04): a single
+    NULL-byte line (json.loads('\\x00') raises the exact reported
+    "Expecting value: line 1 column 1 (char 0)" — `.strip()` does not treat a
+    control byte as whitespace, so it isn't caught by the blank-line skip
+    below) crashed --stage score on an otherwise-complete, ~21000-record
+    artifact. A stray null/control-byte line is the classic signature of two
+    writers touching one file (one process's in-flight write landing past a
+    concurrent truncation point, sparse-filled with zeros by the
+    filesystem) — see _ArtifactLock's docstring for the writer-side guard
+    against that; this is the READ-side complement, for whatever corruption
+    still gets through (a stale pre-lock process, a filesystem hiccup, or
+    any other cause) rather than assuming the lock makes this impossible."""
+    header = None
+    footer = None
+    records = []
+    n_bad_lines = 0
+    bad_line_numbers = []
+    with open(path) as f:
+        for lineno, line in enumerate(f, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                n_bad_lines += 1
+                bad_line_numbers.append(lineno)
+                continue
             if obj.get("record_type") == "header":
                 header = obj
             elif obj.get("record_type") == "footer":
                 footer = obj
             else:
                 records.append(obj)
+    if n_bad_lines:
+        shown = bad_line_numbers[:10]
+        more = f" (+{n_bad_lines - len(shown)} more)" if n_bad_lines > len(shown) else ""
+        print(f"⚠️ [score] {path}: skipped {n_bad_lines} corrupted line(s) that failed to "
+              f"parse as JSON (file line(s) {shown}{more}) — scoring proceeds over the "
+              f"{len(records)} good record(s). If this count is more than a handful, treat "
+              f"it as a signal the artifact may be more broadly damaged and worth "
+              f"re-inferring rather than trusting outright.")
     if header is None:
         raise ValueError(f"Artifact {path} has no header line.")
     if footer:
@@ -652,6 +1055,20 @@ def phase_score(args):
     """
     print(f"📊 [score] reading {args.responses_file}")
     phase_t0 = time.time()
+    # Refuse to read while phase_infer might still be writing this exact
+    # artifact — a plain read (no lock of our own) could otherwise see a
+    # torn/partial file mid-write, or worse, mid-header-repair (the temp-file
+    # rewrite in _prepend_header). Acquire-then-immediately-release rather
+    # than holding it for the whole scoring run: scoring doesn't itself
+    # mutate the artifact, so it only needs to confirm no writer is ACTIVE
+    # right now, not to lock other readers out.
+    try:
+        _ArtifactLock(args.responses_file).acquire().release()
+    except ArtifactLockHeld as e:
+        raise ArtifactLockHeld(
+            f"{e} (raised from --stage score: a phase_infer for this exact "
+            f"artifact appears to still be running — scoring a file mid-write "
+            f"would read a torn/partial result.)") from e
     header, records = _read_artifact(args.responses_file)
     dataset = header["dataset"]
     candidate_vocab = header.get("candidate_vocab")
@@ -897,7 +1314,27 @@ def phase_score(args):
     n_grounding_attempted = n_grounding_confirmed = 0
     clipmatch_top1 = 0
     clipmatch_support = 0
-    flat_rows = []  # one row per stored IMAGE for the output CSV (see below)
+    # The predictions CSV is STREAMED, one row per image as it's scored, not
+    # accumulated and dumped at the end — see _StreamingCSVWriter. Its path is
+    # therefore resolved HERE, before the loop, rather than after it.
+    # Include dataset + model in the filename — otherwise every model run
+    # writes to the same "<stem>_predictions.csv" and each rerun (e.g. a
+    # different VLM on the same dataset) silently overwrites the previous
+    # model's predictions. Grouped into PREDICTIONS_SUBDIR (separate from
+    # RESPONSES_SUBDIR, where that model's .jsonl artifact lives — see
+    # _resolve_responses_file), not next to the shared results JSON.
+    # model_slug uses ONLY the model NAME (see _model_slug's rationale),
+    # falling back to the full family/name "model" string for older artifacts
+    # written before the header carried "model_name" separately.
+    out_dir = Path(args.results_dir)
+    if args.run_name:
+        out_dir = out_dir / args.run_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / Path(args.output_file).name
+    _model_slug_csv = (header.get("model_name") or header.get("model", "unknown_model")).replace("/", "_")
+    csv_path = (out_dir / PREDICTIONS_SUBDIR
+                / f"{out_path.stem}_{dataset}_{_model_slug_csv}_predictions.csv")
+    csv_writer = _StreamingCSVWriter(csv_path, fsync_every=args.fsync_every)
 
     for idx, rec in enumerate(records):
         if args.verbose:
@@ -1320,7 +1757,7 @@ def phase_score(args):
             image_n_confirmed = sum(1 for g in object_groundings if g["grounded"] is True)
             n_grounding_attempted += image_n_attempted
             n_grounding_confirmed += image_n_confirmed
-        flat_rows.append({
+        csv_writer.write({
             "image_path": rec["image_path"],
             "dataset": dataset,
             "model": header.get("model"),
@@ -1405,6 +1842,12 @@ def phase_score(args):
             "hierarchical_f1": hier["hf1"],
             "wup_similarity": wup_sim,
         })
+
+    # Every row is on disk by here. Closed explicitly (rather than left to
+    # garbage collection) so the final fsync happens BEFORE the summary below
+    # is computed and reported — the CSV must be durable before anything
+    # claims the scoring run succeeded.
+    csv_writer.close()
 
     # ---- Assemble summary ----
     n_images = len(records)
@@ -1597,11 +2040,8 @@ def phase_score(args):
     # type one level down — the predictions CSV here goes in
     # PREDICTIONS_SUBDIR, the .jsonl artifact from _resolve_responses_file
     # goes in RESPONSES_SUBDIR.
-    out_dir = Path(args.results_dir)
-    if args.run_name:
-        out_dir = out_dir / args.run_name
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / Path(args.output_file).name
+    # out_dir/out_path were resolved before the scoring loop (the streaming
+    # predictions CSV needs its path up front) — reused here, not recomputed.
     update_results_store(out_path, dataset=dataset, model=header.get("model"), metrics=summary)
     # Per-IMAGE nature/biotic/material GT composition of THIS run's sampled
     # dataset (recap: sampling is deterministic — a fixed --max_samples always
@@ -1614,24 +2054,11 @@ def phase_score(args):
     image_stats = compute_image_stats(records)
     config_key = str(args.max_samples) if args.max_samples is not None else "full"
     update_dataset_image_stats(out_path, dataset=dataset, config_key=config_key, stats=image_stats)
-    if flat_rows:
-        # Include dataset + model in the filename — otherwise every model run
-        # writes to the same "<stem>_predictions.csv" and each rerun (e.g. a
-        # different VLM on the same dataset) silently overwrites the previous
-        # model's predictions. Grouped into PREDICTIONS_SUBDIR (separate from
-        # RESPONSES_SUBDIR, where that model's .jsonl artifact lives — see
-        # _resolve_responses_file), not next to the shared results JSON.
-        # model_slug uses ONLY the model NAME (see _model_slug's rationale),
-        # falling back to the full family/name "model" string for older
-        # artifacts written before the header carried "model_name" separately.
-        predictions_dir = out_dir / PREDICTIONS_SUBDIR
-        predictions_dir.mkdir(parents=True, exist_ok=True)
-        model_slug = (header.get("model_name") or header.get("model", "unknown_model")).replace("/", "_")
-        csv_path = predictions_dir / f"{out_path.stem}_{dataset}_{model_slug}_predictions.csv"
-        with open(csv_path, "w", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=list(flat_rows[0].keys()))
-            w.writeheader(); w.writerows(flat_rows)
-        print(f"💾 [score] wrote {out_path} and {csv_path} ({len(flat_rows)} images stored)")
+    # The predictions CSV was written and fsync'd row-by-row during the loop
+    # above (see _StreamingCSVWriter) — nothing left to write here, just report.
+    if csv_writer.n_written:
+        print(f"💾 [score] wrote {out_path} and {csv_path} "
+              f"({csv_writer.n_written} images stored)")
 
     if args.wandb:
         _log_wandb(args, summary, run_clipmatch)
@@ -2091,6 +2518,22 @@ def build_arg_parser():
                         f"artifact in a '{RESPONSES_SUBDIR}' subfolder; every model's "
                         f"_predictions.csv in a '{PREDICTIONS_SUBDIR}' subfolder. Created if it "
                         "doesn't exist. Default: write directly into --results_dir.")
+    p.add_argument("--fsync_every", type=int, default=50,
+                   help="Force written records all the way to stable storage (fsync) "
+                        "every N records, for BOTH the .jsonl artifact (--stage infer) "
+                        "and the predictions CSV (--stage score). 0 disables the "
+                        "periodic call; the artifact's footer and the CSV's final row "
+                        "are fsync'd regardless, so a run never reports success while "
+                        "the data proving it is still only in a cache. Default 50 "
+                        "bounds an abrupt kill's loss to ~50 images while costing ~1 "
+                        "fsync per 50 images (negligible against ~10s/image of VLM "
+                        "compute). The point is as much EARLY FAILURE DETECTION as "
+                        "durability: fsync raises if the filesystem cannot commit, so "
+                        "storage trouble surfaces in this job's log at the record it "
+                        "occurs — rather than silently, days later, as an artifact "
+                        "that reads back full-size and full of zeros. Lower it on "
+                        "storage you don't trust; raise it if fsync latency dominates "
+                        "on a very fast model.")
     p.add_argument("--resume", action="store_true",
                    help="--stage infer/all only. If --responses_file already exists and has "
                         "no footer (i.e. a previous run died part-way), skip every image "
@@ -2101,7 +2544,15 @@ def build_arg_parser():
                         "instead of restarting from image 0. A truncated final line (hard "
                         "kill mid-write) is dropped and that one image redone. If the file "
                         "already ends in a footer the run is complete and this exits "
-                        "immediately rather than redoing anything. NOTE: pair with the SAME "
+                        "immediately rather than redoing anything (without loading the "
+                        "model at all). ALSO REPAIRS A MISSING HEADER: if the existing file "
+                        "has no header line — a run killed before its buffered header ever "
+                        "reached disk leaves a 0-byte file, and resuming onto that would "
+                        "otherwise append every record with no header ever written, leaving "
+                        "an artifact --stage score and the grounding pipeline can never "
+                        "read — one is rebuilt from THIS invocation's args and prepended, "
+                        "so pass the same dataset/model/--max_hops flags as the original "
+                        "run. NOTE: pair with the SAME "
                         "--max_samples as the original run — the sampled subset is "
                         "seed-42 deterministic, so a different value resumes against a "
                         "different subset.")
