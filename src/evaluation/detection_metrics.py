@@ -368,3 +368,25 @@ def label_summary(records: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     for key in ("hp", "hr", "hf1", "wup"):
         out.update(_stats([float(r[key]) for r in resolved], f"{key}_resolved"))
     return out
+
+
+def axis_agreement_summary(records: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    """Aggregate per-matched-pair biotic/material axis agreement into
+    per-axis accuracy + support, over TRUE POSITIVE detection pairs only.
+
+    Each record is one `score_axis_agreement(...)` dict — see its docstring
+    for why NATURE has no entry here (every matched pair is nature-vs-nature
+    by construction in this evaluation, so an "agreement rate" for it would
+    misreport a tautology as a measurement).
+
+    A pair where either side has no opinion on an axis (`{axis}_agree` is
+    None) is dropped from THAT axis's support rather than counted as either
+    an agreement or a disagreement — an unmapped GT class or an unresolved
+    VLM label is a missing value, not evidence of disagreement.
+    """
+    out: Dict[str, Any] = {}
+    for axis in ("biotic", "material"):
+        vals = [r[f"{axis}_agree"] for r in records if r.get(f"{axis}_agree") is not None]
+        out[axis] = {"support": len(vals),
+                     "accuracy": float(np.mean(vals)) if vals else 0.0}
+    return out

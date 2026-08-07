@@ -523,6 +523,24 @@ never replacing them. Two summary dicts, deliberately never merged:
   gets partial credit (~0.94 hF1) instead of a flat zero. Reported pooled
   (resolution failures as 0.0) and `_resolved`-only, both mean ± population
   std — same convention as the ImageNet/Places hierarchical block.
+  `phrase_matches_terms` matches the whole normalized phrase OR any GT term
+  as a TRAILING SPAN — not just the single trailing word — so a modifier in
+  front of a multi-word term ("huge potted plant" vs "potted plant") still
+  counts as exact; requiring the match at the very end (not anywhere in the
+  phrase) is what keeps "cow shed" from wrongly matching "cow". The same
+  span-based surface-form set (`_pred_label_terms`) feeds the curated-
+  vocabulary FP-vs-excluded test below, for the identical reason.
+- AXIS AGREEMENT (`summary["detection_axis_agreement"]`, biotic/material
+  only): for the SAME matched pairs, compares the predicted entity's own
+  hybrid label (`object_finals`) against the GT box's taxonomy position —
+  read off the geometric box correspondence, a tighter binding than the
+  lexical `find_matching_object` the plain axis metrics use (matters with
+  several same-class instances in one image). NATURE has no entry: every
+  matched pair is nature-vs-nature by construction (only nature entities are
+  grounded, GT here is nature-restricted), so an agreement rate for it would
+  misreport a tautology as a measurement. A `None` on either side (unmapped
+  GT, unresolved VLM label) is dropped from that axis's support, not counted
+  as disagreement.
 - NO GT LEAKAGE: the predicted phrase resolves via
   `taxonomy_metrics.resolve_phrase_to_wordnet(phrase, anchor_synset_id=None)`.
   The anchor is deliberately withheld — the only one available is the GT class,

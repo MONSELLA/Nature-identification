@@ -183,16 +183,29 @@ def phrase_matches_terms(phrase, terms):
     """True if an extracted object phrase names one of `terms` (a normalized
     surface-form set, e.g. from `gt_match_terms`).
 
-    Matches the whole normalized phrase, or just its TRAILING word — so
-    extracted "big dog" matches the GT term "dog". Factored out of
-    `find_matching_object` so the detection evaluation's label comparison
-    applies the exact same notion of "names the same thing" that the axis
-    metrics already do, instead of quietly inventing a second one.
+    Matches the whole normalized phrase, or any TERM as a trailing SPAN — so
+    extracted "big dog" matches the term "dog", and "huge potted plant"
+    matches the two-word term "potted plant" (a single-word trailing-word
+    check alone would miss this: the trailing word of "huge potted plant" is
+    just "plant", which usually isn't itself a separate term). English noun
+    phrases are right-headed — "huge potted plant" IS a potted plant, "potted
+    plant food" is NOT a potted plant — so requiring the term to land at the
+    END, not just anywhere in the phrase, is what keeps this from also
+    matching a compound where the term is merely a MODIFIER ("cow shed" must
+    not match the term "cow": its head, and trailing word, is "shed").
+    Anchoring on a word boundary (a preceding space) is what stops "wildcat"
+    from matching the term "cat" — English word-boundaries only occur at
+    spaces here, never mid-word.
+
+    Factored out of `find_matching_object` so the detection evaluation's
+    label comparison applies the exact same notion of "names the same thing"
+    that the axis metrics already do, instead of quietly inventing a second
+    one.
     """
     norm = _normalize_object(phrase)
     if norm in terms:
         return True
-    return " " in norm and norm.split()[-1] in terms
+    return any(norm.endswith(" " + term) for term in terms)
 
 
 def find_matching_object(objects, target):
@@ -339,6 +352,50 @@ def score_label_agreement(phrase, gt_box, graph):
             "hp": hier["hp"], "hr": hier["hr"], "hf1": hier["hf1"], "wup": wup}
 
 
+def score_axis_agreement(pred_final, gt_box):
+    """Compare a matched pair's biotic/material axes: the PREDICTED entity's
+    own hybrid-resolved label (`object_finals`, recap §6) against the GT
+    box's own taxonomy position (`dataset_loader.get_gt_from_graph`) — read
+    straight off the box correspondence the detection matching already
+    produced, rather than the lexical `find_matching_object` the plain COCO
+    axis metrics use elsewhere. A box match binds one SPECIFIC predicted
+    entity to one SPECIFIC GT instance, which is a strictly tighter
+    correspondence than "the first extracted object whose name matches this
+    class" — matters most with several same-class instances in one image,
+    where lexical matching has no way to tell them apart.
+
+    NATURE IS DELIBERATELY NOT SCORED HERE. Every predicted entity that can
+    even reach this comparison already has `final_nature is True` — only
+    nature-labeled entities are grounded at all (src/grounding_pipeline.py) —
+    and every GT box scored in this evaluation is nature-restricted too
+    (`coco_detection_gt_boxes`). So "nature agreement" on a matched pair is
+    1.0 by construction on every single row; reporting it as a measured rate
+    would misrepresent a tautology as a check. biotic/material do NOT share
+    that problem: GT biotic/material come from the graph mapping (can be
+    True, False, or None), and predicted biotic/material come from the
+    entity's OWN independently-derived label — material in particular is
+    ALWAYS the VLM's own judgment, never mapped (recap §6), so even a
+    WordNet-mapped-nature entity's material comparison tests a genuinely
+    separate source, not the same lookup on both sides.
+
+    Returns `{"gt_biotic","pred_biotic","biotic_agree","gt_material",
+    "pred_material","material_agree"}`. An axis's `_agree` key is None (not a
+    fabricated True/False) whenever either side has no opinion on it — an
+    unmapped/ambiguous GT class, or a VLM label that never resolved — so the
+    aggregate can exclude those pairs from that axis's support instead of
+    silently treating "no opinion" as disagreement.
+    """
+    out = {}
+    for axis in ("biotic", "material"):
+        gt_val = gt_box.get(f"gt_{axis}")
+        pred_val = pred_final.get(f"final_{axis}")
+        out[f"gt_{axis}"] = gt_val
+        out[f"pred_{axis}"] = pred_val
+        out[f"{axis}_agree"] = (bool(gt_val) == bool(pred_val)
+                                if gt_val is not None and pred_val is not None else None)
+    return out
+
+
 def score_image_detection(rec, gt_boxes_by_file, eval_vocab_terms, graph, iou_threshold):
     """Full detection + label evaluation for ONE image.
 
@@ -365,10 +422,20 @@ def score_image_detection(rec, gt_boxes_by_file, eval_vocab_terms, graph, iou_th
     matches, unmatched_gt, unmatched_pred = detection_metrics.match_boxes(
         gt_bboxes, pred_bboxes, iou_threshold=iou_threshold, ious=ious)
 
-    pair_rows, label_records = [], []
+    finals = rec.get("object_finals") or []
+    pair_rows, label_records, axis_records = [], [], []
     for gi, pi, iou in matches:
         agreement = score_label_agreement(preds[pi]["object"], gt_targets[gi], graph)
         label_records.append(agreement)
+        # Axis agreement is read off the SAME box correspondence, via the
+        # predicted entity's own index (preds[pi]["object_idx"]) into
+        # object_finals — a tighter binding than the lexical matching the
+        # plain COCO axis metrics use, since it's tied to this SPECIFIC
+        # instance rather than "the first same-named object in the image".
+        pred_final = (finals[preds[pi]["object_idx"]]
+                     if preds[pi]["object_idx"] < len(finals) else {})
+        axis = score_axis_agreement(pred_final, gt_targets[gi])
+        axis_records.append(axis)
         pair_rows.append({
             "gt_class": gt_targets[gi]["class_name"],
             "gt_synset": gt_targets[gi].get("synset_id"),
@@ -378,6 +445,7 @@ def score_image_detection(rec, gt_boxes_by_file, eval_vocab_terms, graph, iou_th
             "pred_score": preds[pi]["score"],
             "iou": iou,
             **agreement,
+            **axis,
         })
 
     # Unmatched predictions: false positive only if the entity names a class in
@@ -456,6 +524,7 @@ def score_image_detection(rec, gt_boxes_by_file, eval_vocab_terms, graph, iou_th
         "missed_gt": [{"gt_class": gt_targets[i]["class_name"],
                        "gt_bbox": gt_targets[i]["bbox"]} for i in unmatched_gt],
         "label_records": label_records,
+        "axis_records": axis_records,
         # {iou_threshold: [(score, is_tp), ...]} for every prediction that
         # COUNTS toward AP. Excluded and crowd-suppressed predictions are left
         # out on purpose — feeding them in as negatives would reimpose exactly
@@ -503,14 +572,26 @@ def _classify_unmatched(preds, unmatched_pred, crowd_boxes, eval_vocab_terms,
 
 
 def _pred_label_terms(phrase):
-    """Normalized surface forms for a predicted entity phrase — the phrase
-    itself plus its trailing head noun ("brown cow" -> {"brown cow", "cow"}),
-    the same two forms `phrase_matches_terms` tests in the other direction."""
+    """Normalized surface forms for a predicted entity phrase: the phrase
+    itself plus every TRAILING SPAN of it — its last word, last two words,
+    last three, and so on ("huge potted plant" -> {"huge potted plant",
+    "potted plant", "plant"}).
+
+    Feeds `classify_unmatched_prediction`'s dict-membership test against the
+    evaluated vocabulary, whose keys can be multi-word terms ("potted
+    plant"). A single trailing WORD only (the previous behavior) misses any
+    vocabulary term longer than one word once a modifier precedes it — the
+    same gap `phrase_matches_terms` closes on the GT side by suffix-testing
+    every term instead of checking only the last word. Kept as a separate
+    helper rather than calling `phrase_matches_terms` directly because this
+    generates a candidate SET for dict lookup, while that function tests one
+    phrase against a term set — same underlying idea (English noun phrases
+    are right-headed, so the entity's own name is always the trailing span),
+    applied on whichever side of the comparison needs it.
+    """
     norm = _normalize_object(phrase)
-    terms = {norm}
-    if " " in norm:
-        terms.add(norm.split()[-1])
-    return {t for t in terms if t}
+    words = norm.split()
+    return {t for t in ({norm} | {" ".join(words[i:]) for i in range(len(words))}) if t}
 
 
 def _fmt_big5_axis_cell(vals):
@@ -1228,6 +1309,7 @@ def phase_score(args):
                   # accumulated separately from the headline counters above.
                   "ap_records": {t: [] for t in detection_metrics.COCO_AP_IOU_THRESHOLDS}}
     det_label_records = []
+    det_axis_records = []
     # Taxonomy-disagreement diagnostic (see score_image_detection): which
     # NON-nature COCO classes a grounded nature entity most often lands on.
     # The per-class breakdown is the useful part — a long tail of one-offs
@@ -1635,6 +1717,7 @@ def phase_score(args):
             for t, recs in det["ap_records"].items():
                 det_counts["ap_records"][t].extend(recs)
             det_label_records.extend(det["label_records"])
+            det_axis_records.extend(det["axis_records"])
             det_nature_on_non_nature.extend(det["nature_on_non_nature"])
 
         # One CSV row PER IMAGE (not per object) — everything needed to
@@ -1775,6 +1858,17 @@ def phase_score(args):
                                     if det and det["pairs"] else None),
             "detection_wup_image": (float(np.mean([p["wup"] for p in det["pairs"]]))
                                     if det and det["pairs"] else None),
+            # Axis agreement (biotic/material only — see score_axis_agreement
+            # on why nature is excluded) for THIS image's matched pairs. The
+            # gt_biotic/pred_biotic/gt_material/pred_material fields on each
+            # pair are already inside detection_matches above; these are just
+            # the per-image rollup for a quick scan without parsing that JSON.
+            "detection_biotic_agreement_rate_image": (
+                float(np.mean([p["biotic_agree"] for p in det["pairs"] if p["biotic_agree"] is not None]))
+                if det and any(p["biotic_agree"] is not None for p in det["pairs"]) else None),
+            "detection_material_agreement_rate_image": (
+                float(np.mean([p["material_agree"] for p in det["pairs"] if p["material_agree"] is not None]))
+                if det and any(p["material_agree"] is not None for p in det["pairs"]) else None),
             "wordnet_mapping_rate_image": (image_n_map_nature / (image_n_map_nature + image_n_vlm_nature))
                                            if (image_n_map_nature + image_n_vlm_nature) else None,
             "parse_failure_count_image": image_n_parse_fail,
@@ -1947,6 +2041,22 @@ def phase_score(args):
         summary["detection"]["instance_score_threshold"] = \
             header["grounding"].get("instance_score_threshold")
         summary["detection_labels"] = detection_metrics.label_summary(det_label_records)
+        # Biotic/material agreement between the PREDICTED entity's own hybrid
+        # label and the GT box's taxonomy position, on the SAME matched
+        # pairs — a per-instance check independent of the lexical matching
+        # biotic_matched/material_matched (the plain COCO axis metrics) use.
+        # Nature is intentionally absent — see score_axis_agreement.
+        summary["detection_axis_agreement"] = detection_metrics.axis_agreement_summary(
+            det_axis_records)
+        summary["detection_axis_agreement"]["note"] = (
+            "biotic/material agreement between the matched predicted entity's own hybrid "
+            "label (object_finals) and the GT box's taxonomy position, over the SAME "
+            "detection-matched pairs as detection_labels — NOT the lexical find_matching_object "
+            "the plain biotic_matched/material_matched axis metrics use elsewhere, so this is a "
+            "tighter per-INSTANCE check rather than 'the first same-named object in the image'. "
+            "nature has no entry: every matched pair here is nature-vs-nature by construction "
+            "(only nature entities are grounded, and GT is nature-restricted), so an agreement "
+            "rate for it would misreport a tautology as a measurement.")
         # Third dict, and again never merged into the other two: these are
         # neither localization successes nor naming successes, they are
         # TAXONOMY DISAGREEMENTS — a grounded nature entity landing on a GT box
@@ -2218,6 +2328,13 @@ def _print_summary(s, run_clipmatch):
                   f"hF1 {dl['hf1_resolved']:.4f}±{dl['hf1_resolved_std']:.4f} "
                   f"| Wu-Palmer {dl['wup_resolved']:.4f}±{dl['wup_resolved_std']:.4f}")
             print(f"  WordNet resolution-failure rate: {dl['resolution_failure_rate']:.1%}")
+        da = s.get("detection_axis_agreement", {})
+        if da.get("biotic", {}).get("support") or da.get("material", {}).get("support"):
+            print("[axis agreement, matched pairs only, vs the GT box's own taxonomy position "
+                  "— nature omitted, trivially 1.0 by construction]")
+            for axis in ("biotic", "material"):
+                a = da[axis]
+                print(f"  {axis:<9} accuracy {a['accuracy']:.4f} (support {a['support']})")
     if run_clipmatch:
         primary_label = "summary-caption" if s["clip_models"]["clipmatch_primary_source"] == "summary_caption" else "caption-based"
         cm = s["clipmatch"]
@@ -2349,6 +2466,11 @@ def _log_wandb(args, summary, run_clipmatch):
             for key in ("hp", "hr", "hf1", "wup"):
                 log[f"DetectionLabels/{key}"] = dl[key]
                 log[f"DetectionLabels/{key}_ResolvedOnly"] = dl[f"{key}_resolved"]
+        da = summary.get("detection_axis_agreement", {})
+        for axis in ("biotic", "material"):
+            if da.get(axis, {}).get("support"):
+                log[f"DetectionAxisAgreement/{axis}_accuracy"] = da[axis]["accuracy"]
+                log[f"DetectionAxisAgreement/{axis}_support"] = da[axis]["support"]
     wandb.log(log)
     wandb.finish()
 

@@ -800,14 +800,30 @@ g) COCO BOX-IoU DETECTION EVALUATION (NEW in v21, IMPLEMENTED) —
    EM/Contains vs hP/hR throughout.
      - EXACT MATCH, using the same surface-form test as the extraction-hit
        diagnostic (class name or any WordNet lemma of its synset, whole
-       phrase or trailing head noun), so "named it correctly" means one thing
-       across the whole codebase.
+       phrase or trailing SPAN — not just the trailing single word), so
+       "named it correctly" means one thing across the whole codebase. The
+       span generalization matters for any GT term longer than one word: the
+       old single-trailing-word check matched "huge cow" against "cow" fine,
+       but missed "huge potted plant" against "potted plant" (its trailing
+       WORD is just "plant"). Anchoring at the phrase's END, not anywhere
+       inside it, is what still correctly rejects "cow shed" against "cow" —
+       English noun phrases are right-headed, so the entity's own name is
+       always the trailing span, never a leading modifier.
      - HIERARCHICAL: hP/hR/hF1 + Wu-Palmer between the GT synset and the
        predicted phrase's synset. Measured: "bull" against a GT "cow" scores
        hF1 ~0.94 and Wu-Palmer ~0.94, versus 0.27 against "airplane" — the
        graded credit the exact-match view scores as flat zero. Reported
        pooled (resolution failures counted as 0.0) and resolved-only, each
        mean ± population std, matching the ImageNet/Places convention in f.
+     - AXIS AGREEMENT (biotic/material only): the matched predicted entity's
+       own hybrid label vs the GT box's taxonomy position, off the SAME box
+       correspondence — a tighter binding than the lexical matching the plain
+       COCO axis metrics use, since it's tied to a specific instance rather
+       than "the first same-named object in the image". NATURE is excluded on
+       purpose: every matched pair here is nature-vs-nature by construction
+       (only nature entities get grounded, and GT is nature-restricted for
+       this eval), so a reported agreement rate for it would be a tautology,
+       not a measurement.
 
    NO GT LEAKAGE — the part most easily got wrong. Resolving the predicted
    phrase to a WordNet node needs word-sense disambiguation, and the one
@@ -835,7 +851,7 @@ g) COCO BOX-IoU DETECTION EVALUATION (NEW in v21, IMPLEMENTED) —
    from --instances_json, keyed by file name, so an artifact produced before
    this existed can be scored without paying for COCO-scale inference again.
 
-   NOT YET VALIDATED ON REAL DATA. The logic is covered by 123 checks over
+   NOT YET VALIDATED ON REAL DATA. The logic is covered by 143 checks over
    synthetic boxes/records (geometry, Hungarian vs greedy, the crowd and
    curated-vocabulary rules, AP edge cases, mask->bbox exclusivity, the
    anchorless-resolution regressions, and the cow/bull case end to end), but
