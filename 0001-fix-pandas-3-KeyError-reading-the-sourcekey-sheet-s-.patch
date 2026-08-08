@@ -1,0 +1,60 @@
+From 80f141006bedd3b752ac4c02953c4630c7b0b9a2 Mon Sep 17 00:00:00 2001
+From: rsoleyma <ramin.soleymani@bsc.es>
+Date: Sat, 8 Aug 2026 10:45:16 +0200
+Subject: [PATCH] fix: pandas 3 KeyError reading the sourcekey sheet's MIT
+ synsets
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+_load_places_taxonomy_synsets read the "sourcekey" sheet with header=0, so
+each iterrows() row is a Series indexed by column name ('Column1',
+'Column2') — but then accessed it positionally as row[0]/row[1]. That only
+worked because Series.__getitem__ used to fall back to positional lookup
+for an integer key on a non-integer index. pandas deprecated that in 2.2
+(FutureWarning) and REMOVED it in 3.0, so the integer is now unambiguously
+a label, no label 0 exists, and load_places365 died with KeyError: 0.
+
+Select by position explicitly with .iloc instead, which also drops the
+iterrows() overhead and no longer depends on what the sheet's headers are
+named. Note this was a silent-behaviour boundary too, not just a crash
+one: on a sheet whose header row happened to be integers, row[0] would
+keep "working" on pandas 3 as a coincidental label match.
+
+Verified against flat_wordnet_tree_fixed.xlsx on pandas 1.5.3, 2.0.3,
+2.2.3 and 3.0.5 — all four give exclusion=124, taxonomy_synsets=207 with
+no warnings, so the fix is not a trade against older versions.
+
+Swept the other pandas call sites for 3.0 removals while here; they all
+use label access (excel_loader row[mat_col], load_big5
+row.get("platform_id")) and are unaffected.
+---
+ src/loaders/dataset_loader.py | 10 +++++++---
+ 1 file changed, 7 insertions(+), 3 deletions(-)
+
+diff --git a/src/loaders/dataset_loader.py b/src/loaders/dataset_loader.py
+index 857974b..153beb2 100644
+--- a/src/loaders/dataset_loader.py
++++ b/src/loaders/dataset_loader.py
+@@ -457,11 +457,15 @@ def _load_places_taxonomy_synsets(excel_path):
+     # they were confirmed to correspond to. We only want the ones tagged as
+     # coming from "MIT" (Places365's source), so the heuristic resolver above
+     # only ever picks synsets that are actually meant for Places scenes.
++    # header=0 means the row Series is indexed by COLUMN NAME, not position —
++    # `row[0]` would be a label lookup for the literal key 0 and raise KeyError
++    # (pandas dropped the positional-integer fallback). Select by position
++    # explicitly with .iloc so the sheet's actual header names don't matter.
+     sourcekey_df = pd.read_excel(excel_path, sheet_name="sourcekey", header=0)
+     taxonomy_synsets = {
+-        str(row[0]).strip().split(' ')[0]
+-        for _, row in sourcekey_df.iterrows()
+-        if pd.notna(row[0]) and pd.notna(row[1]) and 'MIT' in str(row[1])
++        str(synset).strip().split(' ')[0]
++        for synset, source in zip(sourcekey_df.iloc[:, 0], sourcekey_df.iloc[:, 1])
++        if pd.notna(synset) and pd.notna(source) and 'MIT' in str(source)
+     }
+     return exclusion, taxonomy_synsets
+ 
+-- 
+2.34.1
+

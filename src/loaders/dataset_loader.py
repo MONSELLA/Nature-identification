@@ -457,11 +457,15 @@ def _load_places_taxonomy_synsets(excel_path):
     # they were confirmed to correspond to. We only want the ones tagged as
     # coming from "MIT" (Places365's source), so the heuristic resolver above
     # only ever picks synsets that are actually meant for Places scenes.
+    # header=0 means the row Series is indexed by COLUMN NAME, not position —
+    # `row[0]` would be a label lookup for the literal key 0 and raise KeyError
+    # (pandas dropped the positional-integer fallback). Select by position
+    # explicitly with .iloc so the sheet's actual header names don't matter.
     sourcekey_df = pd.read_excel(excel_path, sheet_name="sourcekey", header=0)
     taxonomy_synsets = {
-        str(row[0]).strip().split(' ')[0]
-        for _, row in sourcekey_df.iterrows()
-        if pd.notna(row[0]) and pd.notna(row[1]) and 'MIT' in str(row[1])
+        str(synset).strip().split(' ')[0]
+        for synset, source in zip(sourcekey_df.iloc[:, 0], sourcekey_df.iloc[:, 1])
+        if pd.notna(synset) and pd.notna(source) and 'MIT' in str(source)
     }
     return exclusion, taxonomy_synsets
 

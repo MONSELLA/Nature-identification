@@ -2518,15 +2518,15 @@ def build_arg_parser():
                         f"artifact in a '{RESPONSES_SUBDIR}' subfolder; every model's "
                         f"_predictions.csv in a '{PREDICTIONS_SUBDIR}' subfolder. Created if it "
                         "doesn't exist. Default: write directly into --results_dir.")
-    p.add_argument("--fsync_every", type=int, default=50,
+    p.add_argument("--fsync_every", type=int, default=32,
                    help="Force written records all the way to stable storage (fsync) "
                         "every N records, for BOTH the .jsonl artifact (--stage infer) "
                         "and the predictions CSV (--stage score). 0 disables the "
                         "periodic call; the artifact's footer and the CSV's final row "
                         "are fsync'd regardless, so a run never reports success while "
-                        "the data proving it is still only in a cache. Default 50 "
-                        "bounds an abrupt kill's loss to ~50 images while costing ~1 "
-                        "fsync per 50 images (negligible against ~10s/image of VLM "
+                        "the data proving it is still only in a cache. Default 32 "
+                        "bounds an abrupt kill's loss to ~32 images while costing ~1 "
+                        "fsync per 32 images (negligible against ~10s/image of VLM "
                         "compute). The point is as much EARLY FAILURE DETECTION as "
                         "durability: fsync raises if the filesystem cannot commit, so "
                         "storage trouble surfaces in this job's log at the record it "
