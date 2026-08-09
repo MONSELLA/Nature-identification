@@ -3,17 +3,18 @@ TAXONOMY REFERENCE: LIFE CATEGORY AXIS
 CATEGORY 1: BIOTIC
 Definition: All more-than-human living entities, the ecosystems and environments in which they exist and interact, and their representations and derivatives.
 Inclusion Scope:
-- Flora and its derivatives: Wild or potted plants such as flowers, trees, and vegetables, as well as foods, drinks and materials derived from them (for example, salad, vegetables, coffee, liqueur, and wood with visible grain).
-- Fauna and its derivatives: Wild, domesticated, or bred more-than-human animals such as mammals, molluscs, and insects, as well as foods and materials derived from them (for example, butter, honey, meat, seafood, eggs, wool, and leather).
+- Flora and its derivatives: Wild or potted plants such as flowers, trees, and vegetables, as well as foods, drinks and materials derived from them (for example, salad, vegetables, coffee, liqueur, wood with visible grain).
+- Fauna and its derivatives: Wild, domesticated, or bred more-than-human animals such as mammals, molluscs, and insects, as well as foods and materials derived from them (for example, butter, honey, meat, seafood, eggs).
 - Fungi and Microorganisms: Wild or cultivated mushrooms, moulds, yeasts, bacteria and virus.
-- Ecosystems and Environments: Natural or semi-natural environments where the more-than-human living entities exist and interact (for example, forests, coral reefs, nature reserves, urban parks, vegetable gardens, and beaches).
-- Representations: Real, stylized, abstract, artistic, scientific or fictional depictions of the more-than-human living entities (for example, landscape paintings, cartoon or stuffed animals and plants, video-game forests, and figurines or statues of fauna and flora).
+- Ecosystems and Environments: Natural or semi-natural environments where the more-than-human living entities exist and interact (for example, forests, coral reefs, nature reserves, urban parks, vegetable gardens, beaches).
+- Representations: Real, stylized, abstract, artistic, scientific, fictional or graphic depictions of the more-than-human living entities (for example, landscape paintings, cartoon or stuffed animals and plants, video-game forests, figurines or statues of fauna and flora, a leaf printed on a shirt).
+    
 
 CATEGORY 2: ABIOTIC
 Definition: All non-living physical, chemical, geological, topographical, meteorological, or astrophysical elements that characterize or occur within an ecosystem or natural environment.
 Inclusion Scope:
-- Hydrological: Water bodies and fluid flows (for example, rivers, ponds, lakes, oceans, and streams).
+- Hydrological: Water bodies and fluid flows (for example, rivers, ponds, lakes, oceans, streams).
 - Atmospheric and Meteorological: For example, rain, clouds, snow, wind, and sky.
 - Geological and Topographical: Large-scale landforms, earth structures, and soil materials (for example, mountains, canyons, cliffs, valleys, caves, dunes, rocks, land, sand, salt).
-- Astrophysical: Celestial bodies (for example, sun, stars, moon, and planets).
-- Representations: Real, stylized, abstract, artistic, scientific or fictional depictions of the non-living natural elements (for example, a painting or a video-game scene of a mountain range with a blue or cloudy sky).
+- Astrophysical: Celestial bodies (for example, sun, stars, moon, planets).
+- Representations: Real, stylized, abstract, artistic, scientific, fictional or graphic depictions of the non-living natural elements (for example, a painting or a video-game scene of a mountain range with a blue or cloudy sky).
