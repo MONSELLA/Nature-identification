@@ -156,7 +156,20 @@ def _load_new_targets_by_path(dataset_name, args):
     by_path = {}
     dupes = 0
     for inst in instances:
-        p = inst["image_path"]
+        # Resolved (os.path.abspath, relative to THIS process's cwd) rather
+        # than the raw string load_big5 built — different --stage infer runs
+        # of the same underlying dataset have been observed to pass
+        # --big_5_twitter_images_dir as a relative path for some models and
+        # an absolute one for others, which produces two different
+        # image_path STRINGS for the identical file on disk. Matching on the
+        # raw string would then spuriously report every record in a
+        # relative-path artifact as unmatched. Resolving both this dict's
+        # keys and the artifact's own image_path (see _stream_patch) the
+        # same way makes the match robust to that, as long as this script is
+        # run from the SAME working directory --stage infer originally used
+        # to resolve its own relative path (this project's convention: jobs
+        # are submitted from inside scripts/).
+        p = os.path.abspath(inst["image_path"])
         if p in by_path:
             dupes += 1
         by_path[p] = inst["targets"]
@@ -214,8 +227,15 @@ def _stream_patch(in_path, out_f, new_targets_by_path, stats):
                 saw_footer = True
             elif rt == "image":
                 path = obj.get("image_path")
-                if path in new_targets_by_path:
-                    obj["targets"] = new_targets_by_path[path]
+                # Resolved the SAME way new_targets_by_path's own keys are
+                # (see _load_new_targets_by_path) — otherwise a relative
+                # image_path in the artifact (some --stage infer runs passed
+                # --big_5_*_images_dir as relative, others absolute) would
+                # never match an absolute key even though it names the exact
+                # same file on disk.
+                lookup_path = os.path.abspath(path) if path else path
+                if lookup_path in new_targets_by_path:
+                    obj["targets"] = new_targets_by_path[lookup_path]
                     stats["patched"] += 1
                 else:
                     stats["unmatched"] += 1
