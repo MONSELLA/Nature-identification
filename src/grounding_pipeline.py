@@ -457,6 +457,33 @@ class SAM3Grounder:
         from PIL import Image
         return Image.open(path).convert("RGB")
 
+    def _encode(self, images, texts):
+        """Build SAM3 model inputs from a batch of images + text prompts,
+        WITHOUT going through `Sam3Processor.__call__`'s own dispatch.
+
+        `Sam3Processor.__call__(images=..., text=..., ...)` is the documented
+        one-call entry point, and its OWN implementation (verified against
+        transformers 5.14.1's source) is exactly the two calls below: the
+        image processor on `images`, the tokenizer on `text` (padded to
+        `max_length=32`, SAM3's own convention), merged into one encoding.
+        Calling it that way ourselves instead of through the top-level
+        `__call__` sidesteps a real regression hit in production: a newer
+        transformers release changed how `Sam3Processor.__call__` routes its
+        `**kwargs` internally, and `text` started leaking into the IMAGE
+        processor's own kwargs validation — `Sam3ImageProcessorKwargs.
+        __init__() got an unexpected keyword argument 'text'` — failing every
+        single grounding forward pass while looking, from this file's own
+        try/except, like an ordinary per-batch failure (see `_ground_batch`).
+        Doing the two calls explicitly means this file no longer depends on
+        that internal routing at all, so it can't regress the same way again
+        even if `Sam3Processor.__call__` itself keeps changing.
+        """
+        image_inputs = self.processor.image_processor(images, return_tensors="pt")
+        text_inputs = self.processor.tokenizer(texts, return_tensors="pt",
+                                               padding="max_length", max_length=32)
+        image_inputs.update(text_inputs)
+        return image_inputs
+
     def segment_pairs(self, pairs: Sequence[Tuple[Any, str]]) -> List[np.ndarray]:
         """Segment a flat list of (PIL image, prompt) pairs in ONE forward pass.
 
@@ -494,7 +521,7 @@ class SAM3Grounder:
         # PIL's .size is (width, height); post_process wants (height, width).
         target_sizes = [(img.height, img.width) for img in images]
 
-        inputs = self.processor(images=images, text=texts, return_tensors="pt").to(self.device)
+        inputs = self._encode(images, texts).to(self.device)
         with torch.inference_mode():
             outputs = self.model(**inputs)
 
