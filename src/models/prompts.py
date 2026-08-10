@@ -145,9 +145,11 @@ def get_summary_caption_prompt(dataset: str) -> str:
 # list of individual objects/elements. This list is what gets fed into Stage 3
 # (one taxonomy-labeling call per object) and into the CLIP-based metrics
 # (each object becomes its own "a photo of a {object}" text embedding).
-EXTRACTION_PROMPT = """You are an expert computer vision annotator. 
+EXTRACTION_PROMPT = """You are an expert computer vision annotator. Below is a baseline description of the image:
 
-Your task is to extract visual entities from the provided image and caption, keeping the total to a maximum of 12 items to avoid noise.
+"{caption}"
+
+Your task is to extract visual entities from the image, keeping the total to a maximum of 12 items to avoid noise.
 
 RULES:
  - Macro Elements (Objective): Extract the countable Things (salient objects like dog, guitar, desk, tree), uncountable Stuff (amorphous regions like sky, grass, ocean, sand, road), and the overarching Scene (settings like forest, office, restaurant), objectively.
@@ -158,53 +160,40 @@ RULES:
  - Do not hallucinate entities not visually present.
  - Do not repeat the same extracted entity twice.
 
-***
-
 EXAMPLE 1 (Mixed Environment):
-Image/Caption context: A person sitting in an indoor office chair at a desk with a laptop. On the desk is a little dog figurine and an orange. The person is wearing a shirt with a geometric triangle pattern. In the background, there is a potted plant near a window.
+Image: A person sitting in an indoor office chair at a desk with a laptop. On the desk is a little dog figurine and an orange. The person is wearing a shirt with a geometric triangle pattern. In the background, there is a potted plant near a window.
 {{
-  "reasoning": "Step 1: Macro elements include things (desk, chair, person, laptop, window), and the scene (office). Step 2: For micro elements, the little dog figurine, the orange, and the potted plant represent nature, so they will be extracted. I will ignore the geometric pattern on the shirt as it is NOT a nature representation.",
+  "reasoning": "Step 1: Macro elements include things (desk, chair, person, laptop, window), and the scene (office). Step 2: For micro elements, the little dog figurine, the orange, and the potted plant represent nature, so they will be extracted. I will ignore the geometric pattern on the shirt as it is not a nature representation.",
   "objects": ["desk", "chair", "person", "laptop", "window", "office", "dog figurine", "orange", "potted plant"]
 }}
 
 EXAMPLE 2 (Pure Nature Space):
-Image/Caption context: A sunny beach with crashing ocean waves and sand. A surfer carrying a surfboard with a bird logo walks near the water. A small crab is resting on the sand.
+Image: A sunny beach with crashing ocean waves and sand. A surfer carrying a surfboard with a bird logo walks near the water. A small crab is resting on the sand.
 {{
-  "reasoning": "Step 1: Macro elements include things (surfer, surfboard), stuff (ocean, sand), and the scene (beach). Step 2: For micro elements, the small crab and the bird logo represent nature and will be extracted.",
+  "reasoning": "Step 1: Macro elements include things (surfer, surfboard), stuff (ocean, sand), and the scene (beach). Step 2: For micro elements, the small crab and the bird logo represents nature and will be extracted.",
   "objects": ["surfer", "surfboard", "ocean", "sand", "beach", "crab", "bird logo"]
 }}
 
 EXAMPLE 3 (Pure No-nature Space):
-Image/Caption context: A photograph of a brightly lit convenience store in an urban city. Shelves are stocked with snacks and soda bottles. A cashier stands behind the counter.
+Image: A photograph of a brightly lit convenience store in an urban city. Shelves are stocked with snacks and soda bottles. A cashier stands behind the counter.
 {{
   "reasoning": "Step 1: Macro elements include things (shelf, cashier, counter) and the scene (store, city). Step 2: For micro elements, there are junk food snacks and soda bottles, but since none of these represent nature, they will be ignored. I will only extract the macro items.",
   "objects": ["shelf", "cashier", "counter", "store", "city"]
 }}
 
 EXAMPLE 4 (Social Media Text & Depiction):
-Image/Caption context: A messy indoor bedroom with a desk, a chair and a bed. A person wearing a shirt with a flower print is taking a selfie in the mirror. A teddy bear is laying on the bed. Overlaid on the image is a text banner that says "Save the trees!".
+Image: A messy indoor bedroom with a desk, a chair and a bed. A person wearing a shirt with a flower print is taking a selfie in the mirror. A teddy bear is laying on the bed. Overlaid on the image is a text banner that says "Save the trees!".
 {{
   "reasoning": "Step 1: Macro elements include things (person, mirror, desk, chair, bed) and the scene (bedroom). Step 2: For micro elements, the 'flower' print on the shirt, the 'teddy bear' (depicting an animal), and the word 'trees' from the text overlay all represent nature-related concepts and will be extracted. The rest of the messy room clutter will be ignored.",
   "objects": ["person", "mirror", "desk", "chair", "bed", "bedroom", "flower", "teddy bear", "trees"]
 }}
 
 EXAMPLE 5 (Social Media Selfie):
-Image/Caption context: Two people taking a selfie outdoors. The man on the left is wearing a plain black T-shirt. The woman on the right is wearing a red T-shirt with a hockey helmet logo. The background shows an outdoor setting with a paved walkway with a few trees and grass in the distance.
+Image: Two people taking a selfie outdoors. The man on the left is wearing a plain black T-shirt. The woman on the right is wearing a red T-shirt with a hockey helmet logo. The background shows an outdoor setting with a paved walkway with a few trees and grass in the distance.
 {{
   "reasoning": "Step 1: Macro elements include things (person, trees), stuff (grass) and the scene (urban walk). Step 2: For micro elements, the 'hockey helmet' logo on the shirt is not a nature representation, so it will be ignored.",
   "objects": ["person", "trees", "urban walk", "grass"]
-}}
-
-***
-
-TARGET IMAGE CAPTION:
-{caption}
-
-STRICT CONSTRAINTS: 
-1. You MUST strictly limit your final 'objects' list to a MAXIMUM of 12 items. Focus only on the most prominent Macro elements and valid Nature-related Micro elements.
-2. DO NOT hallucinate. Only extract entities that are explicitly mentioned in the caption or clearly visible in the image.
-
-Now, generate the JSON extraction for the target image and caption:"""
+}}"""
 
 class ObjectExtractionResponse(BaseModel):
     """Structured schema for baseline and nature-filtered entity extraction."""
@@ -340,15 +329,13 @@ def build_classification_prompt(class_name, axes):
     # the visual evidence (not just the word "oak tree" in isolation), and
     # lists exactly which fields/labels it must produce and how.
     return f"""You are analyzing a specific target entity identified in the provided image.
-
 TARGET ENTITY TO CLASSIFY: "{class_name}"
 
-Based on the visual evidence in the image and the strict definitions provided, classify this specific entity. Follow the interleaved reasoning structure: evaluate nature first, lock in the decision, and only then evaluate the sub-axes according to these rules:
+Based on the visual evidence in the image and the strict definitions provided, classify this specific "{class_name}" instance.
+Follow the interleaved reasoning structure: evaluate nature first, lock in the decision, and only then evaluate the sub-axes according to these rules:
 {field_lines}
 
-***
-
-EXAMPLE OUTPUT FOR TARGET "sky painting":
+EXAMPLE OUTPUT FOR TARGET "sky":
 {{
   "nature_reasoning": "The target entity is sky. The visual evidence shows an artistic painting on canvas depicting a sky, rather than a literal photograph of reality. Artistic depictions of atmospheric elements explicitly count as Representations of Nature. This fulfills the inclusion criteria.",
   "nature": "yes",
@@ -419,10 +406,6 @@ EXAMPLE OUTPUT FOR TARGET "elephant figurine":
   "life_category": "biotic",
   "tangibility": "immaterial"
 }}
-
-***
-
-Now, generate the JSON classification for "{class_name}":
 """
 
 
@@ -463,13 +446,10 @@ def build_material_classification_prompt(class_name, biotic):
     """
     
     return f"""You are analyzing a specific target entity identified in the provided image.
-
 TARGET ENTITY TO CLASSIFY: "{class_name}"
 
-Your task is to classify this specific instance's tangibility, based on the visual evidence in the image and the strict definitions provided. 
+Your task is to classify this specific "{class_name}" instance's tangibility, based on the visual evidence in the image and the strict definitions provided. 
 First, provide a one-sentence reasoning step explaining what you see. Then, output your final tangibility classification as either "material" or "immaterial".
-
-***
 
 EXAMPLE OUTPUT FOR TARGET "river":
 {{
@@ -477,7 +457,7 @@ EXAMPLE OUTPUT FOR TARGET "river":
   "tangibility": "material"
 }}
 
-EXAMPLE OUTPUT FOR TARGET "cartoon dog":
+EXAMPLE OUTPUT FOR TARGET "dog":
 {{
   "reasoning": "The visual evidence shows a stylized animated cartoon depiction of a dog rather than a physical real-world organism directly captured by the camera. Because it is a depiction that reimagines nature in a non-literal form, it falls under Fictional Representations and is classified as immaterial.",
   "tangibility": "immaterial"
@@ -489,7 +469,7 @@ EXAMPLE OUTPUT FOR TARGET "chair":
   "tangibility": "material"
 }}
 
-EXAMPLE OUTPUT FOR TARGET "sky painting":
+EXAMPLE OUTPUT FOR TARGET "sunset":
 {{
   "reasoning": "The visual evidence reveals an artistic painting on canvas depicting a sky at dusk rather than a physical non-living element directly captured by the camera in reality. Because it is an expressive interpretation of nature, it falls under Artistic and Abstract Representations and is classified as immaterial.",
   "tangibility": "immaterial"
@@ -501,15 +481,11 @@ EXAMPLE OUTPUT FOR TARGET "canyon":
   "tangibility": "material"
 }}
 
-EXAMPLE OUTPUT FOR TARGET "elephant figurine":
+EXAMPLE OUTPUT FOR TARGET "elephant":
 {{
   "reasoning": "The visual evidence shows a three-dimensional manufactured object explicitly designed to depict fauna, rather than being the natural entity itself. Because its primary purpose is representational, it falls under Physical Representational Objects and is classified as immaterial.",
   "tangibility": "immaterial"
 }}
-
-***
-
-Now, generate the JSON tangibility classification for "{class_name}":
 """
 
 
