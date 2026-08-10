@@ -200,7 +200,15 @@ evaluating the models.
   `detection_false_positives` / `detection_excluded_predictions` /
   `detection_missed_gt` / `detection_nature_on_non_nature` — so a
   disagreement is reviewable without opening the `.jsonl`.
-- SAM3 (`facebook/sam3`) via plain transformers AutoModel/AutoProcessor. Read
+- SAM3 (`facebook/sam3`) via `Sam3Model`/`Sam3Processor`, loaded EXPLICITLY —
+  NEVER `AutoModel`/`AutoProcessor`. Confirmed a real production regression:
+  on a newer transformers release, `AutoModel.from_pretrained("facebook/sam3")`
+  resolves to `Sam3VideoModel` (the video/tracking head, whose `forward()`
+  needs an `inference_session` this pipeline never constructs) instead of the
+  image model this file needs — silently failing every single forward pass.
+  The official facebook/sam3 model card and transformers' own SAM3 doc page
+  both load it via the concrete classes for exactly this image+text use case;
+  there is no AutoModel example anywhere in the documented usage. Read
   `outputs.semantic_seg` (concept-level pixel coverage) for the relevance
   score on EVERY dataset. The instance-level `pred_masks`/`pred_boxes`/
   `pred_logits` are read ONLY for COCO's box-IoU evaluation (see below) —

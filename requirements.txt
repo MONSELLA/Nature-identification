@@ -50,9 +50,12 @@ pydantic>=2.0          # v2 API required (model_json_schema / model_fields)
 vllm>=0.10.0
 # 5.14.1 floor (higher than vLLM's OWN floor) because the Grounding pipeline's
 # SAM3 support (transformers.models.sam3) only exists from 5.14.1 on —
-# confirmed present there. If AutoModel.from_pretrained("facebook/sam3")
+# confirmed present there. If Sam3Model.from_pretrained("facebook/sam3")
 # raises an unknown-model-type error, this floor is why: upgrade transformers,
-# don't chase it as a config problem.
+# don't chase it as a config problem. (Loaded via the EXPLICIT Sam3Model/
+# Sam3Processor classes, never AutoModel/AutoProcessor — AutoModel resolves to
+# Sam3VideoModel, not this image model, on at least one newer transformers
+# release; see src/grounding_pipeline.py's SAM3Grounder.__init__.)
 # CHECKED FOR CONFLICT WITH vLLM (this is exactly the kind of pairing that
 # broke things before — see the outlines<1.0.0 story above): vLLM's own
 # latest PyPI release (0.26.0, checked 2026-07) declares `transformers>=5.5.3`
@@ -118,9 +121,10 @@ regex>=2023.0
 # worth the operational overhead here.
 
 # --- Grounding pipeline (src/grounding_pipeline.py) ---
-# SAM3 (facebook/sam3) is loaded through plain transformers AutoModel/
-# AutoProcessor — no trust_remote_code, no separate detector, no separate
-# segmentation model. Needs `transformers.models.sam3`, which is why the
+# SAM3 (facebook/sam3) is loaded through plain transformers, via the EXPLICIT
+# Sam3Model/Sam3Processor classes (never AutoModel/AutoProcessor — see the
+# floor comment above) — no trust_remote_code, no separate detector, no
+# separate segmentation model. Needs `transformers.models.sam3`, which is why the
 # transformers floor above is 5.14.1, not some older version — see that
 # entry's comment.
 # pycocotools (listed below for the closed-set baselines) is ALSO required here

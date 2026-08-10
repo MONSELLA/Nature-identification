@@ -400,7 +400,9 @@ def entity_prompt(object_str: str) -> str:
 
 
 class SAM3Grounder:
-    """Thin wrapper around `facebook/sam3` (AutoModel + AutoProcessor) exposing
+    """Thin wrapper around `facebook/sam3` (`Sam3Model` + `Sam3Processor`,
+    loaded explicitly — see `__init__`'s comment on why not AutoModel/
+    AutoProcessor) exposing
     exactly one operation: segment a batch of (image, text-prompt) pairs into
     binary masks at each image's ORIGINAL resolution.
 
@@ -423,7 +425,18 @@ class SAM3Grounder:
         import os
 
         import torch
-        from transformers import AutoModel, AutoProcessor
+        # EXPLICIT classes, never AutoModel/AutoProcessor — confirmed a real
+        # regression in production: on a newer transformers release,
+        # AutoModel.from_pretrained("facebook/sam3") resolves to
+        # Sam3VideoModel (SAM3's video/tracking head — its forward() requires
+        # an `inference_session` we never construct), not the image model this
+        # file actually needs. facebook/sam3's own model card and the
+        # transformers SAM3 doc page both load it as Sam3Model/Sam3Processor
+        # explicitly for exactly this image+text-prompt use case — there is no
+        # AutoModel example anywhere in the official usage. Importing the
+        # concrete classes removes the ambiguity outright rather than hoping
+        # AutoModel's mapping stays pointed at the image variant.
+        from transformers import Sam3Model, Sam3Processor
 
         self._torch = torch
         self.device = device
@@ -449,8 +462,8 @@ class SAM3Grounder:
         # cached token (huggingface_hub's own resolution order — passing
         # token=None here still lets that automatic lookup happen).
         token = hf_token or os.environ.get("HF_TOKEN")
-        self.processor = AutoProcessor.from_pretrained(model_name, token=token)
-        self.model = AutoModel.from_pretrained(model_name, token=token, **dtype_kwargs)
+        self.processor = Sam3Processor.from_pretrained(model_name, token=token)
+        self.model = Sam3Model.from_pretrained(model_name, token=token, **dtype_kwargs)
         self.model.eval().to(device)
 
     def _load_image(self, path: str):
