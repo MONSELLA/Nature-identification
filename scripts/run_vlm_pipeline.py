@@ -2705,7 +2705,10 @@ def phase_score(args):
                      "is firing, a flat spread of unrelated classes suggests loose boxes."),
         }
         summary["detection_note"] = (
-            "COCO box-IoU evaluation of SAM3 instance boxes against COCO's per-instance GT. "
+            f"COCO {args.detection_iou_type}-IoU evaluation of SAM3 instance "
+            f"{'masks' if args.detection_iou_type == 'mask' else 'boxes'} against COCO's "
+            "per-instance GT (see summary['detection']['iou_type'] — the same artifact scores "
+            "differently under mask vs box matching, so a number is not comparable without it). "
             "Assignment is CLASS-AGNOSTIC (Hungarian, one-to-one, IoU >= "
             f"{args.detection_iou_threshold}) so a predicted 'bull' can still be paired with a "
             "GT 'cow' and scored hierarchically instead of being thrown away as a false "
@@ -2901,7 +2904,8 @@ def _print_summary(s, run_clipmatch):
                   f"not a contradiction; feeds the detection FN count below")
     det = s.get("detection")
     if det is not None:
-        print(f"\n--- COCO detection [box IoU >= {det['iou_threshold']}, instance score > "
+        print(f"\n--- COCO detection [{det.get('iou_type', 'box')} IoU >= "
+              f"{det['iou_threshold']}, instance score > "
               f"{det.get('instance_score_threshold')}] "
               f"({det['n_gt_boxes']} nature GT boxes, {det['n_pred_boxes']} predicted) ---")
         print(f"[localization, class-agnostic matching]  P {det['precision']:.4f} | "
