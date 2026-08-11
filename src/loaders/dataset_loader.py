@@ -337,7 +337,7 @@ def _coco_box_xyxy(ann):
     return [float(x), float(y), float(x) + float(w), float(y) + float(h)]
 
 
-def coco_gt_boxes(instances_json, taxonomy_graph, images_dir=None):
+def coco_gt_boxes(instances_json, taxonomy_graph, images_dir=None, include_masks=False):
     """Per-INSTANCE COCO ground truth, keyed by image FILE NAME:
     `{file_name: [box_dict, ...]}`.
 
@@ -351,6 +351,15 @@ def coco_gt_boxes(instances_json, taxonomy_graph, images_dir=None):
     Each box dict is:
         {"class_name", "synset_id", "category_id", "gt_nature", "gt_biotic",
          "gt_material", "bbox": [x1,y1,x2,y2], "area", "iscrowd"}
+
+    With `include_masks=True` each dict also carries "mask_rle" — COCO's own
+    per-instance `segmentation`, converted to the same JSON-safe pycocotools
+    RLE shape the Grounding pipeline stores its predicted masks in
+    (`grounding_pipeline.encode_rle`), so GT and prediction masks are directly
+    comparable. Masks are deliberately NOT stored in the artifact by
+    `load_coco` (they would bloat every image record for a use only scoring
+    has); they are loaded here, at scoring time, straight from the annotation
+    file instead.
 
     Keyed by file name rather than full path so a predictions artifact written
     against a DIFFERENT `images_dir` (a copy of val2017 on another machine,
@@ -379,7 +388,7 @@ def coco_gt_boxes(instances_json, taxonomy_graph, images_dir=None):
                 # project's "GT-unmapped instances are excluded" convention,
                 # it is neither a detection target nor a miss.
                 continue
-            boxes.append({
+            entry = {
                 **target,
                 "category_id": int(ann["category_id"]),
                 "bbox": _coco_box_xyxy(ann),
@@ -391,7 +400,20 @@ def coco_gt_boxes(instances_json, taxonomy_graph, images_dir=None):
                 # matcher can apply that same rule rather than scoring a
                 # crowd box as an ordinary instance.
                 "iscrowd": bool(ann.get("iscrowd", 0)),
-            })
+            }
+            if include_masks:
+                # annToRLE handles all three of COCO's segmentation encodings
+                # (polygon list, uncompressed RLE, compressed RLE) uniformly,
+                # including the crowd regions that use RLE rather than
+                # polygons. `counts` comes back as bytes; decode to str for
+                # the same JSON-safe shape grounding_pipeline.encode_rle uses.
+                rle = coco.annToRLE(ann)
+                counts = rle["counts"]
+                entry["mask_rle"] = {
+                    "size": [int(rle["size"][0]), int(rle["size"][1])],
+                    "counts": counts.decode("ascii") if isinstance(counts, bytes) else counts,
+                }
+            boxes.append(entry)
         if boxes:
             by_file[info["file_name"]] = boxes
     return by_file

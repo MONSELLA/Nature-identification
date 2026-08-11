@@ -131,6 +131,74 @@ def iou_matrix(gt_boxes: Sequence[Sequence[float]],
     return mat
 
 
+def mask_iou_matrix(gt_rles: Sequence[Dict[str, Any]],
+                    pred_rles: Sequence[Dict[str, Any]],
+                    gt_iscrowd: Optional[Sequence[bool]] = None) -> np.ndarray:
+    """Dense (n_gt, n_pred) MASK IoU matrix, via pycocotools' own `maskUtils.iou`.
+
+    This is the segmentation counterpart of `iou_matrix`, and the one that
+    actually fits this project: the pipeline's predictions ARE masks (SAM3's
+    instance head), and COCO ships per-instance `segmentation` for every
+    annotation, so reducing both sides to boxes before comparing them discards
+    real signal. A box around a curled-up dog is mostly the sofa behind it; a
+    box around a diagonal giraffe is mostly sky. Two masks that overlap poorly
+    can still have near-identical boxes, and box IoU cannot tell them apart.
+    COCO's own evaluation has always had both an `iouType="bbox"` and an
+    `iouType="segm"` task for exactly this reason — this function is the latter.
+
+    Computed with pycocotools' C implementation rather than decoding to dense
+    arrays and intersecting in NumPy: it operates directly on the
+    run-length encoding, so it stays fast at COCO scale and never materializes
+    a full HxW boolean array per pair.
+
+    `gt_iscrowd` is passed through to pycocotools, which switches a crowd
+    column from IoU to intersection-over-DETECTION-area — the same asymmetry
+    `box_ioa` implements for the box path, and the reason a crowd region
+    dwarfing a single prediction still suppresses it.
+    """
+    if not gt_rles or not pred_rles:
+        return np.zeros((len(gt_rles), len(pred_rles)), dtype=float)
+    mask_utils = _mask_utils()
+
+    def _native(rle):
+        counts = rle["counts"]
+        return {"size": list(rle["size"]),
+                "counts": counts.encode("ascii") if isinstance(counts, str) else counts}
+
+    gt_native = [_native(r) for r in gt_rles]
+    pred_native = [_native(r) for r in pred_rles]
+    crowd = [int(bool(c)) for c in (gt_iscrowd or [False] * len(gt_rles))]
+    # maskUtils.iou returns (n_detections, n_gt); this module's convention
+    # everywhere else is (n_gt, n_pred), so transpose.
+    ious = mask_utils.iou(pred_native, gt_native, crowd)
+    return np.asarray(ious, dtype=float).reshape(len(pred_rles), len(gt_rles)).T
+
+
+def _mask_utils():
+    """Import pycocotools' mask module lazily, mirroring
+    grounding_pipeline._mask_utils, so this module stays importable (and its
+    pure-geometry helpers unit-testable) without the C extension present."""
+    from pycocotools import mask as mask_utils
+    return mask_utils
+
+
+def mask_ioa(pred_rle: Dict[str, Any], region_rle: Dict[str, Any]) -> float:
+    """Intersection over the PREDICTION's own mask area — the mask counterpart
+    of `box_ioa`, used for crowd suppression on the segmentation path."""
+    mask_utils = _mask_utils()
+
+    def _native(rle):
+        counts = rle["counts"]
+        return {"size": list(rle["size"]),
+                "counts": counts.encode("ascii") if isinstance(counts, str) else counts}
+
+    # iscrowd=1 makes pycocotools normalize by the DETECTION's area rather
+    # than the union — exactly the "how much of this prediction sits inside
+    # that region" question, computed without decoding either mask.
+    val = mask_utils.iou([_native(pred_rle)], [_native(region_rle)], [1])
+    return float(np.asarray(val).reshape(-1)[0]) if np.asarray(val).size else 0.0
+
+
 def box_ioa(pred: Sequence[float], region: Sequence[float]) -> float:
     """Intersection over the PREDICTION's own area — "how much of this
     prediction sits inside that region". Used for crowd suppression, where IoU

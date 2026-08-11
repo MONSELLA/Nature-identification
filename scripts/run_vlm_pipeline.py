@@ -284,14 +284,24 @@ def coco_detection_gt_boxes(rec, gt_boxes_by_file):
 
     Returns `(targets, crowd_boxes, non_nature_boxes)`.
     """
-    boxes = rec.get("gt_boxes")
-    if boxes is None and gt_boxes_by_file is not None:
+    # `gt_boxes_by_file`, when the caller loaded it, WINS over the record's own
+    # copy — it comes straight from --instances_json and is the only source
+    # carrying segmentation masks (the artifact deliberately stores boxes
+    # only). Letting the record shadow it would silently drop back to box
+    # matching on exactly the runs that asked for masks.
+    boxes = None
+    if gt_boxes_by_file is not None:
         boxes = gt_boxes_by_file.get(os.path.basename(rec["image_path"]))
+    if boxes is None:
+        boxes = rec.get("gt_boxes")
     if not boxes:
         return None, [], []
     nature = [b for b in boxes if b.get("gt_nature") is True]
     return ([b for b in nature if not b.get("iscrowd")],
-            [b["bbox"] for b in nature if b.get("iscrowd")],
+            # Crowd regions carried whole (not just their box) so the
+            # segmentation path can suppress against the crowd MASK, matching
+            # whichever IoU type the run is using.
+            [b for b in nature if b.get("iscrowd")],
             [b for b in boxes if b.get("gt_nature") is not True])
 
 
@@ -309,6 +319,11 @@ def collect_predicted_boxes(rec):
         for inst in entry.get("instances", []):
             out.append({
                 "bbox": inst["bbox"],
+                # The predicted MASK itself (pycocotools RLE), carried so the
+                # segmentation IoU path can compare mask-to-mask instead of
+                # reducing both sides to boxes first. Already stored by the
+                # Grounding pipeline; nothing extra is computed here.
+                "mask_rle": inst.get("mask_rle"),
                 "score": float(inst.get("score", 0.0)),
                 "object": entry["object"],
                 "object_idx": oi,
@@ -400,7 +415,8 @@ def score_axis_agreement(pred_final, gt_box):
     return out
 
 
-def score_image_detection(rec, gt_boxes_by_file, eval_vocab_terms, graph, iou_threshold):
+def score_image_detection(rec, gt_boxes_by_file, eval_vocab_terms, graph, iou_threshold,
+                          iou_type="mask"):
     """Full detection + label evaluation for ONE image.
 
     Returns None when the image has nothing to evaluate (no nature GT boxes),
@@ -422,7 +438,24 @@ def score_image_detection(rec, gt_boxes_by_file, eval_vocab_terms, graph, iou_th
     pred_bboxes = [p["bbox"] for p in preds]
     # Computed ONCE and reused by the headline threshold and every rung of the
     # AP ladder below — the geometry is the same, only the cut-off changes.
-    ious = detection_metrics.iou_matrix(gt_bboxes, pred_bboxes)
+    #
+    # MASK vs BOX (--detection_iou_type): "mask" is the default and the one
+    # that fits this pipeline, because what the model actually produces IS a
+    # mask (SAM3's instance head) and COCO ships per-instance segmentation for
+    # every annotation. Reducing both sides to boxes first discards real
+    # signal — a box around a curled-up dog is mostly the sofa behind it — and
+    # two masks that overlap poorly can share nearly identical boxes. These
+    # are COCO's own two evaluation tasks, `segm` and `bbox`; "box" is kept
+    # available so a run can be compared against standard detection numbers
+    # (and against this project's own earlier box-matched results).
+    use_masks = (iou_type == "mask"
+                 and all(t.get("mask_rle") for t in gt_targets)
+                 and all(p.get("mask_rle") for p in preds))
+    if use_masks:
+        ious = detection_metrics.mask_iou_matrix(
+            [t["mask_rle"] for t in gt_targets], [p["mask_rle"] for p in preds])
+    else:
+        ious = detection_metrics.iou_matrix(gt_bboxes, pred_bboxes)
     matches, unmatched_gt, unmatched_pred = detection_metrics.match_boxes(
         gt_bboxes, pred_bboxes, iou_threshold=iou_threshold, ious=ious)
 
@@ -466,7 +499,8 @@ def score_image_detection(rec, gt_boxes_by_file, eval_vocab_terms, graph, iou_th
     matched_entity_idxs = {preds[pi]["object_idx"] for _, pi, _ in matches}
     n_fp, n_excluded, n_crowd, is_fp_flag, counted_flag = _classify_unmatched(
         preds, unmatched_pred, crowd_boxes, eval_vocab_terms, fp_rows, excluded_rows,
-        counted_flag=counted_flag, matched_entity_idxs=matched_entity_idxs)
+        counted_flag=counted_flag, matched_entity_idxs=matched_entity_idxs,
+        use_masks=use_masks)
 
     # TAXONOMY-DISAGREEMENT DIAGNOSTIC: an unmatched prediction sitting on a GT
     # box of a NON-nature class. This can never be a true positive by
@@ -491,7 +525,13 @@ def score_image_detection(rec, gt_boxes_by_file, eval_vocab_terms, graph, iou_th
     for pi in unmatched_pred:
         best = None
         for gt in non_nature_gt:
-            iou = detection_metrics.box_iou(preds[pi]["bbox"], gt["bbox"])
+            # Same geometry the matching itself used, so this diagnostic's
+            # threshold means the same thing as the one above it.
+            if use_masks and preds[pi].get("mask_rle") and gt.get("mask_rle"):
+                iou = float(detection_metrics.mask_iou_matrix(
+                    [gt["mask_rle"]], [preds[pi]["mask_rle"]])[0, 0])
+            else:
+                iou = detection_metrics.box_iou(preds[pi]["bbox"], gt["bbox"])
             if iou >= iou_threshold and (best is None or iou > best["iou"]):
                 best = {"pred_object": preds[pi]["object"],
                         "pred_bbox": preds[pi]["bbox"],
@@ -519,7 +559,7 @@ def score_image_detection(rec, gt_boxes_by_file, eval_vocab_terms, graph, iou_th
                 t_counted[pi] = True
             _, _, _, t_fp_flag, t_counted = _classify_unmatched(
                 preds, t_unmatched, crowd_boxes, eval_vocab_terms, None, None,
-                counted_flag=t_counted,
+                counted_flag=t_counted, use_masks=use_masks,
                 matched_entity_idxs={preds[pi]["object_idx"] for _, pi, _ in t_matches})
         ap_records[t] = [(preds[pi]["score"], not t_fp_flag[pi])
                          for pi in range(len(preds)) if t_counted[pi]]
@@ -543,9 +583,30 @@ def score_image_detection(rec, gt_boxes_by_file, eval_vocab_terms, graph, iou_th
     }
 
 
+def _crowd_suppressed(pred, crowd_regions, use_masks):
+    """Is this prediction explained by a crowd region, under whichever
+    geometry the run is scoring with?
+
+    Mask path when available (matching how the IoU matrix was built), box path
+    otherwise. Both ask the same question — what fraction of the PREDICTION
+    lies inside the crowd region, not IoU — because a crowd region dwarfs any
+    single prediction and IoU would stay near zero even for one sitting
+    entirely inside it.
+    """
+    for region in crowd_regions:
+        if use_masks and pred.get("mask_rle") and region.get("mask_rle"):
+            if detection_metrics.mask_ioa(pred["mask_rle"], region["mask_rle"]) >= \
+                    detection_metrics.DEFAULT_CROWD_IOA_THRESHOLD:
+                return True
+        elif detection_metrics.box_ioa(pred["bbox"], region["bbox"]) >= \
+                detection_metrics.DEFAULT_CROWD_IOA_THRESHOLD:
+            return True
+    return False
+
+
 def _classify_unmatched(preds, unmatched_pred, crowd_boxes, eval_vocab_terms,
                         fp_rows, excluded_rows, is_fp_flag=None, counted_flag=None,
-                        matched_entity_idxs=frozenset()):
+                        matched_entity_idxs=frozenset(), use_masks=False):
     """Apply the crowd-suppression and curated-vocabulary rules to a set of
     unmatched predictions.
 
@@ -588,7 +649,7 @@ def _classify_unmatched(preds, unmatched_pred, crowd_boxes, eval_vocab_terms,
         counted_flag = [False] * len(preds)
     n_fp = n_excluded = n_crowd = 0
     for pi in unmatched_pred:
-        if detection_metrics.crowd_suppressed(preds[pi]["bbox"], crowd_boxes):
+        if _crowd_suppressed(preds[pi], crowd_boxes, use_masks):
             n_crowd += 1
             continue
         named = detection_metrics.classify_unmatched_prediction(
@@ -1782,18 +1843,34 @@ def phase_score(args):
         # boxes have no "gt_boxes" on their records. Loading them here from
         # --instances_json makes those artifacts scoreable without paying for
         # inference again (see coco_detection_gt_boxes).
-        needs_backfill = not any(r.get("gt_boxes") for r in records)
+        # MASK matching always loads GT from --instances_json, whether or not
+        # the artifact carries boxes: COCO's per-instance `segmentation` is
+        # deliberately NOT stored in the artifact (it would bloat every image
+        # record for a use only scoring has), so the annotation file is the
+        # only source for it.
+        needs_backfill = (args.detection_iou_type == "mask"
+                          or not any(r.get("gt_boxes") for r in records))
         if needs_backfill:
             if not args.instances_json:
-                print("⚠️  COCO detection evaluation needs GT boxes, but this artifact "
-                      "predates them and --instances_json was not given — skipping the "
-                      "detection metrics. Re-run --stage score with --instances_json "
-                      "pointing at the same annotations file used for inference.")
-                run_detection = False
+                if args.detection_iou_type == "mask":
+                    print("⚠️  --detection_iou_type mask needs GT segmentation from "
+                          "--instances_json, which was not given — falling back to BOX "
+                          "matching. Pass --instances_json to score masks against masks.")
+                    args.detection_iou_type = "box"
+                    needs_backfill = not any(r.get("gt_boxes") for r in records)
+                if needs_backfill:
+                    print("⚠️  COCO detection evaluation needs GT boxes, but this artifact "
+                          "predates them and --instances_json was not given — skipping the "
+                          "detection metrics. Re-run --stage score with --instances_json "
+                          "pointing at the same annotations file used for inference.")
+                    run_detection = False
             else:
-                print(f"📦 [score] artifact has no per-instance GT boxes — backfilling "
+                want_masks = args.detection_iou_type == "mask"
+                print(f"📦 [score] loading COCO GT "
+                      f"{'boxes + segmentation masks' if want_masks else 'boxes'} "
                       f"from {args.instances_json}")
-                det_gt_boxes_by_file = coco_gt_boxes(args.instances_json, graph)
+                det_gt_boxes_by_file = coco_gt_boxes(args.instances_json, graph,
+                                                     include_masks=want_masks)
     if run_detection:
         # The evaluated vocabulary (nature-mapped COCO classes) has to be built
         # from ALL images' GT, not per image — an unmatched "dog" prediction on
@@ -2187,7 +2264,8 @@ def phase_score(args):
         det = None
         if run_detection:
             det = score_image_detection(rec, det_gt_boxes_by_file, det_eval_vocab,
-                                        graph, args.detection_iou_threshold)
+                                        graph, args.detection_iou_threshold,
+                                        iou_type=args.detection_iou_type)
         if det is not None:
             for key in ("tp", "fp", "fn", "excluded_pred", "crowd_suppressed"):
                 det_counts[key] += det[key]
@@ -2572,6 +2650,11 @@ def phase_score(args):
         summary["detection"] = detection_metrics.detection_summary(det_counts)
         summary["detection"]["instance_score_threshold"] = \
             header["grounding"].get("instance_score_threshold")
+        # Which geometry the matching used — COCO's `segm` vs `bbox` task.
+        # Recorded because the SAME artifact scores differently under the two,
+        # so a number is not interpretable (or comparable across runs) without
+        # it.
+        summary["detection"]["iou_type"] = args.detection_iou_type
         summary["detection_labels"] = detection_metrics.label_summary(det_label_records)
         # Biotic/material agreement between the PREDICTED entity's own hybrid
         # label and the GT box's taxonomy position, on the SAME matched
@@ -3215,6 +3298,21 @@ def build_arg_parser():
                         "`inflect` package. Has no effect together with "
                         "--use_wordnet_definitions_clipmatch (that path always inflects its own "
                         "article regardless, as its own separate pre-existing behavior).")
+    p.add_argument("--detection_iou_type", type=str, default="mask",
+                   choices=["mask", "box"],
+                   help="--stage score, COCO only: whether detection matching compares "
+                        "MASKS (default) or bounding boxes. These are COCO's own two "
+                        "evaluation tasks, `segm` and `bbox`. 'mask' fits this pipeline: "
+                        "what SAM3 actually produces IS a mask, and COCO ships per-instance "
+                        "segmentation for every annotation, so reducing both sides to boxes "
+                        "first discards real signal (a box around a curled-up dog is mostly "
+                        "the sofa behind it; two masks overlapping poorly can share nearly "
+                        "identical boxes). 'box' is kept for comparability with standard "
+                        "detection numbers and with this project's own earlier box-matched "
+                        "results. NOTE 'mask' requires --instances_json, since GT "
+                        "segmentation is read from the annotation file at scoring time "
+                        "rather than stored in the (already large) artifact; it falls back "
+                        "to boxes per-image if either side's masks are unavailable.")
     p.add_argument("--detection_iou_threshold", type=float,
                    default=detection_metrics.DEFAULT_IOU_THRESHOLD,
                    help="--stage score, COCO only: box IoU at which a predicted SAM3 instance "

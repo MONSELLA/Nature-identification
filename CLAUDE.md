@@ -496,6 +496,20 @@ never replacing them. Two summary dicts, deliberately never merged:
   scoring time from `--instances_json` so pre-existing artifacts need NO
   re-inference). Boxes are xyxy, converted from COCO's native xywh once, in
   `_coco_box_xyxy`.
+- MATCHING IS ON **MASKS** BY DEFAULT (`--detection_iou_type mask|box`, default
+  `mask`) — COCO's own `segm` task, not `bbox`. What SAM3 produces IS a mask
+  and COCO ships per-instance `segmentation` for every annotation, so reducing
+  both sides to boxes discards real signal: two crossing diagonal strokes have
+  box IoU **1.000** and mask IoU **0.000** (verified in the test suite). `box`
+  is kept for comparability with standard detection numbers and this project's
+  own earlier box-matched results. Mask mode REQUIRES `--instances_json` (GT
+  segmentation is read from the annotation file at scoring time, never stored
+  in the artifact — it would bloat every record for a scoring-only use), and
+  falls back to boxes per-image if either side lacks masks. `--instances_json`
+  GT WINS over the record's own `gt_boxes` whenever loaded, since only the
+  former carries masks. Recorded as `summary["detection"]["iou_type"]` — the
+  same artifact scores differently under the two, so a number isn't
+  comparable without it.
 - MATCHING IS CLASS-AGNOSTIC — Hungarian (not greedy), one-to-one, maximizing
   total IoU, threshold `--detection_iou_threshold` (default 0.5). This is the
   whole point: matching on class first (the standard detection protocol) would
