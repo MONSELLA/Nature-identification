@@ -115,12 +115,26 @@ class BatchProgress:
             return
         elapsed = now - self._t0
         avg = elapsed / done
-        remaining = avg * (self.num_batches - done)
+        # Clamp at 0 rather than let a caller's UNDER-counted num_batches (or
+        # more batches genuinely running than were estimated up front) drive
+        # this negative. Confirmed a real production bug: `ground_records`
+        # falls back to num_batches=1 whenever its own caller doesn't know the
+        # true total (n_total=None, which is EVERY real run — --max_samples,
+        # the only source of a total there, is a smoke-test-only flag), so
+        # `done` sails past that "1" from the second batch on, and
+        # `format_duration` renders the resulting negative seconds as a
+        # nonsensical "-1-23:56:48" (Python's divmod floors a negative
+        # dividend toward -inf, so -3372 seconds becomes days=-1 plus a large
+        # positive remainder, not "-0-00:56:12" as you'd naively expect). "n/a"
+        # here is an honest signal the original estimate was wrong, which a
+        # more negative number dressed up as a duration is not.
+        remaining = max(0.0, avg * (self.num_batches - done))
+        remaining_str = format_duration(remaining) if done <= self.num_batches else "n/a"
         msg = (f"[INFO] {self.label} {done}/{self.num_batches} done in {batch_seconds:.1f}s "
                f"(avg {avg:.1f}s/batch)")
         if n_done is not None and n_total is not None:
             msg += f" | {n_done}/{n_total} items"
-        msg += f" | elapsed {format_duration(elapsed)} | ETA {format_duration(remaining)}"
+        msg += f" | elapsed {format_duration(elapsed)} | ETA {remaining_str}"
         if extra:
             msg += f" | {extra}"
         print(msg, flush=True)

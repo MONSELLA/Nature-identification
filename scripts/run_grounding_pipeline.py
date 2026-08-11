@@ -110,6 +110,19 @@ def phase_ground(args):
     header, footer_holder, records = stream_artifact(in_path)
     if args.max_samples is not None:
         records = _take(records, args.max_samples)
+        n_total_for_progress = args.max_samples
+    else:
+        # Without this, ground_records/BatchProgress falls back to
+        # num_batches=1 (n_total=None on every REAL run — --max_samples is a
+        # smoke-test-only flag) and the printed ETA diverges into nonsense
+        # after the first batch (see src/utils.py's BatchProgress.tick for the
+        # exact mechanism; confirmed in production: "ETA -1-23:56:48" one
+        # batch in). A second pass over the artifact just to COUNT image
+        # records is negligible next to the SAM3 forward passes that actually
+        # dominate a grounding run's wall time — even a 2M-image production
+        # artifact costs a few seconds of line-reading against a run that
+        # takes hours.
+        n_total_for_progress = _count_image_records(in_path)
 
     # Instance grounding (SAM3's per-instance masks/boxes, on top of the
     # concept-level semantic map) is what COCO's box-IoU evaluation needs and
@@ -166,7 +179,7 @@ def phase_ground(args):
             max_pairs_per_forward=args.max_pairs_per_forward,
             center_sigma=args.center_sigma,
             instance_grounding=instance_grounding,
-            n_total=args.max_samples,
+            n_total=n_total_for_progress,
             verbose=args.verbose,
         ):
             n_images += 1
@@ -191,6 +204,28 @@ def phase_ground(args):
     _print_summary(args, header, diagnostics, footer["grounding_time_seconds"], out_path)
     if args.wandb:
         _log_wandb(args, header, diagnostics)
+
+
+def _count_image_records(path):
+    """Count `record_type == "image"` lines in a VLM artifact with a cheap
+    pre-pass, so `ground_records`'s progress bar gets a real total instead of
+    the `n_total=None` fallback (see the call site's comment). One JSON parse
+    per line, same cost `stream_artifact`'s own generator already pays to
+    read the file once — negligible next to the SAM3 forward passes that
+    dominate a grounding run's actual wall time.
+    """
+    n = 0
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                if json.loads(line).get("record_type") == "image":
+                    n += 1
+            except json.JSONDecodeError:
+                continue
+    return n
 
 
 def _take(iterator, n):
