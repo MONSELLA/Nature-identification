@@ -460,9 +460,13 @@ def score_image_detection(rec, gt_boxes_by_file, eval_vocab_terms, graph, iou_th
     counted_flag = [False] * len(preds)
     for _, pi, _ in matches:
         counted_flag[pi] = True
+    # Entities with at least one instance matched to a GT box — the geometric
+    # half of the false-positive test (see _classify_unmatched). Recomputed
+    # per IoU threshold below, since which pairs match changes with it.
+    matched_entity_idxs = {preds[pi]["object_idx"] for _, pi, _ in matches}
     n_fp, n_excluded, n_crowd, is_fp_flag, counted_flag = _classify_unmatched(
         preds, unmatched_pred, crowd_boxes, eval_vocab_terms, fp_rows, excluded_rows,
-        counted_flag=counted_flag)
+        counted_flag=counted_flag, matched_entity_idxs=matched_entity_idxs)
 
     # TAXONOMY-DISAGREEMENT DIAGNOSTIC: an unmatched prediction sitting on a GT
     # box of a NON-nature class. This can never be a true positive by
@@ -515,7 +519,8 @@ def score_image_detection(rec, gt_boxes_by_file, eval_vocab_terms, graph, iou_th
                 t_counted[pi] = True
             _, _, _, t_fp_flag, t_counted = _classify_unmatched(
                 preds, t_unmatched, crowd_boxes, eval_vocab_terms, None, None,
-                counted_flag=t_counted)
+                counted_flag=t_counted,
+                matched_entity_idxs={preds[pi]["object_idx"] for _, pi, _ in t_matches})
         ap_records[t] = [(preds[pi]["score"], not t_fp_flag[pi])
                          for pi in range(len(preds)) if t_counted[pi]]
 
@@ -539,7 +544,8 @@ def score_image_detection(rec, gt_boxes_by_file, eval_vocab_terms, graph, iou_th
 
 
 def _classify_unmatched(preds, unmatched_pred, crowd_boxes, eval_vocab_terms,
-                        fp_rows, excluded_rows, is_fp_flag=None, counted_flag=None):
+                        fp_rows, excluded_rows, is_fp_flag=None, counted_flag=None,
+                        matched_entity_idxs=frozenset()):
     """Apply the crowd-suppression and curated-vocabulary rules to a set of
     unmatched predictions.
 
@@ -547,6 +553,34 @@ def _classify_unmatched(preds, unmatched_pred, crowd_boxes, eval_vocab_terms,
     / `excluded_rows` collect the per-prediction detail for the CSV and may be
     None when the caller only needs the counters (the AP sweep re-runs this
     at ten thresholds and wants no duplicated detail rows).
+
+    An unmatched prediction is a FALSE POSITIVE under EITHER of two tests, and
+    EXCLUDED only if it fails both:
+
+      (a) LEXICAL — its own phrase names a class in the evaluated vocabulary
+          (`classify_unmatched_prediction`). The original rule.
+      (b) GEOMETRIC — another instance of the SAME extracted entity, in this
+          same image, did match a GT box (`matched_entity_idxs`, keyed by
+          `object_idx`).
+
+    Test (b) closes a perverse incentive in (a) alone, where naming an object
+    WRONG improved precision. The exclusion rule exists because COCO annotates
+    only 80 curated classes, so a correctly-detected tree is not a
+    hallucination — but (a) decides "is this kind of thing annotated in COCO?"
+    by a LEXICAL PROXY, and a geometric match is direct, strictly stronger
+    evidence of the very same fact. Worked example, on a real 24-donut image
+    whose GT annotates only 12 of them: called "donut" (correct), the 12
+    unmatched detections are FPs because donut is a COCO class, giving
+    precision 12/24 = 0.50; called "pretzel" (wrong), those same 12 boxes
+    name nothing in the vocabulary, fall through to `excluded`, and
+    precision reads 12/12 = 1.00. Identical boxes, identical localization,
+    and the model that misnamed them scored better. With (b), the matched
+    "pretzel" instances prove pretzels ARE being annotated here (as donuts),
+    so its unmatched siblings are charged exactly as donut's were.
+
+    Note (b) is scoped per (image, entity), not dataset-wide: a match is
+    evidence about THIS image's annotations, and one spurious match elsewhere
+    should not retroactively make every instance of a phrase chargeable.
     """
     if is_fp_flag is None:
         is_fp_flag = [False] * len(preds)
@@ -559,7 +593,8 @@ def _classify_unmatched(preds, unmatched_pred, crowd_boxes, eval_vocab_terms,
             continue
         named = detection_metrics.classify_unmatched_prediction(
             _pred_label_terms(preds[pi]["object"]), eval_vocab_terms)
-        if named is None:
+        entity_matched = preds[pi]["object_idx"] in matched_entity_idxs
+        if named is None and not entity_matched:
             n_excluded += 1
             if excluded_rows is not None:
                 excluded_rows.append({"pred_object": preds[pi]["object"],
@@ -571,7 +606,12 @@ def _classify_unmatched(preds, unmatched_pred, crowd_boxes, eval_vocab_terms,
         counted_flag[pi] = True
         if fp_rows is not None:
             fp_rows.append({"pred_object": preds[pi]["object"], "named_class": named,
-                            "pred_bbox": preds[pi]["bbox"], "pred_score": preds[pi]["score"]})
+                            "pred_bbox": preds[pi]["bbox"], "pred_score": preds[pi]["score"],
+                            # Which test caught it — so a reviewer can tell a
+                            # lexically-named hallucination apart from an
+                            # over-count of a genuinely present object.
+                            "fp_reason": ("names_evaluated_class" if named is not None
+                                          else "entity_matched_elsewhere_in_image")})
     return n_fp, n_excluded, n_crowd, is_fp_flag, counted_flag
 
 
@@ -2541,8 +2581,12 @@ def phase_score(args):
             "the naming side lives in detection_labels. GT is restricted to NATURE-mapped COCO "
             "classes because only nature-labeled entities are grounded, so a non-nature GT box "
             "could never be matched and counting it as a miss would measure the protocol rather "
-            "than the model. An unmatched prediction is a false positive only when its own "
-            "phrase names a class in that evaluated vocabulary; otherwise it is EXCLUDED (COCO "
+            "than the model. An unmatched prediction is a false positive when EITHER its own "
+            "phrase names a class in that evaluated vocabulary, OR another instance of the same "
+            "entity in the same image did match a GT box (a geometric match is direct evidence "
+            "that this kind of object IS annotated here, and strictly stronger than the lexical "
+            "test; without it, misnaming an object would IMPROVE precision by routing its "
+            "unmatched siblings to 'excluded'). Failing both, it is EXCLUDED (COCO "
             "annotates 80 curated classes, so a correctly-detected tree is not a hallucination) "
             "and reported as excluded_predictions. iscrowd regions are neither required to be "
             "detected nor charged as false positives, per COCO's own convention. NO accuracy is "

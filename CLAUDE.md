@@ -506,12 +506,22 @@ never replacing them. Two summary dicts, deliberately never merged:
 - GT restricted to NATURE-mapped COCO classes, because only nature-labeled
   entities are grounded — a `car` box could never be matched, so counting it
   as a miss would measure the protocol, not the model.
-- UNMATCHED PREDICTION → false positive ONLY if its own phrase names a class
-  in that evaluated vocabulary; otherwise EXCLUDED and reported as
-  `excluded_predictions` (COCO annotates 80 curated classes, so a correctly
-  detected tree is not a hallucination). `build_coco_eval_vocab` MUST filter
-  to nature exactly as the box filter does — the two agreeing is what makes
-  the rule fair.
+- UNMATCHED PREDICTION → false positive under EITHER test, EXCLUDED only if it
+  fails both: (a) LEXICAL — its own phrase names a class in the evaluated
+  vocabulary; (b) GEOMETRIC — another instance of the SAME entity in the SAME
+  image did match a GT box. Recorded per-FP as `fp_reason`
+  (`names_evaluated_class` / `entity_matched_elsewhere_in_image`).
+  Test (b) is NOT optional polish — without it the metric has a PERVERSE
+  INCENTIVE where misnaming an object IMPROVES precision: on a 24-donut image
+  whose GT annotates only 12, calling them "donut" charges the 12 unmatched
+  detections as FP (P=0.50), while calling them "pretzel" routes the identical
+  boxes to `excluded` (P=1.00). (a) is only a LEXICAL PROXY for "is this kind
+  of thing annotated in COCO?"; a geometric match is direct, strictly stronger
+  evidence of the same fact. Scoped per (image, entity), never dataset-wide.
+  Otherwise EXCLUDED and reported as `excluded_predictions` (COCO annotates 80
+  curated classes, so a correctly detected tree is not a hallucination).
+  `build_coco_eval_vocab` MUST filter to nature exactly as the box filter
+  does — the two agreeing is what makes the rule fair.
 - `iscrowd` regions: not detection targets, but still suppress FPs (IoA over
   the PREDICTION's area ≥ 0.5, not IoU — a crowd box dwarfs any one
   prediction). COCO's own convention.
