@@ -555,6 +555,24 @@ never replacing them. Two summary dicts, deliberately never merged:
   image shows — so a hit is often the concept-vs-instance gap, not an error.
   Read `by_gt_class` to tell them apart (wood/stone furniture dominating =
   that clause firing; a flat spread of unrelated classes = loose masks).
+- INSTANCE NMS (`--instance_nms_iou`, default 0.5, score-time): SAM3's own
+  post-processing applies ONLY a score threshold — no NMS, no dedup (verified
+  in the transformers source) — so several queries firing on the SAME object
+  all survive, and one-to-one matching charges the redundant twins as FPs
+  (observed: 7 overlapping "orange slice" masks over 2 annotated oranges,
+  precision 0.29 instead of 1.00 on that image). Suppression is PER-ENTITY
+  only: two DIFFERENT entities overlapping ("cow" and "herd" on the same
+  pixels) is a real prediction, not a duplicate.
+- ENTITY-LEVEL BLOCK (`summary["detection_entity"]` / `_labels` /
+  `_axis_agreement`, `score_image_entities`) — reported ALONGSIDE the
+  instance-level block, never merged. Unions every instance mask of one
+  extracted entity into ONE region, every annotated instance of one GT class
+  into ONE region, then matches those. Same matching/FP/crowd/label/axis code,
+  granularity ONLY differs. Fairer on two measurable counts: duplicates
+  collapse by construction (no NMS needed), and COCO's non-exhaustive
+  annotation of crowded scenes stops capping TPs (the 24-donut/12-box case).
+  COSTS: no per-object counting ("found 8 of 12 cows") and no AP — both exist
+  only at instance granularity, which is why both blocks are kept.
 - NO TRUE NEGATIVES, so no accuracy is reported — unlike the axis metrics,
   detection has no finite negative class. Don't add one.
 - AP@0.5 and AP@[.50:.95] (101-point interpolated, class-agnostic) over the

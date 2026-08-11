@@ -200,6 +200,68 @@ def _mask_utils():
     return mask_utils
 
 
+def merge_rles(rles: Sequence[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Union several RLE masks into one, via pycocotools' own `merge`.
+
+    Used to collapse an ENTITY's many instance masks into a single
+    concept-level mask (and, on the GT side, a CLASS's many annotated
+    instances into one region) for the entity-level evaluation. Overlapping
+    pixels are counted once — the whole reason to union rather than sum.
+    Returns None for an empty input.
+    """
+    if not rles:
+        return None
+    mask_utils = _mask_utils()
+    native = []
+    for rle in rles:
+        counts = rle["counts"]
+        native.append({"size": list(rle["size"]),
+                       "counts": counts.encode("ascii") if isinstance(counts, str) else counts})
+    merged = mask_utils.merge(native, intersect=False)
+    counts = merged["counts"]
+    return {"size": [int(merged["size"][0]), int(merged["size"][1])],
+            "counts": counts.decode("ascii") if isinstance(counts, bytes) else counts}
+
+
+def mask_nms(rles: Sequence[Dict[str, Any]], scores: Sequence[float],
+             iou_threshold: float = 0.5) -> List[int]:
+    """Greedy non-maximum suppression over MASKS. Returns the indices to KEEP,
+    highest-score-first.
+
+    WHY THIS IS NEEDED HERE, verified against the transformers source rather
+    than assumed: `Sam3ImageProcessor.post_process_instance_segmentation`
+    applies ONLY a score threshold (`keep = scores > threshold`) — there is no
+    NMS and no deduplication anywhere in it. So when several of SAM3's
+    instance queries fire on the SAME physical object, every one of them above
+    `--instance_score_threshold` survives as a separate "instance". Observed
+    in production: seven heavily-overlapping "orange slice" masks over what
+    were really two annotated oranges.
+
+    That matters beyond cosmetics, because duplicates are charged as false
+    positives: the first duplicate matches the GT instance, and one-to-one
+    Hungarian assignment leaves its twins unmatched, where the
+    curated-vocabulary rule (specifically its `entity_matched_elsewhere_in_image`
+    half) then counts each as an FP. Suppressing them is standard detection
+    practice and is what makes the precision figure mean "how often was a
+    prediction right" rather than "how often did the model emit exactly one
+    box per object".
+
+    Greedy rather than anything cleverer: take the highest-scoring mask, drop
+    every remaining mask overlapping it by >= `iou_threshold`, repeat. This is
+    the textbook formulation and the one COCO-era detectors use.
+    """
+    order = sorted(range(len(rles)), key=lambda i: scores[i], reverse=True)
+    keep: List[int] = []
+    while order:
+        best = order.pop(0)
+        keep.append(best)
+        if not order:
+            break
+        ious = mask_iou_matrix([rles[best]], [rles[i] for i in order])[0]
+        order = [i for k, i in enumerate(order) if ious[k] < iou_threshold]
+    return keep
+
+
 def mask_ioa(pred_rle: Dict[str, Any], region_rle: Dict[str, Any]) -> float:
     """Intersection over the PREDICTION's own mask area — the mask counterpart
     of `box_ioa`, used for crowd suppression on the segmentation path."""
