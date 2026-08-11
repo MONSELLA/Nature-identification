@@ -1749,6 +1749,8 @@ def phase_score(args):
     # independent model", never a ground-truth signal).
     run_grounding = bool(header.get("grounding"))
     n_grounding_attempted = n_grounding_confirmed = 0
+    # See the semantic-vs-instance gap comment in the per-image loop.
+    n_semantic_only = 0
     # --- COCO box-IoU detection evaluation (Grounding pipeline) ---
     # Runs only when the artifact is COCO AND the Grounding pipeline recorded
     # instance grounding, since it is SAM3's instance boxes that get matched
@@ -2267,6 +2269,32 @@ def phase_score(args):
             image_n_confirmed = sum(1 for g in object_groundings if g["grounded"] is True)
             n_grounding_attempted += image_n_attempted
             n_grounding_confirmed += image_n_confirmed
+        # SEMANTIC-vs-INSTANCE GAP: entities the SEMANTIC head confirmed
+        # (grounded is True — pixels for this concept exist) but for which the
+        # INSTANCE head produced no box at all. Not a bug and not a
+        # contradiction: the two are different heads answering different
+        # questions. "Are there dog pixels here?" (semantic, thresholded at
+        # --mask_threshold on pixel probability) is a strictly easier call than
+        # "here is ONE discrete countable dog and its extent" (instance,
+        # gated by --instance_score_threshold), and a dark/occluded/blurry
+        # object can pass the first while the second declines to commit.
+        # A second path lands here too: an instance CAN clear the score gate
+        # and still be dropped by _postprocess_instances when its mask
+        # binarizes to empty, leaving no derivable box.
+        #
+        # WHY THIS IS WORTH REPORTING: it is the reconciliation between a
+        # grounding confirmation rate near 100% and a detection recall well
+        # below it — those numbers come from different heads, so they can
+        # diverge arbitrarily, and without this the reader has no way to see
+        # that. It is also a direct, quantified contributor to the detection
+        # FN count.
+        image_n_sem_only = None
+        object_instances = rec.get("object_instances")
+        if object_groundings is not None and object_instances is not None:
+            image_n_sem_only = sum(
+                1 for g, inst in zip(object_groundings, object_instances)
+                if g["grounded"] is True and inst.get("attempted") and not inst.get("instances"))
+            n_semantic_only += image_n_sem_only
         csv_writer.write({
             "image_path": rec["image_path"],
             "dataset": dataset,
@@ -2293,6 +2321,10 @@ def phase_score(args):
             "grounding_confirmed_image": image_n_confirmed,
             "grounding_confirmation_rate_image": (image_n_confirmed / image_n_attempted)
                                                   if image_n_attempted else None,
+            # Entities semantically confirmed on THIS image that yielded no
+            # instance box — the per-image view of the semantic/instance gap
+            # (see the loop comment). Blank off COCO / without instance grounding.
+            "grounding_semantic_only_image": image_n_sem_only,
             # --- COCO box-IoU detection (blank on every other dataset, and on
             # a COCO artifact without instance grounding). Per the project's
             # "the predictions CSV alone must be enough to spot-check a run"
@@ -2512,6 +2544,23 @@ def phase_score(args):
                                   if n_grounding_attempted else 0.0,
             "sam3_model": header["grounding"].get("sam3_model"),
             "mask_threshold": header["grounding"].get("mask_threshold"),
+            # Entities the SEMANTIC head confirmed but the INSTANCE head gave
+            # no box for — see the per-image loop's comment. Only meaningful
+            # on an instance-grounded (COCO) artifact; 0 elsewhere.
+            "semantic_confirmed_but_no_instance": n_semantic_only,
+            "semantic_only_rate": (n_semantic_only / n_grounding_confirmed)
+                                   if n_grounding_confirmed else 0.0,
+            "semantic_only_note": (
+                "Nature entities the SEMANTIC head found pixels for but the INSTANCE head "
+                "produced no box for. NOT a contradiction: 'are there dog pixels here' "
+                "(semantic, gated by mask_threshold on pixel probability) is a strictly "
+                "easier judgment than 'here is ONE discrete countable dog and its extent' "
+                "(instance, gated by instance_score_threshold), and an occluded/dark/blurry "
+                "object can pass the first while the second declines. An instance clearing "
+                "the score gate whose mask then binarizes to empty also lands here. This is "
+                "the reconciliation between a grounding confirmation rate near 100% and a "
+                "materially lower detection recall — they come from different heads — and a "
+                "direct contributor to the detection FN count."),
         }
     if run_detection:
         # TWO dicts, never merged into one score. "detection" is pure
@@ -2762,6 +2811,11 @@ def _print_summary(s, run_clipmatch):
               f"(nature entities attempted {g['nature_entities_attempted']}) ---")
         print(f"Confirmation rate: {g['confirmation_rate']:.1%} "
               f"({g['confirmed']}/{g['nature_entities_attempted']}) — agreement with SAM3, not ground truth")
+        if g.get("semantic_confirmed_but_no_instance"):
+            print(f"Semantic-confirmed but NO instance box: "
+                  f"{g['semantic_confirmed_but_no_instance']} "
+                  f"({g['semantic_only_rate']:.1%} of confirmed) — different SAM3 heads, "
+                  f"not a contradiction; feeds the detection FN count below")
     det = s.get("detection")
     if det is not None:
         print(f"\n--- COCO detection [box IoU >= {det['iou_threshold']}, instance score > "
