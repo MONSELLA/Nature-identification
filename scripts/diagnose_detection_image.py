@@ -2,23 +2,27 @@
 """
 scripts/diagnose_detection_image.py
 
-Why did (or didn't) a specific image's predicted box match a specific GT box?
+Why did (or didn't) a specific image's predicted mask match a specific GT mask?
 
-Prints, for ONE image in a scored predictions CSV: every evaluated GT box,
-every predicted INSTANCE box, and the full IoU matrix between them — plus the
-buckets the scorer actually put each prediction in (TP / FP / excluded /
-nature-on-non-nature) and the per-instance confidence scores.
+Prints, for ONE image in a scored predictions CSV: every evaluated GT
+instance, every predicted INSTANCE, and the full MASK-IoU matrix between
+them — plus the buckets the scorer actually put each prediction in (TP / FP /
+excluded / nature-on-non-nature) and the per-instance confidence scores.
+
+MATCHING IS ON MASKS, NOT BOXES (COCO's `segm` task) — this script computes
+the SAME geometry the scorer used, via pycocotools, not an approximation.
+Bounding boxes are still printed alongside each mask purely for a quick visual
+sense of WHERE something is; they play no role in the numbers.
 
 THE DISTINCTION THIS EXISTS TO SETTLE: the prediction viewer's "SAM3
 GROUNDINGS" panel draws `object_groundings` — the SEMANTIC, concept-level mask
 (one blob per entity, binarized at --mask_threshold). The detection evaluation
 does NOT use those. It uses `object_instances` — SAM3's INSTANCE head, gated by
---instance_score_threshold, each instance's mask reduced to its tight bbox by
-grounding_pipeline.mask_to_bbox. A semantic overlay can look like a perfect fit
-over a GT box while the instance box that was actually scored is somewhere
-else, is much larger, or was never produced at all. When a match looks like it
-"obviously should have happened", check the numbers here before suspecting the
-matcher.
+--instance_score_threshold. A semantic overlay can look like a perfect fit
+over a GT instance while the instance mask that was actually scored is
+somewhere else, is much smaller, or was never produced at all. When a match
+looks like it "obviously should have happened", check the numbers here before
+suspecting the matcher.
 
 Usage:
     python scripts/diagnose_detection_image.py <predictions.csv> <image_substring>
@@ -36,7 +40,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.evaluation.detection_metrics import box_iou, DEFAULT_IOU_THRESHOLD
+from src.evaluation.detection_metrics import DEFAULT_IOU_THRESHOLD, mask_iou_matrix
 
 
 def _fmt_box(b):
@@ -121,34 +125,48 @@ def main():
                   f"-> GT {p['gt_class']} {_fmt_box(p['gt_bbox'])} IoU {p['iou']:.3f}")
         print()
 
-    # THE ACTUAL ANSWER: every GT box against every predicted box, so a
-    # "why didn't these two pair up" question becomes a number you can read.
-    gt_boxes = ([(m["gt_class"], m["gt_bbox"]) for m in matches]
-                + [(m["gt_class"], m["gt_bbox"]) for m in missed])
-    pred_boxes = ([(m["pred_object"], m["pred_bbox"]) for m in matches]
-                  + [(p["pred_object"], p["pred_bbox"]) for p in fps]
-                  + [(p["pred_object"], p["pred_bbox"]) for p in excluded])
+    # THE ACTUAL ANSWER: every GT mask against every predicted mask, so a
+    # "why didn't these two pair up" question becomes a number you can read —
+    # the SAME mask-IoU computation the scorer itself used, not a box
+    # approximation that can disagree with the real verdict.
+    gt_entries = ([(m["gt_class"], m["gt_bbox"], m.get("gt_mask_rle")) for m in matches]
+                  + [(m["gt_class"], m["gt_bbox"], m.get("gt_mask_rle")) for m in missed])
+    pred_entries = ([(m["pred_object"], m["pred_bbox"], m.get("pred_mask_rle")) for m in matches]
+                    + [(p["pred_object"], p["pred_bbox"], p.get("pred_mask_rle")) for p in fps]
+                    + [(p["pred_object"], p["pred_bbox"], p.get("pred_mask_rle")) for p in excluded])
 
-    if not gt_boxes or not pred_boxes:
-        print("(no GT and/or predicted boxes to cross-compare)")
+    if not gt_entries or not pred_entries:
+        print("(no GT and/or predicted instances to cross-compare)")
         return
 
-    print(f"--- FULL IoU MATRIX  ({len(gt_boxes)} GT x {len(pred_boxes)} pred) ---")
-    print(f"    threshold for a match: IoU >= {DEFAULT_IOU_THRESHOLD} "
+    gt_rles = [e[2] for e in gt_entries]
+    pred_rles = [e[2] for e in pred_entries]
+    if not all(gt_rles) or not all(pred_rles):
+        print("(this CSV predates per-pair mask_rle storage — re-score to get a real "
+              "mask-IoU matrix here; nothing further to show from box coordinates alone, "
+              "since matching itself is mask-only and a box approximation can disagree "
+              "with the actual verdict)")
+        return
+
+    ious = mask_iou_matrix(gt_rles, pred_rles)
+
+    print(f"--- FULL MASK-IoU MATRIX  ({len(gt_entries)} GT x {len(pred_entries)} pred) ---")
+    print(f"    threshold for a match: mask IoU >= {DEFAULT_IOU_THRESHOLD} "
           f"(or whatever --detection_iou_threshold the run used)")
+    print(f"    boxes shown below are for orientation only — matching used masks, not these")
     print()
-    header = " " * 26 + "".join(f"{n[:11]:>13}" for n, _ in pred_boxes)
+    header = " " * 26 + "".join(f"{n[:11]:>13}" for n, _, _ in pred_entries)
     print(header)
-    for gname, gbox in gt_boxes:
-        cells = ""
-        for pname, pbox in pred_boxes:
-            iou = box_iou(gbox, pbox)
-            mark = "*" if iou >= DEFAULT_IOU_THRESHOLD else " "
-            cells += f"{iou:12.3f}{mark}"
+    for gi, (gname, gbox, _) in enumerate(gt_entries):
+        cells = "".join(
+            f"{ious[gi, pi]:12.3f}{'*' if ious[gi, pi] >= DEFAULT_IOU_THRESHOLD else ' '}"
+            for pi in range(len(pred_entries)))
         print(f"  GT {gname[:20]:<22}{cells}")
     print()
     print("  * = clears the IoU threshold. A pair with no '*' could never have")
     print("    matched no matter what the assignment algorithm did.")
+    print(f"  boxes (for reference): "
+          + " | ".join(f"GT {n}={_fmt_box(b)}" for n, b, _ in gt_entries))
 
 
 if __name__ == "__main__":

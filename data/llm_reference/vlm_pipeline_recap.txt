@@ -1,4 +1,4 @@
-BIG-5 VLM PIPELINE — DESIGN RECAP (v21)
+BIG-5 VLM PIPELINE — DESIGN RECAP (v22)
 (v4: the VLM pipeline is now IMPLEMENTED — this doc records both the original
 design rationale AND, in "IMPLEMENTED:" notes, how the shipped code actually
 does it where the two differ. v5: ClipMatch switched to the caption-based
@@ -701,7 +701,8 @@ f) Hierarchical Precision / Recall (hP/hR) + Wu-Palmer, per
        are then the ancestral-closure overlap of GT node vs. predicted
        node (compute_hierarchical_metrics).
 
-g) COCO BOX-IoU DETECTION EVALUATION (NEW in v21, IMPLEMENTED) —
+g) COCO MASK-IoU DETECTION EVALUATION (NEW in v21, IMPLEMENTED; MASK-ONLY as
+   of v22 — see RESOLVED IN v22 below, box matching is GONE, not an option) —
    src/evaluation/detection_metrics.py, driven from run_vlm_pipeline.py's
    --stage score. COCO ONLY, and only on an artifact the Grounding pipeline
    enriched with INSTANCE grounding. Runs ALONGSIDE the lexical axis metrics
@@ -727,9 +728,10 @@ g) COCO BOX-IoU DETECTION EVALUATION (NEW in v21, IMPLEMENTED) —
    "cow" is counted as a false positive AND a false negative, and the pair
    never reaches the label metrics at all — which throws away exactly the
    granularity-mismatch case hP/hR exist to measure (see f, above, and the
-   Yu et al. fine-grained finding in the SOTA review). So assignment uses box
-   overlap only (Hungarian, one-to-one, maximizing total IoU, IoU >= 0.5 by
-   default), and the class comparison happens afterwards, on the pairs the
+   Yu et al. fine-grained finding in the SOTA review). So assignment uses
+   MASK overlap only (Hungarian, one-to-one, maximizing total IoU, IoU >= 0.5
+   by default — v22: masks, never boxes; see RESOLVED IN v22 below), and the
+   class comparison happens afterwards, on the pairs the
    geometry produced. CONSEQUENCE TO STATE WHEN REPORTING: precision/recall/
    F1/AP from this block measure LOCALIZATION alone. They are NOT "detected
    the right thing" — that half is the label metrics, reported separately and
@@ -1007,6 +1009,42 @@ RESOLVED IN v6 (decided after repeated integration failures):
   clip_metrics.CLIPScorer's class docstring) were PROPOSED as
   replacements here, but neither was actually added to CLIP_PRESETS at
   the time — see RESOLVED IN v8 below for what's actually wired in.
+
+RESOLVED IN v22 (decided per Pau, after the first real COCO run):
+- Box-IoU matching is REMOVED — not deprioritized, not kept as an option
+  behind a flag, gone. There is no --detection_iou_type anymore; detection
+  matches on MASKS, full stop. Reasoning Pau gave: this pipeline's actual
+  output IS a mask (SAM3's instance head), and COCO ships per-instance
+  `segmentation` for every annotation — so matching on boxes was measuring the
+  wrong thing from the start. It briefly shipped as a --detection_iou_type
+  mask|box toggle (mask default, box kept "for comparability"), then removed
+  entirely once real numbers made the gap concrete: two crossing diagonal
+  strokes score box IoU 1.000 (a "perfect match") and mask IoU 0.000 — a box
+  around a curled-up dog is mostly the sofa behind it, and two masks that
+  overlap poorly can share a nearly identical box. Keeping a toggle around
+  would have implied box matching was a legitimate, if lesser, choice; it
+  isn't one for this pipeline.
+- GT segmentation is loaded from --instances_json UNCONDITIONALLY now (COCO's
+  segmentation is deliberately never stored in the artifact — it would bloat
+  every record for a scoring-only use). Missing --instances_json means
+  detection is skipped outright with a clear message, never a silent
+  downgrade to box matching — the same principle as removing the flag.
+- Every per-pair/FP/excluded/missed-GT row in the predictions CSV now carries
+  gt_mask_rle/pred_mask_rle alongside the box (which is display-only — matching
+  used masks, not it). scripts/diagnose_detection_image.py (built the same
+  round, for a real "why didn't these two obviously-overlapping things match"
+  question during review) recomputes the actual mask-IoU matrix from these via
+  pycocotools, rather than showing a box approximation that can legitimately
+  disagree with the real verdict — which is exactly what motivated dropping
+  box matching in the first place, so showing it in the diagnostic would have
+  been the same mistake twice.
+- Test fixtures were unified rather than duplicated: gtbox()/inst() (used by
+  ~90 pre-existing checks) now build a real mask_rle from a FILLED RECTANGLE
+  matching the given bbox. A filled rectangle's mask IoU against another
+  filled rectangle is mathematically identical to those same rectangles' box
+  IoU, so every prior assertion still holds while now genuinely exercising
+  mask-only code with no fallback. Shape-specific fixtures (diagonals, etc.)
+  stay separate, since a bbox literally cannot describe them.
 
 RESOLVED IN v21 (built per Pau's spec):
 - COCO can now be evaluated with BOTH pipelines together, which is what this
