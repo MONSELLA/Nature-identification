@@ -213,7 +213,16 @@ evaluating the models.
   score on EVERY dataset. The instance-level `pred_masks`/`pred_boxes`/
   `pred_logits` are read ONLY for COCO's box-IoU evaluation (see below) —
   never for the relevance score, which is about pixel coverage of a concept,
-  not how many instances of it there are.
+  not how many instances of it there are. Every tensor read off a SAM3 output
+  goes through `_to_numpy` (`.float()` before `.numpy()`), NEVER a bare
+  `.detach().cpu().numpy()` — confirmed a second production regression:
+  NumPy has no bfloat16 representation, so `.numpy()` on one raises `Got
+  unsupported ScalarType BFloat16`. This bites specifically because
+  `run_pipeline.py`'s `--dtype` is a flag BOTH the VLM and grounding stages
+  declare, so `--dtype bfloat16` (meant for the VLM) silently also loads SAM3
+  in bfloat16 unless `--grounding_dtype` overrides it — `_to_numpy` makes the
+  read-out correct either way rather than depending on that override being
+  remembered on every invocation.
 - INSTANCE GROUNDING (COCO only; `--instance_grounding auto|on|off`, auto =
   on for COCO artifacts, read from the artifact's own header). Adds
   `object_instances` — aligned index-for-index with `objects` like every other

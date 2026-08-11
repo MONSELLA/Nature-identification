@@ -279,6 +279,25 @@ def decode_rle(rle: Dict[str, Any]) -> np.ndarray:
     return mask_utils.decode(native).astype(bool)
 
 
+def _to_numpy(tensor: "torch.Tensor") -> np.ndarray:
+    """`tensor.detach().cpu().numpy()`, made safe for a bfloat16 tensor.
+
+    NumPy has no bfloat16 representation at all, so `.numpy()` on one raises
+    `TypeError: Got unsupported ScalarType BFloat16` — hit in production when
+    `--dtype bfloat16` (meant for the VLM) also got inherited by SAM3Grounder
+    (run_pipeline.py's `--dtype` is a flag BOTH stages declare; without an
+    explicit `--grounding_dtype` override, the shared value applies to SAM3
+    too — see the module's `--grounding_dtype` CLI help). `.float()` first is
+    a no-op for a tensor that's already float32, bool, or long (the dtypes
+    every one of this file's four `.numpy()` call sites actually expects), so
+    this is a strict safety net, not a behavior change for the common case —
+    and it fixes the crash regardless of which exact op in a given
+    transformers version happens to preserve the model's low-precision dtype
+    through to the tensor this file reads.
+    """
+    return tensor.detach().cpu().float().numpy()
+
+
 def mask_to_bbox(mask: np.ndarray) -> Optional[List[float]]:
     """Tight axis-aligned bounding box of a boolean mask, as
     `[x1, y1, x2, y2]` — the same convention COCO GT is converted to
@@ -550,7 +569,7 @@ class SAM3Grounder:
         maps = self.processor.post_process_semantic_segmentation(
             outputs, target_sizes=target_sizes, threshold=self.mask_threshold
         )
-        masks = [m.detach().cpu().numpy().astype(bool) for m in maps]
+        masks = [_to_numpy(m).astype(bool) for m in maps]
 
         instances = None
         if want_instances:
@@ -590,9 +609,9 @@ class SAM3Grounder:
         is not a detection.
         """
         out: List[Dict[str, Any]] = []
-        scores = result["scores"].detach().cpu().numpy()
-        boxes = result["boxes"].detach().cpu().numpy()
-        masks = result["masks"].detach().cpu().numpy().astype(bool)
+        scores = _to_numpy(result["scores"])
+        boxes = _to_numpy(result["boxes"])
+        masks = _to_numpy(result["masks"]).astype(bool)
         for score, sam_box, mask in zip(scores, boxes, masks):
             bbox = mask_to_bbox(mask)
             if bbox is None:
