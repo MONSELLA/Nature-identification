@@ -573,6 +573,18 @@ never replacing them. Two summary dicts, deliberately never merged:
   annotation of crowded scenes stops capping TPs (the 24-donut/12-box case).
   COSTS: no per-object counting ("found 8 of 12 cows") and no AP — both exist
   only at instance granularity, which is why both blocks are kept.
+- PIXEL COVERAGE (`summary["detection_pixels"]`, `detection_metrics.pixel_stats`
+  / `pixel_summary`) — NO IoU threshold, NO assignment step: all predicted
+  nature pixels on an image vs all annotated nature pixels. Answers "how much
+  of the banana did we find", which neither detection block can: region
+  matching is BINARY above a threshold, so 55%- and 99%-covered objects both
+  score as one TP. Includes missed GT classes (pixels count against recall)
+  and unmatched predictions (against precision) — not just the cases that went
+  well. `micro_*` pools every pixel (big objects count for their real size);
+  `mean_image_iou` weights images equally — a large gap between them means
+  performance depends on object size. `by_gt_class` gives the same per COCO
+  class. Per-image `pixel_recall_image`/`pixel_precision_image`/`pixel_iou_image`
+  land in the predictions CSV.
 - NO TRUE NEGATIVES, so no accuracy is reported — unlike the axis metrics,
   detection has no finite negative class. Don't add one.
 - AP@0.5 and AP@[.50:.95] (101-point interpolated, class-agnostic) over the

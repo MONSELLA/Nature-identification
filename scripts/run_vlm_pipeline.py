@@ -715,6 +715,10 @@ def score_image_entities(rec, gt_boxes_by_file, eval_vocab_terms, graph, iou_thr
                       if pred_entries[pi]["object_idx"] < len(finals) else {})
         axis = score_axis_agreement(pred_final, gt_entries[gi])
         axis_records.append(axis)
+        # PIXEL COVERAGE for this concept — "how much of the banana did we
+        # actually find", as opposed to the binary did-it-match verdict above.
+        px = detection_metrics.pixel_stats(gt_entries[gi]["mask_rle"],
+                                           pred_entries[pi]["mask_rle"])
         pair_rows.append({
             "gt_class": gt_entries[gi]["class_name"],
             "gt_synset": gt_entries[gi].get("synset_id"),
@@ -723,6 +727,7 @@ def score_image_entities(rec, gt_boxes_by_file, eval_vocab_terms, graph, iou_thr
             "pred_n_instances": pred_entries[pi]["n_instances"],
             "pred_score": pred_entries[pi]["score"],
             "iou": iou,
+            **px,
             **agreement,
             **axis,
         })
@@ -739,15 +744,30 @@ def score_image_entities(rec, gt_boxes_by_file, eval_vocab_terms, graph, iou_thr
         pred_entries, unmatched_pred, crowd_regions, eval_vocab_terms,
         fp_rows, excluded_rows, counted_flag=counted_flag)
 
+    # WHOLE-IMAGE PIXEL COVERAGE, class-agnostic and match-independent: every
+    # nature pixel the pipeline predicted vs every nature pixel COCO annotated.
+    # Deliberately NOT restricted to matched pairs — a GT class the pipeline
+    # missed entirely must still count its pixels against recall, and a
+    # predicted region that matched nothing must still count against
+    # precision, or the number would only describe the cases that already went
+    # well. This is the metric that most directly answers "did we find the
+    # nature pixels", with no threshold and no assignment step anywhere in it.
+    image_px = detection_metrics.pixel_stats(
+        detection_metrics.merge_rles([g["mask_rle"] for g in gt_entries]),
+        detection_metrics.merge_rles([p["mask_rle"] for p in pred_entries]))
+
     return {
         "n_gt": len(gt_entries), "n_pred": len(pred_entries),
         "tp": len(matches), "fp": n_fp, "fn": len(unmatched_gt),
         "excluded_pred": n_excluded, "crowd_suppressed": n_crowd,
         "pairs": pair_rows, "false_positives": fp_rows, "excluded": excluded_rows,
         "missed_gt": [{"gt_class": gt_entries[i]["class_name"],
-                       "gt_n_instances": gt_entries[i]["n_instances"]} for i in unmatched_gt],
+                       "gt_n_instances": gt_entries[i]["n_instances"],
+                       "gt_pixels": detection_metrics.rle_area(gt_entries[i]["mask_rle"])}
+                      for i in unmatched_gt],
         "label_records": label_records,
         "axis_records": axis_records,
+        "image_pixels": image_px,
         "ap_records": {t: [] for t in detection_metrics.COCO_AP_IOU_THRESHOLDS},
     }
 
@@ -2011,6 +2031,13 @@ def phase_score(args):
                   "iou_threshold": args.detection_iou_threshold, "ap_records": {}}
     ent_label_records = []
     ent_axis_records = []
+    # Pixel coverage: pooled counts for the micro view, per-image IoU for the
+    # macro view. See detection_metrics.pixel_summary on why both.
+    px_counts = {"pixel_tp": 0, "pixel_fp": 0, "pixel_fn": 0}
+    px_per_image_iou = []
+    # Per-concept pixel coverage, keyed by GT class, so "which things do we
+    # cover well" is answerable rather than only the pooled average.
+    px_by_class = {}
     # None disables NMS entirely (0 or >1 means "don't suppress"), so the flag
     # reads naturally as a threshold while still having an explicit off state.
     det_nms_iou = (args.instance_nms_iou
@@ -2453,6 +2480,25 @@ def phase_score(args):
             ent_counts["n_pred_instances"] += ent["n_pred"]
             ent_label_records.extend(ent["label_records"])
             ent_axis_records.extend(ent["axis_records"])
+            for k in ("pixel_tp", "pixel_fp", "pixel_fn"):
+                px_counts[k] += ent["image_pixels"][k]
+            px_per_image_iou.append(ent["image_pixels"]["pixel_iou"])
+            for pair in ent["pairs"]:
+                slot = px_by_class.setdefault(pair["gt_class"],
+                                              {"pixel_tp": 0, "pixel_fp": 0, "pixel_fn": 0,
+                                               "n_images": 0})
+                for k in ("pixel_tp", "pixel_fp", "pixel_fn"):
+                    slot[k] += pair[k]
+                slot["n_images"] += 1
+            # A GT class with no matching prediction still owes its pixels to
+            # recall — otherwise per-class coverage would only ever be
+            # computed on the classes that were found.
+            for miss in ent["missed_gt"]:
+                slot = px_by_class.setdefault(miss["gt_class"],
+                                              {"pixel_tp": 0, "pixel_fp": 0, "pixel_fn": 0,
+                                               "n_images": 0})
+                slot["pixel_fn"] += miss["gt_pixels"]
+                slot["n_images"] += 1
 
         # One CSV row PER IMAGE (not per object) — everything needed to
         # spot-check a single image's whole prediction lives on one line:
@@ -2600,6 +2646,11 @@ def phase_score(args):
             "detection_entity_excluded_image": ent["excluded_pred"] if ent else None,
             "detection_entity_matches": json.dumps(ent["pairs"]) if ent else None,
             "detection_entity_missed_gt": json.dumps(ent["missed_gt"]) if ent else None,
+            # Whole-image pixel coverage (class-agnostic, threshold-free):
+            # how much of this image's annotated nature pixels were found.
+            "pixel_recall_image": ent["image_pixels"]["pixel_recall"] if ent else None,
+            "pixel_precision_image": ent["image_pixels"]["pixel_precision"] if ent else None,
+            "pixel_iou_image": ent["image_pixels"]["pixel_iou"] if ent else None,
             "detection_tp_image": det["tp"] if det else None,
             "detection_fp_image": det["fp"] if det else None,
             "detection_fn_image": det["fn"] if det else None,
@@ -2868,6 +2919,38 @@ def phase_score(args):
         summary["detection_entity_labels"] = detection_metrics.label_summary(ent_label_records)
         summary["detection_entity_axis_agreement"] = \
             detection_metrics.axis_agreement_summary(ent_axis_records)
+        # PIXEL COVERAGE — the threshold-free view. Everything above answers
+        # "did a prediction land on the right object"; this answers "how much
+        # of the object did we actually cover", which is a different and for
+        # this project arguably more relevant question, since the nature
+        # relevance score is itself a pixel-coverage measure.
+        summary["detection_pixels"] = detection_metrics.pixel_summary(
+            px_counts, px_per_image_iou)
+        summary["detection_pixels"]["by_gt_class"] = {
+            cls: {**v,
+                  "pixel_recall": (v["pixel_tp"] / (v["pixel_tp"] + v["pixel_fn"])
+                                   if (v["pixel_tp"] + v["pixel_fn"]) else 0.0),
+                  "pixel_precision": (v["pixel_tp"] / (v["pixel_tp"] + v["pixel_fp"])
+                                      if (v["pixel_tp"] + v["pixel_fp"]) else 0.0),
+                  "pixel_iou": (v["pixel_tp"] / (v["pixel_tp"] + v["pixel_fp"] + v["pixel_fn"])
+                                if (v["pixel_tp"] + v["pixel_fp"] + v["pixel_fn"]) else 0.0)}
+            for cls, v in sorted(px_by_class.items(),
+                                 key=lambda kv: -(kv[1]["pixel_tp"] + kv[1]["pixel_fn"]))}
+        summary["detection_pixels_note"] = (
+            "PIXEL coverage of the nature concepts, with NO IoU threshold and no assignment "
+            "step: every nature pixel the pipeline predicted on an image, unioned, against "
+            "every nature pixel COCO annotated on it, unioned. Answers 'how much of the "
+            "banana did we find', which the detection blocks above cannot — region matching "
+            "is binary above a threshold, so a prediction covering 55% of an object and one "
+            "covering 99% both score as one true positive. Deliberately includes GT classes "
+            "that were missed entirely (their pixels count against recall) and predicted "
+            "regions that matched nothing (theirs count against precision), so it is not just "
+            "a summary of the cases that already went well. micro_* pools every pixel in the "
+            "split (large objects count for what they physically occupy); mean_image_iou "
+            "weights every image equally regardless of object size — a big gap between the "
+            "two means performance depends strongly on object size. by_gt_class breaks the "
+            "same numbers down per COCO class, so 'which concepts do we cover well' is "
+            "answerable rather than only the pooled average.")
         summary["detection_entity_note"] = (
             "ENTITY-level (concept-level) mask-IoU evaluation: every instance mask of one "
             "extracted entity is unioned into ONE region, every annotated instance of one GT "
@@ -3183,6 +3266,27 @@ def _print_summary(s, run_clipmatch):
             for axis in ("biotic", "material"):
                 a = ea[axis]
                 print(f"  {axis:<9} accuracy {a['accuracy']:.4f} (support {a['support']})")
+    px = s.get("detection_pixels")
+    if px is not None and px.get("n_images"):
+        print(f"\n--- COCO PIXEL COVERAGE (no IoU threshold, no matching) "
+              f"({px['n_images']} images) ---")
+        print("how much of each nature concept's pixels were actually found — the question "
+              "region matching can't answer, since it scores 55%- and 99%-covered objects "
+              "identically")
+        print(f"[micro, every pixel pooled]  precision {px['micro_pixel_precision']:.4f} | "
+              f"recall {px['micro_pixel_recall']:.4f} | F1 {px['micro_pixel_f1']:.4f} | "
+              f"IoU {px['micro_pixel_iou']:.4f}")
+        print(f"[macro, every image equal]   mean IoU {px['mean_image_iou']:.4f}"
+              f"±{px['mean_image_iou_std']:.4f}   "
+              f"(a big micro/macro gap = performance depends on object size)")
+        by_cls = list(px.get("by_gt_class", {}).items())
+        if by_cls:
+            best = sorted(by_cls, key=lambda kv: -kv[1]["pixel_iou"])[:5]
+            worst = sorted(by_cls, key=lambda kv: kv[1]["pixel_iou"])[:5]
+            print("  best-covered classes:  "
+                  + ", ".join(f"{c} {v['pixel_iou']:.2f}" for c, v in best))
+            print("  worst-covered classes: "
+                  + ", ".join(f"{c} {v['pixel_iou']:.2f}" for c, v in worst))
     if run_clipmatch:
         primary_label = "summary-caption" if s["clip_models"]["clipmatch_primary_source"] == "summary_caption" else "caption-based"
         cm = s["clipmatch"]

@@ -262,6 +262,92 @@ def mask_nms(rles: Sequence[Dict[str, Any]], scores: Sequence[float],
     return keep
 
 
+def rle_area(rle: Optional[Dict[str, Any]]) -> int:
+    """Pixel count of an RLE mask, straight from pycocotools (no decode)."""
+    if rle is None:
+        return 0
+    mask_utils = _mask_utils()
+    counts = rle["counts"]
+    native = {"size": list(rle["size"]),
+              "counts": counts.encode("ascii") if isinstance(counts, str) else counts}
+    return int(mask_utils.area(native))
+
+
+def pixel_stats(gt_rle: Optional[Dict[str, Any]],
+                pred_rle: Optional[Dict[str, Any]]) -> Dict[str, float]:
+    """PIXEL-level agreement between one GT region and one predicted region.
+
+    A different question from the matched/not-matched verdict the detection
+    metrics report, and the one that matters when what you care about is "how
+    much of the banana did we actually find" rather than "did we find a
+    banana at all". Region matching is BINARY above a threshold: a prediction
+    covering 55% of the GT and one covering 99% both score as a single true
+    positive. These numbers separate them, and need no threshold at all.
+
+        pixel_recall    = |pred ∩ gt| / |gt|    how much of the real thing we got
+        pixel_precision = |pred ∩ gt| / |pred|  how much of what we claimed is real
+        pixel_iou       = |pred ∩ gt| / |pred ∪ gt|
+
+    Computed on the RLE directly (pycocotools `area`/`merge`), so this stays
+    cheap enough to run per pair over a full COCO split without decoding a
+    dense HxW array anywhere.
+    """
+    gt_area, pred_area = rle_area(gt_rle), rle_area(pred_rle)
+    inter = 0
+    if gt_rle is not None and pred_rle is not None:
+        mask_utils = _mask_utils()
+
+        def _native(rle):
+            counts = rle["counts"]
+            return {"size": list(rle["size"]),
+                    "counts": counts.encode("ascii") if isinstance(counts, str) else counts}
+
+        inter = int(mask_utils.area(
+            mask_utils.merge([_native(gt_rle), _native(pred_rle)], intersect=True)))
+    union = gt_area + pred_area - inter
+    return {
+        "pixel_tp": inter,
+        "pixel_fp": pred_area - inter,
+        "pixel_fn": gt_area - inter,
+        "pixel_precision": (inter / pred_area) if pred_area else 0.0,
+        "pixel_recall": (inter / gt_area) if gt_area else 0.0,
+        "pixel_iou": (inter / union) if union else 0.0,
+    }
+
+
+def pixel_summary(counts: Dict[str, int], per_image_iou: Sequence[float]) -> Dict[str, Any]:
+    """Aggregate pixel coverage two ways, because they answer different
+    questions and one alone is misleading:
+
+      * MICRO ("dataset pixel precision/recall") pools every pixel in the
+        split before dividing, so a single huge object counts for as much as
+        it physically occupies. This is the honest answer to "across all of
+        COCO, what fraction of annotated nature pixels did the pipeline
+        cover".
+      * MACRO (`mean_image_iou`) averages each IMAGE's own IoU equally, so a
+        photo of one small bird counts the same as a landscape full of trees.
+        This is the answer to "how well does it do on a typical image".
+
+    A big gap between them means performance depends strongly on object size —
+    worth knowing before quoting either number on its own.
+    """
+    tp, fp, fn = counts.get("pixel_tp", 0), counts.get("pixel_fp", 0), counts.get("pixel_fn", 0)
+    micro_p = tp / (tp + fp) if (tp + fp) else 0.0
+    micro_r = tp / (tp + fn) if (tp + fn) else 0.0
+    denom = tp + fp + fn
+    return {
+        "pixel_tp": tp, "pixel_fp": fp, "pixel_fn": fn,
+        "micro_pixel_precision": micro_p,
+        "micro_pixel_recall": micro_r,
+        "micro_pixel_f1": (2 * micro_p * micro_r / (micro_p + micro_r)
+                           if (micro_p + micro_r) else 0.0),
+        "micro_pixel_iou": (tp / denom) if denom else 0.0,
+        "mean_image_iou": float(np.mean(per_image_iou)) if len(per_image_iou) else 0.0,
+        "mean_image_iou_std": float(np.std(per_image_iou)) if len(per_image_iou) else 0.0,
+        "n_images": len(per_image_iou),
+    }
+
+
 def mask_ioa(pred_rle: Dict[str, Any], region_rle: Dict[str, Any]) -> float:
     """Intersection over the PREDICTION's own mask area — the mask counterpart
     of `box_ioa`, used for crowd suppression on the segmentation path."""
