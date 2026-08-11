@@ -86,7 +86,7 @@ def main():
     nonnat = _j("detection_nature_on_non_nature")
 
     print("--- SCORER'S OWN VERDICT (counts from the scored run) ---")
-    for k in ("detection_n_gt_boxes_image", "detection_n_pred_boxes_image",
+    for k in ("detection_n_gt_instances_image", "detection_n_pred_instances_image",
               "detection_tp_image", "detection_fp_image", "detection_fn_image",
               "detection_excluded_pred_image", "detection_crowd_suppressed_image"):
         print(f"  {k:<38} {row.get(k)}")

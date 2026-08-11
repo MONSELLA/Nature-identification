@@ -1,20 +1,21 @@
 """
 src/evaluation/detection_metrics.py
 
-Box-level detection evaluation for COCO — the metric half of the Grounding
-pipeline's COCO story (the pixel half is src/grounding_pipeline.py's instance
-grounding, and the wiring is scripts/run_vlm_pipeline.py's `--stage score`).
+Mask-IoU detection evaluation for COCO (COCO's own `segm` task, never `bbox`)
+— the metric half of the Grounding pipeline's COCO story (the pixel half is
+src/grounding_pipeline.py's instance grounding, and the wiring is
+scripts/run_vlm_pipeline.py's `--stage score`).
 
 WHAT THIS EVALUATES
     The VLM pipeline extracts entity PHRASES ("a cow", "grass"); SAM3's
-    instance head turns each nature-labeled phrase into instance masks, and
-    each mask into a box (grounding_pipeline.mask_to_bbox). COCO ships
-    per-instance GT boxes with a class label. This module answers the two
-    questions that pairing makes possible, and keeps them SEPARATE:
+    instance head turns each nature-labeled phrase into instance MASKS. COCO
+    ships per-instance segmentation with a class label for every annotation.
+    This module answers the two questions that pairing makes possible, and
+    keeps them SEPARATE:
 
-      1. LOCALIZATION — did the pipeline put a box where COCO says an object
-         is?  TP / FP / FN -> precision, recall, F1, plus AP.
-      2. LABEL CORRECTNESS — for the boxes that DID land on a GT object, was
+      1. LOCALIZATION — did the pipeline's mask land where COCO says an
+         object is?  TP / FP / FN -> precision, recall, F1, plus AP.
+      2. LABEL CORRECTNESS — for the instances that DID match a GT object, was
          the entity named correctly?  Scored two ways: exact match (the strict
          view) and hierarchically (hP/hR/hF1 + Wu-Palmer, the graded view that
          gives "bull" partial credit against a GT of "cow" instead of flat
@@ -24,51 +25,68 @@ WHAT THIS EVALUATES
     model that localizes badly but names well look identical to one that does
     the reverse, and those are different failures with different fixes.
 
-MATCHING IS CLASS-AGNOSTIC — deliberately, and this is the non-obvious part.
-    Standard detection evaluation matches a prediction to a GT box only if
-    their CLASSES already agree. That is precisely the wrong protocol here: if
-    a predicted "bull" could never be paired with a GT "cow", it would be
-    counted as a false positive AND the cow as a false negative, and the
-    hierarchical label metrics — the whole reason for evaluating this way —
-    would never see the pair at all. So assignment uses box overlap ONLY, and
-    the class comparison happens afterwards, on the pairs geometry produced.
-    Consequence to keep in mind when reading the numbers: precision/recall
-    here measure LOCALIZATION alone, not "detected the right thing" — the
-    label side of that is exactly what the accompanying label metrics report.
+MATCHING IS ON MASKS, NEVER BOXES. What SAM3 actually produces IS a mask, and
+    COCO ships per-instance `segmentation` for every annotation, so reducing
+    both sides to boxes first discards real signal: a box around a curled-up
+    dog is mostly the sofa behind it, and two masks that overlap poorly can
+    share a nearly identical box (`mask_iou_matrix`, via pycocotools' own
+    `iou`, is what `score_image_detection` actually calls; `box_iou`/
+    `iou_matrix` below remain as general-purpose box-geometry primitives —
+    used by the pure-geometry test suite and by crowd suppression's box
+    variant — not as an alternative matching mode). Two crossing diagonal
+    strokes have box IoU 1.000 and mask IoU 0.000 (verified in the test suite)
+    — that gap is why there is no box-matching option in this pipeline at all.
+
+MATCHING IS ALSO CLASS-AGNOSTIC — deliberately, and this is the non-obvious
+    part. Standard detection evaluation matches a prediction to a GT instance
+    only if their CLASSES already agree. That is precisely the wrong protocol
+    here: if a predicted "bull" could never be paired with a GT "cow", it
+    would be counted as a false positive AND the cow as a false negative, and
+    the hierarchical label metrics — the whole reason for evaluating this way
+    — would never see the pair at all. So assignment uses geometric overlap
+    ONLY, and the class comparison happens afterwards, on the pairs the
+    geometry produced. Consequence to keep in mind when reading the numbers:
+    precision/recall here measure LOCALIZATION alone, not "detected the right
+    thing" — the label side of that is exactly what the accompanying label
+    metrics report.
 
     Assignment is one-to-one (Hungarian, maximizing total IoU over pairs that
-    clear `iou_threshold`), not greedy, so one large predicted box cannot
-    claim several GT boxes and no GT box can be double-counted.
+    clear `iou_threshold`), not greedy, so one large predicted instance cannot
+    claim several GT instances and no GT instance can be double-counted.
 
 UNMATCHED PREDICTIONS — the curated-vocabulary rule.
-    COCO annotates 80 curated classes, not everything visible. A predicted box
-    around a real tree in a real photograph is a CORRECT detection of
+    COCO annotates 80 curated classes, not everything visible. A predicted
+    mask around a real tree in a real photograph is a CORRECT detection of
     something COCO simply never labeled; scoring it as a false positive would
     punish the pipeline for being right. But a predicted "dog" that matches no
-    GT dog box IS a genuine error and must count. So an unmatched prediction
-    is a FALSE POSITIVE only when its own entity phrase resolves to a class in
-    the evaluated GT vocabulary, and is EXCLUDED (counted, reported, but not
-    charged against precision) otherwise. `classify_unmatched_prediction`
-    implements exactly that test; the excluded count is always reported
-    alongside precision so the size of that exemption is visible rather than
-    hidden.
+    GT dog instance IS a genuine error and must count. So an unmatched
+    prediction is a FALSE POSITIVE only when its own entity phrase resolves to
+    a class in the evaluated GT vocabulary, and is EXCLUDED (counted,
+    reported, but not charged against precision) otherwise.
+    `classify_unmatched_prediction` implements exactly that test; the excluded
+    count is always reported alongside precision so the size of that
+    exemption is visible rather than hidden.
 
 CROWD REGIONS.
-    COCO's `iscrowd=1` annotations cover a GROUP with one loose box. Following
-    COCO's own protocol they are neither required to be detected (not a false
-    negative when missed) nor counted against precision when a prediction
-    lands inside one (not a false positive) — see `crowd_suppressed`.
+    COCO's `iscrowd=1` annotations cover a GROUP with one loose region.
+    Following COCO's own protocol they are neither required to be detected
+    (not a false negative when missed) nor counted against precision when a
+    prediction lands inside one (not a false positive) — see
+    `crowd_suppressed` (box path) / `mask_ioa` (mask path, the one this
+    project actually uses).
 
 NO TRUE NEGATIVES.
-    Detection has no "correctly rejected background box" to count: the space
-    of boxes that could have been predicted and weren't is unbounded. TN is
-    therefore undefined and no accuracy is reported here — only precision,
-    recall, F1 and AP, all of which are well-defined without it. This is a
-    deliberate departure from the axis metrics elsewhere in the project, which
-    DO report accuracy because their negative class is a real, finite thing.
+    Detection has no "correctly rejected background region" to count: the
+    space of masks that could have been predicted and weren't is unbounded.
+    TN is therefore undefined and no accuracy is reported here — only
+    precision, recall, F1 and AP, all of which are well-defined without it.
+    This is a deliberate departure from the axis metrics elsewhere in the
+    project, which DO report accuracy because their negative class is a real,
+    finite thing.
 
-Pure math + WordNet only: no torch, no model loading, no I/O. Everything here
-is unit-testable on plain lists of boxes.
+Pure math + WordNet only: no torch, no model loading, no I/O (mask_iou_matrix
+excepted, which needs pycocotools for its C-level RLE math but still no torch/
+model loading). Everything here is unit-testable on plain lists of boxes/RLEs.
 """
 
 from __future__ import annotations
@@ -229,7 +247,7 @@ def match_boxes(
     change, only the cut-off applied to it.
 
     Hungarian assignment rather than the greedy highest-IoU-first loop most
-    detection code uses: greedy can strand a GT box whose only above-threshold
+    detection code uses: greedy can strand a GT instance whose only above-threshold
     partner was taken by an earlier, marginally better pairing, which
     understates recall on crowded images (exactly what COCO has a lot of).
     Falls back to greedy automatically if SciPy isn't importable, so this
@@ -306,10 +324,10 @@ def classify_unmatched_prediction(
     Note the vocabulary tested against is the EVALUATED one, which on this
     project is the nature-mapped subset of COCO's 80 rather than all 80. That
     distinction matters and is not a shortcut: since only nature-labeled
-    entities are grounded, GT boxes of non-nature classes are not evaluation
+    entities are grounded, GT instances of non-nature classes are not evaluation
     targets at all, so a prediction naming one of them could never find a
     partner no matter how well localized it was. Charging it as a false
-    positive would penalize the pipeline for a box the protocol removed from
+    positive would penalize the pipeline for an instance the protocol removed from
     play — the same reasoning that exempts the tree.
     """
     for term in pred_label_terms:
@@ -364,8 +382,8 @@ def average_precision(
 def detection_summary(counts: Dict[str, Any]) -> Dict[str, Any]:
     """Turn the running detection counters into the reported numbers.
 
-    `counts` carries: tp, fp, fn, excluded_pred, crowd_suppressed, n_gt_boxes,
-    n_pred_boxes, plus `ap_records` ({iou_threshold: [(score, is_tp), ...]}).
+    `counts` carries: tp, fp, fn, excluded_pred, crowd_suppressed, n_gt_instances,
+    n_pred_instances, plus `ap_records` ({iou_threshold: [(score, is_tp), ...]}).
 
     Precision's denominator is TP + FP, which by construction EXCLUDES the
     curated-vocabulary exemptions — `excluded_predictions` is reported next to
@@ -383,12 +401,12 @@ def detection_summary(counts: Dict[str, Any]) -> Dict[str, Any]:
         "precision": precision, "recall": recall, "f1": f1,
         "excluded_predictions": counts.get("excluded_pred", 0),
         "crowd_suppressed_predictions": counts.get("crowd_suppressed", 0),
-        "n_gt_boxes": counts.get("n_gt_boxes", 0),
-        "n_pred_boxes": counts.get("n_pred_boxes", 0),
+        "n_gt_instances": counts.get("n_gt_instances", 0),
+        "n_pred_instances": counts.get("n_pred_instances", 0),
     }
 
     ap_records = counts.get("ap_records") or {}
-    n_gt = counts.get("n_gt_boxes", 0)
+    n_gt = counts.get("n_gt_instances", 0)
     per_threshold = {t: average_precision(recs, n_gt) for t, recs in sorted(ap_records.items())}
     if per_threshold:
         summary["ap_50"] = per_threshold.get(0.5, 0.0)

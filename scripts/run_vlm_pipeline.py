@@ -1821,7 +1821,7 @@ def phase_score(args):
     run_detection = (dataset == "coco"
                      and bool(header.get("grounding", {}).get("instance_grounding")))
     det_counts = {"tp": 0, "fp": 0, "fn": 0, "excluded_pred": 0, "crowd_suppressed": 0,
-                  "n_gt_boxes": 0, "n_pred_boxes": 0,
+                  "n_gt_instances": 0, "n_pred_instances": 0,
                   "iou_threshold": args.detection_iou_threshold,
                   # AP is swept over COCO's own IoU ladder. Each threshold needs
                   # its OWN matching pass (a pair that clears 0.5 need not clear
@@ -2253,8 +2253,8 @@ def phase_score(args):
         if det is not None:
             for key in ("tp", "fp", "fn", "excluded_pred", "crowd_suppressed"):
                 det_counts[key] += det[key]
-            det_counts["n_gt_boxes"] += det["n_gt"]
-            det_counts["n_pred_boxes"] += det["n_pred"]
+            det_counts["n_gt_instances"] += det["n_gt"]
+            det_counts["n_pred_instances"] += det["n_pred"]
             for t, recs in det["ap_records"].items():
                 det_counts["ap_records"][t].extend(recs)
             det_label_records.extend(det["label_records"])
@@ -2395,8 +2395,8 @@ def phase_score(args):
             # both the exact-match and hierarchical verdicts — plus the boxes
             # that missed in either direction, so a disagreement can be
             # understood without opening the .jsonl.
-            "detection_n_gt_boxes_image": det["n_gt"] if det else None,
-            "detection_n_pred_boxes_image": det["n_pred"] if det else None,
+            "detection_n_gt_instances_image": det["n_gt"] if det else None,
+            "detection_n_pred_instances_image": det["n_pred"] if det else None,
             "detection_tp_image": det["tp"] if det else None,
             "detection_fp_image": det["fp"] if det else None,
             "detection_fn_image": det["fn"] if det else None,
@@ -2673,8 +2673,8 @@ def phase_score(args):
                                    if (det_counts["fp"] + det_counts["excluded_pred"]) else 0.0,
             "by_gt_class": dict(by_class.most_common()),
             "by_predicted_entity": dict(by_entity.most_common(25)),
-            "note": ("A grounded NATURE entity whose box overlaps (IoU >= "
-                     f"{args.detection_iou_threshold}) a GT box of a COCO class the taxonomy "
+            "note": ("A grounded NATURE entity whose mask overlaps (IoU >= "
+                     f"{args.detection_iou_threshold}) a GT instance of a COCO class the taxonomy "
                      "maps to NON-nature. Can never be a true positive — non-nature GT is "
                      "filtered out before matching — and is NOT counted as a false positive "
                      "either; these predictions stay in whichever bucket the normal rules gave "
@@ -2685,7 +2685,7 @@ def phase_score(args):
                      "counts a wooden table with visible grain AS nature, and a class node "
                      "cannot encode which one THIS image shows. Read by_gt_class to tell the "
                      "two apart — wood/stone furniture classes dominating suggests that clause "
-                     "is firing, a flat spread of unrelated classes suggests loose boxes."),
+                     "is firing, a flat spread of unrelated classes suggests loose masks."),
         }
         summary["detection_note"] = (
             "COCO mask-IoU (segm) evaluation of SAM3 instance masks against COCO's "
@@ -2890,7 +2890,7 @@ def _print_summary(s, run_clipmatch):
         print(f"\n--- COCO detection [mask IoU >= "
               f"{det['iou_threshold']}, instance score > "
               f"{det.get('instance_score_threshold')}] "
-              f"({det['n_gt_boxes']} nature GT boxes, {det['n_pred_boxes']} predicted) ---")
+              f"({det['n_gt_instances']} nature GT instances, {det['n_pred_instances']} predicted) ---")
         print(f"[localization, class-agnostic matching]  P {det['precision']:.4f} | "
               f"R {det['recall']:.4f} | F1 {det['f1']:.4f}   "
               f"(TP {det['tp']} | FP {det['fp']} | FN {det['fn']})")
@@ -2904,7 +2904,7 @@ def _print_summary(s, run_clipmatch):
               f"{det['crowd_suppressed_predictions']}")
         nn = s.get("detection_nature_on_non_nature")
         if nn is not None:
-            print(f"Nature box on a NON-nature GT class: {nn['count']} "
+            print(f"Nature instance on a NON-nature GT class: {nn['count']} "
                   f"({nn['rate_over_unmatched']:.1%} of unmatched predictions) — "
                   f"taxonomy disagreement, not scored either way")
             top = list(nn["by_gt_class"].items())[:5]
@@ -2925,7 +2925,7 @@ def _print_summary(s, run_clipmatch):
             print(f"  WordNet resolution-failure rate: {dl['resolution_failure_rate']:.1%}")
         da = s.get("detection_axis_agreement", {})
         if da.get("biotic", {}).get("support") or da.get("material", {}).get("support"):
-            print("[axis agreement, matched pairs only, vs the GT box's own taxonomy position "
+            print("[axis agreement, matched pairs only, vs the GT instance's own taxonomy position "
                   "— nature omitted, trivially 1.0 by construction]")
             for axis in ("biotic", "material"):
                 a = da[axis]
@@ -3042,7 +3042,7 @@ def _log_wandb(args, summary, run_clipmatch):
         # should never silently be reading the other.
         for key in ("precision", "recall", "f1", "tp", "fp", "fn",
                     "excluded_predictions", "crowd_suppressed_predictions",
-                    "n_gt_boxes", "n_pred_boxes"):
+                    "n_gt_instances", "n_pred_instances"):
             log[f"Detection/{key}"] = det[key]
         if "ap_50" in det:
             log["Detection/AP50"] = det["ap_50"]

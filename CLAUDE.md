@@ -548,13 +548,13 @@ never replacing them. Two summary dicts, deliberately never merged:
   charged as an FP either — these predictions stay in whichever bucket the
   normal rules gave them (nearly always `excluded`), so precision/recall are
   identical with or without this diagnostic. Exists because otherwise the case
-  vanishes into `excluded`, indistinguishable from a box over empty
+  vanishes into `excluded`, indistinguishable from a mask over empty
   background. It is the Nature-Based Artefacts clause made measurable: COCO's
   `dining table` node is non-nature, but a wooden table with visible grain IS
   nature under the taxonomy, and a class node can't encode which one THIS
   image shows — so a hit is often the concept-vs-instance gap, not an error.
   Read `by_gt_class` to tell them apart (wood/stone furniture dominating =
-  that clause firing; a flat spread of unrelated classes = loose boxes).
+  that clause firing; a flat spread of unrelated classes = loose masks).
 - NO TRUE NEGATIVES, so no accuracy is reported — unlike the axis metrics,
   detection has no finite negative class. Don't add one.
 - AP@0.5 and AP@[.50:.95] (101-point interpolated, class-agnostic) over the
