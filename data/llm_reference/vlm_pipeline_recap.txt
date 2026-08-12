@@ -1,5 +1,9 @@
-BIG-5 VLM PIPELINE — DESIGN RECAP (v22)
-(v4: the VLM pipeline is now IMPLEMENTED — this doc records both the original
+BIG-5 VLM PIPELINE — DESIGN RECAP (v23)
+(v23: entity-level COCO detection now reports AP@0.50/AP@[.50:.95] too — the
+v21/v22 claim that AP "only exists at instance granularity" is gone; each
+entity has a real confidence score (its strongest underlying instance) that
+was already being computed for the predictions CSV, so ranking by it for AP
+costs nothing new — see Section 8g and RESOLVED IN v23. v4: the VLM pipeline is now IMPLEMENTED — this doc records both the original
 design rationale AND, in "IMPLEMENTED:" notes, how the shipped code actually
 does it where the two differ. v5: ClipMatch switched to the caption-based
 variant as the only implementation — see Section 8e and Section 11. v6:
@@ -1009,6 +1013,35 @@ RESOLVED IN v6 (decided after repeated integration failures):
   clip_metrics.CLIPScorer's class docstring) were PROPOSED as
   replacements here, but neither was actually added to CLIP_PRESETS at
   the time — see RESOLVED IN v8 below for what's actually wired in.
+
+RESOLVED IN v23 (decided per Pau, after seeing the first real COCO detection
+numbers and finding the entity-level pixel-coverage view too noisy on its
+own):
+- Entity-level detection (`score_image_entities`) now computes real AP@0.50
+  and AP@[.50:.95], not just single-threshold P/R/F1. The v21/v22 framing
+  ("no per-object counting AND no AP — both only exist at instance
+  granularity") turned out to be wrong on the AP half specifically: each
+  merged entity already carries a genuine confidence score
+  (`pred_entries[...]["score"]`, the MAX of its underlying instances' own
+  scores — already computed and already surfaced as the CSV's `pred_score`
+  column), so ranking entities by it for COCO's 101-point-interpolated AP
+  costs nothing beyond re-running `detection_metrics.match_boxes` at each
+  rung of `COCO_AP_IOU_THRESHOLDS`, exactly the same threshold-sweep pattern
+  `score_image_detection` already used for the instance block. Per-object
+  counting ("found 8 of 12 cows") is still gone at this granularity and
+  stays gone by construction — that part of the original claim holds; only
+  the AP half was actually a missing feature, not a structural limitation.
+  `ent_counts["ap_records"]` is now seeded per-threshold and accumulated
+  every image, same as `det_counts["ap_records"]`; `detection_summary` was
+  already threshold-generic and needed no change to produce `ap_50`/
+  `ap_50_95`/`ap_per_iou` once given real records instead of the old
+  `{t: [] for t in ...}` stub. `detection_entity_note` and the console/W&B
+  print text updated to match — see Section 8g.
+- Context: on the first real gemma-4-12B-it COCO run, the entity-level pixel
+  coverage numbers alone (e.g. "potted plant" IoU 0.51) read as noisy/hard to
+  interpret without a companion localization-quality number at the SAME
+  granularity the model is actually built around (concepts, not raw SAM3
+  instances) — entity-level AP is that companion number.
 
 RESOLVED IN v22 (decided per Pau, after the first real COCO run):
 - Box-IoU matching is REMOVED — not deprioritized, not kept as an option

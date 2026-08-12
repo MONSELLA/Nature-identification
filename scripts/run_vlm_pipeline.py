@@ -744,6 +744,31 @@ def score_image_entities(rec, gt_boxes_by_file, eval_vocab_terms, graph, iou_thr
         pred_entries, unmatched_pred, crowd_regions, eval_vocab_terms,
         fp_rows, excluded_rows, counted_flag=counted_flag)
 
+    # AP ladder, same construction as the instance-level block: re-match the
+    # SAME entity/class regions at each of COCO's ten IoU thresholds and
+    # record (score, is_tp) for every entity that counts. Each entity's score
+    # is its STRONGEST underlying instance (see pred_entries above) — a real,
+    # already-computed confidence, not an invented one, so this is genuine
+    # COCO-style AP at entity granularity, not just a re-match at one
+    # threshold.
+    gt_bboxes = [g["bbox"] for g in gt_entries]
+    pred_bboxes = [p["bbox"] for p in pred_entries]
+    ap_records = {}
+    for t in detection_metrics.COCO_AP_IOU_THRESHOLDS:
+        if t == iou_threshold:
+            t_fp_flag, t_counted = is_fp_flag, counted_flag
+        else:
+            t_matches, _, t_unmatched = detection_metrics.match_boxes(
+                gt_bboxes, pred_bboxes, iou_threshold=t, ious=ious)
+            t_counted = [False] * len(pred_entries)
+            for _, pi, _ in t_matches:
+                t_counted[pi] = True
+            _, _, _, t_fp_flag, t_counted = _classify_unmatched(
+                pred_entries, t_unmatched, crowd_regions, eval_vocab_terms, None, None,
+                counted_flag=t_counted)
+        ap_records[t] = [(pred_entries[pi]["score"], not t_fp_flag[pi])
+                         for pi in range(len(pred_entries)) if t_counted[pi]]
+
     # WHOLE-IMAGE PIXEL COVERAGE, class-agnostic and match-independent: every
     # nature pixel the pipeline predicted vs every nature pixel COCO annotated.
     # Deliberately NOT restricted to matched pairs — a GT class the pipeline
@@ -768,7 +793,7 @@ def score_image_entities(rec, gt_boxes_by_file, eval_vocab_terms, graph, iou_thr
         "label_records": label_records,
         "axis_records": axis_records,
         "image_pixels": image_px,
-        "ap_records": {t: [] for t in detection_metrics.COCO_AP_IOU_THRESHOLDS},
+        "ap_records": ap_records,
     }
 
 
@@ -2023,12 +2048,14 @@ def phase_score(args):
     det_nature_on_non_nature = []
     # ENTITY-level (concept-level) counterpart, accumulated in parallel and
     # never merged into the instance numbers — see score_image_entities for
-    # why the two answer different questions. No AP here: it would need a
-    # per-entity confidence ranking that the union of instances doesn't
-    # meaningfully provide.
+    # why the two answer different questions. AP IS computed here too, off
+    # each entity's own strongest-instance score (see score_image_entities'
+    # ap_records construction) — same COCO-style AP as the instance block,
+    # just re-matched at entity granularity.
     ent_counts = {"tp": 0, "fp": 0, "fn": 0, "excluded_pred": 0, "crowd_suppressed": 0,
                   "n_gt_instances": 0, "n_pred_instances": 0,
-                  "iou_threshold": args.detection_iou_threshold, "ap_records": {}}
+                  "iou_threshold": args.detection_iou_threshold,
+                  "ap_records": {t: [] for t in detection_metrics.COCO_AP_IOU_THRESHOLDS}}
     ent_label_records = []
     ent_axis_records = []
     # Pixel coverage: pooled counts for the micro view, per-image IoU for the
@@ -2478,6 +2505,8 @@ def phase_score(args):
                 ent_counts[key] += ent[key]
             ent_counts["n_gt_instances"] += ent["n_gt"]
             ent_counts["n_pred_instances"] += ent["n_pred"]
+            for t, recs in ent["ap_records"].items():
+                ent_counts["ap_records"][t].extend(recs)
             ent_label_records.extend(ent["label_records"])
             ent_axis_records.extend(ent["axis_records"])
             for k in ("pixel_tp", "pixel_fp", "pixel_fn"):
@@ -2963,9 +2992,12 @@ def phase_score(args):
             "tray of ~24 donuts carries 12 boxes — so instance matching caps true positives at "
             "the annotation count and charges correct extra detections as FPs, whereas region "
             "overlap asks whether the right PIXELS were found regardless of how many polygons "
-            "an annotator drew. WHAT IT COSTS: no per-object counting ('found 8 of 12 cows') "
-            "and no AP, both of which only exist at instance granularity — which is exactly "
-            "why summary['detection'] is kept alongside rather than replaced.")
+            "an annotator drew. WHAT IT COSTS: no per-object counting ('found 8 of 12 cows'), "
+            "which only exists at instance granularity — which is exactly why summary['detection'] "
+            "is kept alongside rather than replaced. AP@0.50/AP@[.50:.95] ARE reported here too "
+            "(ap_50/ap_50_95/ap_per_iou, same COCO-style 101-point interpolation as the instance "
+            "block), ranked by each entity's own strongest-instance score — a real, "
+            "already-computed confidence, not an invented one.")
         # Third dict, and again never merged into the other two: these are
         # neither localization successes nor naming successes, they are
         # TAXONOMY DISAGREEMENTS — a grounded nature entity landing on a GT box
@@ -3247,9 +3279,11 @@ def _print_summary(s, run_clipmatch):
               f"({ent['n_gt_instances']} GT classes, {ent['n_pred_instances']} entities) ---")
         print("one merged region per extracted entity vs one per GT class — immune to SAM3's "
               "duplicate instances and to COCO's sparse annotation of crowded scenes; no "
-              "per-object counting or AP at this granularity (see detection_entity_note)")
+              "per-object counting at this granularity (see detection_entity_note)")
         print(f"[localization]  P {ent['precision']:.4f} | R {ent['recall']:.4f} | "
               f"F1 {ent['f1']:.4f}   (TP {ent['tp']} | FP {ent['fp']} | FN {ent['fn']})")
+        if "ap_50" in ent:
+            print(f"AP@0.50 {ent['ap_50']:.4f} | AP@[.50:.95] {ent['ap_50_95']:.4f}")
         print(f"Excluded predictions (named no evaluated COCO class): "
               f"{ent['excluded_predictions']} | crowd-suppressed: "
               f"{ent['crowd_suppressed_predictions']}")

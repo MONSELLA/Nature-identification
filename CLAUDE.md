@@ -571,8 +571,13 @@ never replacing them. Two summary dicts, deliberately never merged:
   granularity ONLY differs. Fairer on two measurable counts: duplicates
   collapse by construction (no NMS needed), and COCO's non-exhaustive
   annotation of crowded scenes stops capping TPs (the 24-donut/12-box case).
-  COSTS: no per-object counting ("found 8 of 12 cows") and no AP — both exist
-  only at instance granularity, which is why both blocks are kept.
+  COSTS: no per-object counting ("found 8 of 12 cows") — that only exists at
+  instance granularity, which is why both blocks are kept. AP@0.50/AP@[.50:.95]
+  ARE reported here too (`ap_50`/`ap_50_95`/`ap_per_iou`, same COCO-style
+  101-point interpolation as the instance block), ranked by each entity's own
+  strongest-instance score (`pred_entries[...]["score"]`, already computed for
+  the CSV's `pred_score` column) — a real confidence, not an invented one, so
+  this is genuine entity-granularity AP, not a proxy.
 - PIXEL COVERAGE (`summary["detection_pixels"]`, `detection_metrics.pixel_stats`
   / `pixel_summary`) — NO IoU threshold, NO assignment step: all predicted
   nature pixels on an image vs all annotated nature pixels. Answers "how much
