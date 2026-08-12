@@ -104,6 +104,44 @@ Entities that fail SAM3's threshold are MARKED (`grounded: false`), never
 deleted — the full VLM output stays auditable even where grounding could not
 confirm the entity's presence.
 
+Stage 1b — INSTANCE GROUNDING (opt-in, `instance_grounding=True`; COCO)
+  Everything above is CONCEPT-level: one mask per entity, however many
+  individual cows it covers. COCO's ground truth is INSTANCE-level (one box
+  per annotated object), so evaluating against it needs the other read-out —
+  SAM3's `pred_masks`/`pred_boxes`/`pred_logits`, thresholded per instance.
+  Every COCO target class is a "thing" (countable, boundable), which is what
+  makes the instance head the right head there; the semantic head remains the
+  right one for the relevance score on every dataset, including COCO.
+
+  This is NOT a second model run. Both read-outs come off the SAME
+  `Sam3ImageSegmentationOutput` from the SAME forward pass — see
+  `SAM3Grounder.segment_pairs_full` — so turning it on adds post-processing
+  cost only, never a second forward pass, and leaves `object_groundings` and
+  both relevance scores bit-for-bit what they would have been without it.
+
+  Adds one more per-image field, again aligned index-for-index with `objects`:
+
+    "object_instances": [
+      {
+        "object": str,
+        "prompt": str | None,
+        "is_nature": bool,
+        "attempted": bool,          # False = SAM3 never ran for this entity
+        "instances": [
+          {
+            "score": float,         # sigmoid(pred_logits) * presence
+            "bbox": [x1,y1,x2,y2],  # TIGHT box of the instance mask (scored)
+            "sam3_bbox": [...],     # SAM3's own regressed box, for comparison
+            "mask_rle": {...},
+            "pixel_count": int,
+          }, ...
+        ],
+      }, ...
+    ]
+
+  Metrics over these boxes live in src/evaluation/detection_metrics.py, not
+  here — this file stays free of metric computation.
+
 NO metric computation lives here, and no argparse/CLI — see
 scripts/run_grounding_pipeline.py (grounding only) and scripts/run_pipeline.py
 (VLM inference -> grounding, end to end).
@@ -123,6 +161,12 @@ from src.vlm_pipeline import _normalize_object
 # SAM3's own stated default binarization threshold for the semantic map (also
 # the default of Sam3ImageProcessor.post_process_semantic_segmentation).
 DEFAULT_MASK_THRESHOLD = 0.5
+
+# SAM3's own stated default confidence threshold for the INSTANCE head
+# (Sam3ImageProcessor.post_process_instance_segmentation's `threshold`). Note
+# this gates instance CONFIDENCE, not pixels — DEFAULT_MASK_THRESHOLD above
+# still binarizes each kept instance's mask.
+DEFAULT_INSTANCE_SCORE_THRESHOLD = 0.3
 
 # HuggingFace repo for the single model this whole stage runs on.
 SAM3_MODEL_ID = "facebook/sam3"
@@ -235,6 +279,44 @@ def decode_rle(rle: Dict[str, Any]) -> np.ndarray:
     return mask_utils.decode(native).astype(bool)
 
 
+def _to_numpy(tensor: "torch.Tensor") -> np.ndarray:
+    """`tensor.detach().cpu().numpy()`, made safe for a bfloat16 tensor.
+
+    NumPy has no bfloat16 representation at all, so `.numpy()` on one raises
+    `TypeError: Got unsupported ScalarType BFloat16` — hit in production when
+    `--dtype bfloat16` (meant for the VLM) also got inherited by SAM3Grounder
+    (run_pipeline.py's `--dtype` is a flag BOTH stages declare; without an
+    explicit `--grounding_dtype` override, the shared value applies to SAM3
+    too — see the module's `--grounding_dtype` CLI help). `.float()` first is
+    a no-op for a tensor that's already float32, bool, or long (the dtypes
+    every one of this file's four `.numpy()` call sites actually expects), so
+    this is a strict safety net, not a behavior change for the common case —
+    and it fixes the crash regardless of which exact op in a given
+    transformers version happens to preserve the model's low-precision dtype
+    through to the tensor this file reads.
+    """
+    return tensor.detach().cpu().float().numpy()
+
+
+def mask_to_bbox(mask: np.ndarray) -> Optional[List[float]]:
+    """Tight axis-aligned bounding box of a boolean mask, as
+    `[x1, y1, x2, y2]` — the same convention COCO GT is converted to
+    (`dataset_loader._coco_box_xyxy`) and the same one SAM3's own `pred_boxes`
+    uses, so all three are directly IoU-comparable.
+
+    Returns None for an all-False mask (no box exists).
+
+    Coordinates are EXCLUSIVE on the far edge: a mask whose only set pixel is
+    column 5 yields x1=5, x2=6, i.e. a width of 1 pixel rather than 0. Getting
+    this wrong collapses single-pixel-wide masks to zero area and silently
+    zeroes their IoU.
+    """
+    ys, xs = np.nonzero(mask)
+    if ys.size == 0:
+        return None
+    return [float(xs.min()), float(ys.min()), float(xs.max() + 1), float(ys.max() + 1)]
+
+
 def union_mask(rles: Sequence[Dict[str, Any]], height: int, width: int) -> np.ndarray:
     """OR every entity's mask together into one nature mask.
 
@@ -337,7 +419,9 @@ def entity_prompt(object_str: str) -> str:
 
 
 class SAM3Grounder:
-    """Thin wrapper around `facebook/sam3` (AutoModel + AutoProcessor) exposing
+    """Thin wrapper around `facebook/sam3` (`Sam3Model` + `Sam3Processor`,
+    loaded explicitly — see `__init__`'s comment on why not AutoModel/
+    AutoProcessor) exposing
     exactly one operation: segment a batch of (image, text-prompt) pairs into
     binary masks at each image's ORIGINAL resolution.
 
@@ -353,17 +437,32 @@ class SAM3Grounder:
         device: str = "cuda",
         dtype: str = "auto",
         mask_threshold: float = DEFAULT_MASK_THRESHOLD,
+        instance_score_threshold: float = DEFAULT_INSTANCE_SCORE_THRESHOLD,
         debug_semantic_range: bool = False,
         hf_token: Optional[str] = None,
     ) -> None:
         import os
 
         import torch
-        from transformers import AutoModel, AutoProcessor
+        # EXPLICIT classes, never AutoModel/AutoProcessor — confirmed a real
+        # regression in production: on a newer transformers release,
+        # AutoModel.from_pretrained("facebook/sam3") resolves to
+        # Sam3VideoModel (SAM3's video/tracking head — its forward() requires
+        # an `inference_session` we never construct), not the image model this
+        # file actually needs. facebook/sam3's own model card and the
+        # transformers SAM3 doc page both load it as Sam3Model/Sam3Processor
+        # explicitly for exactly this image+text-prompt use case — there is no
+        # AutoModel example anywhere in the official usage. Importing the
+        # concrete classes removes the ambiguity outright rather than hoping
+        # AutoModel's mapping stays pointed at the image variant.
+        from transformers import Sam3Model, Sam3Processor
 
         self._torch = torch
         self.device = device
         self.mask_threshold = mask_threshold
+        # Confidence gate for the INSTANCE head only — a separate knob from
+        # mask_threshold (which binarizes pixels). See segment_pairs_full.
+        self.instance_score_threshold = instance_score_threshold
         # When True, print the RAW (pre-sigmoid) semantic_seg min/max for the
         # first few forward passes. The sigmoid question is already settled from
         # the transformers source (see the module docstring — semantic_seg is
@@ -382,13 +481,40 @@ class SAM3Grounder:
         # cached token (huggingface_hub's own resolution order — passing
         # token=None here still lets that automatic lookup happen).
         token = hf_token or os.environ.get("HF_TOKEN")
-        self.processor = AutoProcessor.from_pretrained(model_name, token=token)
-        self.model = AutoModel.from_pretrained(model_name, token=token, **dtype_kwargs)
+        self.processor = Sam3Processor.from_pretrained(model_name, token=token)
+        self.model = Sam3Model.from_pretrained(model_name, token=token, **dtype_kwargs)
         self.model.eval().to(device)
 
     def _load_image(self, path: str):
         from PIL import Image
         return Image.open(path).convert("RGB")
+
+    def _encode(self, images, texts):
+        """Build SAM3 model inputs from a batch of images + text prompts,
+        WITHOUT going through `Sam3Processor.__call__`'s own dispatch.
+
+        `Sam3Processor.__call__(images=..., text=..., ...)` is the documented
+        one-call entry point, and its OWN implementation (verified against
+        transformers 5.14.1's source) is exactly the two calls below: the
+        image processor on `images`, the tokenizer on `text` (padded to
+        `max_length=32`, SAM3's own convention), merged into one encoding.
+        Calling it that way ourselves instead of through the top-level
+        `__call__` sidesteps a real regression hit in production: a newer
+        transformers release changed how `Sam3Processor.__call__` routes its
+        `**kwargs` internally, and `text` started leaking into the IMAGE
+        processor's own kwargs validation — `Sam3ImageProcessorKwargs.
+        __init__() got an unexpected keyword argument 'text'` — failing every
+        single grounding forward pass while looking, from this file's own
+        try/except, like an ordinary per-batch failure (see `_ground_batch`).
+        Doing the two calls explicitly means this file no longer depends on
+        that internal routing at all, so it can't regress the same way again
+        even if `Sam3Processor.__call__` itself keeps changing.
+        """
+        image_inputs = self.processor.image_processor(images, return_tensors="pt")
+        text_inputs = self.processor.tokenizer(texts, return_tensors="pt",
+                                               padding="max_length", max_length=32)
+        image_inputs.update(text_inputs)
+        return image_inputs
 
     def segment_pairs(self, pairs: Sequence[Tuple[Any, str]]) -> List[np.ndarray]:
         """Segment a flat list of (PIL image, prompt) pairs in ONE forward pass.
@@ -397,15 +523,37 @@ class SAM3Grounder:
         image size. The image is repeated in `pairs` once per entity — see the
         module docstring on why SAM3 cannot take several prompts per image.
         """
+        masks, _ = self.segment_pairs_full(pairs, want_instances=False)
+        return masks
+
+    def segment_pairs_full(
+        self,
+        pairs: Sequence[Tuple[Any, str]],
+        want_instances: bool = False,
+    ) -> Tuple[List[np.ndarray], Optional[List[List[Dict[str, Any]]]]]:
+        """One forward pass, BOTH read-outs: `(semantic_masks, instances)`.
+
+        `instances` is None when `want_instances` is False, and otherwise a
+        per-pair list of instance dicts (see `_postprocess_instances`).
+
+        THE POINT OF THIS METHOD: `semantic_seg` and the instance-level
+        `pred_masks`/`pred_boxes`/`pred_logits` are all fields of the SAME
+        `Sam3ImageSegmentationOutput`, produced by the SAME forward pass. So
+        instance grounding is a second post-processing call over tensors that
+        already exist — it costs no additional GPU forward work, only the
+        post-processing (a sigmoid, a bilinear resize of the kept masks, and a
+        threshold). That is why COCO's detection evaluation can be added
+        without doubling the cost of a grounding run.
+        """
         if not pairs:
-            return []
+            return [], ([] if want_instances else None)
         torch = self._torch
         images = [p[0] for p in pairs]
         texts = [p[1] for p in pairs]
         # PIL's .size is (width, height); post_process wants (height, width).
         target_sizes = [(img.height, img.width) for img in images]
 
-        inputs = self.processor(images=images, text=texts, return_tensors="pt").to(self.device)
+        inputs = self._encode(images, texts).to(self.device)
         with torch.inference_mode():
             outputs = self.model(**inputs)
 
@@ -421,7 +569,61 @@ class SAM3Grounder:
         maps = self.processor.post_process_semantic_segmentation(
             outputs, target_sizes=target_sizes, threshold=self.mask_threshold
         )
-        return [m.detach().cpu().numpy().astype(bool) for m in maps]
+        masks = [_to_numpy(m).astype(bool) for m in maps]
+
+        instances = None
+        if want_instances:
+            # Same `outputs` object — no second forward pass. `threshold`
+            # gates INSTANCE CONFIDENCE (sigmoid(pred_logits) * presence),
+            # `mask_threshold` binarizes each kept instance's mask; the two
+            # are separate knobs in SAM3's own signature and are kept separate
+            # here (self.instance_score_threshold vs self.mask_threshold)
+            # rather than collapsed into one number.
+            results = self.processor.post_process_instance_segmentation(
+                outputs,
+                threshold=self.instance_score_threshold,
+                mask_threshold=self.mask_threshold,
+                target_sizes=target_sizes,
+            )
+            instances = [self._postprocess_instances(r) for r in results]
+
+        return masks, instances
+
+    def _postprocess_instances(self, result: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Turn one image's raw `post_process_instance_segmentation` result into
+        plain-Python instance dicts.
+
+        Each instance gets BOTH boxes, deliberately:
+          * "bbox"      — the tight axis-aligned box of the binarized instance
+                          MASK, computed here. This is the box the detection
+                          metrics use, because it is guaranteed consistent with
+                          the mask stored next to it: a reviewer overlaying the
+                          mask sees exactly the region that was scored.
+          * "sam3_bbox" — SAM3's own regressed `pred_boxes` entry for the same
+                          query, carried through unchanged so the two can be
+                          compared (they usually agree closely; they diverge
+                          where the mask is fragmented or the box regressor
+                          over-reaches).
+        An instance whose binarized mask is EMPTY is dropped entirely — it has
+        no derivable box, and a score above threshold with no surviving pixels
+        is not a detection.
+        """
+        out: List[Dict[str, Any]] = []
+        scores = _to_numpy(result["scores"])
+        boxes = _to_numpy(result["boxes"])
+        masks = _to_numpy(result["masks"]).astype(bool)
+        for score, sam_box, mask in zip(scores, boxes, masks):
+            bbox = mask_to_bbox(mask)
+            if bbox is None:
+                continue
+            out.append({
+                "score": float(score),
+                "bbox": bbox,
+                "sam3_bbox": [float(v) for v in sam_box],
+                "mask_rle": encode_rle(mask),
+                "pixel_count": int(mask.sum()),
+            })
+        return out
 
 
 # =============================================================================
@@ -452,12 +654,27 @@ def _empty_grounding(obj: str, is_nature: bool) -> Dict[str, Any]:
             "grounded": None, "mask_rle": None, "pixel_count": 0}
 
 
+def _empty_instances(obj: str, is_nature: bool) -> Dict[str, Any]:
+    """Instance-grounding entry for an entity SAM3 was never asked about.
+
+    `attempted` mirrors the `grounded is None` distinction in
+    `_empty_grounding`: False means SAM3 was never run for this entity (not
+    nature), while True with an empty `instances` list means SAM3 ran and
+    returned no instance above threshold. Collapsing the two would make an
+    un-attempted entity indistinguishable from a genuine non-detection, which
+    is exactly the ambiguity the semantic path already avoids.
+    """
+    return {"object": obj, "prompt": None, "is_nature": is_nature,
+            "attempted": False, "instances": []}
+
+
 def ground_records(
     grounder: SAM3Grounder,
     records: Iterable[Dict[str, Any]],
     batch_size: int = 8,
     max_pairs_per_forward: int = 16,
     center_sigma: float = DEFAULT_CENTER_SIGMA,
+    instance_grounding: bool = False,
     n_total: Optional[int] = None,
     verbose: bool = False,
 ) -> Iterator[Dict[str, Any]]:
@@ -466,6 +683,12 @@ def ground_records(
     enriched with `object_groundings`, `nature_relevance_score_coverage_ratio`
     and `nature_relevance_score_center_weighted` (see the module docstring for
     the exact shape) — BOTH scores are always computed, never just one.
+
+    With `instance_grounding=True` each record ALSO gets `object_instances`
+    (see the module docstring), read off the same forward pass. Nothing about
+    `object_groundings` or either relevance score changes when it is on — the
+    instance read-out is purely additive, so a COCO run and a BIG-5 run still
+    produce the same semantic fields computed the same way.
 
     Records are consumed and yielded in order, `batch_size` IMAGES at a time, so
     this composes with `stream_artifact` for constant memory over a large run.
@@ -489,7 +712,8 @@ def ground_records(
     n_done = 0
 
     def _flush(chunk: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        return _ground_batch(grounder, chunk, max_pairs_per_forward, center_sigma, verbose)
+        return _ground_batch(grounder, chunk, max_pairs_per_forward, center_sigma,
+                             instance_grounding, verbose)
 
     for rec in records:
         batch.append(rec)
@@ -518,6 +742,7 @@ def _ground_batch(
     batch: List[Dict[str, Any]],
     max_pairs_per_forward: int,
     center_sigma: float,
+    instance_grounding: bool,
     verbose: bool,
 ) -> List[Dict[str, Any]]:
     """Ground one batch of image records. Split out from `ground_records` purely
@@ -531,6 +756,9 @@ def _ground_batch(
         nature_idx = set(_nature_object_indices(rec))
         rec["object_groundings"] = [_empty_grounding(obj, i in nature_idx)
                                     for i, obj in enumerate(objs)]
+        if instance_grounding:
+            rec["object_instances"] = [_empty_instances(obj, i in nature_idx)
+                                       for i, obj in enumerate(objs)]
         try:
             img = grounder._load_image(rec["image_path"])
             images.append(img)
@@ -553,11 +781,15 @@ def _ground_batch(
                 if g["is_nature"]:
                     g["prompt"] = entity_prompt(g["object"])
                     g["grounded"] = False
+                    if instance_grounding:
+                        rec["object_instances"][gi]["prompt"] = g["prompt"]
             continue
         for gi, g in enumerate(rec["object_groundings"]):
             if not g["is_nature"]:
                 continue
             g["prompt"] = entity_prompt(g["object"])
+            if instance_grounding:
+                rec["object_instances"][gi]["prompt"] = g["prompt"]
             pairs.append((images[ri], g["prompt"]))
             owners.append((ri, gi))
 
@@ -566,7 +798,8 @@ def _ground_batch(
         chunk = pairs[start : start + max_pairs_per_forward]
         chunk_owners = owners[start : start + max_pairs_per_forward]
         try:
-            masks = grounder.segment_pairs(chunk)
+            masks, instances = grounder.segment_pairs_full(
+                chunk, want_instances=instance_grounding)
         except Exception as exc:
             # Never let one bad forward pass kill a long run — mark this chunk's
             # entities as not grounded and carry on.
@@ -575,6 +808,11 @@ def _ground_batch(
             for ri, gi in chunk_owners:
                 batch[ri]["object_groundings"][gi]["grounded"] = False
             continue
+        if instances is not None:
+            for (ri, gi), inst in zip(chunk_owners, instances):
+                entry = batch[ri]["object_instances"][gi]
+                entry["attempted"] = True
+                entry["instances"] = inst
         for (ri, gi), mask in zip(chunk_owners, masks):
             g = batch[ri]["object_groundings"][gi]
             # PRESENCE/ABSENCE: any pixel over threshold at all. `mask` is
@@ -623,11 +861,20 @@ def grounding_diagnostics(counts: Dict[str, int], n_images: int) -> Dict[str, An
     check (recap §9 — agreement with an independent model, NOT ground truth).
     """
     n_nature = counts.get("nature_entities", 0)
+    n_grounded = counts.get("grounded_entities", 0)
+    n_instances = counts.get("instances_total", 0)
     return {
         "n_images": n_images,
         "objects_total": counts.get("objects_total", 0),
         "nature_entities": n_nature,
-        "grounded_entities": counts.get("grounded_entities", 0),
+        "grounded_entities": n_grounded,
+        # Instance-grounding only (0 when it was off): how many individual
+        # objects SAM3 resolved the confirmed concepts into. Reported next to
+        # the entity counts because the ratio of the two is itself telling —
+        # one "sheep" concept mask becoming twelve instances is the whole
+        # reason COCO needs the instance head.
+        "instances_total": n_instances,
+        "instances_per_grounded_entity": (n_instances / n_grounded) if n_grounded else 0.0,
         "grounding_confirmation_rate": (counts.get("grounded_entities", 0) / n_nature) if n_nature else 0.0,
         "nature_entities_per_image": (n_nature / n_images) if n_images else 0.0,
     }

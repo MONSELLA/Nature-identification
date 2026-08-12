@@ -193,10 +193,52 @@ evaluating the models.
   but whose mask never crossed `--mask_threshold` — `grounded: false`, not
   `null`), and `grounding_confirmation_rate_image`. The run summary/console/
   W&B also report a dataset-wide `confirmation_rate` (recap §9: agreement
-  with SAM3, an INDEPENDENT model, never ground truth).
-- SAM3 (`facebook/sam3`) via plain transformers AutoModel/AutoProcessor. Read
-  `outputs.semantic_seg` (concept-level pixel coverage), NOT the instance-level
-  `pred_masks`/`pred_boxes`/`pred_logits`.
+  with SAM3, an INDEPENDENT model, never ground truth). On COCO the CSV also
+  mirrors the per-image detection results — counts, per-image precision/
+  recall, and the actual `detection_matches` (GT class vs predicted entity,
+  both boxes, IoU, exact-match AND hierarchical verdicts), plus
+  `detection_false_positives` / `detection_excluded_predictions` /
+  `detection_missed_gt` / `detection_nature_on_non_nature` — so a
+  disagreement is reviewable without opening the `.jsonl`.
+- SAM3 (`facebook/sam3`) via `Sam3Model`/`Sam3Processor`, loaded EXPLICITLY —
+  NEVER `AutoModel`/`AutoProcessor`. Confirmed a real production regression:
+  on a newer transformers release, `AutoModel.from_pretrained("facebook/sam3")`
+  resolves to `Sam3VideoModel` (the video/tracking head, whose `forward()`
+  needs an `inference_session` this pipeline never constructs) instead of the
+  image model this file needs — silently failing every single forward pass.
+  The official facebook/sam3 model card and transformers' own SAM3 doc page
+  both load it via the concrete classes for exactly this image+text use case;
+  there is no AutoModel example anywhere in the documented usage. Read
+  `outputs.semantic_seg` (concept-level pixel coverage) for the relevance
+  score on EVERY dataset. The instance-level `pred_masks`/`pred_boxes`/
+  `pred_logits` are read ONLY for COCO's box-IoU evaluation (see below) —
+  never for the relevance score, which is about pixel coverage of a concept,
+  not how many instances of it there are. Every tensor read off a SAM3 output
+  goes through `_to_numpy` (`.float()` before `.numpy()`), NEVER a bare
+  `.detach().cpu().numpy()` — confirmed a second production regression:
+  NumPy has no bfloat16 representation, so `.numpy()` on one raises `Got
+  unsupported ScalarType BFloat16`. This bites specifically because
+  `run_pipeline.py`'s `--dtype` is a flag BOTH the VLM and grounding stages
+  declare, so `--dtype bfloat16` (meant for the VLM) silently also loads SAM3
+  in bfloat16 unless `--grounding_dtype` overrides it — `_to_numpy` makes the
+  read-out correct either way rather than depending on that override being
+  remembered on every invocation.
+- INSTANCE GROUNDING (COCO only; `--instance_grounding auto|on|off`, auto =
+  on for COCO artifacts, read from the artifact's own header). Adds
+  `object_instances` — aligned index-for-index with `objects` like every other
+  parallel list — each `{object, prompt, is_nature, attempted, instances:[
+  {score, bbox, sam3_bbox, mask_rle, pixel_count}]}`. `attempted: false` is
+  the instance-side twin of `grounded: null` (SAM3 never ran for this entity).
+  `bbox` is the TIGHT box of the instance mask (`grounding_pipeline.mask_to_bbox`,
+  xyxy, far edge EXCLUSIVE so a 1px mask has area 1, not 0) — that is the box
+  the metrics score, because it is guaranteed consistent with the mask stored
+  beside it; `sam3_bbox` carries SAM3's own regressed box unchanged for
+  comparison. NOT a second forward pass: `semantic_seg` and the instance
+  tensors are fields of the SAME `Sam3ImageSegmentationOutput`
+  (`SAM3Grounder.segment_pairs_full`), so this costs post-processing only and
+  leaves `object_groundings` and both relevance scores bit-for-bit unchanged.
+  `--instance_score_threshold` (default 0.3, SAM3's own) gates instance
+  CONFIDENCE — a separate knob from `--mask_threshold`, which binarizes pixels.
 - `semantic_seg` is RAW LOGITS (unbounded), verified in the transformers source
   — sigmoid is required. Use `processor.post_process_semantic_segmentation(...)`,
   which does sigmoid → resize to original size → binarize at 0.5 (SAM3's own
@@ -442,8 +484,145 @@ evaluating the models.
   that axis's accuracy/precision/recall table instead of one.
 - **COCO**: image-level nature = OR over extracted objects; biotic/material
   scored on the matched GT object via lexical matching (`find_matching_object`).
-  Evaluated separately via the Grounding pipeline going forward — box-IoU
-  matching (Hungarian, IoU≥0.5) remains FUTURE WORK gated on that pipeline.
+
+## COCO box-IoU detection evaluation (`src/evaluation/detection_metrics.py`)
+IMPLEMENTED. Runs in `--stage score` when the artifact is COCO **and** was
+grounded with instance grounding; it runs ALONGSIDE the axis metrics above,
+never replacing them. Two summary dicts, deliberately never merged:
+`summary["detection"]` (localization) and `summary["detection_labels"]`
+(naming). Console + W&B (`Detection/*`, `DetectionLabels/*`) report both.
+- GT is per-INSTANCE (`load_coco` now stores `gt_boxes` alongside the
+  class-collapsed `targets`; `dataset_loader.coco_gt_boxes` back-fills them at
+  scoring time from `--instances_json` so pre-existing artifacts need NO
+  re-inference). Boxes are xyxy, converted from COCO's native xywh once, in
+  `_coco_box_xyxy`.
+- MATCHING IS ON **MASKS ONLY** — COCO's own `segm` task, not `bbox`. There is
+  NO box-matching mode; it was tried and removed (see the recap) because it
+  measures the wrong thing for a pipeline whose predictions ARE masks: two
+  crossing diagonal strokes have box IoU **1.000** and mask IoU **0.000**
+  (verified in the test suite). REQUIRES `--instances_json` — GT segmentation
+  is read from the annotation file at scoring time, never stored in the
+  artifact (it would bloat every record for a scoring-only use); without it,
+  detection is skipped entirely rather than silently degrading to boxes.
+  `--instances_json` GT WINS over the record's own `gt_boxes` whenever loaded,
+  since only the former carries masks. `summary["detection"]["iou_type"]` is
+  fixed provenance (`"mask"`) so a saved results JSON is self-describing
+  against any older box-matched run. Every per-pair/FP/excluded/missed-GT
+  entry in the predictions CSV carries `gt_mask_rle`/`pred_mask_rle` alongside
+  the box (display-only) — `scripts/diagnose_detection_image.py` recomputes
+  the real mask-IoU matrix from these to answer "why didn't X match Y"
+  without needing the raw `.jsonl`.
+- MATCHING IS CLASS-AGNOSTIC — Hungarian (not greedy), one-to-one, maximizing
+  total IoU, threshold `--detection_iou_threshold` (default 0.5). This is the
+  whole point: matching on class first (the standard detection protocol) would
+  discard every cow/bull pair as FP+FN before the hierarchical metrics could
+  see it. CONSEQUENCE: precision/recall/F1/AP here measure LOCALIZATION only;
+  the naming side is `detection_labels`. Do not describe them as "detection
+  accuracy" without that qualifier.
+- GT restricted to NATURE-mapped COCO classes, because only nature-labeled
+  entities are grounded — a `car` box could never be matched, so counting it
+  as a miss would measure the protocol, not the model.
+- UNMATCHED PREDICTION → false positive under EITHER test, EXCLUDED only if it
+  fails both: (a) LEXICAL — its own phrase names a class in the evaluated
+  vocabulary; (b) GEOMETRIC — another instance of the SAME entity in the SAME
+  image did match a GT box. Recorded per-FP as `fp_reason`
+  (`names_evaluated_class` / `entity_matched_elsewhere_in_image`).
+  Test (b) is NOT optional polish — without it the metric has a PERVERSE
+  INCENTIVE where misnaming an object IMPROVES precision: on a 24-donut image
+  whose GT annotates only 12, calling them "donut" charges the 12 unmatched
+  detections as FP (P=0.50), while calling them "pretzel" routes the identical
+  boxes to `excluded` (P=1.00). (a) is only a LEXICAL PROXY for "is this kind
+  of thing annotated in COCO?"; a geometric match is direct, strictly stronger
+  evidence of the same fact. Scoped per (image, entity), never dataset-wide.
+  Otherwise EXCLUDED and reported as `excluded_predictions` (COCO annotates 80
+  curated classes, so a correctly detected tree is not a hallucination).
+  `build_coco_eval_vocab` MUST filter to nature exactly as the box filter
+  does — the two agreeing is what makes the rule fair.
+- `iscrowd` regions: not detection targets, but still suppress FPs (IoA over
+  the PREDICTION's area ≥ 0.5, not IoU — a crowd box dwarfs any one
+  prediction). COCO's own convention.
+- TAXONOMY-DISAGREEMENT DIAGNOSTIC (`summary["detection_nature_on_non_nature"]`,
+  a THIRD dict, never merged into the other two): a grounded NATURE box
+  overlapping (IoU ≥ threshold) a GT box whose COCO class maps to NON-nature.
+  Can never be a TP (non-nature GT is filtered before matching) and is NOT
+  charged as an FP either — these predictions stay in whichever bucket the
+  normal rules gave them (nearly always `excluded`), so precision/recall are
+  identical with or without this diagnostic. Exists because otherwise the case
+  vanishes into `excluded`, indistinguishable from a mask over empty
+  background. It is the Nature-Based Artefacts clause made measurable: COCO's
+  `dining table` node is non-nature, but a wooden table with visible grain IS
+  nature under the taxonomy, and a class node can't encode which one THIS
+  image shows — so a hit is often the concept-vs-instance gap, not an error.
+  Read `by_gt_class` to tell them apart (wood/stone furniture dominating =
+  that clause firing; a flat spread of unrelated classes = loose masks).
+- INSTANCE NMS (`--instance_nms_iou`, default 0.5, score-time): SAM3's own
+  post-processing applies ONLY a score threshold — no NMS, no dedup (verified
+  in the transformers source) — so several queries firing on the SAME object
+  all survive, and one-to-one matching charges the redundant twins as FPs
+  (observed: 7 overlapping "orange slice" masks over 2 annotated oranges,
+  precision 0.29 instead of 1.00 on that image). Suppression is PER-ENTITY
+  only: two DIFFERENT entities overlapping ("cow" and "herd" on the same
+  pixels) is a real prediction, not a duplicate.
+- ENTITY-LEVEL BLOCK (`summary["detection_entity"]` / `_labels` /
+  `_axis_agreement`, `score_image_entities`) — reported ALONGSIDE the
+  instance-level block, never merged. Unions every instance mask of one
+  extracted entity into ONE region, every annotated instance of one GT class
+  into ONE region, then matches those. Same matching/FP/crowd/label/axis code,
+  granularity ONLY differs. Fairer on two measurable counts: duplicates
+  collapse by construction (no NMS needed), and COCO's non-exhaustive
+  annotation of crowded scenes stops capping TPs (the 24-donut/12-box case).
+  COSTS: no per-object counting ("found 8 of 12 cows") and no AP — both exist
+  only at instance granularity, which is why both blocks are kept.
+- PIXEL COVERAGE (`summary["detection_pixels"]`, `detection_metrics.pixel_stats`
+  / `pixel_summary`) — NO IoU threshold, NO assignment step: all predicted
+  nature pixels on an image vs all annotated nature pixels. Answers "how much
+  of the banana did we find", which neither detection block can: region
+  matching is BINARY above a threshold, so 55%- and 99%-covered objects both
+  score as one TP. Includes missed GT classes (pixels count against recall)
+  and unmatched predictions (against precision) — not just the cases that went
+  well. `micro_*` pools every pixel (big objects count for their real size);
+  `mean_image_iou` weights images equally — a large gap between them means
+  performance depends on object size. `by_gt_class` gives the same per COCO
+  class. Per-image `pixel_recall_image`/`pixel_precision_image`/`pixel_iou_image`
+  land in the predictions CSV.
+- NO TRUE NEGATIVES, so no accuracy is reported — unlike the axis metrics,
+  detection has no finite negative class. Don't add one.
+- AP@0.5 and AP@[.50:.95] (101-point interpolated, class-agnostic) over the
+  full COCO IoU ladder, re-matching at each rung off ONE cached IoU matrix.
+  Excluded/crowd-suppressed predictions are kept OUT of the AP ranking.
+- LABEL SCORING, per matched pair only: `exact_match` (same
+  `phrase_matches_terms`/`gt_match_terms` test the extraction-hit diagnostic
+  uses) AND hP/hR/hF1 + Wu-Palmer against the GT synset, so "bull" for "cow"
+  gets partial credit (~0.94 hF1) instead of a flat zero. Reported pooled
+  (resolution failures as 0.0) and `_resolved`-only, both mean ± population
+  std — same convention as the ImageNet/Places hierarchical block.
+  `phrase_matches_terms` matches the whole normalized phrase OR any GT term
+  as a TRAILING SPAN — not just the single trailing word — so a modifier in
+  front of a multi-word term ("huge potted plant" vs "potted plant") still
+  counts as exact; requiring the match at the very end (not anywhere in the
+  phrase) is what keeps "cow shed" from wrongly matching "cow". The same
+  span-based surface-form set (`_pred_label_terms`) feeds the curated-
+  vocabulary FP-vs-excluded test below, for the identical reason.
+- AXIS AGREEMENT (`summary["detection_axis_agreement"]`, biotic/material
+  only): for the SAME matched pairs, compares the predicted entity's own
+  hybrid label (`object_finals`) against the GT box's taxonomy position —
+  read off the geometric box correspondence, a tighter binding than the
+  lexical `find_matching_object` the plain axis metrics use (matters with
+  several same-class instances in one image). NATURE has no entry: every
+  matched pair is nature-vs-nature by construction (only nature entities are
+  grounded, GT here is nature-restricted), so an agreement rate for it would
+  misreport a tautology as a measurement. A `None` on either side (unmapped
+  GT, unresolved VLM label) is dropped from that axis's support, not counted
+  as disagreement.
+- NO GT LEAKAGE: the predicted phrase resolves via
+  `taxonomy_metrics.resolve_phrase_to_wordnet(phrase, anchor_synset_id=None)`.
+  The anchor is deliberately withheld — the only one available is the GT class,
+  and steering sense disambiguation with it would inflate the very hP/hR it
+  feeds. (`resolve_to_wordnet`'s own anchored use is safe: there the anchor is
+  ClipMatch's PREDICTION, so a wrong anchor drags the score down.) Anchorless
+  falls back to most-frequent-sense, with WordNet INSTANCE synsets (proper
+  nouns) deprioritized — bare MFS resolves "crane" to Stephen Crane the
+  writer. That filter is GT-independent, so it introduces no leakage.
 - **Extraction-hit rate** (exact-match: was the GT object mentioned) is a
   REPORTING-ONLY diagnostic; it no longer gates or feeds the axis scores.
 
@@ -476,7 +655,11 @@ mapping-routed labeling → hybrid resolution → metrics: F-CLIPScore,
 Object-CLIPScore, per-axis acc/P/R/F1, ClipMatch + hP/hR on ImageNet/Places).
 Grounding pipeline is IMPLEMENTED end-to-end (SAM3 semantic segmentation of
 nature entities → RLE masks → nature relevance score), enriching the same
-artifact. Next: spot-check both pipelines on Qwen3.5-0.8B + a real SAM3 run
+artifact. COCO's box-IoU detection evaluation is IMPLEMENTED (SAM3 instance
+boxes vs COCO GT boxes, class-agnostic Hungarian matching, then exact-match +
+hierarchical label scoring on the matched pairs) — NOT yet run on real data:
+the numbers it produces are unvalidated until a real SAM3 COCO run exists.
+Next: spot-check both pipelines on Qwen3.5-0.8B + a real SAM3 run
 (confirm the semantic_seg range empirically with --debug_semantic_range and
 tune --max_pairs_per_forward to the GPU), hand off to Ramin for the BSC infra
 check, then the sequential ablations (recap §7).

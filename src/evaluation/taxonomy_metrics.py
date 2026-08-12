@@ -328,11 +328,34 @@ def _synsets_for_phrase(phrase: str) -> List["wn.synset"]:
         return []
 
 
-def _best_sense(synsets: List["wn.synset"], pred_synset_id: str) -> "wn.synset":
+def _best_sense(synsets: List["wn.synset"], pred_synset_id: Optional[str]) -> "wn.synset":
     """Disambiguate polysemous synsets by maximizing Wu-Palmer similarity
-    against `pred_synset_id` (the ClipMatch-predicted class)."""
+    against `pred_synset_id` (the ClipMatch-predicted class).
+
+    `pred_synset_id=None` means NO anchor is available, and the fallback is
+    WordNet's FIRST sense — its senses are ordered by corpus frequency, so
+    sense 1 is the most-frequent-sense baseline, the standard choice when
+    there is nothing to disambiguate against. See `resolve_phrase_to_wordnet`
+    for why an anchor is sometimes deliberately withheld.
+
+    With one correction to plain most-frequent-sense, applied ONLY on the
+    anchorless path: INSTANCE synsets (WordNet's proper nouns — a specific
+    named person, place or thing, marked by having `instance_hypernyms`) are
+    deprioritized. Bare frequency ranking is actively misleading for an image
+    pipeline here, and not rarely: WordNet's first two senses of "crane" are
+    the writers Stephen and Hart Crane, so an entity a segmenter found in a
+    photograph would resolve to a dead American poet and score its
+    hierarchical metrics against that branch of the tree. The correction is
+    still entirely GT-independent — it asks whether a sense is a proper noun,
+    never what the ground truth happens to be — so it introduces no leakage.
+    A phrase whose senses are ALL instances (a genuine proper noun, "Mount
+    Everest") is unaffected: the filter only reorders, it never empties.
+    """
     if len(synsets) == 1:
         return synsets[0]
+    if pred_synset_id is None:
+        common = [s for s in synsets if not s.instance_hypernyms()]
+        return (common or synsets)[0]
     return max(synsets, key=lambda s: compute_wup_similarity(s.name(), pred_synset_id))
 
 
@@ -412,9 +435,39 @@ def resolve_to_wordnet(
     if threshold is not None and best_score <= threshold:
         return None
 
+    return resolve_phrase_to_wordnet(top_candidate, anchor_synset_id=pred_synset_id)
+
+
+def resolve_phrase_to_wordnet(
+    phrase: str,
+    anchor_synset_id: Optional[str] = None,
+) -> Optional[str]:
+    """Map ONE free-text entity phrase to a canonical WordNet synset id, or
+    None if nothing in it maps.
+
+    This is the resolution machinery `resolve_to_wordnet` runs once it has
+    picked its best candidate phrase, exposed directly for callers that
+    already know which phrase they mean — COCO's detection evaluation, where
+    the phrase is simply the label of the entity whose box got matched, with
+    no ClipMatch ranking involved. See `resolve_to_wordnet`'s docstring for
+    the three resolution steps and why span search ranks by specificity rather
+    than Wu-Palmer; all of that applies unchanged here.
+
+    `anchor_synset_id` steers word-SENSE disambiguation and the choice between
+    alternation branches. It is OPTIONAL, and on COCO it is deliberately left
+    None: the only anchor available there would be the GROUND-TRUTH class of
+    the matched box, and using it would be leakage of the worst kind — it
+    would resolve an ambiguous predicted phrase toward whichever sense the GT
+    happens to be, inflating exactly the hP/hR the resolution feeds. (Contrast
+    `resolve_to_wordnet`'s own use of it, which is safe because there the
+    anchor is ClipMatch's PREDICTION, so a wrong anchor drags the score down
+    rather than up.) With no anchor, senses fall back to WordNet's
+    most-frequent-sense ordering — a fixed, GT-independent rule.
+    """
     # Resolve each alternation branch down to at most one synset.
+    pred_synset_id = anchor_synset_id
     per_alternative: List["wn.synset"] = []
-    for alternative in _split_alternatives(_normalize_phrase(top_candidate)):
+    for alternative in _split_alternatives(_normalize_phrase(phrase)):
         # A whole-phrase lemma is authoritative — if the VLM's entire phrase
         # IS a WordNet entry, no sub-span can be a better reading of it. This
         # is what keeps "swimming pool" from decomposing into the (deeper, but
@@ -436,14 +489,24 @@ def resolve_to_wordnet(
             synsets = _synsets_for_phrase(text)
             if synsets:
                 sense = _best_sense(synsets, pred_synset_id)
-                spans.append((sense.min_depth(),
-                              compute_wup_similarity(sense.name(), pred_synset_id),
-                              sense))
+                # Without an anchor there is nothing to be similar TO, so the
+                # tie-break degenerates to a constant and depth alone decides
+                # (exact depth ties then fall to the first span tried, which
+                # _phrase_variants orders longest-first). Computed explicitly
+                # rather than letting compute_wup_similarity(None) swallow an
+                # exception and return 0.0 by accident.
+                tie_break = (compute_wup_similarity(sense.name(), pred_synset_id)
+                             if pred_synset_id is not None else 0.0)
+                spans.append((sense.min_depth(), tie_break, sense))
         if spans:
             per_alternative.append(max(spans, key=lambda s: (s[0], s[1]))[2])
 
     if not per_alternative:
         return None
+    if pred_synset_id is None:
+        # No anchor: keep the first alternation branch (the order the phrase
+        # itself wrote them in), rather than an arbitrary all-zeros argmax.
+        return per_alternative[0].name()
     # Across genuine alternatives ("insect" vs "larva"), closeness to the
     # predicted class is the right discriminator — they are competing names
     # for one entity, not a generic/specific pair.

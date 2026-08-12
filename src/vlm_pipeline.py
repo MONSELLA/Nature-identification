@@ -472,6 +472,7 @@ def run_inference(
         {
           "image_path": str,
           "targets": [...],                 # GT carried through from the loader
+          "gt_boxes": [...],                # COCO only: per-instance GT boxes (xyxy)
           "caption": str,
           "objects": [str, ...],
           "object_labels": [ {reasoning,nature,biotic,material,parse_failed,vlm_called}, ... ],
@@ -670,6 +671,13 @@ def run_inference(
             yield {
                 "image_path": inst["image_path"],
                 "targets": inst.get("targets", []),
+                # COCO only (see dataset_loader.load_coco): the UNCOLLAPSED
+                # per-instance GT boxes the Grounding pipeline's detection
+                # evaluation scores against. Absent on every other dataset,
+                # and back-fillable at scoring time from --instances_json for
+                # artifacts written before this field existed, so adding it
+                # never forces a re-run of inference.
+                **({"gt_boxes": inst["gt_boxes"]} if inst.get("gt_boxes") else {}),
                 "caption": cap,
                 "objects": objs,
                 "object_labels": labels,

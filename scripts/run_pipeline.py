@@ -14,11 +14,18 @@ one shared per-image artifact:
         v
     ONE artifact per run, holding everything for every image: caption,
     entities, taxonomy labels, masks and the relevance score.
+        |   run_vlm_pipeline.py --stage score   (OPT-IN third subprocess, --score)
+        v
+    Results JSON + predictions CSV.
 
-This runs the VLM's INFERENCE stage only, not its CLIP scoring stage — grounding
-does not consume any scoring output, and scoring stays a separate, deliberate
-step (`run_vlm_pipeline.py --stage score`, which reads the very same artifact
-and simply ignores the grounding fields added to it).
+By default this runs the VLM's INFERENCE stage and grounding only, not
+scoring — grounding does not consume any scoring output, so the two are
+independent, and scoring loads its own CLIP model. Pass --score to also run
+`run_vlm_pipeline.py --stage score` as a third subprocess afterward, so one
+command produces the finished results; without it, scoring stays the
+separate, deliberate step it always was (`run_vlm_pipeline.py --stage score`,
+which reads the very same artifact and simply ignores the grounding fields
+added to it).
 
 PROCESS ISOLATION — the reason this script exists rather than one big process:
 each stage runs as its OWN genuine OS subprocess (`subprocess.run([sys.executable,
@@ -43,6 +50,11 @@ overrides are provided (--grounding_batch_size, --grounding_dtype,
     python scripts/run_pipeline.py --dataset big5 \
         --model_family qwen2_5_vl --model_name Qwen/Qwen3.5-0.8B \
         --run_name baseline --grounding_batch_size 4 --verbose
+
+    # ...or with --score to also produce the finished results in one call:
+    python scripts/run_pipeline.py --dataset coco --data_dir ... --instances_json ... \
+        --model_family qwen2_5_vl --model_name Qwen/Qwen3.5-0.8B \
+        --excel_path ... --score --verbose
 
 HOW TO READ THIS FILE
 Start at `main()` at the bottom. There is no pipeline logic here at all — this
@@ -109,6 +121,20 @@ def build_arg_parser():
                         "run_vlm_pipeline.py --stage infer directly; provided so a script "
                         "or job file can toggle the grounding half off without changing "
                         "which command it invokes.")
+    p.add_argument("--score", action="store_true",
+                   help="Also run --stage score as a THIRD subprocess after grounding, so "
+                        "one command produces the finished results JSON + predictions CSV "
+                        "instead of leaving that as a separate manual step. OFF by default: "
+                        "this script's original contract was infer+ground only (scoring is a "
+                        "deliberate, separate step per the module docstring, and loads its "
+                        "own CLIP model), so existing invocations keep behaving exactly as "
+                        "before unless this is passed. Uses the SAME shared vlm_args "
+                        "Namespace as the infer stage (one parser covers both --stage infer "
+                        "and --stage score flags), so anything score-only "
+                        "(--excel_path/--instances_json/--detection_iou_threshold/CLIP model "
+                        "flags/...) just needs to be on the command line once. Runs only "
+                        "after grounding actually completes (or is skipped outright via "
+                        "--skip_grounding) — never after a failed grounding subprocess.")
     return p
 
 
@@ -225,6 +251,23 @@ def main():
                         "Grounding")
 
     print(f"✅ [pipeline] done — enriched artifact: {vlm_args.responses_file}")
+
+    if own_args.score:
+        # Same subprocess-per-stage rationale as the other two: by the time
+        # this runs, both the VLM and SAM3 have already exited and released
+        # their VRAM, so CLIP (loaded fresh inside this subprocess) has the
+        # GPU to itself, exactly as run_vlm_pipeline.py's own --stage all
+        # already isolates infer from score.
+        # vlm_args already carries every score-relevant flag from the shared
+        # command line (--excel_path, --instances_json,
+        # --detection_iou_threshold, the CLIP model flags, ...) — infer and
+        # score share ONE parser in run_vlm_pipeline.py, so nothing extra
+        # needs to be threaded through here. --responses_file is already
+        # pinned to the artifact both earlier stages just wrote/enriched.
+        _run_subprocess("run_vlm_pipeline.py",
+                        _args_to_cli(vlm_args, vlm_parser, stage="score"),
+                        "Scoring")
+        print(f"✅ [pipeline] done — scored artifact: {vlm_args.responses_file}")
 
 
 if __name__ == "__main__":

@@ -97,6 +97,7 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")   # avoids the fork/par
 import argparse
 import csv
 import json
+from collections import Counter
 import logging
 import random
 import shutil
@@ -113,9 +114,11 @@ import numpy as np
 # needed. (Setting HF_TOKEN is the real fix and also lifts rate limits.)
 logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 
-from src.evaluation import taxonomy_metrics
+from src.evaluation import detection_metrics, taxonomy_metrics
+from src import grounding_pipeline
 from src.loaders.excel_loader import TaxonomyGraph
-from src.loaders.dataset_loader import load_dataset, get_candidate_vocab, BIG5_DATASETS
+from src.loaders.dataset_loader import (load_dataset, get_candidate_vocab, coco_gt_boxes,
+                                        BIG5_DATASETS)
 from src.models.prompts import build_system_prompts
 from src.models.vlm_models import MODEL_REGISTRY, create_vlm
 from src.vlm_pipeline import run_inference, resolve_hybrid_label, _normalize_object
@@ -181,6 +184,35 @@ def gt_match_terms(target):
     return {t for t in terms if t}
 
 
+def phrase_matches_terms(phrase, terms):
+    """True if an extracted object phrase names one of `terms` (a normalized
+    surface-form set, e.g. from `gt_match_terms`).
+
+    Matches the whole normalized phrase, or any TERM as a trailing SPAN — so
+    extracted "big dog" matches the term "dog", and "huge potted plant"
+    matches the two-word term "potted plant" (a single-word trailing-word
+    check alone would miss this: the trailing word of "huge potted plant" is
+    just "plant", which usually isn't itself a separate term). English noun
+    phrases are right-headed — "huge potted plant" IS a potted plant, "potted
+    plant food" is NOT a potted plant — so requiring the term to land at the
+    END, not just anywhere in the phrase, is what keeps this from also
+    matching a compound where the term is merely a MODIFIER ("cow shed" must
+    not match the term "cow": its head, and trailing word, is "shed").
+    Anchoring on a word boundary (a preceding space) is what stops "wildcat"
+    from matching the term "cat" — English word-boundaries only occur at
+    spaces here, never mid-word.
+
+    Factored out of `find_matching_object` so the detection evaluation's
+    label comparison applies the exact same notion of "names the same thing"
+    that the axis metrics already do, instead of quietly inventing a second
+    one.
+    """
+    norm = _normalize_object(phrase)
+    if norm in terms:
+        return True
+    return any(norm.endswith(" " + term) for term in terms)
+
+
 def find_matching_object(objects, target):
     """Return the index of the first extracted object matching the GT target
     (by normalized class-name / synonym, full phrase or trailing head noun), or
@@ -189,16 +221,667 @@ def find_matching_object(objects, target):
     if not terms:
         return None
     for i, obj in enumerate(objects):
-        norm = _normalize_object(obj)
-        if norm in terms:
-            return i
-        # Also accept a match on just the LAST word of a multi-word extracted
-        # phrase, e.g. extracted "brown golden retriever" matching GT term
-        # "golden retriever"... actually the reverse: extracted "big dog"
-        # matching GT term "dog" via its trailing word.
-        if " " in norm and norm.split()[-1] in terms:
+        if phrase_matches_terms(obj, terms):
             return i
     return None
+
+
+# =============================================================================
+# COCO box-IoU detection evaluation (Grounding pipeline; recap §8/§9)
+# =============================================================================
+def build_coco_eval_vocab(gt_boxes_by_image):
+    """Surface-form lookup for the COCO classes this run actually evaluates:
+    `{normalized_term: class_name}`.
+
+    Built from the GT boxes that survive filtering (see
+    `coco_detection_gt_boxes`), so it is the NATURE-mapped subset of COCO's 80
+    rather than all of them — which is the vocabulary the curated-vocabulary
+    false-positive rule must test against (see
+    detection_metrics.classify_unmatched_prediction for why).
+
+    Terms come from `gt_match_terms`, i.e. each class's COCO name plus every
+    WordNet lemma of its synset, so a predicted "sofa" is recognized as naming
+    COCO's "couch" class.
+    """
+    vocab = {}
+    for boxes in gt_boxes_by_image.values():
+        for box in boxes or []:
+            # Filtered to nature exactly as `coco_detection_gt_boxes` filters
+            # the boxes themselves — the two MUST agree. A non-nature class
+            # left in here would make an unmatched "car" prediction a false
+            # positive while no car box was ever a detection target, which is
+            # the precise unfairness the exclusion rule exists to prevent.
+            if box.get("gt_nature") is not True:
+                continue
+            for term in gt_match_terms(box):
+                vocab.setdefault(term, box["class_name"])
+    return vocab
+
+
+def coco_detection_gt_boxes(rec, gt_boxes_by_file):
+    """The GT boxes this image is evaluated against, or None if it has none.
+
+    Two sources, in order: the record's own `gt_boxes` (written by
+    dataset_loader.load_coco through the artifact), falling back to
+    `gt_boxes_by_file` — a backfill keyed by image FILE NAME, loaded straight
+    from --instances_json at scoring time. The fallback is what lets an
+    artifact produced BEFORE per-instance boxes existed be scored without
+    re-running inference, which at COCO's scale is the difference between a
+    re-score and a re-run.
+
+    Filtered to NATURE-mapped classes, because only nature-labeled entities are
+    grounded (src/grounding_pipeline.py) — a GT car box could never be matched
+    no matter how good the pipeline was, so counting it as a false negative
+    would measure the protocol, not the model. Crowd boxes are split out
+    rather than dropped: they are not detection targets, but they still
+    suppress false positives (COCO's own convention).
+
+    The NON-NATURE boxes are returned too, not discarded. They are never
+    matching targets, but they are what makes the taxonomy-disagreement
+    diagnostic possible: a prediction landing squarely on one is a case where
+    the VLM called something nature that the taxonomy node says is not, and
+    without keeping these boxes that prediction is indistinguishable from one
+    over empty background. See `score_image_detection`.
+
+    Returns `(targets, crowd_boxes, non_nature_boxes)`.
+    """
+    # `gt_boxes_by_file`, when the caller loaded it, WINS over the record's own
+    # copy — it comes straight from --instances_json and is the only source
+    # carrying segmentation masks (the artifact deliberately stores boxes
+    # only). Letting the record shadow it would silently drop back to box
+    # matching on exactly the runs that asked for masks.
+    boxes = None
+    if gt_boxes_by_file is not None:
+        boxes = gt_boxes_by_file.get(os.path.basename(rec["image_path"]))
+    if boxes is None:
+        boxes = rec.get("gt_boxes")
+    if not boxes:
+        return None, [], []
+    nature = [b for b in boxes if b.get("gt_nature") is True]
+    return ([b for b in nature if not b.get("iscrowd")],
+            # Crowd regions carried whole (not just their box) so the
+            # segmentation path can suppress against the crowd MASK, matching
+            # whichever IoU type the run is using.
+            [b for b in nature if b.get("iscrowd")],
+            [b for b in boxes if b.get("gt_nature") is not True])
+
+
+def collect_predicted_boxes(rec, nms_iou=None):
+    """Flatten this image's `object_instances` into one list of predicted-box
+    dicts: `{"bbox", "score", "object", "object_idx", "mask_pixel_count"}`.
+
+    Every instance carries the phrase of the ENTITY it came from — that phrase
+    is the "predicted label" the label metrics score, so it has to survive the
+    flattening. Returns [] when the artifact has no instance grounding (i.e.
+    the Grounding pipeline ran without --instance_grounding, or never ran).
+
+    `nms_iou` (when not None) runs mask NMS *within each entity* before
+    returning. SAM3's own post-processing does NO deduplication — verified in
+    the transformers source, it applies only a score threshold — so several of
+    its instance queries firing on the SAME object all survive as separate
+    "instances", and one-to-one matching then charges the redundant twins as
+    false positives. Suppression is per-entity, never across entities: two
+    DIFFERENT entities legitimately overlapping (a "cow" mask and a "herd"
+    mask over the same pixels) is a real, meaningful prediction, not a
+    duplicate to be thrown away — only repeated firings of the same phrase are.
+    """
+    by_entity = {}
+    for oi, entry in enumerate(rec.get("object_instances") or []):
+        for inst in entry.get("instances", []):
+            by_entity.setdefault(oi, []).append({
+                "bbox": inst["bbox"],
+                # The predicted MASK itself (pycocotools RLE), carried so the
+                # segmentation IoU path can compare mask-to-mask instead of
+                # reducing both sides to boxes first. Already stored by the
+                # Grounding pipeline; nothing extra is computed here.
+                "mask_rle": inst.get("mask_rle"),
+                "score": float(inst.get("score", 0.0)),
+                "object": entry["object"],
+                "object_idx": oi,
+                "mask_pixel_count": inst.get("pixel_count", 0),
+            })
+
+    out = []
+    for oi in sorted(by_entity):
+        insts = by_entity[oi]
+        if nms_iou is not None and len(insts) > 1 and all(i.get("mask_rle") for i in insts):
+            keep = detection_metrics.mask_nms([i["mask_rle"] for i in insts],
+                                              [i["score"] for i in insts], nms_iou)
+            insts = [insts[k] for k in sorted(keep)]
+        out.extend(insts)
+    return out
+
+
+def score_label_agreement(phrase, gt_box, graph):
+    """Compare a matched pair's PREDICTED entity phrase against the GT box's
+    class, both strictly and hierarchically.
+
+    Returns `{"exact_match", "pred_synset", "resolved", "hp", "hr", "hf1", "wup"}`.
+
+    EXACT MATCH uses the same surface-form test as the extraction-hit
+    diagnostic (`phrase_matches_terms` over `gt_match_terms`), so "correct
+    name" means the same thing everywhere in this codebase.
+
+    HIERARCHICAL resolves the phrase to a WordNet node and scores ancestral-
+    closure overlap with the GT synset — this is what gives a predicted "bull"
+    against a GT "cow" the partial credit an exact-match check scores as flat
+    zero. The resolution deliberately passes NO anchor synset: the only one
+    available here is the GT class itself, and steering sense disambiguation
+    with it would be leakage that inflates the very number it feeds (see
+    taxonomy_metrics.resolve_phrase_to_wordnet).
+
+    A phrase that resolves to nothing scores 0.0 across the hierarchical keys
+    and is flagged `resolved: False`, so the aggregate can report both the
+    "failures as error" and "resolved only" views (detection_metrics.label_summary).
+    """
+    terms = gt_match_terms(gt_box)
+    exact = phrase_matches_terms(phrase, terms) if terms else False
+    gt_synset = gt_box.get("synset_id")
+    pred_synset = taxonomy_metrics.resolve_phrase_to_wordnet(phrase, anchor_synset_id=None)
+
+    if pred_synset is None or not gt_synset:
+        return {"exact_match": exact, "pred_synset": pred_synset, "resolved": False,
+                "hp": 0.0, "hr": 0.0, "hf1": 0.0, "wup": 0.0}
+
+    perfect = pred_synset == gt_synset
+    hier = taxonomy_metrics.compute_hierarchical_metrics(
+        graph, gt_synset, pred_synset, perfect_match=perfect)
+    wup = taxonomy_metrics.compute_wup_similarity(gt_synset, pred_synset, perfect_match=perfect)
+    return {"exact_match": exact, "pred_synset": pred_synset, "resolved": True,
+            "hp": hier["hp"], "hr": hier["hr"], "hf1": hier["hf1"], "wup": wup}
+
+
+def score_axis_agreement(pred_final, gt_box):
+    """Compare a matched pair's biotic/material axes: the PREDICTED entity's
+    own hybrid-resolved label (`object_finals`, recap §6) against the GT
+    box's own taxonomy position (`dataset_loader.get_gt_from_graph`) — read
+    straight off the box correspondence the detection matching already
+    produced, rather than the lexical `find_matching_object` the plain COCO
+    axis metrics use elsewhere. A box match binds one SPECIFIC predicted
+    entity to one SPECIFIC GT instance, which is a strictly tighter
+    correspondence than "the first extracted object whose name matches this
+    class" — matters most with several same-class instances in one image,
+    where lexical matching has no way to tell them apart.
+
+    NATURE IS DELIBERATELY NOT SCORED HERE. Every predicted entity that can
+    even reach this comparison already has `final_nature is True` — only
+    nature-labeled entities are grounded at all (src/grounding_pipeline.py) —
+    and every GT box scored in this evaluation is nature-restricted too
+    (`coco_detection_gt_boxes`). So "nature agreement" on a matched pair is
+    1.0 by construction on every single row; reporting it as a measured rate
+    would misrepresent a tautology as a check. biotic/material do NOT share
+    that problem: GT biotic/material come from the graph mapping (can be
+    True, False, or None), and predicted biotic/material come from the
+    entity's OWN independently-derived label — material in particular is
+    ALWAYS the VLM's own judgment, never mapped (recap §6), so even a
+    WordNet-mapped-nature entity's material comparison tests a genuinely
+    separate source, not the same lookup on both sides.
+
+    Returns `{"gt_biotic","pred_biotic","biotic_agree","gt_material",
+    "pred_material","material_agree"}`. An axis's `_agree` key is None (not a
+    fabricated True/False) whenever either side has no opinion on it — an
+    unmapped/ambiguous GT class, or a VLM label that never resolved — so the
+    aggregate can exclude those pairs from that axis's support instead of
+    silently treating "no opinion" as disagreement.
+    """
+    out = {}
+    for axis in ("biotic", "material"):
+        gt_val = gt_box.get(f"gt_{axis}")
+        pred_val = pred_final.get(f"final_{axis}")
+        out[f"gt_{axis}"] = gt_val
+        out[f"pred_{axis}"] = pred_val
+        out[f"{axis}_agree"] = (bool(gt_val) == bool(pred_val)
+                                if gt_val is not None and pred_val is not None else None)
+    return out
+
+
+def score_image_detection(rec, gt_boxes_by_file, eval_vocab_terms, graph, iou_threshold,
+                          nms_iou=None):
+    """Full detection + label evaluation for ONE image, matched on MASKS.
+
+    Returns None when the image has nothing to evaluate (no nature GT boxes),
+    so it is skipped entirely rather than scored as an all-miss.
+
+    ALWAYS mask IoU, never boxes. What the model actually produces IS a mask
+    (SAM3's instance head) and COCO ships per-instance segmentation for every
+    annotation — reducing both sides to boxes first throws away real signal: a
+    box around a curled-up dog is mostly the sofa behind it, and two masks
+    that overlap poorly can share a nearly identical box (verified in the test
+    suite: two crossing diagonal strokes score box IoU 1.000, mask IoU 0.000).
+    This is COCO's own `segm` evaluation task, not `bbox`. The box-matching
+    path this project shipped first is gone — it measured the wrong thing for
+    a pipeline whose predictions are masks, not boxes.
+
+    The caller (`phase_score`) guarantees every GT target here carries
+    `mask_rle` (from `--instances_json`, required up front — see `run_detection`
+    setup) and every prediction carries one too (SAM3's instance head always
+    stores one — `grounding_pipeline._postprocess_instances`). Nothing here
+    falls back to boxes if either is missing; an image with a hole in that
+    guarantee is a data bug to fix at the source, not a case to paper over.
+
+    The order of operations is the whole design (see
+    src/evaluation/detection_metrics.py's docstring): assign CLASS-AGNOSTICALLY
+    first, then compare labels on the pairs that assignment produced. Doing it
+    the other way round — the standard per-class detection protocol — would
+    throw away every cow/bull pair before the hierarchical metrics could see it.
+    """
+    gt_targets, crowd_boxes, non_nature_gt = coco_detection_gt_boxes(rec, gt_boxes_by_file)
+    if not gt_targets:
+        return None
+
+    preds = collect_predicted_boxes(rec, nms_iou=nms_iou)
+    gt_bboxes = [t["bbox"] for t in gt_targets]
+    pred_bboxes = [p["bbox"] for p in preds]
+    # Computed ONCE and reused by the headline threshold and every rung of the
+    # AP ladder below — the geometry is the same, only the cut-off changes.
+    ious = detection_metrics.mask_iou_matrix(
+        [t["mask_rle"] for t in gt_targets], [p["mask_rle"] for p in preds])
+    matches, unmatched_gt, unmatched_pred = detection_metrics.match_boxes(
+        gt_bboxes, pred_bboxes, iou_threshold=iou_threshold, ious=ious)
+
+    finals = rec.get("object_finals") or []
+    pair_rows, label_records, axis_records = [], [], []
+    for gi, pi, iou in matches:
+        agreement = score_label_agreement(preds[pi]["object"], gt_targets[gi], graph)
+        label_records.append(agreement)
+        # Axis agreement is read off the SAME box correspondence, via the
+        # predicted entity's own index (preds[pi]["object_idx"]) into
+        # object_finals — a tighter binding than the lexical matching the
+        # plain COCO axis metrics use, since it's tied to this SPECIFIC
+        # instance rather than "the first same-named object in the image".
+        pred_final = (finals[preds[pi]["object_idx"]]
+                     if preds[pi]["object_idx"] < len(finals) else {})
+        axis = score_axis_agreement(pred_final, gt_targets[gi])
+        axis_records.append(axis)
+        pair_rows.append({
+            "gt_class": gt_targets[gi]["class_name"],
+            "gt_synset": gt_targets[gi].get("synset_id"),
+            "gt_bbox": gt_targets[gi]["bbox"],
+            # Masks alongside the boxes — matching decided this pair on mask
+            # IoU, so the box alone can't reproduce the actual number; storing
+            # the mask too (same precedent as object_groundings' own mask_rle)
+            # keeps the CSV self-sufficient for review without the .jsonl.
+            "gt_mask_rle": gt_targets[gi].get("mask_rle"),
+            "pred_object": preds[pi]["object"],
+            "pred_bbox": preds[pi]["bbox"],
+            "pred_mask_rle": preds[pi].get("mask_rle"),
+            "pred_score": preds[pi]["score"],
+            "iou": iou,
+            **agreement,
+            **axis,
+        })
+
+    # Unmatched predictions: false positive only if the entity names a class in
+    # the evaluated vocabulary, and not already explained by a crowd region.
+    fp_rows, excluded_rows = [], []
+    # Matched predictions are true positives, so they enter the AP ranking
+    # already flagged as counted before the unmatched ones are classified.
+    counted_flag = [False] * len(preds)
+    for _, pi, _ in matches:
+        counted_flag[pi] = True
+    # Entities with at least one instance matched to a GT box — the geometric
+    # half of the false-positive test (see _classify_unmatched). Recomputed
+    # per IoU threshold below, since which pairs match changes with it.
+    matched_entity_idxs = {preds[pi]["object_idx"] for _, pi, _ in matches}
+    n_fp, n_excluded, n_crowd, is_fp_flag, counted_flag = _classify_unmatched(
+        preds, unmatched_pred, crowd_boxes, eval_vocab_terms, fp_rows, excluded_rows,
+        counted_flag=counted_flag, matched_entity_idxs=matched_entity_idxs)
+
+    # TAXONOMY-DISAGREEMENT DIAGNOSTIC: an unmatched prediction sitting on a GT
+    # box of a NON-nature class. This can never be a true positive by
+    # construction (non-nature GT is filtered out before matching), and without
+    # this check it would vanish into `excluded` — indistinguishable from a
+    # prediction over empty background, which is a very different thing.
+    #
+    # It is the "Nature-Based Artefacts" boundary made measurable: a wooden
+    # table with visible grain IS nature under the taxonomy's own inclusion
+    # clause, but COCO's `dining table` NODE resolves to non-nature, because a
+    # class node cannot encode whether THIS instance shows wood grain or
+    # painted MDF. So a hit here is not necessarily a model error at all — it
+    # is the concept-vs-instance gap the hybrid labeling routing already
+    # accepts elsewhere. Reported, never scored.
+    #
+    # Deliberately does NOT alter tp/fp/fn: these predictions stay in whichever
+    # bucket the normal rules put them (almost always `excluded`, since the
+    # eval vocabulary is nature-only), so precision/recall keep the exact same
+    # definition they have with this diagnostic switched off, and runs stay
+    # comparable. The disagreements are surfaced as their own list instead.
+    nature_on_non_nature = []
+    for pi in unmatched_pred:
+        best = None
+        for gt in non_nature_gt:
+            # Same geometry the matching itself used, so this diagnostic's
+            # threshold means the same thing as the one above it.
+            iou = float(detection_metrics.mask_iou_matrix(
+                [gt["mask_rle"]], [preds[pi]["mask_rle"]])[0, 0])
+            if iou >= iou_threshold and (best is None or iou > best["iou"]):
+                best = {"pred_object": preds[pi]["object"],
+                        "pred_bbox": preds[pi]["bbox"],
+                        "pred_mask_rle": preds[pi].get("mask_rle"),
+                        "pred_score": preds[pi]["score"],
+                        "gt_class": gt["class_name"],
+                        "gt_synset": gt.get("synset_id"),
+                        "gt_bbox": gt["bbox"],
+                        "gt_mask_rle": gt.get("mask_rle"),
+                        "iou": iou}
+        if best is not None:
+            nature_on_non_nature.append(best)
+
+    # AP ladder: re-match the SAME boxes at each of COCO's ten IoU thresholds
+    # (a pair clearing 0.5 need not clear 0.75, so each rung needs its own
+    # assignment) and record (score, is_tp) for every prediction that counts.
+    ap_records = {}
+    for t in detection_metrics.COCO_AP_IOU_THRESHOLDS:
+        if t == iou_threshold:
+            t_fp_flag, t_counted, t_unmatched = is_fp_flag, counted_flag, unmatched_pred
+            t_matches = matches
+        else:
+            t_matches, _, t_unmatched = detection_metrics.match_boxes(
+                gt_bboxes, pred_bboxes, iou_threshold=t, ious=ious)
+            t_counted = [False] * len(preds)
+            for _, pi, _ in t_matches:
+                t_counted[pi] = True
+            _, _, _, t_fp_flag, t_counted = _classify_unmatched(
+                preds, t_unmatched, crowd_boxes, eval_vocab_terms, None, None,
+                counted_flag=t_counted,
+                matched_entity_idxs={preds[pi]["object_idx"] for _, pi, _ in t_matches})
+        ap_records[t] = [(preds[pi]["score"], not t_fp_flag[pi])
+                         for pi in range(len(preds)) if t_counted[pi]]
+
+    return {
+        "n_gt": len(gt_targets), "n_pred": len(preds),
+        "tp": len(matches), "fp": n_fp, "fn": len(unmatched_gt),
+        "excluded_pred": n_excluded, "crowd_suppressed": n_crowd,
+        "nature_on_non_nature": nature_on_non_nature,
+        "pairs": pair_rows, "false_positives": fp_rows, "excluded": excluded_rows,
+        "missed_gt": [{"gt_class": gt_targets[i]["class_name"],
+                       "gt_bbox": gt_targets[i]["bbox"],
+                       "gt_mask_rle": gt_targets[i].get("mask_rle")} for i in unmatched_gt],
+        "label_records": label_records,
+        "axis_records": axis_records,
+        # {iou_threshold: [(score, is_tp), ...]} for every prediction that
+        # COUNTS toward AP. Excluded and crowd-suppressed predictions are left
+        # out on purpose — feeding them in as negatives would reimpose exactly
+        # the penalty the curated-vocabulary rule removes.
+        "ap_records": ap_records,
+        "preds": preds, "gt_targets": gt_targets, "crowd_boxes": crowd_boxes,
+    }
+
+
+def score_image_entities(rec, gt_boxes_by_file, eval_vocab_terms, graph, iou_threshold):
+    """ENTITY-level (concept-level) detection scoring for ONE image.
+
+    The instance-level evaluation above asks "did each individual predicted
+    object land on an individual annotated object". This asks the question the
+    pipeline is actually built around: the VLM extracts a CONCEPT ("orange
+    slice"), SAM3 grounds that concept, and COCO annotates instances of a
+    CLASS ("orange"). So here BOTH sides are collapsed to one region per
+    concept before matching:
+
+      * PREDICTION: the union of every instance mask belonging to one
+        extracted entity -> one mask per entity.
+      * GT: the union of every annotated instance mask of one class -> one
+        mask per class.
+
+    WHY THIS IS FAIRER, and it fixes two distinct distortions the
+    instance-level view suffers from at once:
+
+      1. DUPLICATE INSTANCES. SAM3's post-processing does no NMS (see
+         collect_predicted_boxes), so several queries firing on the same
+         orange all survive. Under instance matching one matches and its twins
+         become false positives. Under a union they collapse into the same
+         region and simply stop existing as separate predictions — no
+         suppression heuristic and no threshold needed to get there.
+      2. ANNOTATION SPARSITY. COCO does not exhaustively annotate crowded
+         scenes — a tray with ~24 visible donuts carries 12 boxes. Instance
+         matching can therefore award at most 12 true positives no matter how
+         well the model did, and charges the remaining correct detections as
+         false positives. Comparing one "donut" region against one merged GT
+         "donut" region asks whether the right PIXELS were found, which does
+         not depend on how many separate polygons an annotator happened to
+         draw.
+
+    WHAT IT COSTS, stated plainly rather than buried: there is no longer any
+    notion of "found 8 of the 12 cows" — per-object counting is gone by
+    construction, which is the point but is also a real loss. The instance
+    block is kept alongside precisely so both readings stay available.
+
+    Matching, the false-positive rule, crowd suppression and the label/axis
+    scoring are all IDENTICAL to the instance path — same functions, same
+    thresholds — so the two blocks differ in granularity ONLY and stay
+    directly comparable. Returns None when the image has no nature GT.
+    """
+    gt_targets, crowd_regions, non_nature_gt = coco_detection_gt_boxes(rec, gt_boxes_by_file)
+    if not gt_targets:
+        return None
+
+    # --- collapse GT to one region per CLASS ---
+    gt_by_class = {}
+    for t in gt_targets:
+        slot = gt_by_class.setdefault(t["class_name"], {"class_name": t["class_name"],
+                                                        "synset_id": t.get("synset_id"),
+                                                        "gt_nature": t.get("gt_nature"),
+                                                        "gt_biotic": t.get("gt_biotic"),
+                                                        "gt_material": t.get("gt_material"),
+                                                        "rles": []})
+        slot["rles"].append(t["mask_rle"])
+    gt_entries = []
+    for slot in gt_by_class.values():
+        merged = detection_metrics.merge_rles(slot["rles"])
+        gt_entries.append({**{k: v for k, v in slot.items() if k != "rles"},
+                           "mask_rle": merged,
+                           "bbox": grounding_pipeline.mask_to_bbox(
+                               grounding_pipeline.decode_rle(merged)),
+                           "n_instances": len(slot["rles"])})
+
+    # --- collapse predictions to one region per ENTITY ---
+    preds_by_entity = {}
+    for p in collect_predicted_boxes(rec):
+        slot = preds_by_entity.setdefault(p["object_idx"], {"object": p["object"],
+                                                            "object_idx": p["object_idx"],
+                                                            "rles": [], "scores": []})
+        slot["rles"].append(p["mask_rle"])
+        slot["scores"].append(p["score"])
+    pred_entries = []
+    for slot in preds_by_entity.values():
+        merged = detection_metrics.merge_rles(slot["rles"])
+        pred_entries.append({
+            "object": slot["object"], "object_idx": slot["object_idx"],
+            "mask_rle": merged,
+            "bbox": grounding_pipeline.mask_to_bbox(grounding_pipeline.decode_rle(merged)),
+            # The entity's confidence is its STRONGEST instance — the union
+            # exists because at least that instance was believed, so the
+            # weakest fragment shouldn't drag the concept's score down.
+            "score": max(slot["scores"]) if slot["scores"] else 0.0,
+            "n_instances": len(slot["rles"]),
+        })
+
+    if not gt_entries:
+        return None
+
+    ious = detection_metrics.mask_iou_matrix([g["mask_rle"] for g in gt_entries],
+                                             [p["mask_rle"] for p in pred_entries]) \
+        if pred_entries else np.zeros((len(gt_entries), 0))
+    matches, unmatched_gt, unmatched_pred = detection_metrics.match_boxes(
+        [g["bbox"] for g in gt_entries], [p["bbox"] for p in pred_entries],
+        iou_threshold=iou_threshold, ious=ious)
+
+    finals = rec.get("object_finals") or []
+    pair_rows, label_records, axis_records = [], [], []
+    for gi, pi, iou in matches:
+        agreement = score_label_agreement(pred_entries[pi]["object"], gt_entries[gi], graph)
+        label_records.append(agreement)
+        pred_final = (finals[pred_entries[pi]["object_idx"]]
+                      if pred_entries[pi]["object_idx"] < len(finals) else {})
+        axis = score_axis_agreement(pred_final, gt_entries[gi])
+        axis_records.append(axis)
+        # PIXEL COVERAGE for this concept — "how much of the banana did we
+        # actually find", as opposed to the binary did-it-match verdict above.
+        px = detection_metrics.pixel_stats(gt_entries[gi]["mask_rle"],
+                                           pred_entries[pi]["mask_rle"])
+        pair_rows.append({
+            "gt_class": gt_entries[gi]["class_name"],
+            "gt_synset": gt_entries[gi].get("synset_id"),
+            "gt_n_instances": gt_entries[gi]["n_instances"],
+            "pred_object": pred_entries[pi]["object"],
+            "pred_n_instances": pred_entries[pi]["n_instances"],
+            "pred_score": pred_entries[pi]["score"],
+            "iou": iou,
+            **px,
+            **agreement,
+            **axis,
+        })
+
+    # Same FP rule as the instance path. The geometric half
+    # (`entity_matched_elsewhere_in_image`) is inert here by construction —
+    # each entity appears exactly once, so it can never have a matched sibling
+    # — leaving the lexical test to decide, which is the intended behaviour.
+    fp_rows, excluded_rows = [], []
+    counted_flag = [False] * len(pred_entries)
+    for _, pi, _ in matches:
+        counted_flag[pi] = True
+    n_fp, n_excluded, n_crowd, is_fp_flag, counted_flag = _classify_unmatched(
+        pred_entries, unmatched_pred, crowd_regions, eval_vocab_terms,
+        fp_rows, excluded_rows, counted_flag=counted_flag)
+
+    # WHOLE-IMAGE PIXEL COVERAGE, class-agnostic and match-independent: every
+    # nature pixel the pipeline predicted vs every nature pixel COCO annotated.
+    # Deliberately NOT restricted to matched pairs — a GT class the pipeline
+    # missed entirely must still count its pixels against recall, and a
+    # predicted region that matched nothing must still count against
+    # precision, or the number would only describe the cases that already went
+    # well. This is the metric that most directly answers "did we find the
+    # nature pixels", with no threshold and no assignment step anywhere in it.
+    image_px = detection_metrics.pixel_stats(
+        detection_metrics.merge_rles([g["mask_rle"] for g in gt_entries]),
+        detection_metrics.merge_rles([p["mask_rle"] for p in pred_entries]))
+
+    return {
+        "n_gt": len(gt_entries), "n_pred": len(pred_entries),
+        "tp": len(matches), "fp": n_fp, "fn": len(unmatched_gt),
+        "excluded_pred": n_excluded, "crowd_suppressed": n_crowd,
+        "pairs": pair_rows, "false_positives": fp_rows, "excluded": excluded_rows,
+        "missed_gt": [{"gt_class": gt_entries[i]["class_name"],
+                       "gt_n_instances": gt_entries[i]["n_instances"],
+                       "gt_pixels": detection_metrics.rle_area(gt_entries[i]["mask_rle"])}
+                      for i in unmatched_gt],
+        "label_records": label_records,
+        "axis_records": axis_records,
+        "image_pixels": image_px,
+        "ap_records": {t: [] for t in detection_metrics.COCO_AP_IOU_THRESHOLDS},
+    }
+
+
+def _crowd_suppressed(pred, crowd_regions):
+    """Is this prediction explained by a crowd region?
+
+    Mask intersection-over-the-PREDICTION's-area, not IoU — a crowd region
+    dwarfs any single prediction, so IoU would stay near zero even for one
+    sitting entirely inside it.
+    """
+    for region in crowd_regions:
+        if detection_metrics.mask_ioa(pred["mask_rle"], region["mask_rle"]) >= \
+                detection_metrics.DEFAULT_CROWD_IOA_THRESHOLD:
+            return True
+    return False
+
+
+def _classify_unmatched(preds, unmatched_pred, crowd_boxes, eval_vocab_terms,
+                        fp_rows, excluded_rows, is_fp_flag=None, counted_flag=None,
+                        matched_entity_idxs=frozenset()):
+    """Apply the crowd-suppression and curated-vocabulary rules to a set of
+    unmatched predictions.
+
+    Returns `(n_fp, n_excluded, n_crowd, is_fp_flag, counted_flag)`. `fp_rows`
+    / `excluded_rows` collect the per-prediction detail for the CSV and may be
+    None when the caller only needs the counters (the AP sweep re-runs this
+    at ten thresholds and wants no duplicated detail rows).
+
+    An unmatched prediction is a FALSE POSITIVE under EITHER of two tests, and
+    EXCLUDED only if it fails both:
+
+      (a) LEXICAL — its own phrase names a class in the evaluated vocabulary
+          (`classify_unmatched_prediction`). The original rule.
+      (b) GEOMETRIC — another instance of the SAME extracted entity, in this
+          same image, did match a GT box (`matched_entity_idxs`, keyed by
+          `object_idx`).
+
+    Test (b) closes a perverse incentive in (a) alone, where naming an object
+    WRONG improved precision. The exclusion rule exists because COCO annotates
+    only 80 curated classes, so a correctly-detected tree is not a
+    hallucination — but (a) decides "is this kind of thing annotated in COCO?"
+    by a LEXICAL PROXY, and a geometric match is direct, strictly stronger
+    evidence of the very same fact. Worked example, on a real 24-donut image
+    whose GT annotates only 12 of them: called "donut" (correct), the 12
+    unmatched detections are FPs because donut is a COCO class, giving
+    precision 12/24 = 0.50; called "pretzel" (wrong), those same 12 boxes
+    name nothing in the vocabulary, fall through to `excluded`, and
+    precision reads 12/12 = 1.00. Identical boxes, identical localization,
+    and the model that misnamed them scored better. With (b), the matched
+    "pretzel" instances prove pretzels ARE being annotated here (as donuts),
+    so its unmatched siblings are charged exactly as donut's were.
+
+    Note (b) is scoped per (image, entity), not dataset-wide: a match is
+    evidence about THIS image's annotations, and one spurious match elsewhere
+    should not retroactively make every instance of a phrase chargeable.
+    """
+    if is_fp_flag is None:
+        is_fp_flag = [False] * len(preds)
+    if counted_flag is None:
+        counted_flag = [False] * len(preds)
+    n_fp = n_excluded = n_crowd = 0
+    for pi in unmatched_pred:
+        if _crowd_suppressed(preds[pi], crowd_boxes):
+            n_crowd += 1
+            continue
+        named = detection_metrics.classify_unmatched_prediction(
+            _pred_label_terms(preds[pi]["object"]), eval_vocab_terms)
+        entity_matched = preds[pi]["object_idx"] in matched_entity_idxs
+        if named is None and not entity_matched:
+            n_excluded += 1
+            if excluded_rows is not None:
+                excluded_rows.append({"pred_object": preds[pi]["object"],
+                                      "pred_bbox": preds[pi]["bbox"],
+                                      "pred_mask_rle": preds[pi].get("mask_rle"),
+                                      "pred_score": preds[pi]["score"]})
+            continue
+        n_fp += 1
+        is_fp_flag[pi] = True
+        counted_flag[pi] = True
+        if fp_rows is not None:
+            fp_rows.append({"pred_object": preds[pi]["object"], "named_class": named,
+                            "pred_bbox": preds[pi]["bbox"],
+                            "pred_mask_rle": preds[pi].get("mask_rle"),
+                            "pred_score": preds[pi]["score"],
+                            # Which test caught it — so a reviewer can tell a
+                            # lexically-named hallucination apart from an
+                            # over-count of a genuinely present object.
+                            "fp_reason": ("names_evaluated_class" if named is not None
+                                          else "entity_matched_elsewhere_in_image")})
+    return n_fp, n_excluded, n_crowd, is_fp_flag, counted_flag
+
+
+def _pred_label_terms(phrase):
+    """Normalized surface forms for a predicted entity phrase: the phrase
+    itself plus every TRAILING SPAN of it — its last word, last two words,
+    last three, and so on ("huge potted plant" -> {"huge potted plant",
+    "potted plant", "plant"}).
+
+    Feeds `classify_unmatched_prediction`'s dict-membership test against the
+    evaluated vocabulary, whose keys can be multi-word terms ("potted
+    plant"). A single trailing WORD only (the previous behavior) misses any
+    vocabulary term longer than one word once a modifier precedes it — the
+    same gap `phrase_matches_terms` closes on the GT side by suffix-testing
+    every term instead of checking only the last word. Kept as a separate
+    helper rather than calling `phrase_matches_terms` directly because this
+    generates a candidate SET for dict lookup, while that function tests one
+    phrase against a term set — same underlying idea (English noun phrases
+    are right-headed, so the entity's own name is always the trailing span),
+    applied on whichever side of the comparison needs it.
+    """
+    norm = _normalize_object(phrase)
+    words = norm.split()
+    return {t for t in ({norm} | {" ".join(words[i:]) for i in range(len(words))}) if t}
 
 
 def _fmt_big5_axis_cell(vals):
@@ -1312,6 +1995,83 @@ def phase_score(args):
     # independent model", never a ground-truth signal).
     run_grounding = bool(header.get("grounding"))
     n_grounding_attempted = n_grounding_confirmed = 0
+    # See the semantic-vs-instance gap comment in the per-image loop.
+    n_semantic_only = 0
+    # --- COCO box-IoU detection evaluation (Grounding pipeline) ---
+    # Runs only when the artifact is COCO AND the Grounding pipeline recorded
+    # instance grounding, since it is SAM3's instance boxes that get matched
+    # against COCO's GT boxes. A COCO artifact grounded semantically only
+    # (or not grounded at all) scores exactly as it did before — every other
+    # COCO metric is untouched by this block.
+    run_detection = (dataset == "coco"
+                     and bool(header.get("grounding", {}).get("instance_grounding")))
+    det_counts = {"tp": 0, "fp": 0, "fn": 0, "excluded_pred": 0, "crowd_suppressed": 0,
+                  "n_gt_instances": 0, "n_pred_instances": 0,
+                  "iou_threshold": args.detection_iou_threshold,
+                  # AP is swept over COCO's own IoU ladder. Each threshold needs
+                  # its OWN matching pass (a pair that clears 0.5 need not clear
+                  # 0.75), so the per-threshold (score, is_tp) lists are
+                  # accumulated separately from the headline counters above.
+                  "ap_records": {t: [] for t in detection_metrics.COCO_AP_IOU_THRESHOLDS}}
+    det_label_records = []
+    det_axis_records = []
+    # Taxonomy-disagreement diagnostic (see score_image_detection): which
+    # NON-nature COCO classes a grounded nature entity most often lands on.
+    # The per-class breakdown is the useful part — a long tail of one-offs
+    # reads very differently from "dining table" and "bench" dominating, which
+    # would be the Nature-Based Artefacts clause showing up in the data.
+    det_nature_on_non_nature = []
+    # ENTITY-level (concept-level) counterpart, accumulated in parallel and
+    # never merged into the instance numbers — see score_image_entities for
+    # why the two answer different questions. No AP here: it would need a
+    # per-entity confidence ranking that the union of instances doesn't
+    # meaningfully provide.
+    ent_counts = {"tp": 0, "fp": 0, "fn": 0, "excluded_pred": 0, "crowd_suppressed": 0,
+                  "n_gt_instances": 0, "n_pred_instances": 0,
+                  "iou_threshold": args.detection_iou_threshold, "ap_records": {}}
+    ent_label_records = []
+    ent_axis_records = []
+    # Pixel coverage: pooled counts for the micro view, per-image IoU for the
+    # macro view. See detection_metrics.pixel_summary on why both.
+    px_counts = {"pixel_tp": 0, "pixel_fp": 0, "pixel_fn": 0}
+    px_per_image_iou = []
+    # Per-concept pixel coverage, keyed by GT class, so "which things do we
+    # cover well" is answerable rather than only the pooled average.
+    px_by_class = {}
+    # None disables NMS entirely (0 or >1 means "don't suppress"), so the flag
+    # reads naturally as a threshold while still having an explicit off state.
+    det_nms_iou = (args.instance_nms_iou
+                   if 0 < args.instance_nms_iou <= 1 else None)
+    det_gt_boxes_by_file = None
+    det_eval_vocab = {}
+    if run_detection:
+        # Detection matches on MASKS, always — see score_image_detection. GT
+        # segmentation is deliberately NOT stored in the artifact (it would
+        # bloat every image record for a use only scoring has), so
+        # --instances_json is the only source for it and is REQUIRED here,
+        # not a fallback path. This also backfills GT for artifacts written
+        # before load_coco carried per-instance boxes at all — one load
+        # covers both needs.
+        if not args.instances_json:
+            print("⚠️  COCO detection evaluation needs GT segmentation masks from "
+                  "--instances_json, which was not given — skipping the detection metrics. "
+                  "Re-run --stage score with --instances_json pointing at the same "
+                  "annotations file used for inference.")
+            run_detection = False
+        else:
+            print(f"📦 [score] loading COCO GT boxes + segmentation masks "
+                  f"from {args.instances_json}")
+            det_gt_boxes_by_file = coco_gt_boxes(args.instances_json, graph, include_masks=True)
+    if run_detection:
+        # The evaluated vocabulary (nature-mapped COCO classes) has to be built
+        # from ALL images' GT, not per image — an unmatched "dog" prediction on
+        # a beach photo still names a COCO class even though that photo has no
+        # dog box.
+        if det_gt_boxes_by_file is not None:
+            det_eval_vocab = build_coco_eval_vocab(det_gt_boxes_by_file)
+        else:
+            det_eval_vocab = build_coco_eval_vocab(
+                {r["image_path"]: r.get("gt_boxes") or [] for r in records})
     clipmatch_top1 = 0
     clipmatch_support = 0
     # The predictions CSV is STREAMED, one row per image as it's scored, not
@@ -1642,14 +2402,14 @@ def phase_score(args):
         else:
             # --- COCO (multi-label): image-level nature OR + matched-object
             #     biotic/material, via lexical GT matching (find_matching_object) ---
-            # TODO(grounding-pipeline, recap §6.4): replace this lexical
-            # matching with Hungarian box-IoU assignment (IoU>=0.5) once
-            # Grounding DINO 1.5 provides predicted boxes — matched GT boxes
-            # score bio/material/nature as usual; unmatched GT boxes are
-            # penalized as wrong; unmatched PREDICTED boxes are excluded, NOT
-            # penalized (COCO's 80 classes are a curated subset, so an extra
-            # real object is not a hallucination). Not implementable until the
-            # Grounding pipeline exists.
+            # The box-IoU detection evaluation the old TODO here asked for now
+            # EXISTS (score_image_detection, below) and runs alongside this
+            # block rather than replacing it: it needs SAM3 instance boxes, so
+            # it is only available on a grounded artifact, while these
+            # lexically-matched axis scores are what a VLM-only COCO run can
+            # still report. The two answer different questions — "is the label
+            # right for the classes present" vs "did a box land on the object"
+            # — and are reported separately, never merged.
             g_nat = image_gt_nature(targets)
             if g_nat is not None:
                 image_gt_nature_val = bool(g_nat)
@@ -1686,6 +2446,59 @@ def phase_score(args):
                     mat_pred.append(pred_m)
                     match_info["gt_material"], match_info["pred_material"] = gt_m, pred_m
                 target_matches.append(match_info)
+
+        # --- COCO box-IoU detection evaluation (grounded artifacts only) ---
+        # Deliberately OUTSIDE the single_label/BIG-5/COCO if-chain above: it
+        # is an additional, independent evaluation of the same image, not an
+        # alternative to the axis scoring, and it is the only place SAM3's
+        # instance boxes are used.
+        det = None
+        if run_detection:
+            det = score_image_detection(rec, det_gt_boxes_by_file, det_eval_vocab,
+                                        graph, args.detection_iou_threshold,
+                                        nms_iou=det_nms_iou)
+        if det is not None:
+            for key in ("tp", "fp", "fn", "excluded_pred", "crowd_suppressed"):
+                det_counts[key] += det[key]
+            det_counts["n_gt_instances"] += det["n_gt"]
+            det_counts["n_pred_instances"] += det["n_pred"]
+            for t, recs in det["ap_records"].items():
+                det_counts["ap_records"][t].extend(recs)
+            det_label_records.extend(det["label_records"])
+            det_axis_records.extend(det["axis_records"])
+            det_nature_on_non_nature.extend(det["nature_on_non_nature"])
+
+        # ENTITY-level view of the SAME image, scored independently.
+        ent = None
+        if run_detection:
+            ent = score_image_entities(rec, det_gt_boxes_by_file, det_eval_vocab,
+                                       graph, args.detection_iou_threshold)
+        if ent is not None:
+            for key in ("tp", "fp", "fn", "excluded_pred", "crowd_suppressed"):
+                ent_counts[key] += ent[key]
+            ent_counts["n_gt_instances"] += ent["n_gt"]
+            ent_counts["n_pred_instances"] += ent["n_pred"]
+            ent_label_records.extend(ent["label_records"])
+            ent_axis_records.extend(ent["axis_records"])
+            for k in ("pixel_tp", "pixel_fp", "pixel_fn"):
+                px_counts[k] += ent["image_pixels"][k]
+            px_per_image_iou.append(ent["image_pixels"]["pixel_iou"])
+            for pair in ent["pairs"]:
+                slot = px_by_class.setdefault(pair["gt_class"],
+                                              {"pixel_tp": 0, "pixel_fp": 0, "pixel_fn": 0,
+                                               "n_images": 0})
+                for k in ("pixel_tp", "pixel_fp", "pixel_fn"):
+                    slot[k] += pair[k]
+                slot["n_images"] += 1
+            # A GT class with no matching prediction still owes its pixels to
+            # recall — otherwise per-class coverage would only ever be
+            # computed on the classes that were found.
+            for miss in ent["missed_gt"]:
+                slot = px_by_class.setdefault(miss["gt_class"],
+                                              {"pixel_tp": 0, "pixel_fp": 0, "pixel_fn": 0,
+                                               "n_images": 0})
+                slot["pixel_fn"] += miss["gt_pixels"]
+                slot["n_images"] += 1
 
         # One CSV row PER IMAGE (not per object) — everything needed to
         # spot-check a single image's whole prediction lives on one line:
@@ -1757,6 +2570,32 @@ def phase_score(args):
             image_n_confirmed = sum(1 for g in object_groundings if g["grounded"] is True)
             n_grounding_attempted += image_n_attempted
             n_grounding_confirmed += image_n_confirmed
+        # SEMANTIC-vs-INSTANCE GAP: entities the SEMANTIC head confirmed
+        # (grounded is True — pixels for this concept exist) but for which the
+        # INSTANCE head produced no box at all. Not a bug and not a
+        # contradiction: the two are different heads answering different
+        # questions. "Are there dog pixels here?" (semantic, thresholded at
+        # --mask_threshold on pixel probability) is a strictly easier call than
+        # "here is ONE discrete countable dog and its extent" (instance,
+        # gated by --instance_score_threshold), and a dark/occluded/blurry
+        # object can pass the first while the second declines to commit.
+        # A second path lands here too: an instance CAN clear the score gate
+        # and still be dropped by _postprocess_instances when its mask
+        # binarizes to empty, leaving no derivable box.
+        #
+        # WHY THIS IS WORTH REPORTING: it is the reconciliation between a
+        # grounding confirmation rate near 100% and a detection recall well
+        # below it — those numbers come from different heads, so they can
+        # diverge arbitrarily, and without this the reader has no way to see
+        # that. It is also a direct, quantified contributor to the detection
+        # FN count.
+        image_n_sem_only = None
+        object_instances = rec.get("object_instances")
+        if object_groundings is not None and object_instances is not None:
+            image_n_sem_only = sum(
+                1 for g, inst in zip(object_groundings, object_instances)
+                if g["grounded"] is True and inst.get("attempted") and not inst.get("instances"))
+            n_semantic_only += image_n_sem_only
         csv_writer.write({
             "image_path": rec["image_path"],
             "dataset": dataset,
@@ -1783,6 +2622,78 @@ def phase_score(args):
             "grounding_confirmed_image": image_n_confirmed,
             "grounding_confirmation_rate_image": (image_n_confirmed / image_n_attempted)
                                                   if image_n_attempted else None,
+            # Entities semantically confirmed on THIS image that yielded no
+            # instance box — the per-image view of the semantic/instance gap
+            # (see the loop comment). Blank off COCO / without instance grounding.
+            "grounding_semantic_only_image": image_n_sem_only,
+            # --- COCO box-IoU detection (blank on every other dataset, and on
+            # a COCO artifact without instance grounding). Per the project's
+            # "the predictions CSV alone must be enough to spot-check a run"
+            # rule, this carries not just the counts but the actual matched
+            # pairs — GT class vs predicted entity, both boxes, the IoU, and
+            # both the exact-match and hierarchical verdicts — plus the boxes
+            # that missed in either direction, so a disagreement can be
+            # understood without opening the .jsonl.
+            "detection_n_gt_instances_image": det["n_gt"] if det else None,
+            "detection_n_pred_instances_image": det["n_pred"] if det else None,
+            # ENTITY-level view of the same image (see score_image_entities):
+            # one merged region per entity vs one per GT class.
+            "detection_entity_n_gt_classes_image": ent["n_gt"] if ent else None,
+            "detection_entity_n_pred_entities_image": ent["n_pred"] if ent else None,
+            "detection_entity_tp_image": ent["tp"] if ent else None,
+            "detection_entity_fp_image": ent["fp"] if ent else None,
+            "detection_entity_fn_image": ent["fn"] if ent else None,
+            "detection_entity_excluded_image": ent["excluded_pred"] if ent else None,
+            "detection_entity_matches": json.dumps(ent["pairs"]) if ent else None,
+            "detection_entity_missed_gt": json.dumps(ent["missed_gt"]) if ent else None,
+            # Whole-image pixel coverage (class-agnostic, threshold-free):
+            # how much of this image's annotated nature pixels were found.
+            "pixel_recall_image": ent["image_pixels"]["pixel_recall"] if ent else None,
+            "pixel_precision_image": ent["image_pixels"]["pixel_precision"] if ent else None,
+            "pixel_iou_image": ent["image_pixels"]["pixel_iou"] if ent else None,
+            "detection_tp_image": det["tp"] if det else None,
+            "detection_fp_image": det["fp"] if det else None,
+            "detection_fn_image": det["fn"] if det else None,
+            "detection_excluded_pred_image": det["excluded_pred"] if det else None,
+            "detection_crowd_suppressed_image": det["crowd_suppressed"] if det else None,
+            "detection_precision_image": (det["tp"] / (det["tp"] + det["fp"]))
+                                          if det and (det["tp"] + det["fp"]) else None,
+            "detection_recall_image": (det["tp"] / (det["tp"] + det["fn"]))
+                                       if det and (det["tp"] + det["fn"]) else None,
+            "detection_matches": json.dumps(det["pairs"]) if det else None,
+            "detection_false_positives": json.dumps(det["false_positives"]) if det else None,
+            "detection_excluded_predictions": json.dumps(det["excluded"]) if det else None,
+            "detection_missed_gt": json.dumps(det["missed_gt"]) if det else None,
+            # Taxonomy disagreements on THIS image: nature entities whose box
+            # landed on a non-nature GT class. Carries the GT class and the IoU
+            # so the "is this the Nature-Based Artefacts clause or a loose box"
+            # question can be answered by eye, per image, from the CSV alone.
+            "detection_nature_on_non_nature": (json.dumps(det["nature_on_non_nature"])
+                                               if det else None),
+            "detection_nature_on_non_nature_count_image": (len(det["nature_on_non_nature"])
+                                                           if det else None),
+            # Label quality over THIS image's matched pairs — the two views
+            # side by side, which is the whole point of scoring both: a row
+            # where exact-match is 0 but hF1 is high is a naming miss on the
+            # right kind of thing ("bull" for "cow"), not a detection failure.
+            "detection_exact_match_rate_image": (
+                float(np.mean([p["exact_match"] for p in det["pairs"]]))
+                if det and det["pairs"] else None),
+            "detection_hf1_image": (float(np.mean([p["hf1"] for p in det["pairs"]]))
+                                    if det and det["pairs"] else None),
+            "detection_wup_image": (float(np.mean([p["wup"] for p in det["pairs"]]))
+                                    if det and det["pairs"] else None),
+            # Axis agreement (biotic/material only — see score_axis_agreement
+            # on why nature is excluded) for THIS image's matched pairs. The
+            # gt_biotic/pred_biotic/gt_material/pred_material fields on each
+            # pair are already inside detection_matches above; these are just
+            # the per-image rollup for a quick scan without parsing that JSON.
+            "detection_biotic_agreement_rate_image": (
+                float(np.mean([p["biotic_agree"] for p in det["pairs"] if p["biotic_agree"] is not None]))
+                if det and any(p["biotic_agree"] is not None for p in det["pairs"]) else None),
+            "detection_material_agreement_rate_image": (
+                float(np.mean([p["material_agree"] for p in det["pairs"] if p["material_agree"] is not None]))
+                if det and any(p["material_agree"] is not None for p in det["pairs"]) else None),
             "wordnet_mapping_rate_image": (image_n_map_nature / (image_n_map_nature + image_n_vlm_nature))
                                            if (image_n_map_nature + image_n_vlm_nature) else None,
             "parse_failure_count_image": image_n_parse_fail,
@@ -1927,8 +2838,10 @@ def phase_score(args):
                               "has_abiotic when GT=abiotic, symmetrically for material) — an image "
                               "can contain both a biotic AND an abiotic entity and still score "
                               "correctly against a GT of just one of them. coco: image-level nature "
-                              "(OR) + matched-object biotic/material via lexical GT matching (box-IoU "
-                              "is future work, recap §6.4)."),
+                              "(OR) + matched-object biotic/material via lexical GT matching. On a "
+                              "COCO artifact enriched with SAM3 INSTANCE grounding, the separate "
+                              "box-IoU detection evaluation in summary['detection'] runs alongside "
+                              "these (never replacing them) — see its own note."),
         "material_caveat": ("Material GT for imagenet/coco/places is the heuristic "
                             "gt_material=True default (real photos); only BIG-5 has genuine "
                             "material GT. Predicted material is always the VLM's judgment "
@@ -1947,7 +2860,166 @@ def phase_score(args):
                                   if n_grounding_attempted else 0.0,
             "sam3_model": header["grounding"].get("sam3_model"),
             "mask_threshold": header["grounding"].get("mask_threshold"),
+            # Entities the SEMANTIC head confirmed but the INSTANCE head gave
+            # no box for — see the per-image loop's comment. Only meaningful
+            # on an instance-grounded (COCO) artifact; 0 elsewhere.
+            "semantic_confirmed_but_no_instance": n_semantic_only,
+            "semantic_only_rate": (n_semantic_only / n_grounding_confirmed)
+                                   if n_grounding_confirmed else 0.0,
+            "semantic_only_note": (
+                "Nature entities the SEMANTIC head found pixels for but the INSTANCE head "
+                "produced no box for. NOT a contradiction: 'are there dog pixels here' "
+                "(semantic, gated by mask_threshold on pixel probability) is a strictly "
+                "easier judgment than 'here is ONE discrete countable dog and its extent' "
+                "(instance, gated by instance_score_threshold), and an occluded/dark/blurry "
+                "object can pass the first while the second declines. An instance clearing "
+                "the score gate whose mask then binarizes to empty also lands here. This is "
+                "the reconciliation between a grounding confirmation rate near 100% and a "
+                "materially lower detection recall — they come from different heads — and a "
+                "direct contributor to the detection FN count."),
         }
+    if run_detection:
+        # TWO dicts, never merged into one score. "detection" is pure
+        # LOCALIZATION (did a box land on an annotated object) under
+        # class-agnostic matching; "detection_labels" is how well the entity
+        # that produced each matched box was NAMED. See
+        # src/evaluation/detection_metrics.py's docstring for why the two are
+        # kept apart and why matching ignores the class.
+        summary["detection"] = detection_metrics.detection_summary(det_counts)
+        summary["detection"]["instance_score_threshold"] = \
+            header["grounding"].get("instance_score_threshold")
+        # Always mask ("segm") matching — see score_image_detection. Recorded
+        # as fixed provenance so a saved results JSON says which geometry
+        # produced it, distinguishing it from any older box-matched run.
+        summary["detection"]["iou_type"] = "mask"
+        summary["detection_labels"] = detection_metrics.label_summary(det_label_records)
+        # Biotic/material agreement between the PREDICTED entity's own hybrid
+        # label and the GT box's taxonomy position, on the SAME matched
+        # pairs — a per-instance check independent of the lexical matching
+        # biotic_matched/material_matched (the plain COCO axis metrics) use.
+        # Nature is intentionally absent — see score_axis_agreement.
+        summary["detection_axis_agreement"] = detection_metrics.axis_agreement_summary(
+            det_axis_records)
+        summary["detection_axis_agreement"]["note"] = (
+            "biotic/material agreement between the matched predicted entity's own hybrid "
+            "label (object_finals) and the GT box's taxonomy position, over the SAME "
+            "detection-matched pairs as detection_labels — NOT the lexical find_matching_object "
+            "the plain biotic_matched/material_matched axis metrics use elsewhere, so this is a "
+            "tighter per-INSTANCE check rather than 'the first same-named object in the image'. "
+            "nature has no entry: every matched pair here is nature-vs-nature by construction "
+            "(only nature entities are grounded, and GT is nature-restricted), so an agreement "
+            "rate for it would misreport a tautology as a measurement.")
+        # ENTITY-level block — the same three views (localization / naming /
+        # axis agreement) at CONCEPT granularity: one merged region per
+        # extracted entity vs one merged region per GT class. Kept in its own
+        # namespace and never averaged with the instance numbers; see
+        # score_image_entities for what each granularity is and isn't fair to.
+        summary["detection_entity"] = detection_metrics.detection_summary(ent_counts)
+        summary["detection_entity"]["iou_type"] = "mask"
+        summary["detection_entity_labels"] = detection_metrics.label_summary(ent_label_records)
+        summary["detection_entity_axis_agreement"] = \
+            detection_metrics.axis_agreement_summary(ent_axis_records)
+        # PIXEL COVERAGE — the threshold-free view. Everything above answers
+        # "did a prediction land on the right object"; this answers "how much
+        # of the object did we actually cover", which is a different and for
+        # this project arguably more relevant question, since the nature
+        # relevance score is itself a pixel-coverage measure.
+        summary["detection_pixels"] = detection_metrics.pixel_summary(
+            px_counts, px_per_image_iou)
+        summary["detection_pixels"]["by_gt_class"] = {
+            cls: {**v,
+                  "pixel_recall": (v["pixel_tp"] / (v["pixel_tp"] + v["pixel_fn"])
+                                   if (v["pixel_tp"] + v["pixel_fn"]) else 0.0),
+                  "pixel_precision": (v["pixel_tp"] / (v["pixel_tp"] + v["pixel_fp"])
+                                      if (v["pixel_tp"] + v["pixel_fp"]) else 0.0),
+                  "pixel_iou": (v["pixel_tp"] / (v["pixel_tp"] + v["pixel_fp"] + v["pixel_fn"])
+                                if (v["pixel_tp"] + v["pixel_fp"] + v["pixel_fn"]) else 0.0)}
+            for cls, v in sorted(px_by_class.items(),
+                                 key=lambda kv: -(kv[1]["pixel_tp"] + kv[1]["pixel_fn"]))}
+        summary["detection_pixels_note"] = (
+            "PIXEL coverage of the nature concepts, with NO IoU threshold and no assignment "
+            "step: every nature pixel the pipeline predicted on an image, unioned, against "
+            "every nature pixel COCO annotated on it, unioned. Answers 'how much of the "
+            "banana did we find', which the detection blocks above cannot — region matching "
+            "is binary above a threshold, so a prediction covering 55% of an object and one "
+            "covering 99% both score as one true positive. Deliberately includes GT classes "
+            "that were missed entirely (their pixels count against recall) and predicted "
+            "regions that matched nothing (theirs count against precision), so it is not just "
+            "a summary of the cases that already went well. micro_* pools every pixel in the "
+            "split (large objects count for what they physically occupy); mean_image_iou "
+            "weights every image equally regardless of object size — a big gap between the "
+            "two means performance depends strongly on object size. by_gt_class breaks the "
+            "same numbers down per COCO class, so 'which concepts do we cover well' is "
+            "answerable rather than only the pooled average.")
+        summary["detection_entity_note"] = (
+            "ENTITY-level (concept-level) mask-IoU evaluation: every instance mask of one "
+            "extracted entity is unioned into ONE region, every annotated instance of one GT "
+            "class into ONE region, and those are matched instead of individual objects. "
+            "Fairer than the instance-level block for two specific, measurable reasons. (1) "
+            "SAM3 applies NO NMS (only a score threshold — checked in the transformers "
+            "source), so several queries firing on the same object survive as duplicates that "
+            "instance matching charges as false positives; a union collapses them without any "
+            "suppression heuristic. (2) COCO does not exhaustively annotate crowded scenes — a "
+            "tray of ~24 donuts carries 12 boxes — so instance matching caps true positives at "
+            "the annotation count and charges correct extra detections as FPs, whereas region "
+            "overlap asks whether the right PIXELS were found regardless of how many polygons "
+            "an annotator drew. WHAT IT COSTS: no per-object counting ('found 8 of 12 cows') "
+            "and no AP, both of which only exist at instance granularity — which is exactly "
+            "why summary['detection'] is kept alongside rather than replaced.")
+        # Third dict, and again never merged into the other two: these are
+        # neither localization successes nor naming successes, they are
+        # TAXONOMY DISAGREEMENTS — a grounded nature entity landing on a GT box
+        # whose COCO class resolves to non-nature. Counted and broken down by
+        # class, never scored (see score_image_detection on why this is often
+        # the concept-vs-instance gap rather than a model error).
+        by_class = Counter(d["gt_class"] for d in det_nature_on_non_nature)
+        by_entity = Counter(_normalize_object(d["pred_object"])
+                            for d in det_nature_on_non_nature)
+        summary["detection_nature_on_non_nature"] = {
+            "count": len(det_nature_on_non_nature),
+            # Denominator is the predictions that COULD have hit one: matched
+            # predictions are already accounted for against nature GT.
+            "rate_over_unmatched": (len(det_nature_on_non_nature) /
+                                    (det_counts["fp"] + det_counts["excluded_pred"]))
+                                   if (det_counts["fp"] + det_counts["excluded_pred"]) else 0.0,
+            "by_gt_class": dict(by_class.most_common()),
+            "by_predicted_entity": dict(by_entity.most_common(25)),
+            "note": ("A grounded NATURE entity whose mask overlaps (IoU >= "
+                     f"{args.detection_iou_threshold}) a GT instance of a COCO class the taxonomy "
+                     "maps to NON-nature. Can never be a true positive — non-nature GT is "
+                     "filtered out before matching — and is NOT counted as a false positive "
+                     "either; these predictions stay in whichever bucket the normal rules gave "
+                     "them (nearly always 'excluded', since the evaluated vocabulary is "
+                     "nature-only), so precision/recall are unaffected by this diagnostic. "
+                     "A hit is not automatically a model error: COCO's 'dining table' node "
+                     "resolves to non-nature, but the taxonomy's Nature-Based Artefacts clause "
+                     "counts a wooden table with visible grain AS nature, and a class node "
+                     "cannot encode which one THIS image shows. Read by_gt_class to tell the "
+                     "two apart — wood/stone furniture classes dominating suggests that clause "
+                     "is firing, a flat spread of unrelated classes suggests loose masks."),
+        }
+        summary["detection_note"] = (
+            "COCO mask-IoU (segm) evaluation of SAM3 instance masks against COCO's "
+            "per-instance segmentation GT — what the model actually produces IS a mask, so "
+            "matching on boxes would discard real signal (verified in the test suite: two "
+            "crossing diagonal strokes have identical boxes but near-zero mask overlap). "
+            "Assignment is CLASS-AGNOSTIC (Hungarian, one-to-one, IoU >= "
+            f"{args.detection_iou_threshold}) so a predicted 'bull' can still be paired with a "
+            "GT 'cow' and scored hierarchically instead of being thrown away as a false "
+            "positive — precision/recall/F1/AP here therefore measure LOCALIZATION only, and "
+            "the naming side lives in detection_labels. GT is restricted to NATURE-mapped COCO "
+            "classes because only nature-labeled entities are grounded, so a non-nature GT box "
+            "could never be matched and counting it as a miss would measure the protocol rather "
+            "than the model. An unmatched prediction is a false positive when EITHER its own "
+            "phrase names a class in that evaluated vocabulary, OR another instance of the same "
+            "entity in the same image did match a GT box (a geometric match is direct evidence "
+            "that this kind of object IS annotated here, and strictly stronger than the lexical "
+            "test; without it, misnaming an object would IMPROVE precision by routing its "
+            "unmatched siblings to 'excluded'). Failing both, it is EXCLUDED (COCO "
+            "annotates 80 curated classes, so a correctly-detected tree is not a hallucination) "
+            "and reported as excluded_predictions. iscrowd regions are neither required to be "
+            "detected nor charged as false positives, per COCO's own convention. NO accuracy is "
+            "reported: detection has no true negatives to count.")
     if run_clipmatch:
         # Token stats for whichever text is PRIMARY this run: the summary
         # caption when the artifact has one, else the raw caption itself
@@ -2119,6 +3191,102 @@ def _print_summary(s, run_clipmatch):
               f"(nature entities attempted {g['nature_entities_attempted']}) ---")
         print(f"Confirmation rate: {g['confirmation_rate']:.1%} "
               f"({g['confirmed']}/{g['nature_entities_attempted']}) — agreement with SAM3, not ground truth")
+        if g.get("semantic_confirmed_but_no_instance"):
+            print(f"Semantic-confirmed but NO instance box: "
+                  f"{g['semantic_confirmed_but_no_instance']} "
+                  f"({g['semantic_only_rate']:.1%} of confirmed) — different SAM3 heads, "
+                  f"not a contradiction; feeds the detection FN count below")
+    det = s.get("detection")
+    if det is not None:
+        print(f"\n--- COCO detection [mask IoU >= "
+              f"{det['iou_threshold']}, instance score > "
+              f"{det.get('instance_score_threshold')}] "
+              f"({det['n_gt_instances']} nature GT instances, {det['n_pred_instances']} predicted) ---")
+        print(f"[localization, class-agnostic matching]  P {det['precision']:.4f} | "
+              f"R {det['recall']:.4f} | F1 {det['f1']:.4f}   "
+              f"(TP {det['tp']} | FP {det['fp']} | FN {det['fn']})")
+        if "ap_50" in det:
+            print(f"AP@0.50 {det['ap_50']:.4f} | AP@[.50:.95] {det['ap_50_95']:.4f}")
+        # Always printed next to precision: these are the predictions the
+        # curated-vocabulary rule let off, so the reader can see how large the
+        # exemption is rather than taking precision at face value.
+        print(f"Excluded predictions (named no evaluated COCO class): "
+              f"{det['excluded_predictions']} | crowd-suppressed: "
+              f"{det['crowd_suppressed_predictions']}")
+        nn = s.get("detection_nature_on_non_nature")
+        if nn is not None:
+            print(f"Nature instance on a NON-nature GT class: {nn['count']} "
+                  f"({nn['rate_over_unmatched']:.1%} of unmatched predictions) — "
+                  f"taxonomy disagreement, not scored either way")
+            top = list(nn["by_gt_class"].items())[:5]
+            if top:
+                print("  top GT classes: " + ", ".join(f"{c} ({n})" for c, n in top))
+        dl = s.get("detection_labels", {})
+        if dl.get("support"):
+            print(f"[naming, over the {dl['support']} matched pairs]  "
+                  f"Exact-match {dl['exact_match_accuracy']:.4f}")
+            print(f"  [failures as error]  hP {dl['hp']:.4f}±{dl['hp_std']:.4f} | "
+                  f"hR {dl['hr']:.4f}±{dl['hr_std']:.4f} | hF1 {dl['hf1']:.4f}±{dl['hf1_std']:.4f} "
+                  f"| Wu-Palmer {dl['wup']:.4f}±{dl['wup_std']:.4f}")
+            print(f"  [resolved only, support {dl['support_resolved']}]  "
+                  f"hP {dl['hp_resolved']:.4f}±{dl['hp_resolved_std']:.4f} | "
+                  f"hR {dl['hr_resolved']:.4f}±{dl['hr_resolved_std']:.4f} | "
+                  f"hF1 {dl['hf1_resolved']:.4f}±{dl['hf1_resolved_std']:.4f} "
+                  f"| Wu-Palmer {dl['wup_resolved']:.4f}±{dl['wup_resolved_std']:.4f}")
+            print(f"  WordNet resolution-failure rate: {dl['resolution_failure_rate']:.1%}")
+        da = s.get("detection_axis_agreement", {})
+        if da.get("biotic", {}).get("support") or da.get("material", {}).get("support"):
+            print("[axis agreement, matched pairs only, vs the GT instance's own taxonomy position "
+                  "— nature omitted, trivially 1.0 by construction]")
+            for axis in ("biotic", "material"):
+                a = da[axis]
+                print(f"  {axis:<9} accuracy {a['accuracy']:.4f} (support {a['support']})")
+    ent = s.get("detection_entity")
+    if ent is not None:
+        print(f"\n--- COCO detection, ENTITY level [mask IoU >= {ent['iou_threshold']}] "
+              f"({ent['n_gt_instances']} GT classes, {ent['n_pred_instances']} entities) ---")
+        print("one merged region per extracted entity vs one per GT class — immune to SAM3's "
+              "duplicate instances and to COCO's sparse annotation of crowded scenes; no "
+              "per-object counting or AP at this granularity (see detection_entity_note)")
+        print(f"[localization]  P {ent['precision']:.4f} | R {ent['recall']:.4f} | "
+              f"F1 {ent['f1']:.4f}   (TP {ent['tp']} | FP {ent['fp']} | FN {ent['fn']})")
+        print(f"Excluded predictions (named no evaluated COCO class): "
+              f"{ent['excluded_predictions']} | crowd-suppressed: "
+              f"{ent['crowd_suppressed_predictions']}")
+        el = s.get("detection_entity_labels", {})
+        if el.get("support"):
+            print(f"[naming, over the {el['support']} matched pairs]  "
+                  f"Exact-match {el['exact_match_accuracy']:.4f}")
+            print(f"  [failures as error]  hP {el['hp']:.4f}±{el['hp_std']:.4f} | "
+                  f"hR {el['hr']:.4f}±{el['hr_std']:.4f} | hF1 {el['hf1']:.4f}±{el['hf1_std']:.4f} "
+                  f"| Wu-Palmer {el['wup']:.4f}±{el['wup_std']:.4f}")
+        ea = s.get("detection_entity_axis_agreement", {})
+        if ea.get("biotic", {}).get("support") or ea.get("material", {}).get("support"):
+            print("[axis agreement, matched pairs only — nature omitted, trivially 1.0]")
+            for axis in ("biotic", "material"):
+                a = ea[axis]
+                print(f"  {axis:<9} accuracy {a['accuracy']:.4f} (support {a['support']})")
+    px = s.get("detection_pixels")
+    if px is not None and px.get("n_images"):
+        print(f"\n--- COCO PIXEL COVERAGE (no IoU threshold, no matching) "
+              f"({px['n_images']} images) ---")
+        print("how much of each nature concept's pixels were actually found — the question "
+              "region matching can't answer, since it scores 55%- and 99%-covered objects "
+              "identically")
+        print(f"[micro, every pixel pooled]  precision {px['micro_pixel_precision']:.4f} | "
+              f"recall {px['micro_pixel_recall']:.4f} | F1 {px['micro_pixel_f1']:.4f} | "
+              f"IoU {px['micro_pixel_iou']:.4f}")
+        print(f"[macro, every image equal]   mean IoU {px['mean_image_iou']:.4f}"
+              f"±{px['mean_image_iou_std']:.4f}   "
+              f"(a big micro/macro gap = performance depends on object size)")
+        by_cls = list(px.get("by_gt_class", {}).items())
+        if by_cls:
+            best = sorted(by_cls, key=lambda kv: -kv[1]["pixel_iou"])[:5]
+            worst = sorted(by_cls, key=lambda kv: kv[1]["pixel_iou"])[:5]
+            print("  best-covered classes:  "
+                  + ", ".join(f"{c} {v['pixel_iou']:.2f}" for c, v in best))
+            print("  worst-covered classes: "
+                  + ", ".join(f"{c} {v['pixel_iou']:.2f}" for c, v in worst))
     if run_clipmatch:
         primary_label = "summary-caption" if s["clip_models"]["clipmatch_primary_source"] == "summary_caption" else "caption-based"
         cm = s["clipmatch"]
@@ -2224,6 +3392,37 @@ def _log_wandb(args, summary, run_clipmatch):
         log["Grounding/ConfirmationRate"] = summary["grounding"]["confirmation_rate"]
         log["Grounding/NatureEntitiesAttempted"] = summary["grounding"]["nature_entities_attempted"]
         log["Grounding/Confirmed"] = summary["grounding"]["confirmed"]
+    if summary.get("detection") is not None:
+        det = summary["detection"]
+        # Localization and naming stay in SEPARATE W&B namespaces for the same
+        # reason they stay separate in the summary — a sweep that optimizes one
+        # should never silently be reading the other.
+        for key in ("precision", "recall", "f1", "tp", "fp", "fn",
+                    "excluded_predictions", "crowd_suppressed_predictions",
+                    "n_gt_instances", "n_pred_instances"):
+            log[f"Detection/{key}"] = det[key]
+        if "ap_50" in det:
+            log["Detection/AP50"] = det["ap_50"]
+            log["Detection/AP50_95"] = det["ap_50_95"]
+        nn = summary.get("detection_nature_on_non_nature")
+        if nn is not None:
+            # Own namespace, like the localization/naming split: this is a
+            # third kind of outcome, not a component of either score.
+            log["DetectionTaxonomyDisagreement/Count"] = nn["count"]
+            log["DetectionTaxonomyDisagreement/RateOverUnmatched"] = nn["rate_over_unmatched"]
+        dl = summary.get("detection_labels", {})
+        if dl.get("support"):
+            log["DetectionLabels/ExactMatch"] = dl["exact_match_accuracy"]
+            log["DetectionLabels/Support"] = dl["support"]
+            log["DetectionLabels/ResolutionFailureRate"] = dl["resolution_failure_rate"]
+            for key in ("hp", "hr", "hf1", "wup"):
+                log[f"DetectionLabels/{key}"] = dl[key]
+                log[f"DetectionLabels/{key}_ResolvedOnly"] = dl[f"{key}_resolved"]
+        da = summary.get("detection_axis_agreement", {})
+        for axis in ("biotic", "material"):
+            if da.get(axis, {}).get("support"):
+                log[f"DetectionAxisAgreement/{axis}_accuracy"] = da[axis]["accuracy"]
+                log[f"DetectionAxisAgreement/{axis}_support"] = da[axis]["support"]
     wandb.log(log)
     wandb.finish()
 
@@ -2443,6 +3642,39 @@ def build_arg_parser():
                         "`inflect` package. Has no effect together with "
                         "--use_wordnet_definitions_clipmatch (that path always inflects its own "
                         "article regardless, as its own separate pre-existing behavior).")
+    p.add_argument("--instance_nms_iou", type=float, default=0.5,
+                   help="--stage score, COCO only: mask-IoU threshold for non-maximum "
+                        "suppression WITHIN each extracted entity's instances, applied "
+                        "before the instance-level detection metrics. SAM3's own "
+                        "post-processing applies ONLY a score threshold — no NMS, no dedup "
+                        "(checked in the transformers source) — so several of its queries "
+                        "firing on the SAME object all survive, and one-to-one matching then "
+                        "charges the redundant twins as false positives (observed: seven "
+                        "overlapping 'orange slice' masks over two annotated oranges). "
+                        "Suppression is per-entity only: two DIFFERENT entities overlapping "
+                        "is a real prediction, not a duplicate. Set to 0 or above 1 to "
+                        "disable. Does not affect the ENTITY-level block, which unions "
+                        "instances anyway and is immune to duplicates by construction.")
+    p.add_argument("--detection_iou_threshold", type=float,
+                   default=detection_metrics.DEFAULT_IOU_THRESHOLD,
+                   help="--stage score, COCO only: MASK IoU (COCO's `segm` task) at which a "
+                        "predicted SAM3 instance counts as landing on a GT instance. Always "
+                        "masks, never boxes — what SAM3 actually produces IS a mask, and COCO "
+                        "ships per-instance segmentation for every annotation, so reducing "
+                        "both sides to boxes first discards real signal (verified in the test "
+                        "suite: two crossing diagonal strokes have identical boxes but "
+                        "near-zero mask overlap). REQUIRES --instances_json — GT segmentation "
+                        "is read from the annotation file at scoring time, never stored in the "
+                        "artifact. Matching is CLASS-AGNOSTIC (so a "
+                        "predicted 'bull' can pair with a GT 'cow' and be scored hierarchically "
+                        "rather than discarded), and this threshold sets the headline "
+                        "precision/recall/F1 operating point only — AP is always swept over "
+                        "COCO's full 0.50:0.05:0.95 ladder regardless. Ignored unless the "
+                        "artifact is COCO AND was grounded with SAM3 instance grounding "
+                        "(run_grounding_pipeline.py --instance_grounding). Note --instances_json "
+                        "is also needed here for artifacts written before per-instance GT boxes "
+                        "were stored, so the boxes can be back-filled without re-running "
+                        "inference.")
     p.add_argument("--max_hops", type=int, default=0,
                    help="Maximum WordNet hop distance allowed when mapping an EXTRACTED "
                         "object onto the labeled taxonomy (map_object_to_taxonomy -> "
