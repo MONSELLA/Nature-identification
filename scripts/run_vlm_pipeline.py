@@ -2631,10 +2631,13 @@ def phase_score(args):
                 "easier judgment than 'here is ONE discrete countable dog and its extent' "
                 "(instance, gated by instance_score_threshold), and an occluded/dark/blurry "
                 "object can pass the first while the second declines. An instance clearing "
-                "the score gate whose mask then binarizes to empty also lands here. This is "
-                "the reconciliation between a grounding confirmation rate near 100% and a "
-                "materially lower detection recall — they come from different heads — and a "
-                "direct contributor to the detection FN count."),
+                "the score gate whose mask then binarizes to empty also lands here. "
+                "HISTORICAL SIGNIFICANCE: this number is why detection switched to the "
+                "semantic head. While predictions were built by unioning INSTANCE masks, "
+                "every entity counted here contributed no prediction at all and its GT region "
+                "was charged as a false negative. Detection now scores semantic_seg, so these "
+                "entities are ordinary predictions and this is a head-comparison diagnostic "
+                "only — it no longer feeds the FN count."),
         }
     if run_detection:
         # THREE dicts, never merged into one score, all at ENTITY (concept)
