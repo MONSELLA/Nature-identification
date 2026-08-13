@@ -8,13 +8,13 @@ scripts/run_vlm_pipeline.py's `--stage score`).
 
 WHAT THIS EVALUATES
     The VLM pipeline extracts entity PHRASES ("a cow", "grass"); SAM3's
-    instance head turns each nature-labeled phrase into instance MASKS. COCO
-    ships per-instance segmentation with a class label for every annotation.
-    This module answers the two questions that pairing makes possible, and
-    keeps them SEPARATE:
+    SEMANTIC head turns each nature-labeled phrase into one concept-level MASK.
+    COCO ships per-instance segmentation with a class label for every
+    annotation. This module answers the two questions that pairing makes
+    possible, and keeps them SEPARATE:
 
       1. LOCALIZATION — did the pipeline's mask land where COCO says an
-         object is?  TP / FP / FN -> precision, recall, F1, plus AP.
+         object is?  TP / FP / FN -> precision, recall, F1.
       2. LABEL CORRECTNESS — for the regions that DID match a GT object, was
          the entity named correctly?  Scored two ways: exact match (the strict
          view) and hierarchically (hP/hR/hF1 + Wu-Palmer, the graded view that
@@ -27,25 +27,27 @@ WHAT THIS EVALUATES
 
 GRANULARITY IS ENTITY (CONCEPT) LEVEL, set by the caller
     (`scripts/run_vlm_pipeline.py`'s `score_image_entities`, this module's only
-    production consumer). Every instance mask of one extracted entity is
-    unioned into ONE region, and every annotated instance of one GT class into
-    ONE region, before anything here runs. The functions below are granularity-
-    agnostic — they take regions and counters — but the numbers they produce
-    are about CONCEPTS, not individual objects, because that is what this
-    pipeline predicts. An instance-level caller existed and was removed: it
-    punished SAM3's undeduplicated duplicate queries and COCO's non-exhaustive
-    annotation of crowded scenes, neither of which is a model error.
+    production consumer). Each prediction is SAM3's `semantic_seg` mask for one
+    extracted entity — already one region per concept — and each GT entry is
+    every annotated instance of one class merged into ONE region. The functions
+    below are granularity-agnostic (they take regions and counters), but the
+    numbers they produce are about CONCEPTS, not individual objects, because
+    that is what this pipeline predicts. An instance-level caller existed and
+    was removed: it punished SAM3's undeduplicated duplicate queries and COCO's
+    non-exhaustive annotation of crowded scenes, neither a model error.
 
-TWO DIFFERENT SWEEPS, both reported, easily confused (see `sweep_summary` vs
-    `detection_summary`):
-      * `sweep_summary` varies the IoU THRESHOLD at a fixed prediction set ->
-        precision/recall/F1 as a function of strictness. Measures MASK
-        TIGHTNESS.
-      * `average_precision` varies the CONFIDENCE cutoff at a fixed IoU ->
-        the area under the PR curve. Measures whether the confidence RANKING
-        is informative.
-    AP is not "a stricter F1", and F1@0.75 is not "AP at 0.75". Do not
-    describe one in the other's terms when reporting.
+NO AVERAGE PRECISION — deliberate, and the reason is not "we didn't get to it".
+    AP ranks predictions by confidence and integrates the resulting PR curve,
+    so it needs a per-prediction confidence. `semantic_seg` is a dense logit
+    map: there is no scalar score attached to a concept's mask. An earlier
+    version scored the instance head instead and ranked by each entity's
+    strongest instance, which was an engineering convenience rather than a
+    measurement — "the strongest instance that happened to clear the score
+    gate", not a calibrated confidence for the region actually being matched.
+    Manufacturing a replacement (mean sigmoid inside the mask, pixel count,
+    ...) would be strictly worse than reporting nothing. `sweep_summary` is
+    the headline instead, and needs no confidence at all: it varies the IoU
+    THRESHOLD at a fixed prediction set, which measures MASK TIGHTNESS.
 
 MATCHING IS ON MASKS, NEVER BOXES. What SAM3 actually produces IS a mask, and
     COCO ships per-instance `segmentation` for every annotation, so reducing
@@ -101,7 +103,7 @@ NO TRUE NEGATIVES.
     Detection has no "correctly rejected background region" to count: the
     space of masks that could have been predicted and weren't is unbounded.
     TN is therefore undefined and no accuracy is reported here — only
-    precision, recall, F1 and AP, all of which are well-defined without it.
+    precision, recall and F1, all of which are well-defined without it.
     This is a deliberate departure from the axis metrics elsewhere in the
     project, which DO report accuracy because their negative class is a real,
     finite thing.
@@ -120,7 +122,9 @@ import numpy as np
 # Standard COCO-style operating point for "the box is on the right object".
 DEFAULT_IOU_THRESHOLD = 0.5
 
-# COCO's own AP sweep: 0.50, 0.55, ..., 0.95.
+# COCO's own IoU ladder: 0.50, 0.55, ..., 0.95. Used by the strictness sweep
+# (sweep_summary); the name is kept for continuity with COCO's convention even
+# though this project no longer computes AP over it.
 COCO_AP_IOU_THRESHOLDS = tuple(round(0.5 + 0.05 * i, 2) for i in range(10))
 
 # Fraction of a PREDICTED box that must fall inside a crowd region before the
@@ -245,45 +249,6 @@ def merge_rles(rles: Sequence[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
             "counts": counts.decode("ascii") if isinstance(counts, bytes) else counts}
 
 
-def mask_nms(rles: Sequence[Dict[str, Any]], scores: Sequence[float],
-             iou_threshold: float = 0.5) -> List[int]:
-    """Greedy non-maximum suppression over MASKS. Returns the indices to KEEP,
-    highest-score-first.
-
-    WHY THIS IS NEEDED HERE, verified against the transformers source rather
-    than assumed: `Sam3ImageProcessor.post_process_instance_segmentation`
-    applies ONLY a score threshold (`keep = scores > threshold`) — there is no
-    NMS and no deduplication anywhere in it. So when several of SAM3's
-    instance queries fire on the SAME physical object, every one of them above
-    `--instance_score_threshold` survives as a separate "instance". Observed
-    in production: seven heavily-overlapping "orange slice" masks over what
-    were really two annotated oranges.
-
-    That matters beyond cosmetics, because duplicates are charged as false
-    positives: the first duplicate matches the GT instance, and one-to-one
-    Hungarian assignment leaves its twins unmatched, where the
-    curated-vocabulary rule (specifically its `entity_matched_elsewhere_in_image`
-    half) then counts each as an FP. Suppressing them is standard detection
-    practice and is what makes the precision figure mean "how often was a
-    prediction right" rather than "how often did the model emit exactly one
-    box per object".
-
-    Greedy rather than anything cleverer: take the highest-scoring mask, drop
-    every remaining mask overlapping it by >= `iou_threshold`, repeat. This is
-    the textbook formulation and the one COCO-era detectors use.
-    """
-    order = sorted(range(len(rles)), key=lambda i: scores[i], reverse=True)
-    keep: List[int] = []
-    while order:
-        best = order.pop(0)
-        keep.append(best)
-        if not order:
-            break
-        ious = mask_iou_matrix([rles[best]], [rles[i] for i in order])[0]
-        order = [i for k, i in enumerate(order) if ious[k] < iou_threshold]
-    return keep
-
-
 def rle_area(rle: Optional[Dict[str, Any]]) -> int:
     """Pixel count of an RLE mask, straight from pycocotools (no decode)."""
     if rle is None:
@@ -337,9 +302,9 @@ def match_boxes(
     `(gt_index, pred_index, iou)` and every match's IoU is `>= iou_threshold`.
 
     `ious` optionally supplies an already-computed (n_gt, n_pred) matrix. The
-    AP sweep re-matches the same boxes at ten IoU thresholds, and recomputing
-    the matrix ten times per image would be pure waste — the geometry doesn't
-    change, only the cut-off applied to it.
+    strictness sweep re-matches the same regions at ten IoU thresholds, and
+    recomputing the matrix ten times per image would be pure waste — the
+    geometry doesn't change, only the cut-off applied to it.
 
     Hungarian assignment rather than the greedy highest-IoU-first loop most
     detection code uses: greedy can strand a GT instance whose only above-threshold
@@ -432,58 +397,20 @@ def classify_unmatched_prediction(
 
 
 # =============================================================================
-# Average precision
-# =============================================================================
-def average_precision(
-    scored_predictions: Sequence[Tuple[float, bool]],
-    n_gt: int,
-) -> float:
-    """Class-agnostic AP from `(score, is_true_positive)` pairs pooled over the
-    whole dataset, using COCO's 101-point interpolated precision.
-
-    Excluded predictions (the curated-vocabulary rule above) must be left OUT
-    of `scored_predictions` by the caller — including them as negatives would
-    reimpose exactly the penalty that rule exists to remove.
-
-    Returns 0.0 when there is no GT to recall.
-    """
-    if n_gt <= 0:
-        return 0.0
-    if not scored_predictions:
-        return 0.0
-
-    order = sorted(range(len(scored_predictions)),
-                   key=lambda k: scored_predictions[k][0], reverse=True)
-    tp = np.array([1.0 if scored_predictions[k][1] else 0.0 for k in order])
-    fp = 1.0 - tp
-    tp_cum, fp_cum = np.cumsum(tp), np.cumsum(fp)
-
-    recalls = tp_cum / float(n_gt)
-    precisions = tp_cum / np.maximum(tp_cum + fp_cum, np.finfo(float).eps)
-
-    # Make precision monotonically non-increasing as recall grows (the standard
-    # envelope), then sample it at 101 evenly spaced recall levels.
-    precisions = np.maximum.accumulate(precisions[::-1])[::-1]
-    levels = np.linspace(0.0, 1.0, 101)
-    idx = np.searchsorted(recalls, levels, side="left")
-    sampled = np.where(idx < len(precisions), precisions[np.minimum(idx, len(precisions) - 1)], 0.0)
-    sampled[idx >= len(precisions)] = 0.0
-    return float(sampled.mean())
-
-
-# =============================================================================
 # Aggregation
 # =============================================================================
 def detection_summary(counts: Dict[str, Any]) -> Dict[str, Any]:
     """Turn the running detection counters into the reported numbers.
 
-    `counts` carries: tp, fp, fn, excluded_pred, crowd_suppressed, n_gt_instances,
-    n_pred_instances, plus `ap_records` ({iou_threshold: [(score, is_tp), ...]}).
+    `counts` carries: tp, fp, fn, excluded_pred, crowd_suppressed,
+    n_gt_instances, n_pred_instances.
 
     Precision's denominator is TP + FP, which by construction EXCLUDES the
     curated-vocabulary exemptions — `excluded_predictions` is reported next to
     it so the exemption's size is always visible. There is no accuracy key:
-    see the module docstring on why TN is undefined here.
+    see the module docstring on why TN is undefined here. There is no AP key
+    either: see the module docstring on why the semantic head this pipeline
+    scores supports no confidence ranking.
     """
     tp, fp, fn = counts.get("tp", 0), counts.get("fp", 0), counts.get("fn", 0)
     precision = tp / (tp + fp) if (tp + fp) else 0.0
@@ -499,14 +426,6 @@ def detection_summary(counts: Dict[str, Any]) -> Dict[str, Any]:
         "n_gt_instances": counts.get("n_gt_instances", 0),
         "n_pred_instances": counts.get("n_pred_instances", 0),
     }
-
-    ap_records = counts.get("ap_records") or {}
-    n_gt = counts.get("n_gt_instances", 0)
-    per_threshold = {t: average_precision(recs, n_gt) for t, recs in sorted(ap_records.items())}
-    if per_threshold:
-        summary["ap_50"] = per_threshold.get(0.5, 0.0)
-        summary["ap_50_95"] = float(np.mean(list(per_threshold.values())))
-        summary["ap_per_iou"] = per_threshold
     return summary
 
 
@@ -519,17 +438,17 @@ def sweep_summary(sweep_counts: Dict[float, Dict[str, int]]) -> Dict[str, Any]:
 
     THIS IS NOT AP, and the distinction matters when reporting:
 
-      * P/R/F1 at threshold t is ONE OPERATING POINT — every prediction above
-        the run's fixed instance-score threshold is included, and the only
-        thing varying across the sweep is how much overlap counts as a hit. The
+      * P/R/F1 at threshold t is ONE OPERATING POINT — every confirmed
+        entity mask is included, and the only thing varying across the sweep
+        is how much overlap counts as a hit. The
         SHAPE of that curve is a direct readout of MASK TIGHTNESS: an F1 that
         holds from 0.50 to 0.75 means the masks genuinely trace their objects;
         one that collapses means they are loose blobs that only just cleared
         the permissive threshold.
-      * AP at threshold t (`detection_summary`) instead sweeps the CONFIDENCE
-        cutoff at fixed overlap and integrates the resulting PR curve, which
-        measures whether the confidence RANKING is informative. A model can
-        score well on one and poorly on the other.
+      * AP would instead sweep the CONFIDENCE cutoff at fixed overlap and
+        integrate the resulting PR curve, measuring whether the confidence
+        RANKING is informative. This project does NOT report AP — see the
+        module docstring on why the semantic head supports no such ranking.
 
     Reports each rung plus three headline numbers mirroring COCO's own naming:
     `@0.50` (permissive), `@0.75` (strict), and `@[.50:.95]` (the mean across

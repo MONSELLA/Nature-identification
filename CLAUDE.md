@@ -491,6 +491,18 @@ evaluating the models.
 IMPLEMENTED. Runs in `--stage score` when the artifact is COCO **and** was
 grounded with instance grounding; it runs ALONGSIDE the axis metrics above,
 never replacing them.
+- **PREDICTIONS COME FROM SAM3's SEMANTIC HEAD** (`semantic_seg`, read from
+  `object_groundings[k]["mask_rle"]`) — already one region per extracted
+  concept, and the SAME mask the nature relevance score uses, so "the region
+  predicted for this concept" means one thing project-wide. The instance head
+  is NOT read by detection at all. It previously was (unioned per entity to
+  rebuild a concept mask), which was reconstructing something `semantic_seg`
+  provides directly AND silently dropped every entity SAM3 confirmed
+  semantically but produced no instance for — measured at 10.4% of confirmed
+  groundings, each one charging its GT region as a false negative.
+  CONSEQUENCES: `--instance_score_threshold` has NO effect on detection (the
+  only gate is `--mask_threshold`); detection no longer requires
+  `--instance_grounding`, only that grounding ran at all.
 - **ENTITY (concept) GRANULARITY ONLY** (`score_image_entities`). The
   instance-level block was REMOVED — do not reintroduce it. This pipeline
   predicts CONCEPTS (the VLM extracts "orange slice", SAM3 grounds that
@@ -498,8 +510,8 @@ never replacing them.
   punished two things that are not model errors: SAM3's undeduplicated
   duplicate queries on one object, and COCO's non-exhaustive annotation of
   crowded scenes (a tray of ~24 donuts carries 12 boxes, capping TPs at 12 and
-  charging the correct extras as FPs). Both distortions vanish under a union.
-  ACCEPTED COST: no per-object counting ("found 8 of 12 cows").
+  charging the correct extras as FPs). ACCEPTED COST: no per-object counting
+  ("found 8 of 12 cows").
 - Summary dicts, deliberately never merged: `summary["detection"]`
   (localization at the headline threshold), `summary["detection_iou_sweep"]`
   (the strictness curve — see below), `summary["detection_labels"]` (naming),
@@ -587,18 +599,17 @@ never replacing them.
   TIGHTNESS**: an F1 that holds from 0.50 to 0.75 means the masks genuinely
   trace their objects; one that collapses means blobs that only just cleared
   the permissive threshold.
-- **AP IS A DIFFERENT QUESTION — never describe it as a stricter F1.** The
-  sweep above varies the IoU THRESHOLD at a fixed prediction set. AP
-  (`ap_50`/`ap_50_95`/`ap_per_iou`, 101-point interpolated, class-agnostic)
-  varies the CONFIDENCE cutoff at fixed IoU and integrates the PR curve — it
-  measures whether SAM3's confidence RANKING is informative. Entities are
-  ranked by each entity's own strongest-instance score
-  (`pred_entries[...]["score"]`, already computed for the CSV's `pred_score`
-  column) — a real confidence, not an invented one. Excluded/crowd-suppressed
-  predictions are kept OUT of the AP ranking. NOTE AP is capped by max
-  achievable recall, so AP below F1 is normal, not a contradiction. It is AP,
-  **not mAP** — matching is class-agnostic, so there is no per-class axis to
-  average over; calling it mAP in the thesis would be wrong.
+- **NO AP — deliberate, do not add one back.** AP ranks predictions by
+  confidence and integrates the PR curve, so it needs a per-prediction
+  confidence. `semantic_seg` is a dense logit map with no scalar score per
+  concept mask. An earlier version scored the instance head and ranked by each
+  entity's strongest instance — an engineering convenience, not a measurement
+  ("the strongest instance that happened to clear the score gate", not a
+  calibrated confidence for the region being matched). Manufacturing a
+  substitute (mean sigmoid in the mask, pixel count, …) would be worse than
+  reporting nothing. The IoU sweep is the headline and needs no confidence.
+  `average_precision` and `mask_nms` were deleted from `detection_metrics.py`
+  along with this.
 - NO TRUE NEGATIVES, so no accuracy is reported — unlike the axis metrics,
   detection has no finite negative class. Don't add one.
 - PIXEL COVERAGE (`summary["detection_pixels"]`, `pixel_stats`/`pixel_summary`)

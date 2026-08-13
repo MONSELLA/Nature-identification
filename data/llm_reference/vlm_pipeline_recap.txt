@@ -1,5 +1,12 @@
-BIG-5 VLM PIPELINE — DESIGN RECAP (v24)
-(v24: the INSTANCE-level COCO detection block and the PIXEL COVERAGE block are
+BIG-5 VLM PIPELINE — DESIGN RECAP (v25)
+(v25: COCO detection PREDICTIONS now come from SAM3's SEMANTIC head
+(semantic_seg) instead of a per-entity UNION of its instance masks, and AP is
+dropped entirely as a consequence — semantic_seg carries no per-region
+confidence to rank by, and the instance-max score that previously stood in for
+one was an engineering convenience, not a measurement. Detection therefore no
+longer requires --instance_grounding and is unaffected by
+--instance_score_threshold. See RESOLVED IN v25.
+v24: the INSTANCE-level COCO detection block and the PIXEL COVERAGE block are
 both REMOVED; entity (concept) granularity is now the only detection
 evaluation, and its headline is a PRECISION/RECALL/F1 SWEEP across COCO's IoU
 ladder (@0.50, @0.75, @[.50:.95]) measuring MASK TIGHTNESS. AP is kept but
@@ -1022,6 +1029,54 @@ RESOLVED IN v6 (decided after repeated integration failures):
   clip_metrics.CLIPScorer's class docstring) were PROPOSED as
   replacements here, but neither was actually added to CLIP_PRESETS at
   the time — see RESOLVED IN v8 below for what's actually wired in.
+
+RESOLVED IN v25 (decided per Pau, immediately after v24, on the observation
+that if the pipeline is concept-level everywhere else it should take its
+detection predictions from the concept-level head too):
+- PREDICTIONS ARE NOW SAM3's SEMANTIC MASKS. score_image_entities reads
+  object_groundings[k]["mask_rle"] — the post_process_semantic_segmentation
+  output, binarized at --mask_threshold — as the predicted region for entity k.
+  The previous approach unioned that entity's INSTANCE masks to rebuild a
+  concept region, which was reconstructing something semantic_seg already
+  provides directly. The instance head is no longer read by scoring at all.
+- THE DECISIVE ARGUMENT was a number already printed by the run: "Semantic-
+  confirmed but NO instance box: 1868 (10.4% of confirmed)". Those are entities
+  where SAM3's semantic head found the concept but its instance head produced
+  nothing above --instance_score_threshold. Under the instance-union they
+  contributed NO prediction whatsoever, so every GT region they should have
+  matched was charged as a false negative — the pipeline was being penalized
+  for entities it had in fact grounded. The old code comment on that diagnostic
+  even said so out loud ("a direct, quantified contributor to the detection FN
+  count"); v25 removes the cause rather than continuing to report the symptom.
+  The diagnostic is KEPT (it is still a real semantic-vs-instance head
+  comparison) but its wording now says these still count as predictions.
+- AP IS REMOVED, and this is the honest consequence rather than a regression.
+  AP needs a per-prediction confidence to rank by; semantic_seg is a dense
+  logit map with no scalar per concept mask. v23/v24 ranked entities by their
+  strongest underlying INSTANCE score, which Pau correctly identified as "an
+  engineering step" — it is the strongest instance that happened to clear a
+  score gate, not a calibrated confidence for the merged region actually being
+  matched, and it is not even defined for the 1868 semantic-only entities
+  above. Manufacturing a substitute (mean sigmoid inside the mask, pixel count,
+  ...) would be worse than reporting nothing. detection_metrics.average_precision
+  and mask_nms are deleted; summary["detection"] has no ap_* keys.
+  The IoU SWEEP (v24) is unaffected and is now the sole headline — it needs no
+  confidence at all, which is exactly why it survives this change intact.
+- FALLOUT, all simplifications: --instance_score_threshold no longer influences
+  detection in any way (the only gate is --mask_threshold, SAM3's own default,
+  already used for the relevance score); run_detection is gated on grounding
+  having run AT ALL rather than on instance_grounding specifically, so any
+  grounded COCO artifact can be scored; collect_predicted_boxes is deleted; the
+  GEOMETRIC half of the false-positive test is deleted with it (already inert
+  at entity granularity since v24); summary["detection"] now records
+  mask_threshold and prediction_source="semantic_seg" as provenance instead of
+  instance_score_threshold. NO RE-RUN IS NEEDED — object_groundings is written
+  by EVERY grounded run, so this is a --stage score change only.
+- STILL TRUE and worth restating because it did not change: the instance head
+  is still COMPUTED by the grounding pipeline (object_instances), still stored
+  in the artifact, and still costs only post-processing off the same forward
+  pass. It is simply no longer what detection scores. Leaving it in the
+  artifact keeps the semantic-vs-instance comparison auditable.
 
 RESOLVED IN v24 (decided per Pau, after reading the first full gemma-4-12B-it
 COCO numbers and finding two of the three reported blocks actively
