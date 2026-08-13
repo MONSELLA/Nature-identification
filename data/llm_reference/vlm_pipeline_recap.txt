@@ -1,5 +1,12 @@
-BIG-5 VLM PIPELINE — DESIGN RECAP (v23)
-(v23: entity-level COCO detection now reports AP@0.50/AP@[.50:.95] too — the
+BIG-5 VLM PIPELINE — DESIGN RECAP (v24)
+(v24: the INSTANCE-level COCO detection block and the PIXEL COVERAGE block are
+both REMOVED; entity (concept) granularity is now the only detection
+evaluation, and its headline is a PRECISION/RECALL/F1 SWEEP across COCO's IoU
+ladder (@0.50, @0.75, @[.50:.95]) measuring MASK TIGHTNESS. AP is kept but
+explicitly reframed as a different question (confidence-ranking quality), not
+a stricter F1. The taxonomy-disagreement diagnostic was PORTED to entity level
+rather than deleted with the instance block. See RESOLVED IN v24.
+v23: entity-level COCO detection now reports AP@0.50/AP@[.50:.95] too — the
 v21/v22 claim that AP "only exists at instance granularity" is gone; each
 entity has a real confidence score (its strongest underlying instance) that
 was already being computed for the predictions CSV, so ranking by it for AP
@@ -706,24 +713,26 @@ f) Hierarchical Precision / Recall (hP/hR) + Wu-Palmer, per
        node (compute_hierarchical_metrics).
 
 g) COCO MASK-IoU DETECTION EVALUATION (NEW in v21, IMPLEMENTED; MASK-ONLY as
-   of v22 — see RESOLVED IN v22 below, box matching is GONE, not an option) —
+   of v22 — see RESOLVED IN v22 below, box matching is GONE, not an option;
+   ENTITY-GRANULARITY-ONLY as of v24, with an IoU sweep as its headline and
+   pixel coverage deleted — see RESOLVED IN v24, which supersedes several
+   paragraphs below and is the authority where they disagree) —
    src/evaluation/detection_metrics.py, driven from run_vlm_pipeline.py's
    --stage score. COCO ONLY, and only on an artifact the Grounding pipeline
    enriched with INSTANCE grounding. Runs ALONGSIDE the lexical axis metrics
    in the IMPLEMENTED block below, never replacing them.
 
-   WHY THE INSTANCE HEAD. Everything else in the Grounding pipeline reads
-   SAM3's semantic_seg, which is concept-level: one mask for "cow", however
-   many cows. COCO's GT is instance-level (one box per annotated object), so
-   evaluating against it needs pred_masks/pred_boxes/pred_logits instead.
-   Every COCO target class is a "thing" (countable, boundable), which is what
-   makes the instance head appropriate there — the semantic head stays the
-   right one for the relevance score everywhere, COCO included. Both come off
-   the SAME forward pass, so this is a post-processing cost, not a second run.
-   Predicted boxes are the TIGHT box of each instance MASK, not SAM3's own
-   regressed pred_boxes — chosen so the scored box always agrees with the
-   mask stored beside it for review; pred_boxes is carried along as
-   "sam3_bbox" for comparison rather than discarded.
+   WHY THE INSTANCE HEAD IS STILL READ, EVEN THOUGH SCORING IS ENTITY-LEVEL.
+   Everything else in the Grounding pipeline reads SAM3's semantic_seg, which
+   is concept-level: one mask for "cow", however many cows. COCO's GT is
+   per-instance, so evaluating against it needs pred_masks/pred_boxes/
+   pred_logits — and, critically, the instance head is also what supplies the
+   per-entity CONFIDENCE score (max over an entity's instances) that AP ranks
+   by. Both heads come off the SAME forward pass, so this is a post-processing
+   cost, not a second run. v24 note: the instance masks are now UNIONED per
+   extracted entity before matching, so instance granularity survives only as
+   an intermediate representation, never as a reported number — see RESOLVED
+   IN v24 for why instance-level scoring was measuring the wrong thing.
 
    MATCHING IS CLASS-AGNOSTIC — the one substantive departure from the v1
    design sketch, and the reason the whole thing is worth building. Standard
@@ -1013,6 +1022,67 @@ RESOLVED IN v6 (decided after repeated integration failures):
   clip_metrics.CLIPScorer's class docstring) were PROPOSED as
   replacements here, but neither was actually added to CLIP_PRESETS at
   the time — see RESOLVED IN v8 below for what's actually wired in.
+
+RESOLVED IN v24 (decided per Pau, after reading the first full gemma-4-12B-it
+COCO numbers and finding two of the three reported blocks actively
+misleading):
+- INSTANCE-LEVEL DETECTION IS REMOVED. score_image_detection is deleted, not
+  deprecated; summary["detection"] is now the ENTITY-level block (the old
+  summary["detection_entity"] namespace is gone, folded into the primary
+  name). Pau's reasoning: what this pipeline actually predicts is a CONCEPT
+  ("orange slice"), grounded by SAM3 into however many masks, while COCO
+  annotates individual objects — so instance matching was measuring an
+  artifact of that mismatch, not model quality. The numbers made it concrete:
+  instance-level precision 0.358 vs entity-level 0.909 on the SAME
+  predictions, the gap being SAM3's undeduplicated duplicate queries plus
+  COCO's non-exhaustive annotation of crowded scenes. Both distortions vanish
+  under the union by construction. ACCEPTED COST, unchanged from v21: no
+  per-object counting ("found 8 of 12 cows"). Consequences: --instance_nms_iou
+  is removed as DEAD (a union is bit-identical with or without suppression);
+  the GEOMETRIC half of the false-positive test
+  (entity_matched_elsewhere_in_image) is removed because at entity granularity
+  each entity appears exactly once and it could never fire; the
+  taxonomy-disagreement diagnostic was PORTED to entity level (non-nature GT
+  merged per class, matching the evaluation's own granularity) rather than
+  lost with the block that used to compute it.
+- PIXEL COVERAGE IS REMOVED (summary["detection_pixels"], pixel_stats,
+  pixel_summary). Pau called it misleading and it provably was, for a reason
+  worth recording so it is not rebuilt the same way: its by_gt_class view
+  accumulated ONLY matched TP pairs plus wholly-missed GT classes, and never
+  the unmatched/excluded predictions — so per-class pixel_precision/pixel_iou
+  structurally excluded the single dominant source of imprecision, while the
+  whole-image mean_image_iou included all of it. The two could not be
+  reconciled and invited exactly the question that surfaced this ("how can the
+  WORST class be 0.51 when the mean image IoU is 0.32?"). The honest fix and
+  the flattering fix pointed in opposite directions, and the IoU sweep below
+  answers the underlying question ("how well do the masks trace the objects")
+  without the ambiguity, so the block was dropped rather than patched.
+- THE HEADLINE IS NOW AN IoU SWEEP (detection_metrics.sweep_summary,
+  summary["detection_iou_sweep"]): precision/recall/F1 recomputed at every rung
+  of COCO's ladder off ONE cached IoU matrix, each rung getting its own
+  independent matching pass (a pair clearing 0.50 need not clear 0.75).
+  Reported at @0.50, @0.75 and @[.50:.95]. The SHAPE of that curve is a direct
+  readout of MASK TIGHTNESS — an F1 that holds from 0.50 to 0.75 means the
+  masks trace their objects, one that collapses means blobs that only just
+  cleared the permissive threshold — which is precisely what neither the old
+  single operating point nor pixel coverage could show.
+- AP IS KEPT BUT REFRAMED, because the request that prompted this round
+  ("precision, recall and f1 for AP@.5, 0.75 and 0.5:0.95") conflated two
+  different instruments, and the code now documents the distinction at every
+  point of use. AP varies the CONFIDENCE cutoff at fixed IoU and integrates the
+  PR curve (is SAM3's ranking informative?); the sweep varies the IoU
+  THRESHOLD at a fixed prediction set (are the masks tight?). AP is NOT a
+  stricter F1, and F1@0.75 is NOT "AP at 0.75". Also recorded: AP is bounded
+  by max achievable recall, so AP@0.50 (0.766) sitting below F1@0.50 (0.852)
+  is expected, not a bug; and it is AP, never mAP — matching is class-agnostic
+  by design, so there is no per-class axis to average over.
+- EXCLUDED PREDICTIONS MUST BE QUOTED WITH PRECISION. Measured on this run:
+  5727 of 7539 entity predictions (76%) named nothing in COCO's evaluated
+  vocabulary — tree, sky, grass, water — and were exempted. Entity precision
+  0.909 therefore describes only the 24% COCO can adjudicate, and is NOT "91%
+  of our masks are good". The console now prints that ratio directly beneath
+  precision so the number cannot be read without its denominator. Recall
+  carries no such caveat.
 
 RESOLVED IN v23 (decided per Pau, after seeing the first real COCO detection
 numbers and finding the entity-level pixel-coverage view too noisy on its
