@@ -514,10 +514,12 @@ never replacing them.
   ("found 8 of 12 cows").
 - Summary dicts, deliberately never merged: `summary["detection"]`
   (localization at the headline threshold), `summary["detection_iou_sweep"]`
-  (the strictness curve — see below), `summary["detection_labels"]` (naming),
+  (the strictness curve — see below), `summary["detection_by_size"]` (COCO's
+  small/medium/large split — see below), `summary["detection_labels"]` (naming),
   `summary["detection_axis_agreement"]` (biotic/material), and
   `summary["detection_nature_on_non_nature"]` (taxonomy disagreement). Console
-  + W&B (`Detection/*`, `DetectionSweep/*`, `DetectionLabels/*`) report all.
+  + W&B (`Detection/*`, `DetectionSweep/*`, `DetectionSize/*`,
+  `DetectionLabels/*`) report all.
 - GT is per-INSTANCE (`load_coco` now stores `gt_boxes` alongside the
   class-collapsed `targets`; `dataset_loader.coco_gt_boxes` back-fills them at
   scoring time from `--instances_json` so pre-existing artifacts need NO
@@ -599,6 +601,26 @@ never replacing them.
   TIGHTNESS**: an F1 that holds from 0.50 to 0.75 means the masks genuinely
   trace their objects; one that collapses means blobs that only just cleared
   the permissive threshold.
+- **OBJECT-SIZE SPLIT** (`summary["detection_by_size"]`,
+  `detection_metrics.size_summary` / `COCO_AREA_RANGES` / `area_bucket`):
+  P/R/F1 split by COCO's OWN size buckets — small < 32² px, medium < 96² px,
+  large beyond — taken verbatim from `pycocotools`'
+  `Params(iouType="segm").areaRng`. This is NOT a project invention: it is the
+  area stratification behind the AP^small/AP^medium/AP^large every COCO
+  submission reports, and cocoeval applies these exact cut-offs to the `segm`
+  task using MASK area. Bucket assignment follows `cocoeval.evaluateImg`: a
+  TP/FN takes its **GT** region's bucket (`g['area']`), an FP takes its **own**
+  predicted region's bucket (`d['area']`). Consequence worth relying on: the
+  three buckets PARTITION the `detection_iou_sweep` totals and sum back to them
+  exactly (verified in tests) — cocoeval itself doesn't have that property,
+  since it re-matches per area range with ignore flags.
+  **ONE DEVIATION TO STATE WHEN REPORTING**: this pipeline scores CONCEPT
+  regions, so a GT entry is every instance of one class MERGED, and its area is
+  that union — not one object's area, which is what cocoeval buckets. A class
+  with many small instances can land in a bigger bucket than any of its
+  objects. Thresholds and protocol are COCO's; the unit is this project's, so
+  these are NOT directly comparable to published COCO AP^S/M/L. `n_gt` per
+  bucket is reported so a weak bucket reads as weak rather than low-support.
 - **NO AP — deliberate, do not add one back.** AP ranks predictions by
   confidence and integrates the PR curve, so it needs a per-prediction
   confidence. `semantic_seg` is a dense logit map with no scalar score per

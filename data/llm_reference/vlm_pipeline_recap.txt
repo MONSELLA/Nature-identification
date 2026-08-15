@@ -1,5 +1,10 @@
-BIG-5 VLM PIPELINE — DESIGN RECAP (v25)
-(v25: COCO detection PREDICTIONS now come from SAM3's SEMANTIC head
+BIG-5 VLM PIPELINE — DESIGN RECAP (v26)
+(v26: COCO detection now ALSO reports P/R/F1 split by COCO's own
+small/medium/large object-size buckets (summary["detection_by_size"]) — the
+same area cut-offs behind AP^S/AP^M/AP^L, read verbatim out of pycocotools'
+Params(iouType="segm").areaRng, so nothing here is invented. See RESOLVED IN
+v26.
+v25: COCO detection PREDICTIONS now come from SAM3's SEMANTIC head
 (semantic_seg) instead of a per-entity UNION of its instance masks, and AP is
 dropped entirely as a consequence — semantic_seg carries no per-region
 confidence to rank by, and the instance-max score that previously stood in for
@@ -1029,6 +1034,49 @@ RESOLVED IN v6 (decided after repeated integration failures):
   clip_metrics.CLIPScorer's class docstring) were PROPOSED as
   replacements here, but neither was actually added to CLIP_PRESETS at
   the time — see RESOLVED IN v8 below for what's actually wired in.
+
+RESOLVED IN v26 (requested by Pau, with the explicit constraint "I do not want
+to invent anything new here" — so the precedent was verified in the source
+before anything was built):
+- PRECEDENT, CHECKED NOT REMEMBERED. pycocotools' own
+  Params(iouType="segm").areaRng is [[0,1e10],[0,1024],[1024,9216],[9216,1e10]]
+  with areaRngLbl ['all','small','medium','large'] — i.e. small < 32^2 px,
+  medium < 96^2 px, large beyond. This is COCO's standard object-size
+  stratification (Lin et al. 2014), the thing behind the AP^small/AP^medium/
+  AP^large columns on every COCO leaderboard, and critically it is defined for
+  the SEGMENTATION task too, not only boxes — cocoeval applies these exact
+  cut-offs using each annotation's MASK area. So size-stratified reporting for
+  a mask-IoU evaluation is completely standard practice.
+- BUCKET ASSIGNMENT follows cocoeval.evaluateImg literally, both halves of it:
+  GT outside the range is ignored (`g['area']<aRng[0] or g['area']>aRng[1]`),
+  and detections outside the range are ignored too (`d['area']<aRng[0] or ...`).
+  Translated to this pipeline: a TP or FN takes its GT region's bucket, an FP
+  takes its OWN predicted region's bucket. Excluded/crowd-suppressed
+  predictions are charged to no bucket, exactly as they are charged to no
+  precision denominator.
+- A PROPERTY WORTH RELYING ON that cocoeval itself lacks: because matching is
+  done ONCE per IoU threshold and the outcomes are then partitioned, every TP,
+  FN and FP lands in exactly one bucket and the three buckets SUM BACK to the
+  detection_iou_sweep totals (asserted in the tests). cocoeval re-runs matching
+  per area range with ignore flags, which can in principle form different pairs
+  per range and so does not reconcile this cleanly.
+- THE ONE DEVIATION, stated wherever the numbers are reported (console note,
+  summary["detection_by_size_note"], CLAUDE.md): this pipeline scores CONCEPT
+  regions, so a GT entry is every annotated instance of one class MERGED into
+  one region and its area is that UNION — not one object's area, which is what
+  cocoeval buckets. A class with many small instances can therefore land in a
+  larger bucket than any individual object would. The thresholds and the
+  protocol are COCO's; the unit is this project's. Consequence: these numbers
+  are NOT directly comparable to published COCO AP^S/M/L, and saying so is
+  required rather than optional. n_gt per bucket is reported alongside so a
+  weak bucket can be read as genuinely weak rather than merely low-support.
+- WHY IT EARNS ITS PLACE beyond "COCO does it": small regions are
+  systematically the hardest under an IoU criterion, because a few pixels of
+  boundary error destroys the IoU of a 20x20 region while barely moving a
+  300x300 one. A pooled score is dominated by whichever size is most common, so
+  the split is what separates "the model misses small things" from "the model's
+  masks are loose" — two different failure modes with different fixes, which
+  the IoU sweep alone cannot tell apart.
 
 RESOLVED IN v25 (decided per Pau, immediately after v24, on the observation
 that if the pipeline is concept-level everywhere else it should take its

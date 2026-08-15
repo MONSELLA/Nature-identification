@@ -134,6 +134,40 @@ COCO_AP_IOU_THRESHOLDS = tuple(round(0.5 + 0.05 * i, 2) for i in range(10))
 # when the prediction sits entirely inside it.
 DEFAULT_CROWD_IOA_THRESHOLD = 0.5
 
+# COCO's OWN object-size stratification, taken verbatim from pycocotools'
+# `Params(iouType="segm").areaRng` — small < 32^2 px, medium < 96^2 px, large
+# beyond. Not this project's invention: AP^small/AP^medium/AP^large is a
+# standard part of the COCO detection AND segmentation protocols (Lin et al.
+# 2014), reported by every method on the COCO leaderboard, and cocoeval applies
+# these exact cut-offs to the `segm` task using each annotation's MASK area.
+#
+# WHY SIZE STRATIFICATION AT ALL: a pooled score is dominated by whatever size
+# happens to be most common, and small objects are systematically the hardest —
+# a few pixels of boundary error destroys the IoU of a 20x20 region while
+# barely moving a 300x300 one. Splitting by size separates "the model misses
+# small things" from "the model's masks are loose", which the pooled number
+# cannot.
+COCO_AREA_RANGES = (
+    ("small", 0, 32 ** 2),
+    ("medium", 32 ** 2, 96 ** 2),
+    ("large", 96 ** 2, float("inf")),
+)
+AREA_BUCKETS = tuple(name for name, _, _ in COCO_AREA_RANGES)
+
+
+def area_bucket(area: float) -> str:
+    """COCO size bucket ("small"/"medium"/"large") for a region of `area` px.
+
+    Boundaries follow cocoeval exactly: a region is in a bucket when
+    `lo <= area < hi`, so 1024 px is the first "medium" and 9216 px the first
+    "large". Anything at or below 0 is reported "small" (a degenerate region
+    cannot be anything else).
+    """
+    for name, lo, hi in COCO_AREA_RANGES:
+        if lo <= area < hi:
+            return name
+    return AREA_BUCKETS[-1]
+
 
 # =============================================================================
 # Box geometry
@@ -475,6 +509,58 @@ def sweep_summary(sweep_counts: Dict[float, Dict[str, int]]) -> Dict[str, Any]:
         out[f"{key}_50"] = _at(0.5, key)
         out[f"{key}_75"] = _at(0.75, key)
         out[f"{key}_50_95"] = float(np.mean([v[key] for v in per_threshold.values()]))
+    return out
+
+
+def size_summary(size_counts: Dict[float, Dict[str, Dict[str, int]]]) -> Dict[str, Any]:
+    """Precision/recall/F1 split by COCO OBJECT-SIZE bucket, per IoU threshold.
+
+    `size_counts` is `{iou_threshold: {bucket: {"tp","fp","fn"}}}`, pooled over
+    the dataset. Buckets are COCO's own small/medium/large (`COCO_AREA_RANGES`),
+    the same cut-offs cocoeval applies to the `segm` task.
+
+    HOW A REGION IS ASSIGNED A BUCKET, mirroring cocoeval.evaluateImg:
+      * a TRUE POSITIVE and a FALSE NEGATIVE take the bucket of their GT region
+        (`g['area']` in cocoeval — GT outside the range is ignored there);
+      * a FALSE POSITIVE takes the bucket of its OWN predicted region
+        (`d['area']` in cocoeval — a detection outside the range is ignored).
+
+    This yields a clean property cocoeval itself does not have: every TP, FN and
+    FP lands in exactly one bucket, so the three buckets PARTITION the pooled
+    counts and sum back to the `sweep_summary` totals. cocoeval re-runs matching
+    per area range with ignore flags, which can in principle form different
+    pairs per range; here matching is done once and the results partitioned,
+    which is deterministic and reconciles exactly.
+
+    Returned per bucket: `precision`/`recall`/`f1` at `@0.50`, `@0.75` and the
+    `@[.50:.95]` mean (the same three headline points as `sweep_summary`), the
+    full `per_iou` table, and `n_gt` — the bucket's GT support at IoU 0.50,
+    which is what makes a weak bucket readable as "genuinely bad" versus
+    "almost no support".
+    """
+    if not size_counts:
+        return {}
+
+    out: Dict[str, Any] = {}
+    for bucket in AREA_BUCKETS:
+        per_threshold: Dict[float, Dict[str, Any]] = {}
+        for t, buckets in sorted(size_counts.items()):
+            c = (buckets or {}).get(bucket, {})
+            tp, fp, fn = c.get("tp", 0), c.get("fp", 0), c.get("fn", 0)
+            precision = tp / (tp + fp) if (tp + fp) else 0.0
+            recall = tp / (tp + fn) if (tp + fn) else 0.0
+            f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) else 0.0
+            per_threshold[t] = {"tp": tp, "fp": fp, "fn": fn,
+                                "precision": precision, "recall": recall, "f1": f1}
+        entry: Dict[str, Any] = {"per_iou": per_threshold}
+        for key in ("precision", "recall", "f1"):
+            entry[f"{key}_50"] = per_threshold.get(0.5, {}).get(key, 0.0)
+            entry[f"{key}_75"] = per_threshold.get(0.75, {}).get(key, 0.0)
+            entry[f"{key}_50_95"] = float(np.mean([v[key] for v in per_threshold.values()])) \
+                if per_threshold else 0.0
+        base = per_threshold.get(0.5, {})
+        entry["n_gt"] = base.get("tp", 0) + base.get("fn", 0)
+        out[bucket] = entry
     return out
 
 

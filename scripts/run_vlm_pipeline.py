@@ -474,11 +474,21 @@ def score_image_entities(rec, gt_boxes_by_file, eval_vocab_terms, graph, iou_thr
     gt_entries = []
     for slot in gt_by_class.values():
         merged = detection_metrics.merge_rles(slot["rles"])
+        # COCO size bucket from the MERGED region's mask area. NOTE the
+        # deviation this inherits from entity granularity, documented in the
+        # function docstring: cocoeval buckets each ANNOTATION's own area,
+        # whereas a merged region is the union of every instance of that class,
+        # so a class with many small instances can land in a larger bucket than
+        # any one of its objects would. The cut-offs and the protocol are
+        # COCO's; what is being measured is a concept region, not an object.
+        merged_area = detection_metrics.rle_area(merged)
         gt_entries.append({**{k: v for k, v in slot.items() if k != "rles"},
                            "mask_rle": merged,
                            "bbox": grounding_pipeline.mask_to_bbox(
                                grounding_pipeline.decode_rle(merged)),
-                           "n_instances": len(slot["rles"])})
+                           "n_instances": len(slot["rles"]),
+                           "area": merged_area,
+                           "size_bucket": detection_metrics.area_bucket(merged_area)})
 
     # --- predictions: SAM3's SEMANTIC mask, one per extracted entity ---
     # No union, no reconstruction — `semantic_seg` is already concept-level, so
@@ -490,12 +500,16 @@ def score_image_entities(rec, gt_boxes_by_file, eval_vocab_terms, graph, iou_thr
     for oi, g in enumerate(rec.get("object_groundings") or []):
         if g.get("grounded") is not True or not g.get("mask_rle"):
             continue
+        # pixel_count is SAM3's own count for this mask; fall back to the RLE's
+        # area so the size bucket is never silently 0 on an older artifact.
+        px = g.get("pixel_count") or detection_metrics.rle_area(g["mask_rle"])
         pred_entries.append({
             "object": g["object"], "object_idx": oi,
             "mask_rle": g["mask_rle"],
             "bbox": grounding_pipeline.mask_to_bbox(
                 grounding_pipeline.decode_rle(g["mask_rle"])),
-            "pixel_count": g.get("pixel_count", 0),
+            "pixel_count": px,
+            "size_bucket": detection_metrics.area_bucket(px),
         })
 
     if not gt_entries:
@@ -534,7 +548,7 @@ def score_image_entities(rec, gt_boxes_by_file, eval_vocab_terms, graph, iou_thr
     # matched sibling — leaving the lexical test to decide, which is the
     # intended behaviour here.
     fp_rows, excluded_rows = [], []
-    n_fp, n_excluded, n_crowd = _classify_unmatched(
+    n_fp, n_excluded, n_crowd, fp_idxs = _classify_unmatched(
         pred_entries, unmatched_pred, crowd_regions, eval_vocab_terms,
         fp_rows, excluded_rows)
 
@@ -543,21 +557,40 @@ def score_image_entities(rec, gt_boxes_by_file, eval_vocab_terms, graph, iou_thr
     # each rung needs its own assignment pass. No AP here and no confidence
     # ranking of any kind: `semantic_seg` carries no per-region score (see the
     # docstring), and this metric does not need one.
+    #
+    # Each rung is ALSO partitioned into COCO's small/medium/large size buckets
+    # (detection_metrics.COCO_AREA_RANGES — cocoeval's own cut-offs for the
+    # `segm` task). Assignment follows cocoeval.evaluateImg: a TP/FN takes its
+    # GT region's bucket, an FP takes its OWN region's bucket. Every counted
+    # outcome therefore lands in exactly one bucket, so the buckets partition
+    # the totals above and reconcile with them exactly.
     gt_bboxes = [g["bbox"] for g in gt_entries]
     pred_bboxes = [p["bbox"] for p in pred_entries]
-    sweep = {}
+    sweep, size_sweep = {}, {}
+
+    def _bucket_counts(m, unm_gt, fps):
+        """Partition one threshold's outcomes into COCO size buckets."""
+        b = {name: {"tp": 0, "fp": 0, "fn": 0} for name in detection_metrics.AREA_BUCKETS}
+        for gi, _, _ in m:
+            b[gt_entries[gi]["size_bucket"]]["tp"] += 1
+        for gi in unm_gt:
+            b[gt_entries[gi]["size_bucket"]]["fn"] += 1
+        for pi in fps:
+            b[pred_entries[pi]["size_bucket"]]["fp"] += 1
+        return b
+
     for t in detection_metrics.COCO_AP_IOU_THRESHOLDS:
         if t == iou_threshold:
-            t_tp, t_fp, t_fn = len(matches), n_fp, len(unmatched_gt)
-            t_excluded, t_crowd = n_excluded, n_crowd
+            t_matches, t_unmatched_gt, t_fp_idxs = matches, unmatched_gt, fp_idxs
+            t_fp, t_excluded, t_crowd = n_fp, n_excluded, n_crowd
         else:
             t_matches, t_unmatched_gt, t_unmatched = detection_metrics.match_boxes(
                 gt_bboxes, pred_bboxes, iou_threshold=t, ious=ious)
-            t_fp, t_excluded, t_crowd = _classify_unmatched(
+            t_fp, t_excluded, t_crowd, t_fp_idxs = _classify_unmatched(
                 pred_entries, t_unmatched, crowd_regions, eval_vocab_terms, None, None)
-            t_tp, t_fn = len(t_matches), len(t_unmatched_gt)
-        sweep[t] = {"tp": t_tp, "fp": t_fp, "fn": t_fn,
+        sweep[t] = {"tp": len(t_matches), "fp": t_fp, "fn": len(t_unmatched_gt),
                     "excluded_pred": t_excluded, "crowd_suppressed": t_crowd}
+        size_sweep[t] = _bucket_counts(t_matches, t_unmatched_gt, t_fp_idxs)
 
     # TAXONOMY-DISAGREEMENT DIAGNOSTIC, at entity granularity: a grounded
     # NATURE entity region overlapping a GT region whose COCO class resolves to
@@ -611,6 +644,9 @@ def score_image_entities(rec, gt_boxes_by_file, eval_vocab_terms, graph, iou_thr
         # deliberately no ap_records companion; see the docstring on why the
         # semantic head supports no confidence ranking.
         "sweep": sweep,
+        # {iou_threshold: {size_bucket: {tp, fp, fn}}} — the same outcomes
+        # partitioned by COCO's small/medium/large. Sums back to `sweep`.
+        "size_sweep": size_sweep,
     }
 
 
@@ -633,10 +669,13 @@ def _classify_unmatched(preds, unmatched_pred, crowd_regions, eval_vocab_terms,
     """Apply the crowd-suppression and curated-vocabulary rules to a set of
     unmatched predictions.
 
-    Returns `(n_fp, n_excluded, n_crowd)`. `fp_rows` / `excluded_rows` collect
-    the per-prediction detail for the CSV and may be None when the caller only
-    needs the counters (the IoU sweep re-runs this at ten thresholds and wants
-    no duplicated detail rows).
+    Returns `(n_fp, n_excluded, n_crowd, fp_idxs)`, where `fp_idxs` lists the
+    indices into `preds` that were charged as false positives — needed so the
+    caller can bucket each FP by its own region area (COCO's size
+    stratification assigns an FP by `d['area']`, not the GT's). `fp_rows` /
+    `excluded_rows` collect the per-prediction detail for the CSV and may be
+    None when the caller only needs the counters (the IoU sweep re-runs this at
+    ten thresholds and wants no duplicated detail rows).
 
     An unmatched prediction is a FALSE POSITIVE when its own phrase names a
     class in the evaluated vocabulary (`classify_unmatched_prediction`), and
@@ -654,6 +693,7 @@ def _classify_unmatched(preds, unmatched_pred, crowd_regions, eval_vocab_terms,
     could never fire — it was removed as dead, not as a relaxation.
     """
     n_fp = n_excluded = n_crowd = 0
+    fp_idxs = []
     for pi in unmatched_pred:
         if _crowd_suppressed(preds[pi], crowd_regions):
             n_crowd += 1
@@ -669,12 +709,15 @@ def _classify_unmatched(preds, unmatched_pred, crowd_regions, eval_vocab_terms,
                                       "pred_pixels": preds[pi].get("pixel_count", 0)})
             continue
         n_fp += 1
+        fp_idxs.append(pi)
         if fp_rows is not None:
             fp_rows.append({"pred_object": preds[pi]["object"], "named_class": named,
                             "pred_bbox": preds[pi]["bbox"],
                             "pred_mask_rle": preds[pi].get("mask_rle"),
-                            "pred_pixels": preds[pi].get("pixel_count", 0)})
-    return n_fp, n_excluded, n_crowd
+                            "pred_pixels": preds[pi].get("pixel_count", 0),
+                            "size_bucket": detection_metrics.area_bucket(
+                                preds[pi].get("pixel_count", 0))})
+    return n_fp, n_excluded, n_crowd, fp_idxs
 
 
 def _pred_label_terms(phrase):
@@ -1831,6 +1874,11 @@ def phase_score(args):
     ent_sweep_counts = {t: {"tp": 0, "fp": 0, "fn": 0,
                             "excluded_pred": 0, "crowd_suppressed": 0}
                         for t in detection_metrics.COCO_AP_IOU_THRESHOLDS}
+    # Same outcomes as ent_sweep_counts, partitioned by COCO's small/medium/
+    # large object-size buckets (detection_metrics.COCO_AREA_RANGES).
+    ent_size_counts = {t: {b: {"tp": 0, "fp": 0, "fn": 0}
+                           for b in detection_metrics.AREA_BUCKETS}
+                       for t in detection_metrics.COCO_AP_IOU_THRESHOLDS}
     ent_label_records = []
     ent_axis_records = []
     # Taxonomy-disagreement diagnostic (see score_image_entities): which
@@ -2262,6 +2310,10 @@ def phase_score(args):
             for t, c in ent["sweep"].items():
                 for key in ("tp", "fp", "fn", "excluded_pred", "crowd_suppressed"):
                     ent_sweep_counts[t][key] += c[key]
+            for t, buckets in ent["size_sweep"].items():
+                for b, c in buckets.items():
+                    for key in ("tp", "fp", "fn"):
+                        ent_size_counts[t][b][key] += c[key]
             ent_label_records.extend(ent["label_records"])
             ent_axis_records.extend(ent["axis_records"])
             det_nature_on_non_nature.extend(ent["nature_on_non_nature"])
@@ -2422,6 +2474,12 @@ def phase_score(args):
             "detection_tp_by_iou_image": (
                 json.dumps({str(t): c["tp"] for t, c in sorted(ent["sweep"].items())})
                 if ent else None),
+            # This image's outcomes at the headline threshold, split by COCO
+            # size bucket — so "we only miss small things" is checkable per
+            # image, not just dataset-wide.
+            "detection_by_size_image": (
+                json.dumps(ent["size_sweep"][args.detection_iou_threshold])
+                if ent and args.detection_iou_threshold in ent["size_sweep"] else None),
             # Taxonomy disagreements on THIS image: nature entities whose region
             # landed on a non-nature GT class. Carries the GT class and the IoU
             # so the "is this the Nature-Based Artefacts clause or a loose mask"
@@ -2666,6 +2724,30 @@ def phase_score(args):
         # See detection_metrics.sweep_summary on why this is NOT AP and what
         # each of the two actually measures.
         summary["detection_iou_sweep"] = detection_metrics.sweep_summary(ent_sweep_counts)
+        # COCO's own small/medium/large stratification (AP^S/AP^M/AP^L's area
+        # cut-offs, applied to P/R/F1). Small objects are systematically the
+        # hardest — a few pixels of boundary error wrecks a 20x20 region's IoU
+        # and barely touches a 300x300 one — so the pooled number hides which
+        # failure mode dominates.
+        summary["detection_by_size"] = detection_metrics.size_summary(ent_size_counts)
+        summary["detection_by_size_note"] = (
+            "Precision/recall/F1 split by COCO's OWN object-size buckets: small < 32^2 px, "
+            "medium < 96^2 px, large beyond (detection_metrics.COCO_AREA_RANGES, taken "
+            "verbatim from pycocotools' Params(iouType='segm').areaRng — the same cut-offs "
+            "behind the AP^small/AP^medium/AP^large every COCO submission reports, applied to "
+            "the segmentation task using mask area). Bucket assignment follows "
+            "cocoeval.evaluateImg: a TP or FN takes its GT region's bucket, a FP takes its own "
+            "predicted region's bucket, so the three buckets PARTITION the totals in "
+            "detection_iou_sweep and sum back to them exactly. "
+            "ONE DEVIATION TO STATE WHEN REPORTING: this pipeline evaluates CONCEPT regions, "
+            "so a GT entry is every annotated instance of one class MERGED into a single "
+            "region, and its area is that union — not one object's area, which is what "
+            "cocoeval buckets. A class with many small instances can therefore land in a "
+            "larger bucket than any individual object would. The thresholds and the protocol "
+            "are COCO's; the unit being measured is this project's concept region, so these "
+            "numbers are not directly comparable to published COCO AP^S/M/L. n_gt per bucket "
+            "is reported so a weak bucket can be read as genuinely weak rather than "
+            "low-support.")
         summary["detection_labels"] = detection_metrics.label_summary(ent_label_records)
         # Biotic/material agreement between the PREDICTED entity's own hybrid
         # label and the GT class's taxonomy position, on the SAME matched
@@ -2951,6 +3033,22 @@ def _print_summary(s, run_clipmatch):
                           f"{r['f1']:>8.4f}    {r['tp']}/{r['fp']}/{r['fn']}")
             print(f"{'IoU @[.50:.95]':>16}  {sw['precision_50_95']:>8.4f} "
                   f"{sw['recall_50_95']:>8.4f} {sw['f1_50_95']:>8.4f}    (mean over the ladder)")
+        bysz = s.get("detection_by_size") or {}
+        if bysz:
+            # COCO's own AP^S/AP^M/AP^L area cut-offs, applied to P/R/F1.
+            # n_gt is printed per bucket because a bucket with almost no
+            # support reads very differently from a genuinely weak one.
+            print("[by COCO object size — small <32^2 px, medium <96^2 px, large beyond; "
+                  "GT regions are MERGED per class, see detection_by_size_note]")
+            print(f"{'':>16}  {'P@.50':>8} {'R@.50':>8} {'F1@.50':>8} {'F1@.75':>8} "
+                  f"{'F1@[.5:.95]':>12}   n_GT")
+            for b in detection_metrics.AREA_BUCKETS:
+                e = bysz.get(b)
+                if not e:
+                    continue
+                print(f"{b:>16}  {e['precision_50']:>8.4f} {e['recall_50']:>8.4f} "
+                      f"{e['f1_50']:>8.4f} {e['f1_75']:>8.4f} {e['f1_50_95']:>12.4f}   "
+                      f"{e['n_gt']}")
         else:
             print(f"[localization, class-agnostic matching]  P {det['precision']:.4f} | "
                   f"R {det['recall']:.4f} | F1 {det['f1']:.4f}   "
@@ -3119,6 +3217,12 @@ def _log_wandb(args, summary, run_clipmatch):
                                          ("50_95", "IoU50_95")):
                 if f"{key}_{suffix}" in sw:
                     log[f"DetectionSweep/{key}_{wandb_suffix}"] = sw[f"{key}_{suffix}"]
+        # Size buckets get their own namespace too — comparing a model's small
+        # bucket against another model's pooled number would be meaningless.
+        for b, e in (summary.get("detection_by_size") or {}).items():
+            for key in ("precision_50", "recall_50", "f1_50", "f1_75", "f1_50_95"):
+                log[f"DetectionSize/{b}_{key}"] = e[key]
+            log[f"DetectionSize/{b}_n_gt"] = e["n_gt"]
         nn = summary.get("detection_nature_on_non_nature")
         if nn is not None:
             # Own namespace, like the localization/naming split: this is a
