@@ -474,21 +474,23 @@ def score_image_entities(rec, gt_boxes_by_file, eval_vocab_terms, graph, iou_thr
     gt_entries = []
     for slot in gt_by_class.values():
         merged = detection_metrics.merge_rles(slot["rles"])
-        # COCO size bucket from the MERGED region's mask area. NOTE the
-        # deviation this inherits from entity granularity, documented in the
-        # function docstring: cocoeval buckets each ANNOTATION's own area,
-        # whereas a merged region is the union of every instance of that class,
-        # so a class with many small instances can land in a larger bucket than
-        # any one of its objects would. The cut-offs and the protocol are
-        # COCO's; what is being measured is a concept region, not an object.
-        merged_area = detection_metrics.rle_area(merged)
+        # COCO size bucket from the MEAN of the INDIVIDUAL instances' own
+        # areas, NOT the merged region's area. cocoeval buckets each
+        # annotation by its own area; a bowl of ten small oranges merged into
+        # one region would otherwise inherit the bowl's total footprint and
+        # get bucketed "large" even though every single orange is "small".
+        # Taking the mean of the pre-merge instance areas (still available
+        # here, before slot["rles"] is unioned) keeps the bucket representative
+        # of a typical object of this class rather than of the merged blob.
+        instance_areas = [detection_metrics.rle_area(r) for r in slot["rles"]]
+        mean_instance_area = float(np.mean(instance_areas)) if instance_areas else 0.0
         gt_entries.append({**{k: v for k, v in slot.items() if k != "rles"},
                            "mask_rle": merged,
                            "bbox": grounding_pipeline.mask_to_bbox(
                                grounding_pipeline.decode_rle(merged)),
                            "n_instances": len(slot["rles"]),
-                           "area": merged_area,
-                           "size_bucket": detection_metrics.area_bucket(merged_area)})
+                           "area": mean_instance_area,
+                           "size_bucket": detection_metrics.area_bucket(mean_instance_area)})
 
     # --- predictions: SAM3's SEMANTIC mask, one per extracted entity ---
     # No union, no reconstruction — `semantic_seg` is already concept-level, so
@@ -561,7 +563,11 @@ def score_image_entities(rec, gt_boxes_by_file, eval_vocab_terms, graph, iou_thr
     # Each rung is ALSO partitioned into COCO's small/medium/large size buckets
     # (detection_metrics.COCO_AREA_RANGES — cocoeval's own cut-offs for the
     # `segm` task). Assignment follows cocoeval.evaluateImg: a TP/FN takes its
-    # GT region's bucket, an FP takes its OWN region's bucket. Every counted
+    # GT region's bucket (gt_entries[...]["size_bucket"], the MEAN of that
+    # class's individual pre-merge instance areas — see the GT-collapse loop
+    # above for why not the merged area), an FP takes its OWN predicted
+    # region's bucket (necessarily the whole blob's area: semantic_seg has no
+    # instance decomposition to fall back to, unlike GT). Every counted
     # outcome therefore lands in exactly one bucket, so the buckets partition
     # the totals above and reconcile with them exactly.
     gt_bboxes = [g["bbox"] for g in gt_entries]
@@ -2739,15 +2745,20 @@ def phase_score(args):
             "cocoeval.evaluateImg: a TP or FN takes its GT region's bucket, a FP takes its own "
             "predicted region's bucket, so the three buckets PARTITION the totals in "
             "detection_iou_sweep and sum back to them exactly. "
-            "ONE DEVIATION TO STATE WHEN REPORTING: this pipeline evaluates CONCEPT regions, "
-            "so a GT entry is every annotated instance of one class MERGED into a single "
-            "region, and its area is that union — not one object's area, which is what "
-            "cocoeval buckets. A class with many small instances can therefore land in a "
-            "larger bucket than any individual object would. The thresholds and the protocol "
-            "are COCO's; the unit being measured is this project's concept region, so these "
-            "numbers are not directly comparable to published COCO AP^S/M/L. n_gt per bucket "
-            "is reported so a weak bucket can be read as genuinely weak rather than "
-            "low-support.")
+            "GT'S BUCKET IS THE MEAN OF ITS PRE-MERGE INSTANCE AREAS, not the merged region's "
+            "area — this pipeline evaluates CONCEPT regions, so a GT entry is every annotated "
+            "instance of one class merged into one region for MATCHING, but a bowl of ten small "
+            "oranges merged into one region would otherwise inherit the bowl's total footprint "
+            "and read as 'large' even though every orange is 'small'. The mean of the original, "
+            "pre-merge instance areas keeps the bucket representative of a typical object of "
+            "that class rather than of the merged blob. "
+            "PREDICTIONS CANNOT GET THE SAME TREATMENT: an FP is bucketed by its own predicted "
+            "area, necessarily the whole blob's, because semantic_seg produces one dense mask "
+            "with no instance boundaries to decompose — there is no 'individual predicted "
+            "instance area' to average. This is a real, unavoidable asymmetry: a model that "
+            "over-generates one big blob for a flock of small birds is charged an FP against "
+            "'large' even though the underlying objects were small. n_gt per bucket is reported "
+            "so a weak bucket can be read as genuinely weak rather than low-support.")
         summary["detection_labels"] = detection_metrics.label_summary(ent_label_records)
         # Biotic/material agreement between the PREDICTED entity's own hybrid
         # label and the GT class's taxonomy position, on the SAME matched
@@ -3039,7 +3050,8 @@ def _print_summary(s, run_clipmatch):
             # n_gt is printed per bucket because a bucket with almost no
             # support reads very differently from a genuinely weak one.
             print("[by COCO object size — small <32^2 px, medium <96^2 px, large beyond; "
-                  "GT regions are MERGED per class, see detection_by_size_note]")
+                  "GT bucketed by MEAN pre-merge instance area, FP by its own blob's area "
+                  "(no instance decomposition on the prediction side) — see detection_by_size_note]")
             print(f"{'':>16}  {'P@.50':>8} {'R@.50':>8} {'F1@.50':>8} {'F1@.75':>8} "
                   f"{'F1@[.5:.95]':>12}   n_GT")
             for b in detection_metrics.AREA_BUCKETS:

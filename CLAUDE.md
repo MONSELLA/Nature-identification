@@ -609,18 +609,27 @@ never replacing them.
   area stratification behind the AP^small/AP^medium/AP^large every COCO
   submission reports, and cocoeval applies these exact cut-offs to the `segm`
   task using MASK area. Bucket assignment follows `cocoeval.evaluateImg`: a
-  TP/FN takes its **GT** region's bucket (`g['area']`), an FP takes its **own**
-  predicted region's bucket (`d['area']`). Consequence worth relying on: the
-  three buckets PARTITION the `detection_iou_sweep` totals and sum back to them
-  exactly (verified in tests) — cocoeval itself doesn't have that property,
-  since it re-matches per area range with ignore flags.
-  **ONE DEVIATION TO STATE WHEN REPORTING**: this pipeline scores CONCEPT
-  regions, so a GT entry is every instance of one class MERGED, and its area is
-  that union — not one object's area, which is what cocoeval buckets. A class
-  with many small instances can land in a bigger bucket than any of its
-  objects. Thresholds and protocol are COCO's; the unit is this project's, so
-  these are NOT directly comparable to published COCO AP^S/M/L. `n_gt` per
-  bucket is reported so a weak bucket reads as weak rather than low-support.
+  TP/FN takes its **GT** region's bucket, an FP takes its **own** predicted
+  region's bucket. Consequence worth relying on: the three buckets PARTITION
+  the `detection_iou_sweep` totals and sum back to them exactly (verified in
+  tests) — cocoeval itself doesn't have that property, since it re-matches per
+  area range with ignore flags.
+  **GT'S BUCKET USES THE MEAN OF ITS PRE-MERGE INSTANCE AREAS, not the merged
+  region's area.** This pipeline scores CONCEPT regions, so a GT entry is
+  every annotated instance of one class merged into one region for MATCHING —
+  but bucketing by the merged area would put a bowl of ten small oranges in
+  "large" because the union spans the whole bowl, even though every orange is
+  "small". Averaging the ORIGINAL, pre-merge instance areas (still available
+  before the union — `gt_by_class` retains each instance's own RLE) keeps the
+  bucket representative of a typical object of that class. **PREDICTIONS
+  CANNOT GET THE SAME FIX**: an FP is bucketed by its own predicted area,
+  necessarily the whole blob's, because `semantic_seg` produces one dense mask
+  with no instance boundaries to decompose — there is no "individual predicted
+  instance" to average. This is a real, unavoidable asymmetry, not an
+  oversight: a model that over-generates one big blob for a flock of small
+  birds is charged an FP against "large" even though the underlying objects
+  were small. `n_gt` per bucket is reported so a weak bucket reads as weak
+  rather than low-support.
 - **NO AP — deliberate, do not add one back.** AP ranks predictions by
   confidence and integrates the PR curve, so it needs a per-prediction
   confidence. `semantic_seg` is a dense logit map with no scalar score per

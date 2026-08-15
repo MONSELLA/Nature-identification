@@ -1,5 +1,12 @@
-BIG-5 VLM PIPELINE — DESIGN RECAP (v26)
-(v26: COCO detection now ALSO reports P/R/F1 split by COCO's own
+BIG-5 VLM PIPELINE — DESIGN RECAP (v27)
+(v27: the v26 size split's GT bucket now uses the MEAN of each class's
+pre-merge instance areas, not the merged region's area — fixes a bowl-of-
+oranges/flock-of-birds distortion Pau spotted where many small instances
+merged into one concept region would otherwise read as "large". Predictions
+cannot get the same fix (semantic_seg has no instance decomposition); this
+asymmetry is now documented everywhere the numbers appear. See RESOLVED IN
+v27.
+v26: COCO detection now ALSO reports P/R/F1 split by COCO's own
 small/medium/large object-size buckets (summary["detection_by_size"]) — the
 same area cut-offs behind AP^S/AP^M/AP^L, read verbatim out of pycocotools'
 Params(iouType="segm").areaRng, so nothing here is invented. See RESOLVED IN
@@ -1034,6 +1041,44 @@ RESOLVED IN v6 (decided after repeated integration failures):
   clip_metrics.CLIPScorer's class docstring) were PROPOSED as
   replacements here, but neither was actually added to CLIP_PRESETS at
   the time — see RESOLVED IN v8 below for what's actually wired in.
+
+RESOLVED IN v27 (Pau's own follow-up question on v26, immediately after
+reading its documented deviation — "since I do semantic segmentation for
+both things and stuff, a lot of tiny objects together may fall into large
+area"):
+- THE MECHANISM Pau named precisely: v26 bucketed each merged GT class entry
+  by the UNION area of every instance of that class in the image. A bowl of
+  ten small oranges (each individually well under 32^2 px, genuinely "small"
+  by cocoeval's own per-instance rule) merges into one region whose bounding
+  span covers most of the bowl — easily over 96^2 px — and gets bucketed
+  "large". The pooled small-object number would then be blind to exactly the
+  crowded-scene case (many small instances of one class) that motivated
+  entity-granularity scoring in the first place.
+- THE FIX, GT SIDE ONLY: gt_by_class already retains every instance's own
+  pre-merge RLE (needed to build the merged region in the first place), so
+  bucketing now uses the MEAN of those individual instance areas instead of
+  the merged area — one extra np.mean() over data already in hand, not a new
+  measurement invented. A single-instance class is unaffected (mean of one
+  value equals that value), so this only changes behavior for classes that
+  actually have multiple instances merged, which is precisely the case it
+  targets. Verified: ten synthetic 20x20 instances scattered across an image
+  (union spans the whole image) now bucket "small", matching what a per-
+  instance cocoeval run would report for each individual orange.
+- THE FIX DOES NOT REACH PREDICTIONS, and this is structural, not an
+  oversight to close later. An FP's bucket is still its own predicted area,
+  because v25 moved detection onto SAM3's semantic_seg specifically to get
+  one concept-level mask with NO underlying instance decomposition — there is
+  no list of "individual predicted instances" to average the way GT's
+  pre-merge instances can be. A model that emits one large blob covering a
+  flock of small birds is charged an FP against "large" regardless of how
+  small the real birds were. Documented at every point the numbers surface
+  (detection_by_size_note, the console print, CLAUDE.md) as a named, accepted
+  asymmetry — not hidden and not something a future pass should try to
+  "fix" without a genuinely new source of per-instance prediction geometry.
+- THE PARTITION PROPERTY (buckets sum back to detection_iou_sweep's totals)
+  is UNCHANGED and still holds exactly — only which bucket a GT entry falls
+  into moved, not whether every TP/FN/FP is counted in exactly one bucket.
+  Re-verified in tests alongside the new mean-area assertion.
 
 RESOLVED IN v26 (requested by Pau, with the explicit constraint "I do not want
 to invent anything new here" — so the precedent was verified in the source
