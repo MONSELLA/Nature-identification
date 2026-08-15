@@ -8,14 +8,14 @@ scripts/run_vlm_pipeline.py's `--stage score`).
 
 WHAT THIS EVALUATES
     The VLM pipeline extracts entity PHRASES ("a cow", "grass"); SAM3's
-    instance head turns each nature-labeled phrase into instance MASKS. COCO
-    ships per-instance segmentation with a class label for every annotation.
-    This module answers the two questions that pairing makes possible, and
-    keeps them SEPARATE:
+    SEMANTIC head turns each nature-labeled phrase into one concept-level MASK.
+    COCO ships per-instance segmentation with a class label for every
+    annotation. This module answers the two questions that pairing makes
+    possible, and keeps them SEPARATE:
 
       1. LOCALIZATION — did the pipeline's mask land where COCO says an
-         object is?  TP / FP / FN -> precision, recall, F1, plus AP.
-      2. LABEL CORRECTNESS — for the instances that DID match a GT object, was
+         object is?  TP / FP / FN -> precision, recall, F1.
+      2. LABEL CORRECTNESS — for the regions that DID match a GT object, was
          the entity named correctly?  Scored two ways: exact match (the strict
          view) and hierarchically (hP/hR/hF1 + Wu-Palmer, the graded view that
          gives "bull" partial credit against a GT of "cow" instead of flat
@@ -25,12 +25,36 @@ WHAT THIS EVALUATES
     model that localizes badly but names well look identical to one that does
     the reverse, and those are different failures with different fixes.
 
+GRANULARITY IS ENTITY (CONCEPT) LEVEL, set by the caller
+    (`scripts/run_vlm_pipeline.py`'s `score_image_entities`, this module's only
+    production consumer). Each prediction is SAM3's `semantic_seg` mask for one
+    extracted entity — already one region per concept — and each GT entry is
+    every annotated instance of one class merged into ONE region. The functions
+    below are granularity-agnostic (they take regions and counters), but the
+    numbers they produce are about CONCEPTS, not individual objects, because
+    that is what this pipeline predicts. An instance-level caller existed and
+    was removed: it punished SAM3's undeduplicated duplicate queries and COCO's
+    non-exhaustive annotation of crowded scenes, neither a model error.
+
+NO AVERAGE PRECISION — deliberate, and the reason is not "we didn't get to it".
+    AP ranks predictions by confidence and integrates the resulting PR curve,
+    so it needs a per-prediction confidence. `semantic_seg` is a dense logit
+    map: there is no scalar score attached to a concept's mask. An earlier
+    version scored the instance head instead and ranked by each entity's
+    strongest instance, which was an engineering convenience rather than a
+    measurement — "the strongest instance that happened to clear the score
+    gate", not a calibrated confidence for the region actually being matched.
+    Manufacturing a replacement (mean sigmoid inside the mask, pixel count,
+    ...) would be strictly worse than reporting nothing. `sweep_summary` is
+    the headline instead, and needs no confidence at all: it varies the IoU
+    THRESHOLD at a fixed prediction set, which measures MASK TIGHTNESS.
+
 MATCHING IS ON MASKS, NEVER BOXES. What SAM3 actually produces IS a mask, and
     COCO ships per-instance `segmentation` for every annotation, so reducing
     both sides to boxes first discards real signal: a box around a curled-up
     dog is mostly the sofa behind it, and two masks that overlap poorly can
     share a nearly identical box (`mask_iou_matrix`, via pycocotools' own
-    `iou`, is what `score_image_detection` actually calls; `box_iou`/
+    `iou`, is what `score_image_entities` actually calls; `box_iou`/
     `iou_matrix` below remain as general-purpose box-geometry primitives —
     used by the pure-geometry test suite and by crowd suppression's box
     variant — not as an alternative matching mode). Two crossing diagonal
@@ -79,7 +103,7 @@ NO TRUE NEGATIVES.
     Detection has no "correctly rejected background region" to count: the
     space of masks that could have been predicted and weren't is unbounded.
     TN is therefore undefined and no accuracy is reported here — only
-    precision, recall, F1 and AP, all of which are well-defined without it.
+    precision, recall and F1, all of which are well-defined without it.
     This is a deliberate departure from the axis metrics elsewhere in the
     project, which DO report accuracy because their negative class is a real,
     finite thing.
@@ -98,7 +122,9 @@ import numpy as np
 # Standard COCO-style operating point for "the box is on the right object".
 DEFAULT_IOU_THRESHOLD = 0.5
 
-# COCO's own AP sweep: 0.50, 0.55, ..., 0.95.
+# COCO's own IoU ladder: 0.50, 0.55, ..., 0.95. Used by the strictness sweep
+# (sweep_summary); the name is kept for continuity with COCO's convention even
+# though this project no longer computes AP over it.
 COCO_AP_IOU_THRESHOLDS = tuple(round(0.5 + 0.05 * i, 2) for i in range(10))
 
 # Fraction of a PREDICTED box that must fall inside a crowd region before the
@@ -107,6 +133,40 @@ COCO_AP_IOU_THRESHOLDS = tuple(round(0.5 + 0.05 * i, 2) for i in range(10))
 # typically far larger than any single prediction, so IoU would stay tiny even
 # when the prediction sits entirely inside it.
 DEFAULT_CROWD_IOA_THRESHOLD = 0.5
+
+# COCO's OWN object-size stratification, taken verbatim from pycocotools'
+# `Params(iouType="segm").areaRng` — small < 32^2 px, medium < 96^2 px, large
+# beyond. Not this project's invention: AP^small/AP^medium/AP^large is a
+# standard part of the COCO detection AND segmentation protocols (Lin et al.
+# 2014), reported by every method on the COCO leaderboard, and cocoeval applies
+# these exact cut-offs to the `segm` task using each annotation's MASK area.
+#
+# WHY SIZE STRATIFICATION AT ALL: a pooled score is dominated by whatever size
+# happens to be most common, and small objects are systematically the hardest —
+# a few pixels of boundary error destroys the IoU of a 20x20 region while
+# barely moving a 300x300 one. Splitting by size separates "the model misses
+# small things" from "the model's masks are loose", which the pooled number
+# cannot.
+COCO_AREA_RANGES = (
+    ("small", 0, 32 ** 2),
+    ("medium", 32 ** 2, 96 ** 2),
+    ("large", 96 ** 2, float("inf")),
+)
+AREA_BUCKETS = tuple(name for name, _, _ in COCO_AREA_RANGES)
+
+
+def area_bucket(area: float) -> str:
+    """COCO size bucket ("small"/"medium"/"large") for a region of `area` px.
+
+    Boundaries follow cocoeval exactly: a region is in a bucket when
+    `lo <= area < hi`, so 1024 px is the first "medium" and 9216 px the first
+    "large". Anything at or below 0 is reported "small" (a degenerate region
+    cannot be anything else).
+    """
+    for name, lo, hi in COCO_AREA_RANGES:
+        if lo <= area < hi:
+            return name
+    return AREA_BUCKETS[-1]
 
 
 # =============================================================================
@@ -223,45 +283,6 @@ def merge_rles(rles: Sequence[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
             "counts": counts.decode("ascii") if isinstance(counts, bytes) else counts}
 
 
-def mask_nms(rles: Sequence[Dict[str, Any]], scores: Sequence[float],
-             iou_threshold: float = 0.5) -> List[int]:
-    """Greedy non-maximum suppression over MASKS. Returns the indices to KEEP,
-    highest-score-first.
-
-    WHY THIS IS NEEDED HERE, verified against the transformers source rather
-    than assumed: `Sam3ImageProcessor.post_process_instance_segmentation`
-    applies ONLY a score threshold (`keep = scores > threshold`) — there is no
-    NMS and no deduplication anywhere in it. So when several of SAM3's
-    instance queries fire on the SAME physical object, every one of them above
-    `--instance_score_threshold` survives as a separate "instance". Observed
-    in production: seven heavily-overlapping "orange slice" masks over what
-    were really two annotated oranges.
-
-    That matters beyond cosmetics, because duplicates are charged as false
-    positives: the first duplicate matches the GT instance, and one-to-one
-    Hungarian assignment leaves its twins unmatched, where the
-    curated-vocabulary rule (specifically its `entity_matched_elsewhere_in_image`
-    half) then counts each as an FP. Suppressing them is standard detection
-    practice and is what makes the precision figure mean "how often was a
-    prediction right" rather than "how often did the model emit exactly one
-    box per object".
-
-    Greedy rather than anything cleverer: take the highest-scoring mask, drop
-    every remaining mask overlapping it by >= `iou_threshold`, repeat. This is
-    the textbook formulation and the one COCO-era detectors use.
-    """
-    order = sorted(range(len(rles)), key=lambda i: scores[i], reverse=True)
-    keep: List[int] = []
-    while order:
-        best = order.pop(0)
-        keep.append(best)
-        if not order:
-            break
-        ious = mask_iou_matrix([rles[best]], [rles[i] for i in order])[0]
-        order = [i for k, i in enumerate(order) if ious[k] < iou_threshold]
-    return keep
-
-
 def rle_area(rle: Optional[Dict[str, Any]]) -> int:
     """Pixel count of an RLE mask, straight from pycocotools (no decode)."""
     if rle is None:
@@ -271,81 +292,6 @@ def rle_area(rle: Optional[Dict[str, Any]]) -> int:
     native = {"size": list(rle["size"]),
               "counts": counts.encode("ascii") if isinstance(counts, str) else counts}
     return int(mask_utils.area(native))
-
-
-def pixel_stats(gt_rle: Optional[Dict[str, Any]],
-                pred_rle: Optional[Dict[str, Any]]) -> Dict[str, float]:
-    """PIXEL-level agreement between one GT region and one predicted region.
-
-    A different question from the matched/not-matched verdict the detection
-    metrics report, and the one that matters when what you care about is "how
-    much of the banana did we actually find" rather than "did we find a
-    banana at all". Region matching is BINARY above a threshold: a prediction
-    covering 55% of the GT and one covering 99% both score as a single true
-    positive. These numbers separate them, and need no threshold at all.
-
-        pixel_recall    = |pred ∩ gt| / |gt|    how much of the real thing we got
-        pixel_precision = |pred ∩ gt| / |pred|  how much of what we claimed is real
-        pixel_iou       = |pred ∩ gt| / |pred ∪ gt|
-
-    Computed on the RLE directly (pycocotools `area`/`merge`), so this stays
-    cheap enough to run per pair over a full COCO split without decoding a
-    dense HxW array anywhere.
-    """
-    gt_area, pred_area = rle_area(gt_rle), rle_area(pred_rle)
-    inter = 0
-    if gt_rle is not None and pred_rle is not None:
-        mask_utils = _mask_utils()
-
-        def _native(rle):
-            counts = rle["counts"]
-            return {"size": list(rle["size"]),
-                    "counts": counts.encode("ascii") if isinstance(counts, str) else counts}
-
-        inter = int(mask_utils.area(
-            mask_utils.merge([_native(gt_rle), _native(pred_rle)], intersect=True)))
-    union = gt_area + pred_area - inter
-    return {
-        "pixel_tp": inter,
-        "pixel_fp": pred_area - inter,
-        "pixel_fn": gt_area - inter,
-        "pixel_precision": (inter / pred_area) if pred_area else 0.0,
-        "pixel_recall": (inter / gt_area) if gt_area else 0.0,
-        "pixel_iou": (inter / union) if union else 0.0,
-    }
-
-
-def pixel_summary(counts: Dict[str, int], per_image_iou: Sequence[float]) -> Dict[str, Any]:
-    """Aggregate pixel coverage two ways, because they answer different
-    questions and one alone is misleading:
-
-      * MICRO ("dataset pixel precision/recall") pools every pixel in the
-        split before dividing, so a single huge object counts for as much as
-        it physically occupies. This is the honest answer to "across all of
-        COCO, what fraction of annotated nature pixels did the pipeline
-        cover".
-      * MACRO (`mean_image_iou`) averages each IMAGE's own IoU equally, so a
-        photo of one small bird counts the same as a landscape full of trees.
-        This is the answer to "how well does it do on a typical image".
-
-    A big gap between them means performance depends strongly on object size —
-    worth knowing before quoting either number on its own.
-    """
-    tp, fp, fn = counts.get("pixel_tp", 0), counts.get("pixel_fp", 0), counts.get("pixel_fn", 0)
-    micro_p = tp / (tp + fp) if (tp + fp) else 0.0
-    micro_r = tp / (tp + fn) if (tp + fn) else 0.0
-    denom = tp + fp + fn
-    return {
-        "pixel_tp": tp, "pixel_fp": fp, "pixel_fn": fn,
-        "micro_pixel_precision": micro_p,
-        "micro_pixel_recall": micro_r,
-        "micro_pixel_f1": (2 * micro_p * micro_r / (micro_p + micro_r)
-                           if (micro_p + micro_r) else 0.0),
-        "micro_pixel_iou": (tp / denom) if denom else 0.0,
-        "mean_image_iou": float(np.mean(per_image_iou)) if len(per_image_iou) else 0.0,
-        "mean_image_iou_std": float(np.std(per_image_iou)) if len(per_image_iou) else 0.0,
-        "n_images": len(per_image_iou),
-    }
 
 
 def mask_ioa(pred_rle: Dict[str, Any], region_rle: Dict[str, Any]) -> float:
@@ -390,9 +336,9 @@ def match_boxes(
     `(gt_index, pred_index, iou)` and every match's IoU is `>= iou_threshold`.
 
     `ious` optionally supplies an already-computed (n_gt, n_pred) matrix. The
-    AP sweep re-matches the same boxes at ten IoU thresholds, and recomputing
-    the matrix ten times per image would be pure waste — the geometry doesn't
-    change, only the cut-off applied to it.
+    strictness sweep re-matches the same regions at ten IoU thresholds, and
+    recomputing the matrix ten times per image would be pure waste — the
+    geometry doesn't change, only the cut-off applied to it.
 
     Hungarian assignment rather than the greedy highest-IoU-first loop most
     detection code uses: greedy can strand a GT instance whose only above-threshold
@@ -485,58 +431,20 @@ def classify_unmatched_prediction(
 
 
 # =============================================================================
-# Average precision
-# =============================================================================
-def average_precision(
-    scored_predictions: Sequence[Tuple[float, bool]],
-    n_gt: int,
-) -> float:
-    """Class-agnostic AP from `(score, is_true_positive)` pairs pooled over the
-    whole dataset, using COCO's 101-point interpolated precision.
-
-    Excluded predictions (the curated-vocabulary rule above) must be left OUT
-    of `scored_predictions` by the caller — including them as negatives would
-    reimpose exactly the penalty that rule exists to remove.
-
-    Returns 0.0 when there is no GT to recall.
-    """
-    if n_gt <= 0:
-        return 0.0
-    if not scored_predictions:
-        return 0.0
-
-    order = sorted(range(len(scored_predictions)),
-                   key=lambda k: scored_predictions[k][0], reverse=True)
-    tp = np.array([1.0 if scored_predictions[k][1] else 0.0 for k in order])
-    fp = 1.0 - tp
-    tp_cum, fp_cum = np.cumsum(tp), np.cumsum(fp)
-
-    recalls = tp_cum / float(n_gt)
-    precisions = tp_cum / np.maximum(tp_cum + fp_cum, np.finfo(float).eps)
-
-    # Make precision monotonically non-increasing as recall grows (the standard
-    # envelope), then sample it at 101 evenly spaced recall levels.
-    precisions = np.maximum.accumulate(precisions[::-1])[::-1]
-    levels = np.linspace(0.0, 1.0, 101)
-    idx = np.searchsorted(recalls, levels, side="left")
-    sampled = np.where(idx < len(precisions), precisions[np.minimum(idx, len(precisions) - 1)], 0.0)
-    sampled[idx >= len(precisions)] = 0.0
-    return float(sampled.mean())
-
-
-# =============================================================================
 # Aggregation
 # =============================================================================
 def detection_summary(counts: Dict[str, Any]) -> Dict[str, Any]:
     """Turn the running detection counters into the reported numbers.
 
-    `counts` carries: tp, fp, fn, excluded_pred, crowd_suppressed, n_gt_instances,
-    n_pred_instances, plus `ap_records` ({iou_threshold: [(score, is_tp), ...]}).
+    `counts` carries: tp, fp, fn, excluded_pred, crowd_suppressed,
+    n_gt_instances, n_pred_instances.
 
     Precision's denominator is TP + FP, which by construction EXCLUDES the
     curated-vocabulary exemptions — `excluded_predictions` is reported next to
     it so the exemption's size is always visible. There is no accuracy key:
-    see the module docstring on why TN is undefined here.
+    see the module docstring on why TN is undefined here. There is no AP key
+    either: see the module docstring on why the semantic head this pipeline
+    scores supports no confidence ranking.
     """
     tp, fp, fn = counts.get("tp", 0), counts.get("fp", 0), counts.get("fn", 0)
     precision = tp / (tp + fp) if (tp + fp) else 0.0
@@ -552,15 +460,108 @@ def detection_summary(counts: Dict[str, Any]) -> Dict[str, Any]:
         "n_gt_instances": counts.get("n_gt_instances", 0),
         "n_pred_instances": counts.get("n_pred_instances", 0),
     }
-
-    ap_records = counts.get("ap_records") or {}
-    n_gt = counts.get("n_gt_instances", 0)
-    per_threshold = {t: average_precision(recs, n_gt) for t, recs in sorted(ap_records.items())}
-    if per_threshold:
-        summary["ap_50"] = per_threshold.get(0.5, 0.0)
-        summary["ap_50_95"] = float(np.mean(list(per_threshold.values())))
-        summary["ap_per_iou"] = per_threshold
     return summary
+
+
+def sweep_summary(sweep_counts: Dict[float, Dict[str, int]]) -> Dict[str, Any]:
+    """Precision/recall/F1 as a FUNCTION of the IoU threshold.
+
+    `sweep_counts` is `{iou_threshold: {"tp","fp","fn", ...}}`, pooled over the
+    dataset — each threshold's counters come from its own independent matching
+    pass, because a pair clearing IoU 0.50 need not clear 0.75.
+
+    THIS IS NOT AP, and the distinction matters when reporting:
+
+      * P/R/F1 at threshold t is ONE OPERATING POINT — every confirmed
+        entity mask is included, and the only thing varying across the sweep
+        is how much overlap counts as a hit. The
+        SHAPE of that curve is a direct readout of MASK TIGHTNESS: an F1 that
+        holds from 0.50 to 0.75 means the masks genuinely trace their objects;
+        one that collapses means they are loose blobs that only just cleared
+        the permissive threshold.
+      * AP would instead sweep the CONFIDENCE cutoff at fixed overlap and
+        integrate the resulting PR curve, measuring whether the confidence
+        RANKING is informative. This project does NOT report AP — see the
+        module docstring on why the semantic head supports no such ranking.
+
+    Reports each rung plus three headline numbers mirroring COCO's own naming:
+    `@0.50` (permissive), `@0.75` (strict), and `@[.50:.95]` (the mean across
+    the ladder, so a single number still reflects the whole curve).
+    """
+    per_threshold: Dict[float, Dict[str, Any]] = {}
+    for t, c in sorted(sweep_counts.items()):
+        tp, fp, fn = c.get("tp", 0), c.get("fp", 0), c.get("fn", 0)
+        precision = tp / (tp + fp) if (tp + fp) else 0.0
+        recall = tp / (tp + fn) if (tp + fn) else 0.0
+        f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) else 0.0
+        per_threshold[t] = {"tp": tp, "fp": fp, "fn": fn,
+                            "precision": precision, "recall": recall, "f1": f1,
+                            "excluded_predictions": c.get("excluded_pred", 0),
+                            "crowd_suppressed_predictions": c.get("crowd_suppressed", 0)}
+    if not per_threshold:
+        return {}
+
+    def _at(t: float, key: str) -> float:
+        return per_threshold.get(t, {}).get(key, 0.0)
+
+    out: Dict[str, Any] = {"per_iou": per_threshold}
+    for key in ("precision", "recall", "f1"):
+        out[f"{key}_50"] = _at(0.5, key)
+        out[f"{key}_75"] = _at(0.75, key)
+        out[f"{key}_50_95"] = float(np.mean([v[key] for v in per_threshold.values()]))
+    return out
+
+
+def size_summary(size_counts: Dict[float, Dict[str, Dict[str, int]]]) -> Dict[str, Any]:
+    """Precision/recall/F1 split by COCO OBJECT-SIZE bucket, per IoU threshold.
+
+    `size_counts` is `{iou_threshold: {bucket: {"tp","fp","fn"}}}`, pooled over
+    the dataset. Buckets are COCO's own small/medium/large (`COCO_AREA_RANGES`),
+    the same cut-offs cocoeval applies to the `segm` task.
+
+    HOW A REGION IS ASSIGNED A BUCKET, mirroring cocoeval.evaluateImg:
+      * a TRUE POSITIVE and a FALSE NEGATIVE take the bucket of their GT region
+        (`g['area']` in cocoeval — GT outside the range is ignored there);
+      * a FALSE POSITIVE takes the bucket of its OWN predicted region
+        (`d['area']` in cocoeval — a detection outside the range is ignored).
+
+    This yields a clean property cocoeval itself does not have: every TP, FN and
+    FP lands in exactly one bucket, so the three buckets PARTITION the pooled
+    counts and sum back to the `sweep_summary` totals. cocoeval re-runs matching
+    per area range with ignore flags, which can in principle form different
+    pairs per range; here matching is done once and the results partitioned,
+    which is deterministic and reconciles exactly.
+
+    Returned per bucket: `precision`/`recall`/`f1` at `@0.50`, `@0.75` and the
+    `@[.50:.95]` mean (the same three headline points as `sweep_summary`), the
+    full `per_iou` table, and `n_gt` — the bucket's GT support at IoU 0.50,
+    which is what makes a weak bucket readable as "genuinely bad" versus
+    "almost no support".
+    """
+    if not size_counts:
+        return {}
+
+    out: Dict[str, Any] = {}
+    for bucket in AREA_BUCKETS:
+        per_threshold: Dict[float, Dict[str, Any]] = {}
+        for t, buckets in sorted(size_counts.items()):
+            c = (buckets or {}).get(bucket, {})
+            tp, fp, fn = c.get("tp", 0), c.get("fp", 0), c.get("fn", 0)
+            precision = tp / (tp + fp) if (tp + fp) else 0.0
+            recall = tp / (tp + fn) if (tp + fn) else 0.0
+            f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) else 0.0
+            per_threshold[t] = {"tp": tp, "fp": fp, "fn": fn,
+                                "precision": precision, "recall": recall, "f1": f1}
+        entry: Dict[str, Any] = {"per_iou": per_threshold}
+        for key in ("precision", "recall", "f1"):
+            entry[f"{key}_50"] = per_threshold.get(0.5, {}).get(key, 0.0)
+            entry[f"{key}_75"] = per_threshold.get(0.75, {}).get(key, 0.0)
+            entry[f"{key}_50_95"] = float(np.mean([v[key] for v in per_threshold.values()])) \
+                if per_threshold else 0.0
+        base = per_threshold.get(0.5, {})
+        entry["n_gt"] = base.get("tp", 0) + base.get("fn", 0)
+        out[bucket] = entry
+    return out
 
 
 def label_summary(records: Sequence[Dict[str, Any]]) -> Dict[str, Any]:

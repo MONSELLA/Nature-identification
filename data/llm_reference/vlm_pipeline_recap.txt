@@ -1,5 +1,35 @@
-BIG-5 VLM PIPELINE — DESIGN RECAP (v22)
-(v4: the VLM pipeline is now IMPLEMENTED — this doc records both the original
+BIG-5 VLM PIPELINE — DESIGN RECAP (v27)
+(v27: the v26 size split's GT bucket now uses the MEAN of each class's
+pre-merge instance areas, not the merged region's area — fixes a bowl-of-
+oranges/flock-of-birds distortion Pau spotted where many small instances
+merged into one concept region would otherwise read as "large". Predictions
+cannot get the same fix (semantic_seg has no instance decomposition); this
+asymmetry is now documented everywhere the numbers appear. See RESOLVED IN
+v27.
+v26: COCO detection now ALSO reports P/R/F1 split by COCO's own
+small/medium/large object-size buckets (summary["detection_by_size"]) — the
+same area cut-offs behind AP^S/AP^M/AP^L, read verbatim out of pycocotools'
+Params(iouType="segm").areaRng, so nothing here is invented. See RESOLVED IN
+v26.
+v25: COCO detection PREDICTIONS now come from SAM3's SEMANTIC head
+(semantic_seg) instead of a per-entity UNION of its instance masks, and AP is
+dropped entirely as a consequence — semantic_seg carries no per-region
+confidence to rank by, and the instance-max score that previously stood in for
+one was an engineering convenience, not a measurement. Detection therefore no
+longer requires --instance_grounding and is unaffected by
+--instance_score_threshold. See RESOLVED IN v25.
+v24: the INSTANCE-level COCO detection block and the PIXEL COVERAGE block are
+both REMOVED; entity (concept) granularity is now the only detection
+evaluation, and its headline is a PRECISION/RECALL/F1 SWEEP across COCO's IoU
+ladder (@0.50, @0.75, @[.50:.95]) measuring MASK TIGHTNESS. AP is kept but
+explicitly reframed as a different question (confidence-ranking quality), not
+a stricter F1. The taxonomy-disagreement diagnostic was PORTED to entity level
+rather than deleted with the instance block. See RESOLVED IN v24.
+v23: entity-level COCO detection now reports AP@0.50/AP@[.50:.95] too — the
+v21/v22 claim that AP "only exists at instance granularity" is gone; each
+entity has a real confidence score (its strongest underlying instance) that
+was already being computed for the predictions CSV, so ranking by it for AP
+costs nothing new — see Section 8g and RESOLVED IN v23. v4: the VLM pipeline is now IMPLEMENTED — this doc records both the original
 design rationale AND, in "IMPLEMENTED:" notes, how the shipped code actually
 does it where the two differ. v5: ClipMatch switched to the caption-based
 variant as the only implementation — see Section 8e and Section 11. v6:
@@ -702,24 +732,26 @@ f) Hierarchical Precision / Recall (hP/hR) + Wu-Palmer, per
        node (compute_hierarchical_metrics).
 
 g) COCO MASK-IoU DETECTION EVALUATION (NEW in v21, IMPLEMENTED; MASK-ONLY as
-   of v22 — see RESOLVED IN v22 below, box matching is GONE, not an option) —
+   of v22 — see RESOLVED IN v22 below, box matching is GONE, not an option;
+   ENTITY-GRANULARITY-ONLY as of v24, with an IoU sweep as its headline and
+   pixel coverage deleted — see RESOLVED IN v24, which supersedes several
+   paragraphs below and is the authority where they disagree) —
    src/evaluation/detection_metrics.py, driven from run_vlm_pipeline.py's
    --stage score. COCO ONLY, and only on an artifact the Grounding pipeline
    enriched with INSTANCE grounding. Runs ALONGSIDE the lexical axis metrics
    in the IMPLEMENTED block below, never replacing them.
 
-   WHY THE INSTANCE HEAD. Everything else in the Grounding pipeline reads
-   SAM3's semantic_seg, which is concept-level: one mask for "cow", however
-   many cows. COCO's GT is instance-level (one box per annotated object), so
-   evaluating against it needs pred_masks/pred_boxes/pred_logits instead.
-   Every COCO target class is a "thing" (countable, boundable), which is what
-   makes the instance head appropriate there — the semantic head stays the
-   right one for the relevance score everywhere, COCO included. Both come off
-   the SAME forward pass, so this is a post-processing cost, not a second run.
-   Predicted boxes are the TIGHT box of each instance MASK, not SAM3's own
-   regressed pred_boxes — chosen so the scored box always agrees with the
-   mask stored beside it for review; pred_boxes is carried along as
-   "sam3_bbox" for comparison rather than discarded.
+   WHY THE INSTANCE HEAD IS STILL READ, EVEN THOUGH SCORING IS ENTITY-LEVEL.
+   Everything else in the Grounding pipeline reads SAM3's semantic_seg, which
+   is concept-level: one mask for "cow", however many cows. COCO's GT is
+   per-instance, so evaluating against it needs pred_masks/pred_boxes/
+   pred_logits — and, critically, the instance head is also what supplies the
+   per-entity CONFIDENCE score (max over an entity's instances) that AP ranks
+   by. Both heads come off the SAME forward pass, so this is a post-processing
+   cost, not a second run. v24 note: the instance masks are now UNIONED per
+   extracted entity before matching, so instance granularity survives only as
+   an intermediate representation, never as a reported number — see RESOLVED
+   IN v24 for why instance-level scoring was measuring the wrong thing.
 
    MATCHING IS CLASS-AGNOSTIC — the one substantive departure from the v1
    design sketch, and the reason the whole thing is worth building. Standard
@@ -1009,6 +1041,225 @@ RESOLVED IN v6 (decided after repeated integration failures):
   clip_metrics.CLIPScorer's class docstring) were PROPOSED as
   replacements here, but neither was actually added to CLIP_PRESETS at
   the time — see RESOLVED IN v8 below for what's actually wired in.
+
+RESOLVED IN v27 (Pau's own follow-up question on v26, immediately after
+reading its documented deviation — "since I do semantic segmentation for
+both things and stuff, a lot of tiny objects together may fall into large
+area"):
+- THE MECHANISM Pau named precisely: v26 bucketed each merged GT class entry
+  by the UNION area of every instance of that class in the image. A bowl of
+  ten small oranges (each individually well under 32^2 px, genuinely "small"
+  by cocoeval's own per-instance rule) merges into one region whose bounding
+  span covers most of the bowl — easily over 96^2 px — and gets bucketed
+  "large". The pooled small-object number would then be blind to exactly the
+  crowded-scene case (many small instances of one class) that motivated
+  entity-granularity scoring in the first place.
+- THE FIX, GT SIDE ONLY: gt_by_class already retains every instance's own
+  pre-merge RLE (needed to build the merged region in the first place), so
+  bucketing now uses the MEAN of those individual instance areas instead of
+  the merged area — one extra np.mean() over data already in hand, not a new
+  measurement invented. A single-instance class is unaffected (mean of one
+  value equals that value), so this only changes behavior for classes that
+  actually have multiple instances merged, which is precisely the case it
+  targets. Verified: ten synthetic 20x20 instances scattered across an image
+  (union spans the whole image) now bucket "small", matching what a per-
+  instance cocoeval run would report for each individual orange.
+- THE FIX DOES NOT REACH PREDICTIONS, and this is structural, not an
+  oversight to close later. An FP's bucket is still its own predicted area,
+  because v25 moved detection onto SAM3's semantic_seg specifically to get
+  one concept-level mask with NO underlying instance decomposition — there is
+  no list of "individual predicted instances" to average the way GT's
+  pre-merge instances can be. A model that emits one large blob covering a
+  flock of small birds is charged an FP against "large" regardless of how
+  small the real birds were. Documented at every point the numbers surface
+  (detection_by_size_note, the console print, CLAUDE.md) as a named, accepted
+  asymmetry — not hidden and not something a future pass should try to
+  "fix" without a genuinely new source of per-instance prediction geometry.
+- THE PARTITION PROPERTY (buckets sum back to detection_iou_sweep's totals)
+  is UNCHANGED and still holds exactly — only which bucket a GT entry falls
+  into moved, not whether every TP/FN/FP is counted in exactly one bucket.
+  Re-verified in tests alongside the new mean-area assertion.
+
+RESOLVED IN v26 (requested by Pau, with the explicit constraint "I do not want
+to invent anything new here" — so the precedent was verified in the source
+before anything was built):
+- PRECEDENT, CHECKED NOT REMEMBERED. pycocotools' own
+  Params(iouType="segm").areaRng is [[0,1e10],[0,1024],[1024,9216],[9216,1e10]]
+  with areaRngLbl ['all','small','medium','large'] — i.e. small < 32^2 px,
+  medium < 96^2 px, large beyond. This is COCO's standard object-size
+  stratification (Lin et al. 2014), the thing behind the AP^small/AP^medium/
+  AP^large columns on every COCO leaderboard, and critically it is defined for
+  the SEGMENTATION task too, not only boxes — cocoeval applies these exact
+  cut-offs using each annotation's MASK area. So size-stratified reporting for
+  a mask-IoU evaluation is completely standard practice.
+- BUCKET ASSIGNMENT follows cocoeval.evaluateImg literally, both halves of it:
+  GT outside the range is ignored (`g['area']<aRng[0] or g['area']>aRng[1]`),
+  and detections outside the range are ignored too (`d['area']<aRng[0] or ...`).
+  Translated to this pipeline: a TP or FN takes its GT region's bucket, an FP
+  takes its OWN predicted region's bucket. Excluded/crowd-suppressed
+  predictions are charged to no bucket, exactly as they are charged to no
+  precision denominator.
+- A PROPERTY WORTH RELYING ON that cocoeval itself lacks: because matching is
+  done ONCE per IoU threshold and the outcomes are then partitioned, every TP,
+  FN and FP lands in exactly one bucket and the three buckets SUM BACK to the
+  detection_iou_sweep totals (asserted in the tests). cocoeval re-runs matching
+  per area range with ignore flags, which can in principle form different pairs
+  per range and so does not reconcile this cleanly.
+- THE ONE DEVIATION, stated wherever the numbers are reported (console note,
+  summary["detection_by_size_note"], CLAUDE.md): this pipeline scores CONCEPT
+  regions, so a GT entry is every annotated instance of one class MERGED into
+  one region and its area is that UNION — not one object's area, which is what
+  cocoeval buckets. A class with many small instances can therefore land in a
+  larger bucket than any individual object would. The thresholds and the
+  protocol are COCO's; the unit is this project's. Consequence: these numbers
+  are NOT directly comparable to published COCO AP^S/M/L, and saying so is
+  required rather than optional. n_gt per bucket is reported alongside so a
+  weak bucket can be read as genuinely weak rather than merely low-support.
+- WHY IT EARNS ITS PLACE beyond "COCO does it": small regions are
+  systematically the hardest under an IoU criterion, because a few pixels of
+  boundary error destroys the IoU of a 20x20 region while barely moving a
+  300x300 one. A pooled score is dominated by whichever size is most common, so
+  the split is what separates "the model misses small things" from "the model's
+  masks are loose" — two different failure modes with different fixes, which
+  the IoU sweep alone cannot tell apart.
+
+RESOLVED IN v25 (decided per Pau, immediately after v24, on the observation
+that if the pipeline is concept-level everywhere else it should take its
+detection predictions from the concept-level head too):
+- PREDICTIONS ARE NOW SAM3's SEMANTIC MASKS. score_image_entities reads
+  object_groundings[k]["mask_rle"] — the post_process_semantic_segmentation
+  output, binarized at --mask_threshold — as the predicted region for entity k.
+  The previous approach unioned that entity's INSTANCE masks to rebuild a
+  concept region, which was reconstructing something semantic_seg already
+  provides directly. The instance head is no longer read by scoring at all.
+- THE DECISIVE ARGUMENT was a number already printed by the run: "Semantic-
+  confirmed but NO instance box: 1868 (10.4% of confirmed)". Those are entities
+  where SAM3's semantic head found the concept but its instance head produced
+  nothing above --instance_score_threshold. Under the instance-union they
+  contributed NO prediction whatsoever, so every GT region they should have
+  matched was charged as a false negative — the pipeline was being penalized
+  for entities it had in fact grounded. The old code comment on that diagnostic
+  even said so out loud ("a direct, quantified contributor to the detection FN
+  count"); v25 removes the cause rather than continuing to report the symptom.
+  The diagnostic is KEPT (it is still a real semantic-vs-instance head
+  comparison) but its wording now says these still count as predictions.
+- AP IS REMOVED, and this is the honest consequence rather than a regression.
+  AP needs a per-prediction confidence to rank by; semantic_seg is a dense
+  logit map with no scalar per concept mask. v23/v24 ranked entities by their
+  strongest underlying INSTANCE score, which Pau correctly identified as "an
+  engineering step" — it is the strongest instance that happened to clear a
+  score gate, not a calibrated confidence for the merged region actually being
+  matched, and it is not even defined for the 1868 semantic-only entities
+  above. Manufacturing a substitute (mean sigmoid inside the mask, pixel count,
+  ...) would be worse than reporting nothing. detection_metrics.average_precision
+  and mask_nms are deleted; summary["detection"] has no ap_* keys.
+  The IoU SWEEP (v24) is unaffected and is now the sole headline — it needs no
+  confidence at all, which is exactly why it survives this change intact.
+- FALLOUT, all simplifications: --instance_score_threshold no longer influences
+  detection in any way (the only gate is --mask_threshold, SAM3's own default,
+  already used for the relevance score); run_detection is gated on grounding
+  having run AT ALL rather than on instance_grounding specifically, so any
+  grounded COCO artifact can be scored; collect_predicted_boxes is deleted; the
+  GEOMETRIC half of the false-positive test is deleted with it (already inert
+  at entity granularity since v24); summary["detection"] now records
+  mask_threshold and prediction_source="semantic_seg" as provenance instead of
+  instance_score_threshold. NO RE-RUN IS NEEDED — object_groundings is written
+  by EVERY grounded run, so this is a --stage score change only.
+- STILL TRUE and worth restating because it did not change: the instance head
+  is still COMPUTED by the grounding pipeline (object_instances), still stored
+  in the artifact, and still costs only post-processing off the same forward
+  pass. It is simply no longer what detection scores. Leaving it in the
+  artifact keeps the semantic-vs-instance comparison auditable.
+
+RESOLVED IN v24 (decided per Pau, after reading the first full gemma-4-12B-it
+COCO numbers and finding two of the three reported blocks actively
+misleading):
+- INSTANCE-LEVEL DETECTION IS REMOVED. score_image_detection is deleted, not
+  deprecated; summary["detection"] is now the ENTITY-level block (the old
+  summary["detection_entity"] namespace is gone, folded into the primary
+  name). Pau's reasoning: what this pipeline actually predicts is a CONCEPT
+  ("orange slice"), grounded by SAM3 into however many masks, while COCO
+  annotates individual objects — so instance matching was measuring an
+  artifact of that mismatch, not model quality. The numbers made it concrete:
+  instance-level precision 0.358 vs entity-level 0.909 on the SAME
+  predictions, the gap being SAM3's undeduplicated duplicate queries plus
+  COCO's non-exhaustive annotation of crowded scenes. Both distortions vanish
+  under the union by construction. ACCEPTED COST, unchanged from v21: no
+  per-object counting ("found 8 of 12 cows"). Consequences: --instance_nms_iou
+  is removed as DEAD (a union is bit-identical with or without suppression);
+  the GEOMETRIC half of the false-positive test
+  (entity_matched_elsewhere_in_image) is removed because at entity granularity
+  each entity appears exactly once and it could never fire; the
+  taxonomy-disagreement diagnostic was PORTED to entity level (non-nature GT
+  merged per class, matching the evaluation's own granularity) rather than
+  lost with the block that used to compute it.
+- PIXEL COVERAGE IS REMOVED (summary["detection_pixels"], pixel_stats,
+  pixel_summary). Pau called it misleading and it provably was, for a reason
+  worth recording so it is not rebuilt the same way: its by_gt_class view
+  accumulated ONLY matched TP pairs plus wholly-missed GT classes, and never
+  the unmatched/excluded predictions — so per-class pixel_precision/pixel_iou
+  structurally excluded the single dominant source of imprecision, while the
+  whole-image mean_image_iou included all of it. The two could not be
+  reconciled and invited exactly the question that surfaced this ("how can the
+  WORST class be 0.51 when the mean image IoU is 0.32?"). The honest fix and
+  the flattering fix pointed in opposite directions, and the IoU sweep below
+  answers the underlying question ("how well do the masks trace the objects")
+  without the ambiguity, so the block was dropped rather than patched.
+- THE HEADLINE IS NOW AN IoU SWEEP (detection_metrics.sweep_summary,
+  summary["detection_iou_sweep"]): precision/recall/F1 recomputed at every rung
+  of COCO's ladder off ONE cached IoU matrix, each rung getting its own
+  independent matching pass (a pair clearing 0.50 need not clear 0.75).
+  Reported at @0.50, @0.75 and @[.50:.95]. The SHAPE of that curve is a direct
+  readout of MASK TIGHTNESS — an F1 that holds from 0.50 to 0.75 means the
+  masks trace their objects, one that collapses means blobs that only just
+  cleared the permissive threshold — which is precisely what neither the old
+  single operating point nor pixel coverage could show.
+- AP IS KEPT BUT REFRAMED, because the request that prompted this round
+  ("precision, recall and f1 for AP@.5, 0.75 and 0.5:0.95") conflated two
+  different instruments, and the code now documents the distinction at every
+  point of use. AP varies the CONFIDENCE cutoff at fixed IoU and integrates the
+  PR curve (is SAM3's ranking informative?); the sweep varies the IoU
+  THRESHOLD at a fixed prediction set (are the masks tight?). AP is NOT a
+  stricter F1, and F1@0.75 is NOT "AP at 0.75". Also recorded: AP is bounded
+  by max achievable recall, so AP@0.50 (0.766) sitting below F1@0.50 (0.852)
+  is expected, not a bug; and it is AP, never mAP — matching is class-agnostic
+  by design, so there is no per-class axis to average over.
+- EXCLUDED PREDICTIONS MUST BE QUOTED WITH PRECISION. Measured on this run:
+  5727 of 7539 entity predictions (76%) named nothing in COCO's evaluated
+  vocabulary — tree, sky, grass, water — and were exempted. Entity precision
+  0.909 therefore describes only the 24% COCO can adjudicate, and is NOT "91%
+  of our masks are good". The console now prints that ratio directly beneath
+  precision so the number cannot be read without its denominator. Recall
+  carries no such caveat.
+
+RESOLVED IN v23 (decided per Pau, after seeing the first real COCO detection
+numbers and finding the entity-level pixel-coverage view too noisy on its
+own):
+- Entity-level detection (`score_image_entities`) now computes real AP@0.50
+  and AP@[.50:.95], not just single-threshold P/R/F1. The v21/v22 framing
+  ("no per-object counting AND no AP — both only exist at instance
+  granularity") turned out to be wrong on the AP half specifically: each
+  merged entity already carries a genuine confidence score
+  (`pred_entries[...]["score"]`, the MAX of its underlying instances' own
+  scores — already computed and already surfaced as the CSV's `pred_score`
+  column), so ranking entities by it for COCO's 101-point-interpolated AP
+  costs nothing beyond re-running `detection_metrics.match_boxes` at each
+  rung of `COCO_AP_IOU_THRESHOLDS`, exactly the same threshold-sweep pattern
+  `score_image_detection` already used for the instance block. Per-object
+  counting ("found 8 of 12 cows") is still gone at this granularity and
+  stays gone by construction — that part of the original claim holds; only
+  the AP half was actually a missing feature, not a structural limitation.
+  `ent_counts["ap_records"]` is now seeded per-threshold and accumulated
+  every image, same as `det_counts["ap_records"]`; `detection_summary` was
+  already threshold-generic and needed no change to produce `ap_50`/
+  `ap_50_95`/`ap_per_iou` once given real records instead of the old
+  `{t: [] for t in ...}` stub. `detection_entity_note` and the console/W&B
+  print text updated to match — see Section 8g.
+- Context: on the first real gemma-4-12B-it COCO run, the entity-level pixel
+  coverage numbers alone (e.g. "potted plant" IoU 0.51) read as noisy/hard to
+  interpret without a companion localization-quality number at the SAME
+  granularity the model is actually built around (concepts, not raw SAM3
+  instances) — entity-level AP is that companion number.
 
 RESOLVED IN v22 (decided per Pau, after the first real COCO run):
 - Box-IoU matching is REMOVED — not deprioritized, not kept as an option
