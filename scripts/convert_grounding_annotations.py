@@ -53,6 +53,8 @@ from collections import Counter, OrderedDict
 
 import numpy as np
 from PIL import Image
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from pycocotools import mask as mask_utils
 
 
@@ -137,11 +139,89 @@ def encode_rle(mask):
 # =============================================================================
 # Concept merging
 # =============================================================================
+def _area_bucket(area):
+    """COCO's own small/medium/large cut-offs, imported from the shared
+    definition so the GT and the COCO detection block can never drift apart
+    (pycocotools' `Params(iouType="segm").areaRng`: small < 32^2, medium < 96^2).
+    """
+    from src.evaluation.detection_metrics import area_bucket
+    return area_bucket(area)
+
+
 def _norm_label(text):
     """Lowercase + strip diacritics, matching src/vlm_pipeline._normalize_object
     so a GT "café" and a predicted "cafe" group the same way."""
     text = unicodedata.normalize("NFKD", (text or "").strip().lower())
     return "".join(c for c in text if not unicodedata.combining(c))
+
+
+# =============================================================================
+# Derived sky regions
+# =============================================================================
+def derive_sky_from_cloud(record, stats):
+    """Where an image annotates `cloud` but NOT `sky`, add a `sky` region over
+    the EXACT same pixels, inheriting that image's own cloud axis labels.
+
+    WHY THIS IS A DERIVATION AND NOT AN ANNOTATION FIX: a cloud is always seen
+    against sky, so the pixels a cloud occupies are sky pixels too — the
+    annotator simply had no reason to draw the same outline twice when no sky
+    was visible beyond the cloud itself. But SAM3 prompted with "sky" will
+    answer for that region, and without this the correct answer is charged as a
+    false positive purely because of a drawing convention. Measured: 13 of the
+    170 annotated images are affected.
+
+    SCOPE, exactly as specified: images that already annotate BOTH cloud and
+    sky (12 of them) are left completely alone — their sky region is the
+    annotator's own judgment about how far the sky extends beyond the cloud,
+    which is strictly better information than anything derivable here.
+
+    AXES ARE INHERITED FROM THAT IMAGE'S OWN CLOUD, never hardcoded. Materiality
+    especially cannot be assumed: of the 13 affected images, some clouds are
+    photographed (`material`) and some are drawn/illustrated (`immaterial`), and
+    the sky in the same pixels is necessarily the same kind of thing as the
+    cloud drawn on it. Inheriting keeps that per-image, which a fixed default
+    would get wrong roughly half the time.
+
+    The derived object is flagged `derived_from_cloud: True` so it is always
+    distinguishable from a hand-drawn region in the processed GT.
+
+    NOTE the consequence for matching: the derived sky and its source cloud have
+    IDENTICAL masks, so their pairwise IoU is 1.0 and a single predicted mask is
+    a legitimate candidate for either. That is the annotation honestly saying
+    "these pixels are both sky and cloud" — a model naming both gets two true
+    positives, a model naming one gets one TP and one FN. It does make the
+    one-to-one assignment genuinely ambiguous, which is a further reason the
+    Hungarian solver (SciPy) matters rather than the greedy fallback.
+    """
+    labels = {_norm_label(o.get("entity_label") or o.get("entity_label_freetext"))
+              for o in record.get("objects") or []}
+    if "sky" in labels or "cloud" not in labels:
+        return record
+
+    clouds = [o for o in record["objects"]
+              if _norm_label(o.get("entity_label")
+                             or o.get("entity_label_freetext")) == "cloud"]
+    derived = []
+    for cloud in clouds:
+        derived.append({
+            **cloud,                       # same mask polygons, holes and all
+            "id": f"{cloud.get('id', 'obj')}__derived_sky",
+            "entity_label": "sky",
+            "entity_label_freetext": "",
+            "wordnet_synset_id": "sky.n.01",
+            "in_taxonomy": True,
+            "taxonomy_node": "sky.n.01",
+            "unmapped_from_wordnet": False,
+            # nature / biotic / material carried over from `cloud` by the
+            # spread above — inherited per image, deliberately not defaulted.
+            "derived_from_cloud": True,
+            "notes": (f"Derived by convert_grounding_annotations.py: image "
+                      f"annotated 'cloud' with no 'sky'; sky added over the same "
+                      f"region, axes inherited from that cloud."),
+        })
+    stats["derived_sky"] += len(derived)
+    stats["derived_sky_images"].append(record.get("image_id"))
+    return {**record, "objects": list(record["objects"]) + derived}
 
 
 def merge_key(obj):
@@ -164,11 +244,14 @@ def merge_key(obj):
 # =============================================================================
 # Conversion
 # =============================================================================
-def convert_image(record, image_path, stats):
+def convert_image(record, image_path, stats, derive_sky=True):
     """One annotator JSON -> one processed GT record (or None if skipped)."""
     if record.get("skip_reason"):
         stats["skipped"] += 1
         return None
+
+    if derive_sky:
+        record = derive_sky_from_cloud(record, stats)
 
     with Image.open(image_path) as im:  # header read only, no pixel decode
         width, height = im.size
@@ -183,8 +266,11 @@ def convert_image(record, image_path, stats):
         label, synset, nature, biotic, material = key
 
         mask = np.zeros((height, width), dtype=bool)
+        member_areas = []
         for obj in members:
-            mask |= object_mask(obj, width, height)
+            member_mask = object_mask(obj, width, height)
+            member_areas.append(int(member_mask.sum()))
+            mask |= member_mask
 
         area = int(mask.sum())
         if area == 0:
@@ -212,9 +298,21 @@ def convert_image(record, image_path, stats):
             "nature": nature,
             "biotic": biotic,
             "material": material,
+            "derived_from_cloud": bool(members[0].get("derived_from_cloud")),
             "n_source_objects": len(members),   # >1 == concept-merged
             "bbox": [x0, y0, x1 - x0 + 1, y1 - y0 + 1],  # COCO abs xywh
             "area": area,
+            # COCO size bucket, from the MEAN of the individual pre-merge
+            # regions' areas rather than the merged area — the same rule the
+            # COCO detection block applies (run_vlm_pipeline.score_image_entities).
+            # A class with several small instances merged into one concept
+            # region would otherwise inherit the union's footprint and be
+            # bucketed "large" even though every individual object is "small".
+            # Identical to `area` for the single-region case, which is 374 of
+            # the 377 objects here.
+            "mean_instance_area": float(np.mean(member_areas)) if member_areas else 0.0,
+            "size_bucket": _area_bucket(
+                float(np.mean(member_areas)) if member_areas else 0.0),
             "segmentation": encode_rle(mask),
         })
         if len(members) > 1:
@@ -337,6 +435,9 @@ def main():
                          "tool moves them between the top level and _shared/")
     ap.add_argument("--seed", type=int, default=0,
                     help="seed for the no-nature sample (frozen in the manifest)")
+    ap.add_argument("--no_derive_sky", dest="derive_sky", action="store_false",
+                    help="do NOT add a sky region to images that annotate cloud "
+                         "but no sky (see derive_sky_from_cloud)")
     ap.add_argument("--no_coco", action="store_true",
                     help="skip the portable COCO-format export")
     args = ap.parse_args()
@@ -383,6 +484,7 @@ def main():
     rows = load_subset_rows(args.root)
     stats = Counter()
     stats["empty_mask_detail"] = []
+    stats["derived_sky_images"] = []
     nature_records, missing_images, skipped_ids = [], [], []
 
     for path in src_files:
@@ -399,7 +501,7 @@ def main():
             missing_images.append(image_id)
             continue
 
-        converted = convert_image(record, image_path, stats)
+        converted = convert_image(record, image_path, stats, derive_sky=args.derive_sky)
         if converted is None:
             skipped_ids.append(image_id)
             continue
@@ -411,6 +513,9 @@ def main():
     print(f"processed/nature/     {len(nature_records)} images, "
           f"{stats['objects_out']} objects "
           f"({stats['merged_groups']} concept-merged, {stats['skipped']} skipped)")
+    if args.derive_sky:
+        print(f"                      +{stats['derived_sky']} derived sky region(s) "
+              f"over {len(stats['derived_sky_images'])} cloud-without-sky image(s)")
 
     # --- 3. processed/no_nature/ -------------------------------------------
     platform_counts = Counter(r["platform"] for r in nature_records)
@@ -458,6 +563,9 @@ def main():
         "nature_image_ids": sorted(r["image_id"] for r in nature_records),
         "no_nature_image_ids": sorted(r["image_id"] for r in no_nature_records),
         "concept_merged_groups": stats["merged_groups"],
+        "derive_sky_from_cloud": args.derive_sky,
+        "derived_sky_objects": stats["derived_sky"],
+        "derived_sky_images": sorted(stats["derived_sky_images"]),
         "empty_masks_dropped": stats["empty_masks"],
         "empty_mask_detail": stats["empty_mask_detail"],
         "missing_images": sorted(missing_images),
