@@ -710,6 +710,76 @@ never replacing them.
   performance benchmark; spot-check final config on larger models before
   locking in)
 
+## Fine-tuning (rejection sampling) — `fine_tuning/`
+ALL fine-tuning code lives in that folder; its `README.md` carries the full
+rationale. Hard conventions:
+- SCOPE: LoRA (`peft`) on the LANGUAGE DECODER only. The vision tower and
+  multimodal projector stay frozen — `train_lora.py` ASSERTS this (aborts if
+  any trainable parameter is outside the decoder), because the
+  visual-embedding cache is only valid while they are.
+- PLAIN LoRA IS THE DEFAULT, `--use_dora` IS OPT-IN — a serving decision, not
+  a training one. vLLM's native LoRA adapter serving does not support DoRA
+  weights (`vllm-project/vllm#10849`, open; the one PR that tried, #14389, is
+  closed/unmerged), while it fully supports plain LoRA with per-request
+  hot-swap at ~ms overhead. This project needs exactly that: the adapter
+  applied to SOME calls in a run (extraction + labeling) while captioning
+  always runs untouched base weights, on ONE resident vLLM engine, in a
+  SINGLE pass over the dataset. Passing a DoRA-trained adapter to that path
+  would not error — it would silently apply plain-LoRA math to DoRA weights.
+  Use `--use_dora` only if you intend to `merge_adapter.py` it and serve
+  every call adapted (including captioning).
+- SELECTIVE ADAPTER SERVING: `src.models.vlm_models.VLLMBackedVLM` accepts
+  `lora_adapter_path` (constructs the engine with `enable_lora=True` and a
+  `LoRARequest`) and every `generate`/`generate_batch` call takes a
+  `use_lora` flag routed through vLLM's `lora_request=` per call — NOT a
+  second engine load. `src.vlm_pipeline.caption_batch` and
+  `summarize_caption_batch` take NO `use_lora` parameter at all (structurally
+  cannot apply the adapter, mirroring the existing "no system prompt on the
+  caption call" convention); `extract_objects_batch`/`label_objects_batch`/
+  `run_inference` do, defaulting False. `run_vlm_pipeline.py
+  --lora_adapter_path <adapter dir>` wires this up end-to-end and records
+  `lora_adapter_path`/`lora_adapter_name` in the artifact header for
+  provenance.
+- SPLITS (`make_splits.py` → `/home/pmonserrat/datasets/big_5/rft/splits/`, and
+  the RFT training sets `build_rft_dataset.py` builds from them,
+  `/home/pmonserrat/datasets/big_5/rft/rft_<model>_<balance>/`): 70/10/20,
+  Twitter+Weibo POOLED, grouped by POST (`<platform_id>_<slot>` filename
+  stem) — never by image, since images within a post are near-duplicates.
+  Both live under `datasets/big_5/` alongside the raw images/annotations,
+  NOT under the code repo's `data/` — these are data, not code. Derived from
+  image paths + GT only, never from model output, so ONE split file serves
+  the self-training run and every future distillation run. WRITE-ONCE:
+  regenerating with a different `--seed` invalidates every number reported
+  against it.
+- ACCEPTANCE (`rft_common.image_verdict`): GT non-nature → accepted iff ZERO
+  nature entities predicted. GT nature → accepted iff at least ONE nature
+  entity carries both a matching life_category and tangibility (`strict`,
+  default); `lenient` satisfies the two axes independently and is the rule
+  `run_vlm_pipeline.py`'s BIG-5 branch reports with.
+- REJECTION SAMPLING IS CLASS-BIASED and the bias runs the wrong way: measured
+  93.5% of nature images accepted vs 55.2% of non-nature ones, because
+  over-predicting nature is the model's own failure mode. ALWAYS state which
+  `--balance` mode (`none` / `downsample_nature` / `loss_weight`) produced a
+  number; the first run uses `downsample_nature`.
+- TRAINING EXAMPLES are reconstructed EXACTLY from the artifact, importing the
+  prompt builders from `src.models.prompts` rather than copying them. Stages:
+  extraction + both labeling calls; the free-form CAPTION stage is deliberately
+  excluded (and errors if requested, rather than being silently dropped).
+- `TaxonomyResponse`'s two reasoning fields are now stored SEPARATELY in the
+  artifact (`nature_reasoning`/`sub_axes_reasoning`) alongside the space-joined
+  `reasoning`. `rft_common.split_taxonomy_reasoning` recovers the split from
+  older artifacts and DROPS anything it cannot split rather than fabricating a
+  boundary.
+- `run_vlm_pipeline.py --split_file <file>` restricts a run to the image paths
+  listed in a file (basename-matched), in BOTH `--stage infer` and
+  `--stage score` — how the fine-tuned model is scored on the held-out test
+  split, and how the baseline artifact is re-scored on that same split for the
+  comparison.
+- The fine-tuned model is EVALUATED THROUGH THE NORMAL PIPELINE:
+  `--model_name <base>` + `--lora_adapter_path <adapter dir>` for the default
+  LoRA case (no merge needed); `merge_adapter.py` + `--model_name <merged>`
+  only for a `--use_dora` adapter or a standalone-checkpoint need.
+
 ## Current focus
 Baseline VLM pipeline is IMPLEMENTED end-to-end (caption → extraction →
 mapping-routed labeling → hybrid resolution → metrics: F-CLIPScore,

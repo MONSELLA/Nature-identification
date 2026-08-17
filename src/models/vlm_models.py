@@ -362,8 +362,44 @@ class VLLMBackedVLM(BaseVLM):
     KV-cache management, and batching for us."""
 
     def __init__(self, model_name: str, max_image_side: Optional[int] = 1024,
-                 enable_thinking: bool = False, **kwargs: Any) -> None:
+                 enable_thinking: bool = False,
+                 lora_adapter_path: Optional[str] = None,
+                 lora_adapter_name: str = "rft",
+                 lora_max_rank: int = 16,
+                 **kwargs: Any) -> None:
         super().__init__(model_name, **kwargs)
+        # LoRA/DoRA fine-tune served DIRECTLY by vLLM, no merge needed — see
+        # fine_tuning/train_lora.py and CLAUDE.md's fine-tuning section. This
+        # is what lets the RFT adapter be applied SELECTIVELY per call: the
+        # base engine and the LoRA-adjusted engine are the SAME resident vLLM
+        # engine, and every generate/generate_batch call chooses which one it
+        # wants via `use_lora` (default False — byte-identical to a run
+        # without an adapter). `self.lora_request` is None whenever no
+        # adapter path is given, so `use_lora=True` on a plain baseline VLM
+        # raises immediately instead of silently running unadapted.
+        #
+        # DoRA specifically is NOT supported by vLLM's own LoRA runtime as of
+        # this writing (vllm-project/vllm#10849 — open; the one PR that tried,
+        # #14389, is closed/unmerged) — trying to serve a use_dora=True
+        # adapter here would either error or silently apply plain-LoRA math
+        # to DoRA-trained weights (WRONG, not a crash). This is why
+        # fine_tuning/train_lora.py defaults to plain LoRA (--use_dora is
+        # opt-in, for training experiments only, never for a checkpoint you
+        # intend to serve through this class).
+        self.lora_request = None
+        if lora_adapter_path:
+            from vllm.lora.request import LoRARequest
+            # enable_lora/max_lora_rank are genuine vLLM LLM() constructor
+            # kwargs — folded into `kwargs` here (not left for the caller to
+            # remember) so passing an adapter path is enough on its own to
+            # get a correctly-configured engine.
+            kwargs.setdefault("enable_lora", True)
+            kwargs.setdefault("max_lora_rank", lora_max_rank)
+            # lora_int_id=1: this class only ever serves ONE adapter at a
+            # time (one fine-tuned checkpoint per pipeline run), so a fixed id
+            # is fine — vLLM's multi-adapter hot-swap (several DIFFERENT
+            # adapters resident at once) is not a use case this project has.
+            self.lora_request = LoRARequest(lora_adapter_name, 1, lora_adapter_path)
         # `enable_thinking` — like max_image_side, an EXPLICIT named parameter
         # so it is never forwarded to vLLM's LLM(...) constructor. Controls the
         # model's own chat-template "thinking"/reasoning mode via
@@ -656,6 +692,21 @@ class VLLMBackedVLM(BaseVLM):
         return SamplingParams(temperature=temperature, max_tokens=max_new_tokens,
                             structured_outputs=gd, **kwargs)
 
+    def _resolve_lora_request(self, use_lora: bool):
+        """`use_lora=True` on a VLM built with no `lora_adapter_path` is a
+        caller bug (asking for adapted weights that were never loaded), not a
+        silent no-op — it would otherwise look identical to a successful
+        adapted run in the artifact, with no signal that the adapter was
+        never actually applied."""
+        if not use_lora:
+            return None
+        if self.lora_request is None:
+            raise ValueError(
+                "use_lora=True but this VLM was constructed with no lora_adapter_path — "
+                "there is no adapter loaded to apply."
+            )
+        return self.lora_request
+
     def generate(
         self,
         prompt: str,
@@ -665,6 +716,7 @@ class VLLMBackedVLM(BaseVLM):
         temperature: float = 0.0,
         output_mode: str = "free_form",
         schema: Optional[Any] = None,
+        use_lora: bool = False,
         **kwargs: Any,
     ) -> Union[str, Dict[str, Any], None]:
         """Single (prompt, image) generation via vLLM's chat API."""
@@ -680,6 +732,7 @@ class VLLMBackedVLM(BaseVLM):
         # just one) and returns a list of results — we pull out the single
         # generated text from the first (and only) result.
         outputs = self.llm.chat([messages], sampling_params=sampling_params, use_tqdm=False,
+                                 lora_request=self._resolve_lora_request(use_lora),
                                  **self._chat_kwargs())
         text = outputs[0].outputs[0].text or ""
         return self._parse_response(text, output_mode)
@@ -693,12 +746,21 @@ class VLLMBackedVLM(BaseVLM):
         temperature: float = 0.0,
         output_mode: str = "free_form",
         schema: Optional[Any] = None,
+        use_lora: bool = False,
         **kwargs: Any,
     ) -> List[Union[str, Dict[str, Any], None]]:
         """TRUE batched generation: builds every conversation up front and
         hands them ALL to vLLM in a single `.chat(...)` call, letting vLLM's
         own internal scheduler decide how to efficiently run them together on
-        the GPU (this is much faster than looping generate() one at a time)."""
+        the GPU (this is much faster than looping generate() one at a time).
+
+        `use_lora` (default False — every existing call site is unaffected)
+        applies the fine-tuned LoRA adapter to THIS call only, on the SAME
+        resident engine: the RFT pipeline never re-loads the model to switch
+        between base and adapted weights, it just sets this flag per stage
+        (see src/vlm_pipeline.py: the caption call never sets it, extraction/
+        labeling do when an adapter is loaded — mirroring exactly which calls
+        the adapter was actually trained on)."""
         from vllm import SamplingParams
 
         if images is None:
@@ -713,7 +775,9 @@ class VLLMBackedVLM(BaseVLM):
             output_mode=output_mode, schema=schema, **kwargs
         )
         outputs = self.llm.chat(conversations, sampling_params=sampling_params,
-                                 use_tqdm=len(prompts) > 1, **self._chat_kwargs())
+                                 use_tqdm=len(prompts) > 1,
+                                 lora_request=self._resolve_lora_request(use_lora),
+                                 **self._chat_kwargs())
         return [self._parse_response(o.outputs[0].text or "", output_mode) for o in outputs]
 
 

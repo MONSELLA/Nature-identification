@@ -174,10 +174,17 @@ def caption_batch(
     system_prompt: Optional[str] = None,
     max_new_tokens: int = 256,
     temperature: float = 0.0,
+    use_lora: bool = False,
 ) -> List[str]:
     """Ask the VLM the same open-ended caption question for a whole batch of
     images at once (one API/model call handling many images together, which
-    is much faster than looping one image at a time)."""
+    is much faster than looping one image at a time).
+
+    `use_lora` (default False, same convention as every other stage) applies
+    the RFT adapter (fine_tuning/) to this call too, if one is loaded. Off by
+    default because build_rft_dataset.py's default --stages doesn't train the
+    caption call, so there's nothing for the adapter to have learned here —
+    but nothing stops you from measuring what it does anyway."""
     # The exact same CAPTION_PROMPT is repeated once per image — we're asking
     # every image the identical question, just pairing it with a different
     # picture each time.
@@ -185,9 +192,10 @@ def caption_batch(
     outs = vlm.generate_batch_safe(
         prompts, image_paths,
         label="caption_batch", item_labels=image_paths,
-        system_prompt=system_prompt, 
+        system_prompt=system_prompt,
         max_new_tokens=max_new_tokens,
         temperature=temperature, output_mode="free_form",  # no JSON schema — just get back plain text
+        use_lora=use_lora,
     )
     # Guard against a non-string response (e.g. None on total generation
     # failure) by substituting an empty string, so callers never have to
@@ -207,6 +215,7 @@ def summarize_caption_batch(
     system_prompt: Optional[str] = None,
     max_new_tokens: int = 64,
     temperature: float = 0.0,
+    use_lora: bool = False,
 ) -> List[str]:
     """ClipMatch-only (ImageNet/Places): compress each image's own baseline
     caption into a short (<=~20-word) summary, grounded in BOTH the image and
@@ -222,6 +231,11 @@ def summarize_caption_batch(
     `dataset` selects the prompt: ImageNet gets the object-centric wording,
     Places365 the scene-centric one (prompts.get_summary_caption_prompt), since
     each dataset's ClipMatch candidate vocabulary is a different KIND of label.
+
+    `use_lora` (default False): this call doesn't even run on BIG-5, the RFT
+    dataset (ClipMatch/this call are ImageNet+Places-only — see
+    clip_metrics.CLIPMATCH_DATASETS), so it's here purely for symmetry with
+    every other stage, not because there's a realistic use for it yet.
     """
     prompts = [get_summary_caption_prompt(dataset).format(caption=c) for c in captions]
     outs = vlm.generate_batch_safe(
@@ -229,6 +243,7 @@ def summarize_caption_batch(
         label="summarize_caption_batch", item_labels=image_paths,
         system_prompt=system_prompt, max_new_tokens=max_new_tokens,
         temperature=temperature, output_mode="free_form",
+        use_lora=use_lora,
     )
     return [(o if isinstance(o, str) else "") for o in outs]
 
@@ -243,6 +258,7 @@ def extract_objects_batch(
     system_prompt: Optional[str],
     max_new_tokens: int = 256,
     temperature: float = 0.0,
+    use_lora: bool = False,
 ) -> List[Dict[str, Any]]:
     """Ask the VLM to list every object in each image, using the Stage-1
     caption as extra context alongside a fresh look at the image itself.
@@ -260,6 +276,13 @@ def extract_objects_batch(
     it, both cases are indistinguishable downstream (n_objects=0 either way),
     which previously made a total extraction failure invisible in the
     predictions CSV.
+
+    `use_lora` (default False, harmless on a VLM with no adapter loaded —
+    see VLLMBackedVLM._resolve_lora_request) applies the RFT fine-tune's
+    adapter to THIS call. Extraction IS one of the calls fine_tuning/
+    trains on, so a run scoring a fine-tuned checkpoint sets this True; a
+    normal baseline run leaves it False and behaves exactly as before this
+    parameter existed.
     """
     # Fill in each image's own caption into the shared EXTRACTION_PROMPT
     # template (see src/models/prompts.py) — so each per-image prompt is
@@ -271,6 +294,7 @@ def extract_objects_batch(
         system_prompt=system_prompt, max_new_tokens=max_new_tokens, temperature=temperature,
         output_mode="structured",       # this time we DO want JSON back...
         schema=ObjectExtractionResponse,  # ...shaped exactly like this schema
+        use_lora=use_lora,
     )
     results = []
     for o in outs:
@@ -322,6 +346,7 @@ def label_objects_batch(
     label_system_material: Optional[str],
     max_new_tokens: int = 300,
     temperature: float = 0.0,
+    use_lora: bool = False,
 ) -> List[List[Dict[str, Any]]]:
     """
     Per-object taxonomy labeling, routed by the object's WordNet mapping so the
@@ -359,6 +384,11 @@ def label_objects_batch(
     image's object list; each carries `parse_failed` and `vlm_called` flags.
     Two batched `generate_batch` calls are issued (one per system prompt) so
     vLLM prefix-caches each stable system+image prefix across the batch.
+
+    `use_lora` applies the RFT fine-tune's adapter to BOTH the full and
+    material-only calls below (labeling, like extraction, is one of the
+    stages fine_tuning/ trains on — see extract_objects_batch's docstring
+    for the same flag on the other trained stage).
     """
     # Pre-fill every slot; the two groups below overwrite their own entries and
     # mapped-non-nature objects keep the synthetic label set here.
@@ -406,12 +436,24 @@ def label_objects_batch(
             item_labels=[f"{image_paths[i]}#{j}" for i, j in full_owner],
             system_prompt=label_system_full, max_new_tokens=max_new_tokens,
             temperature=temperature, output_mode="structured", schema=TaxonomyResponse,
+            use_lora=use_lora,
         )
         for (i, j), out in zip(full_owner, outs):
             if isinstance(out, dict):
                 per_image[i][j] = {
                     "reasoning": _combine_taxonomy_reasoning(out), "nature": out.get("nature"),
                     "biotic": out.get("life_category"), "material": out.get("tangibility"),
+                    # TaxonomyResponse's two reasoning fields, ALSO kept
+                    # separately. `reasoning` above joins them with a space for
+                    # every consumer that wants one stable field (CSV,
+                    # diagnostics), but that join is not reversible, and
+                    # rejection-sampling fine-tuning needs the model's literal
+                    # response back to use it as a training target
+                    # (fine_tuning/rft_common.py). Storing both costs
+                    # nothing and removes the need to recover the split
+                    # heuristically from the joined string.
+                    "nature_reasoning": out.get("nature_reasoning"),
+                    "sub_axes_reasoning": out.get("sub_axes_reasoning"),
                     "parse_failed": False, "vlm_called": True,
                 }
             else:
@@ -425,6 +467,7 @@ def label_objects_batch(
             item_labels=[f"{image_paths[i]}#{j}" for i, j in mat_owner],
             system_prompt=label_system_material, max_new_tokens=max_new_tokens,
             temperature=temperature, output_mode="structured", schema=MaterialResponse,
+            use_lora=use_lora,
         )
         for (i, j), out in zip(mat_owner, outs):
             if isinstance(out, dict):
@@ -461,6 +504,7 @@ def run_inference(
     summarize_for_clipmatch: bool = False,
     summary_max_new_tokens: int = 64,
     dataset: Optional[str] = None,
+    use_lora: bool = False,
 ):
     """
     Run caption -> extraction -> (mapping + labeling) over every image and yield
@@ -522,6 +566,17 @@ def run_inference(
     every image's results in memory at once, which matters when running over
     thousands of images. The caller (scripts/run_vlm_pipeline.py's
     phase_infer) writes each yielded record straight to disk as it arrives.
+
+    `use_lora` (default False) applies the fine_tuning/ RFT adapter to the
+    extraction and labeling calls — this function does NOT pass it to
+    caption_batch/summarize_caption_batch (both accept it too, but default to
+    False independently), matching which stages
+    fine_tuning/build_rft_dataset.py trains by default: an adapter trained on
+    extraction+labeling gets applied to exactly extraction+labeling here.
+    Requires the VLM to have been constructed with a `lora_adapter_path`
+    (src.models.vlm_models.VLLMBackedVLM) — set True with no adapter loaded
+    and the very first extraction call raises, rather than silently running
+    unadapted.
     """
     if extraction_system_prompt is None:
         # By default, the extraction call uses the SAME system prompt as the
@@ -595,6 +650,7 @@ def run_inference(
         extraction_results = extract_objects_batch(
             vlm, image_paths, captions, extraction_system_prompt,
             max_new_tokens=resolved_extraction_max_new_tokens, temperature=temperature,
+            use_lora=use_lora,
         )
         objects_per_image = [r["objects"] for r in extraction_results]
         extraction_reasoning_per_image = [r["reasoning"] for r in extraction_results]
@@ -651,6 +707,7 @@ def run_inference(
             vlm, image_paths, objects_per_image, mappings_per_image,
             label_system_full, label_system_material,
             max_new_tokens=label_max_new_tokens, temperature=temperature,
+            use_lora=use_lora,
         )
         if verbose:
             print(f"[infer] batch {b + 1}/{num_batches}: label_objects_batch done.", flush=True)

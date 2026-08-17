@@ -882,6 +882,48 @@ def _clip_token_stats(scorer, texts):
 # =============================================================================
 # PHASE 1 — inference
 # =============================================================================
+def _filter_to_split(items, split_file, key, what):
+    """Restrict `items` to the image paths listed in `split_file` (one per
+    line), for evaluating on ONE split of a train/val/test partition.
+
+    Built for the fine-tuning work (scripts/fine_tuning/make_splits.py writes
+    these files), but nothing here is fine-tuning-specific: it is just "score
+    this subset of the dataset".
+
+    Matching is on the BASENAME, not the full path, on purpose — the split
+    files are written from artifact paths recorded on the cluster, while a
+    dataset may be loaded from a different mount point or a copy of the same
+    images. BIG-5 basenames are "<platform_id>_<slot>.<ext>", unique per
+    platform folder and in practice across both. A split file naming images
+    that are not in the dataset at all is reported rather than silently
+    ignored: it almost always means the wrong split file or the wrong
+    --dataset was passed, and a quietly-empty evaluation is far worse than a
+    loud one.
+    """
+    if not split_file:
+        return items
+    with open(split_file, "r", encoding="utf-8") as fh:
+        wanted = {os.path.basename(line.strip()) for line in fh if line.strip()}
+    if not wanted:
+        raise SystemExit(f"--split_file {split_file} is empty.")
+    kept = [item for item in items if os.path.basename(key(item)) in wanted]
+    matched = {os.path.basename(key(item)) for item in kept}
+    # Deliberately does NOT report "{len(matched)}/{len(wanted)} listed
+    # images found" — a split file MAY legitimately pool several platforms/
+    # datasets into one list (make_splits.py pools BIG-5 Twitter+Weibo), and
+    # --dataset only ever loads one of them, so most of `wanted` is expected
+    # to never match here. That ratio would look like a mostly-failed run
+    # (e.g. 225/1333) on a perfectly correct one — exactly the false alarm
+    # this function's own docstring says to avoid causing.
+    print(f"🔎 --split_file {split_file}: kept {len(kept)}/{len(items)} {what} "
+          f"({len(matched)} distinct basenames from the split file matched this dataset)")
+    if not kept:
+        raise SystemExit(
+            f"--split_file {split_file} matched NONE of the {len(items)} {what}. "
+            f"Wrong split file for this --dataset, or the images differ.")
+    return kept
+
+
 def phase_infer(args, vlm=None):
     """
     Runs the ENTIRE inference half of the pipeline: load the dataset and the
@@ -921,6 +963,9 @@ def phase_infer(args, vlm=None):
     )
     if not dataset:
         print("No dataset instances loaded — exiting."); sys.exit(1)
+
+    dataset = _filter_to_split(dataset, args.split_file, key=lambda inst: inst["image_path"],
+                               what="dataset instances")
 
     if args.max_samples is not None:
         # Fixed seed so re-running with the same --max_samples always samples
@@ -973,6 +1018,12 @@ def phase_infer(args, vlm=None):
         # with different prompt variants would be comparing different setups.
         "summary_caption_prompt": (f"summary_caption_prompt_{args.dataset}"
                                     if summarize_for_clipmatch else None),
+        # Provenance for a fine-tuned run: whether this artifact was produced
+        # with an RFT adapter applied (and to which base model + adapter
+        # path), so a saved results JSON is self-describing and a fine-tuned
+        # run is never mistaken for a baseline one when comparing later.
+        "lora_adapter_path": args.lora_adapter_path,
+        "lora_adapter_name": args.lora_adapter_name if args.lora_adapter_path else None,
     }
 
     out_path = Path(args.responses_file)
@@ -1122,6 +1173,13 @@ def phase_infer(args, vlm=None):
                           # broken combination, and the caption call has no grammar
                           # to stop chain-of-thought leaking into the caption text).
                           "enable_thinking": args.enable_thinking}
+            if args.lora_adapter_path:
+                # See VLLMBackedVLM.__init__: this is enough on its own to
+                # get a correctly-configured engine (enable_lora/
+                # max_lora_rank are folded in there, not the caller's job).
+                vlm_kwargs["lora_adapter_path"] = args.lora_adapter_path
+                vlm_kwargs["lora_adapter_name"] = args.lora_adapter_name
+                vlm_kwargs["lora_max_rank"] = args.lora_max_rank
             if args.max_model_len is not None:
                 vlm_kwargs["max_model_len"] = args.max_model_len
             if args.max_num_seqs is not None:
@@ -1155,6 +1213,7 @@ def phase_infer(args, vlm=None):
                 # above) — picks the object-centric vs scene-centric summary
                 # prompt, see prompts.get_summary_caption_prompt.
                 dataset=args.dataset,
+                use_lora=bool(args.lora_adapter_path),
             ):
                 rec["record_type"] = "image"
                 f.write(json.dumps(rec) + "\n")
@@ -1628,6 +1687,11 @@ def phase_score(args):
     # candidate vocab, so it coincides exactly with run_clipmatch. COCO/BIG-5
     # keep the image-level-OR + matched-object path instead.
     single_label = bool(run_clipmatch)
+    # Applied here as well as in phase_infer so an artifact covering the WHOLE
+    # dataset can still be scored on one split alone — useful for reading a
+    # baseline model's test-split numbers off a run that predates the splits.
+    records = _filter_to_split(records, args.split_file, key=lambda rec: rec["image_path"],
+                               what="artifact records")
     if args.max_samples is not None:
         records = records[: args.max_samples]
 
@@ -3393,6 +3457,25 @@ def build_arg_parser():
                         "— shards the model across this many GPUs. Default 1 (single GPU, no "
                         "change from prior behavior).")
     p.add_argument("--trust_remote_code", action="store_true")
+    p.add_argument("--lora_adapter_path", type=str, default=None,
+                   help="Path to a fine_tuning/train_lora.py adapter directory (the peft "
+                        "output, NOT a merged checkpoint) to serve ON TOP of --model_name, "
+                        "the same base model it was trained from. Applied SELECTIVELY, on "
+                        "the SAME resident vLLM engine as the base weights — the caption "
+                        "call always runs base (it is never trained), extraction/labeling "
+                        "run adapted (see src.vlm_pipeline.run_inference's use_lora). vLLM "
+                        "does NOT support DoRA adapters natively (vllm-project/vllm#10849, "
+                        "open as of this writing) — this flag requires the adapter to have "
+                        "been trained with plain LoRA (train_lora.py's default, --use_dora "
+                        "NOT passed). A DoRA-trained adapter here would silently apply "
+                        "plain-LoRA math to DoRA weights: wrong, not an error.")
+    p.add_argument("--lora_adapter_name", type=str, default="rft",
+                   help="Cosmetic identifier for the adapter (vLLM's LoRARequest name); "
+                        "only meaningful alongside --lora_adapter_path.")
+    p.add_argument("--lora_max_rank", type=int, default=16,
+                   help="Must be >= the adapter's own training rank (train_lora.py's "
+                        "--lora_r, default 16) — vLLM allocates LoRA buffers sized to this "
+                        "at engine startup. Only meaningful alongside --lora_adapter_path.")
     p.add_argument("--max_image_side", type=int, default=1024,
                    help="Downscale (preserving aspect ratio) any image whose longest side "
                         "exceeds this many pixels before it reaches the VLM (see "
@@ -3607,6 +3690,13 @@ def build_arg_parser():
                         "seed-42 deterministic, so a different value resumes against a "
                         "different subset.")
     p.add_argument("--max_samples", type=int, default=None)
+    p.add_argument("--split_file", type=str, default=None,
+                   help="Restrict the run to the image paths listed in this file (one per "
+                        "line; matched by basename). Written by "
+                        "scripts/fine_tuning/make_splits.py as <split>_images.txt — this is "
+                        "how a fine-tuned model is evaluated on the held-out TEST split "
+                        "only. Applies to both --stage infer and --stage score, so an "
+                        "existing whole-dataset artifact can also be re-scored on one split.")
     p.add_argument("--verbose", action="store_true")
     p.add_argument("--wandb", action="store_true")
     p.add_argument("--wandb_run_id", type=str, default=None, help=argparse.SUPPRESS)
