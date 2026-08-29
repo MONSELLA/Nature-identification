@@ -301,7 +301,7 @@ def load_imagenet(data_dir, taxonomy_graph):
     # name, entirely different WordNet synsets — get distinct text instead of
     # colliding, which matters wherever this class_name feeds a CLIP/VLM
     # prompt (get_candidate_vocab's matching branch below, and the calibration
-    # eval in evaluate_taxonomy_labeling.py).
+    # prompt).
     class_names = _imagenet_class_names(idx_to_wnid.values())
     for idx, wnid in idx_to_wnid.items():
         synset_name = _wnid_to_synset(wnid)

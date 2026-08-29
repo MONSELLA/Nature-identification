@@ -63,15 +63,13 @@ def format_duration(seconds):
 
 
 class BatchProgress:
-    """Shared --verbose progress logger for the two top-level scripts' batched
-    VLM-inference loops (run_vlm_pipeline.py's run_inference,
-    evaluate_taxonomy_labeling.py's main batch loop). Previously each script
-    hand-rolled its own version; run_vlm_pipeline.py's just printed "N/M images
-    processed" with no timing, while evaluate_taxonomy_labeling.py printed a
-    per-batch ETA but computed it off an off-by-one batch count
-    (`num_batches - batch_idx + 1`, which over-counts the remaining batches by
-    2). This one fixes that and is used by both, so progress output stays
-    identical in format and doesn't drift between scripts again.
+    """Shared --verbose progress logger for the batched VLM-inference and
+    CLIP-encoding loops (run_vlm_pipeline.py's run_inference, the grounding
+    pipeline, the CLIP encoders). Previously each loop hand-rolled its own
+    version, with inconsistent output and at least one off-by-one ETA
+    (`num_batches - batch_idx + 1`, over-counting the remaining batches by 2).
+    One implementation means progress output stays identical in format and
+    cannot drift between call sites again.
 
     ETA is a RUNNING AVERAGE over every batch completed so far (elapsed /
     done), not just the last batch's duration — a single batch can be an

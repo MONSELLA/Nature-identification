@@ -2,10 +2,9 @@
 src/models/prompts.py
 
 Single home for ALL prompts and structured-output schemas used by the BIG-5
-VLM pipeline. Keeping them here (rather than inline in each script) guarantees
-that the taxonomy-labeling prompt used by the pipeline's VLM-fallback path is
-byte-for-byte identical to the one used by evaluate_taxonomy_labeling.py's
-calibration eval — the two cannot drift, because they import the same objects.
+VLM pipeline. Keeping them here (rather than inline in each script) means every
+caller imports the SAME prompt objects, so the prompt a stage actually sends can
+never drift from the one another script believes it sends.
 
 Contents:
   - CAPTION_PROMPT               : baseline open-ended caption (neutral, no
@@ -381,9 +380,8 @@ class ObjectExtractionResponse(BaseModel):
 # Stage 3 — Per-object taxonomy labeling (the VLM-fallback prompt)
 # =============================================================================
 # IMPORTANT: this schema and build_classification_prompt() are the SHARED,
-# canonical taxonomy-labeling prompt. evaluate_taxonomy_labeling.py imports
-# them from here so the calibration eval and the pipeline's fallback are
-# identical. Any change here changes BOTH — that is intentional.
+# canonical taxonomy-labeling prompt — the one the pipeline's VLM-fallback path
+# sends. Any change here changes that path for every dataset at once.
 
 class TaxonomyResponse(BaseModel):
     """
@@ -654,14 +652,10 @@ EXAMPLE OUTPUT FOR TARGET "elephant":
 # =============================================================================
 # System prompts (built from the data/big5_taxonomy/ definition files)
 # =============================================================================
-# SINGLE HOME for this composition logic. Previously run_vlm_pipeline.py
-# (build_system_prompts) and evaluate_taxonomy_labeling.py (load_system_prompt)
-# each built their own copy of the "all three definitions" system prompt string
-# — same content, two separate implementations that could silently drift apart.
-# Both now import this one function, guaranteeing the pipeline's UNMAPPED-object
-# labeling call and the calibration eval's system prompt stay byte-identical
-# (the whole point of that eval is to measure the exact same fallback prompt
-# the pipeline uses — see evaluate_taxonomy_labeling.py's module docstring).
+# SINGLE HOME for this composition logic. It was previously duplicated across
+# scripts — same content, separate implementations that could silently drift
+# apart. Every caller now imports this one function, so the definition files
+# are read and composed exactly one way.
 def build_system_prompts(nature_path: str, biotic_path: str, material_path: str) -> Tuple[str, str, str]:
     """Build the three system prompts the pipeline needs, reading each
     definition file once:
@@ -677,10 +671,8 @@ def build_system_prompts(nature_path: str, biotic_path: str, material_path: str)
                                  only to seed extraction_system_prompt's
                                  default.
       - label_system_full      : ALL THREE axis definitions — used for
-                                 UNMAPPED objects (where the VLM must decide
-                                 nature/biotic/material from scratch) AND for
-                                 evaluate_taxonomy_labeling.py's calibration
-                                 eval, which measures that exact fallback path.
+                                 UNMAPPED objects, where the VLM must decide
+                                 nature/biotic/material from scratch.
       - label_system_material  : MATERIAL definition only — used for MAPPED-
                                  nature objects, where WordNet already fixed
                                  nature and biotic and only material/immaterial
