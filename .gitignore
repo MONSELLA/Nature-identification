@@ -9,11 +9,15 @@ visualization_app/
 #IDE
 .vscode/
 
-#To avoid uploading Slurm launchers
-*.sh
+# NOTE: Slurm launchers (*.sh) ARE tracked deliberately — they are the only
+# record of how each experiment was actually run, and an untracked launcher is
+# unrecoverable if the working tree is lost. Never hardcode a token in one;
+# read it from the environment (export HF_TOKEN=... before sbatch).
 
-# Python chache
+# Python cache / build artifacts
 __pycache__/
+*.egg-info/
+.ipynb_checkpoints/
 
 # Secrets (e.g. HF_TOKEN)
 .env
