@@ -93,7 +93,6 @@ import json
 import random
 
 import torch
-import torch.nn as nn
 import pandas as pd
 import numpy as np
 from tqdm import tqdm
@@ -105,79 +104,17 @@ from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 import wandb
 
 # Get the absolute path of the directory one level up and add it to sys.path
-# (so the `first_tests.evaluation` import below can be found — see
-# count_classes.py's comment; that module is not present in the current repo
-# tree, so this script cannot currently run as-is.)
+# so `baseline.common` / `src.loaders...` are importable regardless of cwd.
 parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if parent_dir not in sys.path:
     sys.path.insert(0, parent_dir)
 
-from first_tests.evaluation import TaxonomyEvaluationPipeline
-
-
-# ============================================================================
-# MULTITASK DIRECT-TAXONOMY MODEL (Paula Feliu's TFG) -- same as evaluate_imagenet.py
-# https://github.com/paulafeliu/TFG-Interpretability-Techniques-in-Social-Media-Images
-# ============================================================================
-# Inlined rather than imported from a cloned repo (see evaluate_imagenet.py's
-# comment for the full rationale). Copied verbatim from models/backbone.py and
-# models/multitask_model.py, with the same weights=None change (harmless,
-# since load_state_dict(strict=True) overwrites every weight anyway).
-class CustomBackbone(nn.Module):
-    """Swappable CNN feature-extractor — see the identical class in
-    evaluate_imagenet.py for full comments."""
-    def __init__(self, model_choice='ResNet18'):
-        super(CustomBackbone, self).__init__()
-        self.model_choice = model_choice
-        if model_choice == 'DenseNet121':
-            model_base = models.densenet121(weights=None)
-            model_base.classifier = nn.Identity()
-            self.feature_dim = 1024
-        elif model_choice == 'ResNet18':
-            model_base = models.resnet18(weights=None)
-            model_base.fc = nn.Identity()
-            self.feature_dim = 512
-        elif model_choice == 'EfficientNetB0':
-            model_base = models.efficientnet_b0(weights=None)
-            model_base.classifier = nn.Identity()
-            self.feature_dim = 1280
-        else:
-            model_base = models.resnet50(weights=None)
-            model_base.fc = nn.Identity()
-            self.feature_dim = 2048
-        self.backbone = model_base
-
-    def forward(self, x):
-        x = self.backbone(x)
-        return x.view(x.size(0), -1)
-
-
-class MultiTaskModel(nn.Module):
-    """Wraps a CustomBackbone with four independent linear prediction heads
-    sharing the same features — see evaluate_imagenet.py for full comments."""
-    def __init__(self, backbone, feature_dim):
-        super(MultiTaskModel, self).__init__()
-        self.backbone = backbone
-        self.fc_nature = nn.Linear(feature_dim, 2)
-        self.fc_materiality = nn.Linear(feature_dim, 3)
-        self.fc_biological = nn.Linear(feature_dim, 3)
-        self.fc_landscape = nn.Linear(feature_dim, 8)
-
-    def forward(self, x):
-        features = self.backbone(x)
-        out_nature = self.fc_nature(features)
-        out_materiality = self.fc_materiality(features)
-        out_biological = self.fc_biological(features)
-        out_landscape = self.fc_landscape(features)
-        return out_nature, out_materiality, out_biological, out_landscape
-
-
-# Verified label encodings (see evaluate_imagenet.py for the exact source citation):
-#   nature_visual:          {"Yes": 1, "No": 0}                       -> matches our convention directly
-#   nep_materiality_visual: {"material": 0, "immaterial": 1, "nan": 2} -> OPPOSITE of our convention
-#   nep_biological_visual:  {"biotic": 0, "abiotic": 1, "nan": 2}      -> OPPOSITE of our convention
-MULTITASK_MATERIALITY_TO_OURS = {0: 1, 1: 0}  # their material(0)->our 1, their immaterial(1)->our 0
-MULTITASK_BIOLOGICAL_TO_OURS = {0: 1, 1: 0}   # their biotic(0)->our 1, their abiotic(1)->our 0
+from baseline.common import (
+    TaxonomyLookup, CustomBackbone, MultiTaskModel, safe_binary_map,
+    MULTITASK_MATERIALITY_TO_OURS, MULTITASK_BIOLOGICAL_TO_OURS,
+    calculate_binary_metrics, calculate_binary_metrics_direct,
+    append_results_rows, binary_metrics_to_rows, single_row, DEFAULT_RESULTS_CSV,
+)
 
 
 # ============================================================================
@@ -292,6 +229,9 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=128, help="Batch size for inference.")
     parser.add_argument("--num_workers", type=int, default=4, help="Number of dataloader workers.")
     parser.add_argument("--output_file", type=str, default="closed_set_places_baseline.json", help="Summary output.")
+    parser.add_argument("--results_csv", type=str, default=DEFAULT_RESULTS_CSV,
+                        help="Shared long-format CSV every baseline run appends its rows to "
+                             "(pivot this to build the thesis tables instead of the per-run JSON).")
 
     # Mapping strictness
     parser.add_argument("--allow-unresolved", dest="allow_unresolved", action="store_true",
@@ -304,18 +244,6 @@ def parse_args():
     parser.add_argument("--wandb", action="store_true", help="Store the results on WandB.")
 
     return parser.parse_args()
-
-
-def safe_binary_map(val, positive_str, negative_str):
-    """Safely converts string annotations to binary labels. (identical to imagenet script)"""
-    if not isinstance(val, str):
-        return None
-    val = val.strip().lower()
-    if val == positive_str.lower():
-        return 1
-    if val == negative_str.lower():
-        return 0
-    return None
 
 
 # ============================================================================
@@ -667,9 +595,8 @@ def main():
     # ==========================================
     if args.verbose:
         print(f"[INFO] Loading Taxonomy from {args.excel_path}...")
-    pipeline = TaxonomyEvaluationPipeline()
-    df_taxonomy = pd.read_excel(args.excel_path, sheet_name="data corrected")
-    pipeline.load_custom_excel_annotations(df_taxonomy, "Biotic/abiotic", "Material/immaterial")
+    taxonomy = TaxonomyLookup()
+    taxonomy.load(args.excel_path)
 
     if args.verbose:
         print("[INFO] Reconstructing Places365 -> WordNet synset mapping (MIT-tagged synsets only)...")
@@ -707,7 +634,7 @@ def main():
 
     for cid in range(len(places_categories)):
         synset_str = id_to_synset.get(cid)
-        node_attrs = pipeline.get_node_attributes(synset_str) if synset_str else None
+        node_attrs = taxonomy.get_node_attributes(synset_str) if synset_str else None
 
         if not node_attrs:
             # Either excluded (still_missing) or unresolved-but-allowed: leave label as None
@@ -823,61 +750,16 @@ def main():
     # ==========================================
     # 5. METRIC CALCULATION
     # ==========================================
-    def calculate_binary_metrics(gt_list, pred_list, map_dict, task_name):
-        """torchvision mode: both gt/pred are Places CATEGORY IDS, looked up
-        through map_dict to get their taxonomy label — same shape as
-        evaluate_imagenet.py's identically-named function."""
-        valid_gts, valid_preds = [], []
-        for gt_id, pred_id in zip(gt_list, pred_list):
-            mapped_gt = map_dict.get(gt_id)
-            mapped_pred = map_dict.get(pred_id)
-            if mapped_gt is not None:
-                valid_gts.append(mapped_gt)
-                if mapped_pred is None:
-                    valid_preds.append(1 - mapped_gt)  # penalize mapping failure (same as imagenet script)
-                else:
-                    valid_preds.append(mapped_pred)
-        if not valid_gts:
-            return {"accuracy": 0, "precision": 0, "recall": 0, "f1": 0, "support": 0}
-        acc = accuracy_score(valid_gts, valid_preds)
-        p, r, f1, _ = precision_recall_fscore_support(valid_gts, valid_preds, average='binary', zero_division=0)
-        return {"accuracy": float(acc), "precision": float(p), "recall": float(r),
-                "f1": float(f1), "support": len(valid_gts)}
-
-    def calculate_binary_metrics_direct(gt_list, pred_direct_list, map_dict):
-        """
-        Same methodology as calculate_binary_metrics, but for models whose
-        predictions are ALREADY final taxonomy labels (0/1/None) rather than
-        category ids needing a second lookup through map_dict. A None
-        prediction (the model's own "not applicable" class) is penalized as
-        wrong, same convention as a mapping failure -- consistent methodology
-        across both model types rather than silently excluding hard cases.
-        """
-        valid_gts, valid_preds = [], []
-        for gt_id, pred_direct in zip(gt_list, pred_direct_list):
-            mapped_gt = map_dict.get(gt_id)
-            if mapped_gt is not None:
-                valid_gts.append(mapped_gt)
-                if pred_direct is None:
-                    valid_preds.append(1 - mapped_gt)
-                else:
-                    valid_preds.append(pred_direct)
-        if not valid_gts:
-            return {"accuracy": 0, "precision": 0, "recall": 0, "f1": 0, "support": 0}
-        acc = accuracy_score(valid_gts, valid_preds)
-        p, r, f1, _ = precision_recall_fscore_support(valid_gts, valid_preds, average='binary', zero_division=0)
-        return {"accuracy": float(acc), "precision": float(p), "recall": float(r),
-                "f1": float(f1), "support": len(valid_gts)}
-
     if args.model_type == "torchvision":
         # Standard Places365 metrics (365-way)
         places_acc = accuracy_score(all_gt_places, all_pred_places)
         places_p, places_r, places_f1, _ = precision_recall_fscore_support(
             all_gt_places, all_pred_places, average='macro', zero_division=0
         )
-        nature_metrics = calculate_binary_metrics(all_gt_places, all_pred_places, map_nature, "Nature")
-        biotic_metrics = calculate_binary_metrics(all_gt_places, all_pred_places, map_biotic, "Biotic")
-        material_metrics = calculate_binary_metrics(all_gt_places, all_pred_places, map_material, "Material")
+        # Taxonomic Binary Metrics (both classes -- see common.calculate_binary_metrics)
+        nature_metrics = calculate_binary_metrics(all_gt_places, all_pred_places, map_nature)
+        biotic_metrics = calculate_binary_metrics(all_gt_places, all_pred_places, map_biotic)
+        material_metrics = calculate_binary_metrics(all_gt_places, all_pred_places, map_material)
 
     else:  # multitask_direct
         # This model was never trained to do 365-class Places classification,
@@ -904,19 +786,22 @@ def main():
         print("--- 365-Class Places365 ---")
         print("N/A -- this model predicts nature/materiality/biological directly, not Places365 classes.")
 
-    for title, m in [("Nature vs. No Nature", nature_metrics),
-                     ("Biotic vs. Abiotic", biotic_metrics),
-                     ("Material vs. Immaterial", material_metrics)]:
-        print(f"\n--- Binary: {title} (Support: {m['support']}) ---")
+    def print_binary_block(title, m):
+        print(f"\n--- Binary: {title} ---")
         print(f"Accuracy:  {m['accuracy']:.4f}")
-        print(f"Precision: {m['precision']:.4f}")
-        print(f"Recall:    {m['recall']:.4f}")
-        print(f"F1 Score:  {m['f1']:.4f}")
+        for polarity in ("positive", "negative"):
+            pm = m[polarity]
+            print(f"  [{polarity}] Precision: {pm['precision']:.4f}  Recall: {pm['recall']:.4f}  "
+                  f"F1: {pm['f1']:.4f}  (Support: {pm['support']})")
+
+    print_binary_block("Nature vs. No Nature", nature_metrics)
+    print_binary_block("Biotic vs. Abiotic", biotic_metrics)
+    print_binary_block("Material vs. Immaterial", material_metrics)
     print("=" * 55)
 
     if args.wandb:
         print("\n🚀 Uploading baseline metrics to Weights & Biases...")
-        wandb.log({
+        wandb_log_dict = {
             "Number of unmapped/excluded classes:": stats["unmapped"],
             "Number of unresolved classes:": report["n_unresolved"],
 
@@ -924,25 +809,16 @@ def main():
             "Places/Precision_Macro": places_p,
             "Places/Recall_Macro": places_r,
             "Places/F1_Macro": places_f1,
-
-            "Nature/Accuracy": nature_metrics['accuracy'],
-            "Nature/Precision": nature_metrics['precision'],
-            "Nature/Recall": nature_metrics['recall'],
-            "Nature/F1": nature_metrics['f1'],
-            "Nature/Support": nature_metrics['support'],
-
-            "Biotic/Accuracy": biotic_metrics['accuracy'],
-            "Biotic/Precision": biotic_metrics['precision'],
-            "Biotic/Recall": biotic_metrics['recall'],
-            "Biotic/F1": biotic_metrics['f1'],
-            "Biotic/Support": biotic_metrics['support'],
-
-            "Material/Accuracy": material_metrics['accuracy'],
-            "Material/Precision": material_metrics['precision'],
-            "Material/Recall": material_metrics['recall'],
-            "Material/F1": material_metrics['f1'],
-            "Material/Support": material_metrics['support'],
-        })
+        }
+        for name, m in [("Nature", nature_metrics), ("Biotic", biotic_metrics), ("Material", material_metrics)]:
+            wandb_log_dict[f"{name}/Accuracy"] = m["accuracy"]
+            for polarity in ("positive", "negative"):
+                pm = m[polarity]
+                wandb_log_dict[f"{name}/{polarity.capitalize()}/Precision"] = pm["precision"]
+                wandb_log_dict[f"{name}/{polarity.capitalize()}/Recall"] = pm["recall"]
+                wandb_log_dict[f"{name}/{polarity.capitalize()}/F1"] = pm["f1"]
+                wandb_log_dict[f"{name}/{polarity.capitalize()}/Support"] = pm["support"]
+        wandb.log(wandb_log_dict)
 
     summary_results = {
         "model": model_label,
@@ -969,6 +845,20 @@ def main():
     if args.wandb:
         wandb.save(args.output_file)
         wandb.finish()
+
+    # ==========================================
+    # 7. APPEND TO THE SHARED RESULTS CSV (Table 1/2 shape)
+    # ==========================================
+    base_row = {"run_id": model_label, "dataset": "places365", "model": model_label, "model_type": args.model_type}
+    rows = []
+    if args.model_type == "torchvision":
+        rows.append(single_row(base_row, "Base (Macro)", accuracy=places_acc,
+                                precision=places_p, recall=places_r, f1=places_f1, support=len(dataset_to_use)))
+    rows += binary_metrics_to_rows(base_row, "Nature", nature_metrics)
+    rows += binary_metrics_to_rows(base_row, "Biotic", biotic_metrics)
+    rows += binary_metrics_to_rows(base_row, "Material", material_metrics)
+    append_results_rows(args.results_csv, rows)
+    print(f"💾 Appended {len(rows)} rows to {args.results_csv}")
 
 
 def _replace_head_365(model, model_name):

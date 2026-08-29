@@ -63,6 +63,7 @@ from typing import Any, Dict, List, Optional
 from src.models.prompts import (
     CAPTION_PROMPT,
     EXTRACTION_PROMPT,
+    get_extraction_prompt,
     get_summary_caption_prompt,
     MaterialResponse,
     ObjectExtractionResponse,
@@ -216,6 +217,7 @@ def summarize_caption_batch(
     max_new_tokens: int = 64,
     temperature: float = 0.0,
     use_lora: bool = False,
+    no_caption: bool = False,
 ) -> List[str]:
     """ClipMatch-only (ImageNet/Places): compress each image's own baseline
     caption into a short (<=~20-word) summary, grounded in BOTH the image and
@@ -232,12 +234,25 @@ def summarize_caption_batch(
     Places365 the scene-centric one (prompts.get_summary_caption_prompt), since
     each dataset's ClipMatch candidate vocabulary is a different KIND of label.
 
+    `no_caption` (default False) selects the caption-free variant of that
+    prompt, for a run where Stage 1 was ablated away: `captions` is then
+    ignored entirely and this call produces a short description straight from
+    the image rather than a summary of anything. ImageNet only — every other
+    dataset raises (prompts.SUMMARY_CAPTION_PROMPTS_NO_CAPTION).
+
     `use_lora` (default False): this call doesn't even run on BIG-5, the RFT
     dataset (ClipMatch/this call are ImageNet+Places-only — see
     clip_metrics.CLIPMATCH_DATASETS), so it's here purely for symmetry with
     every other stage, not because there's a realistic use for it yet.
     """
-    prompts = [get_summary_caption_prompt(dataset).format(caption=c) for c in captions]
+    if no_caption:
+        # --no_caption: there is no caption to compress, so this call becomes
+        # the run's ONE short, direct image description (see
+        # prompts.SUMMARY_CAPTION_PROMPTS_NO_CAPTION). The prompt has no
+        # "{caption}" placeholder — used verbatim, and `captions` is ignored.
+        prompts = [get_summary_caption_prompt(dataset, no_caption=True)] * len(image_paths)
+    else:
+        prompts = [get_summary_caption_prompt(dataset).format(caption=c) for c in captions]
     outs = vlm.generate_batch_safe(
         prompts, image_paths,
         label="summarize_caption_batch", item_labels=image_paths,
@@ -259,9 +274,16 @@ def extract_objects_batch(
     max_new_tokens: int = 256,
     temperature: float = 0.0,
     use_lora: bool = False,
+    no_caption: bool = False,
 ) -> List[Dict[str, Any]]:
     """Ask the VLM to list every object in each image, using the Stage-1
     caption as extra context alongside a fresh look at the image itself.
+
+    `no_caption` (the --no_caption ABLATION, default False) drops the caption
+    context entirely: `captions` is ignored and the model is prompted from the
+    image alone with prompts.get_extraction_prompt(no_caption=True) — the same
+    instructions minus the caption preamble, so the only variable between a
+    baseline run and an ablation run is the presence of Stage 1 itself.
 
     Returns one {"objects": [...], "reasoning": str | None,
     "extraction_parse_failed": bool} dict per image — "reasoning" is
@@ -287,7 +309,13 @@ def extract_objects_batch(
     # Fill in each image's own caption into the shared EXTRACTION_PROMPT
     # template (see src/models/prompts.py) — so each per-image prompt is
     # slightly different this time, referencing that image's own description.
-    prompts = [EXTRACTION_PROMPT.format(caption=c) for c in captions]
+    if no_caption:
+        # ABLATION: no Stage-1 caption exists, so every image gets the exact
+        # same caption-free instruction (used verbatim — it has no format
+        # placeholder). `captions` is deliberately not read at all here.
+        prompts = [get_extraction_prompt(no_caption=True)] * len(image_paths)
+    else:
+        prompts = [EXTRACTION_PROMPT.format(caption=c) for c in captions]
     outs = vlm.generate_batch_safe(
         prompts, image_paths,
         label="extract_objects_batch", item_labels=image_paths,
@@ -505,6 +533,7 @@ def run_inference(
     summary_max_new_tokens: int = 64,
     dataset: Optional[str] = None,
     use_lora: bool = False,
+    no_caption: bool = False,
 ):
     """
     Run caption -> extraction -> (mapping + labeling) over every image and yield
@@ -567,6 +596,15 @@ def run_inference(
     thousands of images. The caller (scripts/run_vlm_pipeline.py's
     phase_infer) writes each yielded record straight to disk as it arrives.
 
+    `no_caption` (the --no_caption ABLATION, default False) removes STAGE 1
+    entirely: no caption call is made, every record's "caption" is the empty
+    string, and extraction is prompted from the image alone
+    (prompts.get_extraction_prompt(no_caption=True)). It composes with `summarize_for_clipmatch`: on ImageNet
+    that call survives and switches to its caption-free variant, becoming the
+    run's ONE short image description and the text ClipMatch scores (ClipMatch
+    cannot run without some caption-derived text). On BIG-5/COCO
+    `summarize_for_clipmatch` is False anyway and Stage 1 disappears outright.
+
     `use_lora` (default False) applies the fine_tuning/ RFT adapter to the
     extraction and labeling calls — this function does NOT pass it to
     caption_batch/summarize_caption_batch (both accept it too, but default to
@@ -625,7 +663,7 @@ def run_inference(
         # what actually pinpoint WHICH stage it's stuck in (free_form caption
         # vs. structured extraction vs. structured labeling) instead of the
         # log just going silent with no way to tell which call is hanging.
-        if verbose:
+        if verbose and not no_caption:
             print(f"[infer] batch {b + 1}/{num_batches}: caption_batch "
                   f"({len(image_paths)} images, free_form)...", flush=True)
         # Stages 1-2: caption, then structured object extraction.
@@ -640,17 +678,30 @@ def run_inference(
         # caption call skips it. caption_system_prompt is accepted as a
         # run_inference parameter solely to seed extraction_system_prompt's
         # default (see below), not to be passed here.
-        captions = caption_batch(
-            vlm, image_paths,
-            max_new_tokens=caption_max_new_tokens, temperature=temperature,
-        )
+        if no_caption:
+            # ABLATION (--no_caption): Stage 1 is skipped entirely — no VLM call
+            # is made here at all. Each record still carries a "caption" key so
+            # every downstream consumer (scoring, the predictions CSV, the
+            # grounding pipeline) keeps its existing shape; it is just empty,
+            # and --stage score reads the artifact header's caption_stage flag
+            # to know that the caption-based CLIP metrics are inapplicable
+            # rather than genuinely zero.
+            if verbose:
+                print(f"[infer] batch {b + 1}/{num_batches}: caption_batch SKIPPED "
+                      f"(--no_caption ablation).", flush=True)
+            captions = [""] * len(image_paths)
+        else:
+            captions = caption_batch(
+                vlm, image_paths,
+                max_new_tokens=caption_max_new_tokens, temperature=temperature,
+            )
         if verbose:
             print(f"[infer] batch {b + 1}/{num_batches}: extract_objects_batch "
                   f"(structured, ObjectExtractionResponse)...", flush=True)
         extraction_results = extract_objects_batch(
             vlm, image_paths, captions, extraction_system_prompt,
             max_new_tokens=resolved_extraction_max_new_tokens, temperature=temperature,
-            use_lora=use_lora,
+            use_lora=use_lora, no_caption=no_caption,
         )
         objects_per_image = [r["objects"] for r in extraction_results]
         extraction_reasoning_per_image = [r["reasoning"] for r in extraction_results]
@@ -663,10 +714,12 @@ def run_inference(
         if summarize_for_clipmatch:
             if verbose:
                 print(f"[infer] batch {b + 1}/{num_batches}: summarize_caption_batch "
-                      f"(free_form, ClipMatch primary text)...", flush=True)
+                      f"(free_form, ClipMatch primary text"
+                      f"{', caption-free variant' if no_caption else ''})...", flush=True)
             summary_captions = summarize_caption_batch(
                 vlm, image_paths, captions, dataset,
                 max_new_tokens=summary_max_new_tokens, temperature=temperature,
+                no_caption=no_caption,
             )
         else:
             summary_captions = [None] * len(image_paths)

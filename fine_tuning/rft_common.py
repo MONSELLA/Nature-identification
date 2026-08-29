@@ -92,6 +92,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from src.models.prompts import (  # noqa: E402
     EXTRACTION_PROMPT,
+    get_extraction_prompt,
     build_classification_prompt,
     build_material_classification_prompt,
 )
@@ -347,11 +348,22 @@ def examples_for_record(
     source_model: str,
     stages: Tuple[str, ...],
     stats: BuildStats,
+    no_caption: bool = False,
 ) -> List[Example]:
     """Rebuild every training example one ACCEPTED image contributes.
 
     The caller is responsible for having applied `image_verdict` — this
     function does not re-check acceptance, it only reconstructs calls.
+
+    `no_caption` MUST mirror the source artifact's header `caption_stage`
+    (build_rft_dataset reads it and threads it through). A --no_caption run
+    prompts extraction with the caption-free variant and stores `caption: ""`,
+    so rebuilding the example from EXTRACTION_PROMPT would train the model on a
+    prompt shape — the with-caption template with an empty quoted description
+    where a real one belongs — that never occurs at inference. The whole point
+    of reconstructing from `prompts` rather than copying strings is that the
+    training prompt is byte-identical to the served one; this keeps that true
+    for both variants.
     """
     out: List[Example] = []
     image_path = record["image_path"]
@@ -376,6 +388,8 @@ def examples_for_record(
             stats.bump("extraction_skipped_no_reasoning")
         else:
             caption = record.get("caption") or ""
+            extraction_prompt = (get_extraction_prompt(no_caption=True) if no_caption
+                                 else EXTRACTION_PROMPT.format(caption=caption))
             target = json.dumps(
                 {"reasoning": record["extraction_reasoning"],
                  "objects": record.get("objects") or []},
@@ -383,7 +397,7 @@ def examples_for_record(
             )
             out.append(Example(
                 stage="extraction", system_key=SYSTEM_KEYS["extraction"],
-                prompt=EXTRACTION_PROMPT.format(caption=caption), target=target,
+                prompt=extraction_prompt, target=target,
                 **common,
             ))
             stats.bump("examples_extraction")

@@ -3,8 +3,9 @@
 Evaluate any of the four model families built so far (ImageNet-style
 classifier, Places365-style classifier, Query2Label COCO multi-label
 classifier, or Paula Feliu's direct multitask model) against the BIG-5
-Twitter dataset, projecting/comparing predictions against BIG-5's OWN
-direct nature/biotic/material annotations.
+social-media dataset (Twitter and/or Weibo, selected via --dataset),
+projecting/comparing predictions against BIG-5's OWN direct
+nature/biotic/material annotations.
 
 WHAT IS THIS SCRIPT FOR? All the other baseline/evaluate_*.py scripts test a
 model against a STANDARD benchmark dataset (ImageNet/COCO/Places365), each
@@ -29,31 +30,28 @@ families (everything except multitask_direct, which already predicts the
 taxonomy dimensions directly).
 
 ------------------------------------------------------------------------------
-DATA SOURCES AND JOIN MECHANICS -- verified against actual files, not guessed
+DATA SOURCES -- via src.loaders.dataset_loader.load_big5 (shared with the VLM
+pipeline; see that module and CLAUDE.md's BIG-5 GT notes for the full format)
 ------------------------------------------------------------------------------
-Two files per language are needed:
-  1. table_for_pau_twitter-{en,es}-6.csv: the ground-truth annotation table
-     (protocol v6, majority vote + 3rd-coder disagreement resolution per
-     Ramin's email). Columns: platform_id, n_coders, nature_visual_any,
-     nature_visual_0..3, nep_materiality_visual_0..3,
-     nep_immaterial_specific_visual_0..3 (unused for this taxonomy -- a
-     sub-categorization of WHICH kind of immaterial content it is, e.g.
-     illustration/videogame/plain_text/infographic/other, per the BIG-5
-     protocol's documented immaterial subcategories. "other" dominates
-     (~96% of populated values across the ES data) but is not exclusive.
-     Not needed here since nep_materiality_visual_N already gives the
-     top-level material/immaterial call our taxonomy actually uses),
-     nep_biological_visual_0..3.
-  2. phase-1_twitter-{en,es}.csv: platform_id -> media_files, a string that
-     looks like a Python list literal, e.g. "['123_0.jpg', '123_1.jpg']".
-     VERIFIED: the numeric suffix in each filename (_0, _1, ...) matches the
-     nature_visual_N / nep_*_visual_N index positionally, and list order
-     matches index order. VERIFIED: inner-joining both files on platform_id
-     for the ES data produced a 100% match (885/885), with no case of
-     nature_visual_any=='Yes' lacking a populated media_files entry.
-Images are downloaded from:
-    https://big5.cssh.bsc.es/STATIC/phase1-media/twitter_1_all/scaled/<FILENAME>
-and cached locally (see --images_cache_dir) so repeated runs don't re-download.
+Ground truth comes from the SAME majority-vote CSVs and loader the VLM
+pipeline uses (`src.loaders.dataset_loader.load_big5`/`big5_sources`), so this
+script never re-implements CSV parsing:
+  - Twitter: --twitter_en_gt_csv / --twitter_es_gt_csv, 4 image slots per row
+    (nature_visual_0..3), images read locally from --twitter_images_dir.
+  - Weibo:   --weibo_ch0_gt_csv / --weibo_ch1_gt_csv, 9 image slots per row
+    (nature_visual_0..8, slot count auto-detected), images read locally from
+    --weibo_images_dir.
+--dataset selects which platform(s) to evaluate: "big5_twitter" (Twitter
+only), "big5_weibo" (Weibo only), or "big5" (both pooled -- per CLAUDE.md,
+prefer the per-platform runs for reporting, since pooling silently averages
+the two platforms together in the results CSV). Images are LOCAL, not
+downloaded -- each platform's images_dir is a flat folder already containing
+every image, named "<platform_id>_<idx>.<ext>", located by globbing.
+Each configured GT-CSV source (Twitter English/Spanish, Weibo ch0/ch1) is
+loaded SEPARATELY (not pooled into one load_big5 call) so this script can
+still report a per-source breakdown (the "language" field below, now really
+"which GT-CSV split this image came from" -- Twitter's two are actual
+languages, Weibo's two are channel splits, but the code path is identical).
 
 ------------------------------------------------------------------------------
 DATA QUALITY NOTE: 24 inconsistent image-slots (out of 3534 checked, ~0.7%)
@@ -93,14 +91,11 @@ reused VERBATIM from the already-verified scripts, not reimplemented
 
 import os
 import sys
-import ast
 import json
 import argparse
-import urllib.request
 from types import SimpleNamespace
 
 import torch
-import torch.nn as nn
 import numpy as np
 import pandas as pd
 from PIL import Image
@@ -108,9 +103,8 @@ from tqdm import tqdm
 from torchvision import models as tv_models
 import torchvision.transforms as transforms
 from torch.utils.data import Dataset, DataLoader
-from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 
-# Make both the repo root (for the missing `first_tests` module) and this
+# Make both the repo root (for `baseline.common` / `src...`) and this
 # script's own directory importable — see count_classes.py's comment.
 parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if parent_dir not in sys.path:
@@ -119,11 +113,19 @@ this_dir = os.path.abspath(os.path.dirname(__file__))
 if this_dir not in sys.path:
     sys.path.insert(0, this_dir)
 
-from first_tests.evaluation import TaxonomyEvaluationPipeline
-
-# Where BIG-5's Twitter images are hosted; downloaded and cached locally on
-# first use (see download_image_if_missing below).
-IMG_BASE_URL = "https://big5.cssh.bsc.es/STATIC/phase1-media/twitter_1_all/scaled/"
+from baseline.common import (
+    TaxonomyLookup, CustomBackbone, MultiTaskModel, safe_binary_map,
+    MULTITASK_MATERIALITY_TO_OURS, MULTITASK_BIOLOGICAL_TO_OURS,
+    COCO_TO_WNSYNSET, append_results_rows, binary_metrics_to_rows,
+    single_row, DEFAULT_RESULTS_CSV, binary_metrics_from_labels,
+    empty_binary_metrics,
+)
+# Same GT loader the VLM pipeline uses (src/loaders/dataset_loader.py) --
+# handles both BIG-5 platforms (Twitter/Weibo), local (non-downloaded)
+# images, and the platform_id apostrophe-stripping / slot-count-detection
+# fixes documented in CLAUDE.md. NOT a `baseline/`-owned module (imported,
+# not modified) -- see the module docstring's "DATA SOURCES" section.
+from src.loaders.dataset_loader import load_big5, big5_sources
 
 
 # ============================================================================
@@ -161,32 +163,6 @@ def imagenet_idx_to_wnid(idx):
     return imagenet_idx_to_wnid._info.index_to_label_name(idx)
 
 
-
-
-# ============================================================================
-# COCO -> WORDNET SYNSET MAPPING (identical to evaluate_coco.py, needed for
-# --model_family coco_q2l's prediction projection)
-# ============================================================================
-COCO_TO_WNSYNSET = {
-    1: 'person.n.01', 2: 'bicycle.n.01', 3: 'car.n.01', 4: 'motorcycle.n.01', 5: 'airplane.n.01',
-    6: 'bus.n.01', 7: 'train.n.01', 8: 'truck.n.01', 9: 'boat.n.01', 10: 'traffic_light.n.01',
-    11: 'fireplug.n.01', 13: 'street_sign.n.01', 14: 'parking_meter.n.01', 15: 'bench.n.01',
-    16: 'bird.n.01', 17: 'cat.n.01', 18: 'dog.n.01', 19: 'horse.n.01', 20: 'sheep.n.01',
-    21: 'cow.n.01', 22: 'elephant.n.01', 23: 'bear.n.01', 24: 'zebra.n.01', 25: 'giraffe.n.01',
-    27: 'backpack.n.01', 28: 'umbrella.n.01', 31: 'bag.n.04', 32: 'necktie.n.01', 33: 'bag.n.06',
-    34: 'frisbee.n.01', 35: 'ski.n.01', 36: 'snowboard.n.01', 37: 'ball.n.01', 38: 'kite.n.03',
-    39: 'baseball_bat.n.01', 40: 'baseball_glove.n.01', 41: 'skateboard.n.01', 42: 'surfboard.n.01',
-    43: 'tennis_racket.n.01', 44: 'bottle.n.01', 46: 'wineglass.n.01', 47: 'cup.n.01', 48: 'fork.n.01',
-    49: 'knife.n.01', 50: 'spoon.n.01', 51: 'bowl.n.01', 52: 'banana.n.02', 53: 'apple.n.01',
-    54: 'sandwich.n.01', 55: 'orange.n.01', 56: 'broccoli.n.02', 57: 'carrot.n.01', 58: 'hotdog.n.02',
-    59: 'pizza.n.01', 60: 'doughnut.n.02', 61: 'cake.n.03', 62: 'chair.n.01', 63: 'sofa.n.01',
-    64: 'pot_plant.n.01', 65: 'bed.n.01', 67: 'dining_table.n.01', 70: 'toilet.n.02',
-    72: 'television_receiver.n.01',  # corrected from 'television.n.02'
-    73: 'laptop.n.01', 74: 'mouse.n.04', 75: 'remote_control.n.01', 76: 'computer_keyboard.n.01',
-    77: 'cellular_telephone.n.01', 78: 'microwave.n.02', 79: 'oven.n.01', 80: 'toaster.n.02',
-    81: 'sink.n.01', 82: 'refrigerator.n.01', 84: 'book.n.02', 85: 'clock.n.01', 86: 'vase.n.01',
-    87: 'scissors.n.01', 88: 'teddy.n.01', 89: 'hand_blower.n.01', 90: 'toothbrush.n.01',
-}
 
 
 # ============================================================================
@@ -366,6 +342,7 @@ def _replace_head_365(model, model_name):
     """Swap a torchvision classifier head to 365 outputs — see
     evaluate_places.py's identically-named function for the full explanation
     of why each architecture family needs a different attribute path."""
+    import torch.nn as nn
     name = model_name.lower()
     if name.startswith("convnext"):
         in_f = model.classifier[2].in_features
@@ -431,6 +408,7 @@ def install_inplace_abn_shim_if_missing(verbose=False):
     except ImportError:
         pass
     import types as _types
+    import torch.nn as nn
     import torch.nn.functional as F
 
     class InPlaceABNSyncShim(nn.BatchNorm2d):
@@ -466,61 +444,6 @@ def install_inplace_abn_shim_if_missing(verbose=False):
         print("[INFO] Real 'inplace_abn' not found; installed an eval-only shim.")
 
 
-# ============================================================================
-# MULTITASK DIRECT-TAXONOMY MODEL (Paula Feliu's TFG) -- verbatim from the
-# other three scripts.
-# ============================================================================
-class CustomBackbone(nn.Module):
-    """Swappable CNN feature-extractor — see evaluate_imagenet.py for full comments."""
-    def __init__(self, model_choice='ResNet18'):
-        super(CustomBackbone, self).__init__()
-        self.model_choice = model_choice
-        if model_choice == 'DenseNet121':
-            model_base = tv_models.densenet121(weights=None)
-            model_base.classifier = nn.Identity()
-            self.feature_dim = 1024
-        elif model_choice == 'ResNet18':
-            model_base = tv_models.resnet18(weights=None)
-            model_base.fc = nn.Identity()
-            self.feature_dim = 512
-        elif model_choice == 'EfficientNetB0':
-            model_base = tv_models.efficientnet_b0(weights=None)
-            model_base.classifier = nn.Identity()
-            self.feature_dim = 1280
-        else:
-            model_base = tv_models.resnet50(weights=None)
-            model_base.fc = nn.Identity()
-            self.feature_dim = 2048
-        self.backbone = model_base
-
-    def forward(self, x):
-        x = self.backbone(x)
-        return x.view(x.size(0), -1)
-
-
-class MultiTaskModel(nn.Module):
-    """Wraps a CustomBackbone with four independent linear prediction heads
-    sharing the same features — see evaluate_imagenet.py for full comments."""
-    def __init__(self, backbone, feature_dim):
-        super(MultiTaskModel, self).__init__()
-        self.backbone = backbone
-        self.fc_nature = nn.Linear(feature_dim, 2)
-        self.fc_materiality = nn.Linear(feature_dim, 3)
-        self.fc_biological = nn.Linear(feature_dim, 3)
-        self.fc_landscape = nn.Linear(feature_dim, 8)
-
-    def forward(self, x):
-        features = self.backbone(x)
-        return (self.fc_nature(features), self.fc_materiality(features),
-                self.fc_biological(features), self.fc_landscape(features))
-
-
-# Translate the multitask model's own 0/1 class indices into this project's
-# convention — see evaluate_imagenet.py for the full source citation.
-MULTITASK_MATERIALITY_TO_OURS = {0: 1, 1: 0}
-MULTITASK_BIOLOGICAL_TO_OURS = {0: 1, 1: 0}
-
-
 def coco_readable_name(cid):
     """Human-readable name derived from the synset string, e.g. 'person.n.01' -> 'person'."""
     synset = COCO_TO_WNSYNSET.get(cid, "")
@@ -531,112 +454,79 @@ def coco_readable_name(cid):
 
 
 # ============================================================================
-# BIG-5 GROUND TRUTH: build one row per actual image (not per post)
+# BIG-5 GROUND TRUTH: build one row per actual image, via the shared
+# src.loaders.dataset_loader.load_big5 loader (see module docstring's "DATA
+# SOURCES" section for why this script doesn't parse the CSVs itself).
 # ============================================================================
-def _map_yn(val):
-    """'Yes'/'No' -> 1/0, anything else (blank, NaN) -> None."""
-    if not isinstance(val, str):
-        return None
-    v = val.strip().lower()
-    if v == 'yes':
-        return 1
-    if v == 'no':
-        return 0
-    return None
+def _big5_sources_for_args(args):
+    """One (label, gt_csv, images_dir) triple per configured GT-CSV source,
+    restricted to the platform(s) --dataset selects. A source whose gt_csv
+    is None is dropped here (rather than passed through to load_big5) so
+    each remaining source can be loaded SEPARATELY below and keep its own
+    per-source ("language") breakdown."""
+    all_sources = big5_sources(
+        args.dataset,
+        twitter_en_gt=args.twitter_en_gt_csv, twitter_es_gt=args.twitter_es_gt_csv,
+        twitter_images_dir=args.twitter_images_dir,
+        weibo_ch0_gt=args.weibo_ch0_gt_csv, weibo_ch1_gt=args.weibo_ch1_gt_csv,
+        weibo_images_dir=args.weibo_images_dir,
+    )
+    return [s for s in all_sources if s[1]]  # s = (label, gt_csv, images_dir)
 
 
-def _map_materiality(val):
-    """'material'/'immaterial' -> our convention (material=1), blank -> None."""
-    if not isinstance(val, str):
-        return None
-    v = val.strip().lower()
-    if v == 'material':
-        return 1
-    if v == 'immaterial':
-        return 0
-    return None
-
-
-def _map_biological(val):
-    """'biotic'/'abiotic' -> our convention (biotic=1), blank -> None."""
-    if not isinstance(val, str):
-        return None
-    v = val.strip().lower()
-    if v == 'biotic':
-        return 1
-    if v == 'abiotic':
-        return 0
-    return None
-
-
-def build_big5_image_records(gt_csv, media_csv, language):
+def build_big5_image_records(args):
     """
-    Join gt_csv (table_for_pau_twitter-{lang}-6.csv) with media_csv
-    (phase-1_twitter-{lang}.csv) on platform_id, and explode into one record
-    per actual image (0..3). Returns a list of dicts:
-        {language, platform_id, image_index, filename, gt_nature, gt_biotic, gt_material}
-    Applies the verified correction rule: if nature_visual_N == 'No' but
-    materiality/biological are still populated, the stray detail is dropped
-    (nature_visual_N is authoritative) -- per user decision.
-
-    WHY "EXPLODE"? Each ROW in the GT csv describes one Twitter POST, which
-    can have UP TO 4 attached images (indices 0-3, each with its own
-    nature/materiality/biological annotation column suffixed _0.._3). This
-    function turns "N posts, each with up to 4 image-slots" into a flat list
-    of "one dict per actual image" — the natural unit for evaluation, since
-    each image gets its own model prediction.
+    Load every configured BIG-5 GT-CSV source via load_big5 (ONE call per
+    source, so each source's images stay tagged with their own "language"
+    label for the per-source breakdown -- see _big5_sources_for_args), and
+    flatten into this script's own record shape:
+        {language, platform_id, image_index, filename, local_path,
+         gt_nature, gt_biotic, gt_material}
+    gt_nature/gt_biotic/gt_material are 1/0/None (this baseline scores one
+    scalar GT per image, unlike the VLM pipeline's run_vlm_pipeline.py,
+    which scores every element of a coder-disagreement cell as its own GT
+    instance -- see load_big5's own docstring). A disagreement cell (BOTH
+    True and False present, e.g. "material; immaterial") keeps only its
+    FIRST value here; per CLAUDE.md this is a small fraction of the data.
     """
-    gt = pd.read_csv(gt_csv)
-    media = pd.read_csv(media_csv)
-    # Inner join on platform_id: only posts present in BOTH the GT annotation
-    # table AND the media-file listing survive — a post with no matching
-    # media_files entry has nothing to download/evaluate anyway.
-    joined = gt.merge(media, on='platform_id', how='inner')
+    sources = _big5_sources_for_args(args)
+    if not sources:
+        raise ValueError(
+            "No BIG-5 GT source configured for --dataset "
+            f"{args.dataset!r}. Pass the matching --twitter_*_gt_csv/--twitter_images_dir "
+            "and/or --weibo_*_gt_csv/--weibo_images_dir flags."
+        )
 
     records = []
-    n_dropped_stray_detail = 0
-    for _, row in joined.iterrows():
-        media_files_raw = row.get('media_files')
-        if pd.isna(media_files_raw):
-            continue
-        try:
-            # media_files is stored as a STRING that looks like a Python list
-            # literal (e.g. "['123_0.jpg', '123_1.jpg']") — ast.literal_eval
-            # safely parses it back into an actual Python list without using
-            # eval() (which would allow arbitrary code execution).
-            filenames = ast.literal_eval(media_files_raw)
-        except (ValueError, SyntaxError):
-            continue
+    for label, gt_csv, images_dir in sources:
+        entries = load_big5([(label, gt_csv, images_dir)])
+        for entry in entries:
+            image_path = entry["image_path"]
+            target = entry["targets"][0]
+            filename = os.path.basename(image_path)
+            # Filenames are "<platform_id>_<idx>.<ext>" (see load_big5's
+            # docstring) -- recover both pieces for the record shape the
+            # rest of this script (diagnostic sample, eyeball printing) expects.
+            stem = os.path.splitext(filename)[0]
+            platform_id, _, idx_str = stem.rpartition("_")
+            try:
+                image_index = int(idx_str)
+            except ValueError:
+                platform_id, image_index = stem, 0
 
-        for idx in range(4):
-            if idx >= len(filenames):
-                continue  # no image at this slot for this post
-            nat = _map_yn(row.get(f'nature_visual_{idx}'))
-            if nat is None:
-                continue  # this slot wasn't coded at all
-
-            mat_raw = row.get(f'nep_materiality_visual_{idx}')
-            bio_raw = row.get(f'nep_biological_visual_{idx}')
-            mat = _map_materiality(mat_raw)
-            bio = _map_biological(bio_raw)
-
-            if nat == 0 and (mat is not None or bio is not None):
-                # Verified data-quality correction (see module docstring):
-                # nature_visual_N is authoritative; drop stray detail values.
-                n_dropped_stray_detail += 1
-                mat, bio = None, None
-
+            gt_biotic_list = target.get("gt_biotic")
+            gt_material_list = target.get("gt_material")
             records.append({
-                "language": language,
-                "platform_id": row['platform_id'],
-                "image_index": idx,
-                "filename": filenames[idx],
-                "gt_nature": nat,
-                "gt_biotic": bio,
-                "gt_material": mat,
+                "language": label,
+                "platform_id": platform_id,
+                "image_index": image_index,
+                "filename": filename,
+                "local_path": image_path,
+                "gt_nature": 1 if target["gt_nature"] else 0,
+                "gt_biotic": (1 if gt_biotic_list[0] else 0) if gt_biotic_list else None,
+                "gt_material": (1 if gt_material_list[0] else 0) if gt_material_list else None,
             })
-
-    return records, n_dropped_stray_detail
+    return records
 
 
 def select_diagnostic_sample(all_records, size=20, seed=42):
@@ -716,9 +606,9 @@ def load_or_create_diagnostic_sample(all_records, sample_file, size=20):
             return json.load(f)
     sample = select_diagnostic_sample(all_records, size=size)
     to_save = [{
-        "filename": r["filename"], "language": r["language"], "platform_id": str(r["platform_id"]),
-        "image_index": r["image_index"], "gt_nature": r["gt_nature"],
-        "gt_biotic": r["gt_biotic"], "gt_material": r["gt_material"],
+        "filename": r["filename"], "local_path": r["local_path"], "language": r["language"],
+        "platform_id": str(r["platform_id"]), "image_index": r["image_index"],
+        "gt_nature": r["gt_nature"], "gt_biotic": r["gt_biotic"], "gt_material": r["gt_material"],
     } for r in sample]
     with open(sample_file, "w") as f:
         json.dump(to_save, f, indent=2)
@@ -763,31 +653,16 @@ def update_comparison_file(comparison_file, diagnostic_sample, results_by_filena
     return comparison
 
 
-def download_image_if_missing(filename, cache_dir):
-    """Download from IMG_BASE_URL into cache_dir if not already present. Returns
-    the local path, or None if the download failed (skip that image)."""
-    local_path = os.path.join(cache_dir, filename)
-    if os.path.isfile(local_path):
-        return local_path
-    os.makedirs(cache_dir, exist_ok=True)
-    url = IMG_BASE_URL + filename
-    try:
-        urllib.request.urlretrieve(url, local_path)
-        return local_path
-    except Exception as e:
-        print(f"⚠️  Failed to download {url}: {e}")
-        return None
-
-
 class Big5ImageDataset(Dataset):
-    """One instance per actual image. __getitem__ returns
-    (image_tensor, gt_nature, gt_biotic, gt_material, language, platform_id, image_index).
+    """One instance per actual image. Images are LOCAL (rec["local_path"],
+    already resolved by build_big5_image_records/load_big5) -- no download
+    step. __getitem__ returns (image_tensor, gt_nature, gt_biotic,
+    gt_material, language, platform_id, image_index, filename, local_path).
     GT fields are plain ints or None -- collated as lists via big5_collate_fn,
     NOT stacked into tensors, so None passes through unchanged."""
 
-    def __init__(self, records, cache_dir, transform):
+    def __init__(self, records, transform):
         self.records = records
-        self.cache_dir = cache_dir
         self.transform = transform
 
     def __len__(self):
@@ -795,22 +670,20 @@ class Big5ImageDataset(Dataset):
 
     def __getitem__(self, index):
         rec = self.records[index]
-        local_path = download_image_if_missing(rec["filename"], self.cache_dir)
-        if local_path is None:
-            return None  # filtered out by collate_fn
         try:
-            image = Image.open(local_path).convert("RGB")
+            image = Image.open(rec["local_path"]).convert("RGB")
         except Exception as e:
-            print(f"⚠️  Could not open {local_path}: {e}")
+            print(f"⚠️  Could not open {rec['local_path']}: {e}")
             return None
         if self.transform is not None:
             image = self.transform(image)
         return (image, rec["gt_nature"], rec["gt_biotic"], rec["gt_material"],
-                rec["language"], rec["platform_id"], rec["image_index"], rec["filename"])
+                rec["language"], rec["platform_id"], rec["image_index"], rec["filename"],
+                rec["local_path"])
 
 
 def big5_collate_fn(batch):
-    """Drops failed downloads/opens (None entries), stacks images into a
+    """Drops failed image-opens (None entries), stacks images into a
     tensor, keeps GT/metadata as plain Python lists so None values survive.
 
     WHY A CUSTOM COLLATE FUNCTION? PyTorch's DEFAULT collate function tries
@@ -832,20 +705,39 @@ def big5_collate_fn(batch):
     platform_ids = [b[5] for b in batch]
     image_indices = [b[6] for b in batch]
     filenames = [b[7] for b in batch]
-    return images, gt_nature, gt_biotic, gt_material, languages, platform_ids, image_indices, filenames
+    local_paths = [b[8] for b in batch]
+    return (images, gt_nature, gt_biotic, gt_material, languages, platform_ids,
+            image_indices, filenames, local_paths)
 
 
 def parse_args():
     """Command-line flags: BIG-5 data/cache paths, diagnostic-sample /
     cross-model comparison bookkeeping, taxonomy path, which model family to
     run and its family-specific arguments, and generation/testing/logging options."""
-    parser = argparse.ArgumentParser(description="Evaluate a model family against the BIG-5 Twitter dataset")
-    parser.add_argument("--twitter_en_gt_csv", type=str, default=None, help="table_for_pau_twitter-en-6.csv")
-    parser.add_argument("--twitter_es_gt_csv", type=str, default=None, help="table_for_pau_twitter-es-6.csv")
-    parser.add_argument("--twitter_en_media_csv", type=str, default=None, help="phase-1_twitter-en.csv")
-    parser.add_argument("--twitter_es_media_csv", type=str, default=None, help="phase-1_twitter-es.csv")
-    parser.add_argument("--images_cache_dir", type=str, default="/home/pmonserrat/datasets/big_5",
-                        help="Where downloaded images are cached (avoids re-downloading every run).")
+    parser = argparse.ArgumentParser(description="Evaluate a model family against the BIG-5 dataset (Twitter and/or Weibo)")
+    parser.add_argument("--dataset", type=str, default="big5_twitter",
+                        choices=["big5_twitter", "big5_weibo", "big5"],
+                        help="Which BIG-5 platform(s) to evaluate. 'big5_twitter'/'big5_weibo' restrict to one "
+                             "platform (recommended for reporting -- see CLAUDE.md); 'big5' pools both. Matches "
+                             "the results CSV's 'dataset' column so Twitter and Weibo runs are never silently "
+                             "averaged together.")
+    parser.add_argument("--twitter_en_gt_csv", type=str, default=None,
+                        help="[big5_twitter/big5] BIG-5 Twitter-English majority-vote GT CSV "
+                             "(platform_id, n_images, nature_visual_0..3, ...).")
+    parser.add_argument("--twitter_es_gt_csv", type=str, default=None,
+                        help="[big5_twitter/big5] BIG-5 Twitter-Spanish majority-vote GT CSV, same schema.")
+    parser.add_argument("--twitter_images_dir", type=str, default=None,
+                        help="[big5_twitter/big5] Flat folder of local Twitter images, named "
+                             "'<platform_id>_<idx>.<ext>' (no download step -- see module docstring).")
+    parser.add_argument("--weibo_ch0_gt_csv", type=str, default=None,
+                        help="[big5_weibo/big5] BIG-5 Weibo channel-0 majority-vote GT CSV "
+                             "(platform_id, n_images, nature_visual_0..8, ...).")
+    parser.add_argument("--weibo_ch1_gt_csv", type=str, default=None,
+                        help="[big5_weibo/big5] BIG-5 Weibo channel-1 majority-vote GT CSV, same schema.")
+    parser.add_argument("--weibo_images_dir", type=str, default=None,
+                        help="[big5_weibo/big5] Flat folder of local Weibo images, same naming convention "
+                             "as --twitter_images_dir (a DIFFERENT folder -- the two platforms' images "
+                             "live separately on disk).")
     parser.add_argument("--diagnostic_sample_file", type=str, default="big5_diagnostic_sample.json",
                         help="Path to persist/reuse a FIXED set of images for qualitative comparison "
                              "across different --model_family runs. Created via stratified sampling "
@@ -902,6 +794,9 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--output_file", type=str, default="big5_baseline.json")
+    parser.add_argument("--results_csv", type=str, default=DEFAULT_RESULTS_CSV,
+                        help="Shared long-format CSV every baseline run appends its rows to "
+                             "(pivot this to build the thesis tables instead of the per-run JSON).")
     parser.add_argument("--eyeball_samples_per_bucket", type=int, default=3,
                         help="How many example images to print per qualitative category "
                              "(nature TP/FP/TN/FN, no-taxonomy-match, biotic/material errors) "
@@ -910,6 +805,17 @@ def parse_args():
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--wandb", action="store_true")
     args = parser.parse_args()
+
+    # --dataset's own conditionally-required arguments (which platform(s)
+    # need their GT-csv/images_dir pair supplied).
+    if args.dataset in ("big5_twitter", "big5") and not (
+            (args.twitter_en_gt_csv or args.twitter_es_gt_csv) and args.twitter_images_dir):
+        parser.error("--dataset big5_twitter/big5 requires --twitter_images_dir plus at least one of "
+                     "--twitter_en_gt_csv / --twitter_es_gt_csv")
+    if args.dataset in ("big5_weibo", "big5") and not (
+            (args.weibo_ch0_gt_csv or args.weibo_ch1_gt_csv) and args.weibo_images_dir):
+        parser.error("--dataset big5_weibo/big5 requires --weibo_images_dir plus at least one of "
+                     "--weibo_ch0_gt_csv / --weibo_ch1_gt_csv")
 
     # Each model family has its own conditionally-required arguments (argparse
     # itself can't express "required only when --model_family is X" directly),
@@ -947,23 +853,11 @@ def parse_args():
     return args
 
 
-def safe_binary_map(val, positive_str, negative_str):
-    """Safely converts string annotations to binary labels (identical to the
-    other baseline scripts' identically-named function)."""
-    if not isinstance(val, str):
-        return None
-    val = val.strip().lower()
-    if val == positive_str.lower():
-        return 1
-    if val == negative_str.lower():
-        return 0
-    return None
-
-
 def compute_binary_metrics(gts, preds):
     """gts/preds: parallel lists, entries may be None (excluded). A None
     PREDICTION is penalized as wrong, matching convention used throughout
-    this project. A None GROUND TRUTH excludes that instance entirely."""
+    this project. A None GROUND TRUTH excludes that instance entirely.
+    Returns metrics for BOTH classes -- see common.calculate_binary_metrics."""
     valid_gt, valid_pred = [], []
     for gt, pred in zip(gts, preds):
         if gt is None:
@@ -975,12 +869,7 @@ def compute_binary_metrics(gts, preds):
         # scored as the OPPOSITE of ground truth, guaranteeing it counts as
         # an error rather than being silently dropped from the metric.
         valid_pred.append((1 - gt) if pred is None else pred)
-    if not valid_gt:
-        return {"accuracy": 0, "precision": 0, "recall": 0, "f1": 0, "support": 0}
-    acc = accuracy_score(valid_gt, valid_pred)
-    p, r, f1, _ = precision_recall_fscore_support(valid_gt, valid_pred, average='binary', zero_division=0)
-    return {"accuracy": float(acc), "precision": float(p), "recall": float(r),
-            "f1": float(f1), "support": len(valid_gt)}
+    return binary_metrics_from_labels(valid_gt, valid_pred)
 
 
 def stratified_eyeball_examples(results, n_per_bucket=3, seed=42):
@@ -1023,7 +912,7 @@ def stratified_eyeball_examples(results, n_per_bucket=3, seed=42):
     return buckets
 
 
-def print_eyeball_examples(buckets, images_cache_dir):
+def print_eyeball_examples(buckets):
     """Pretty-print each category's sampled examples: local file path, the
     model's raw output, ground truth, and the mapped/final prediction."""
     for bucket_name, examples in buckets.items():
@@ -1032,8 +921,7 @@ def print_eyeball_examples(buckets, images_cache_dir):
             print("  (none found -- this category is empty in this run's results)")
             continue
         for r in examples:
-            local_path = os.path.join(images_cache_dir, r["filename"])
-            print(f"  {local_path}")
+            print(f"  {r['local_path']}")
             print(f"    raw model output: {r['raw_prediction']}")
             print(f"    gt:              nature={r['gt_nature']} biotic={r['gt_biotic']} material={r['gt_material']}")
             print(f"    mapped pred:     nature={r['pred_nature']} biotic={r['pred_biotic']} "
@@ -1056,25 +944,17 @@ def main():
         )
 
     # ==========================================
-    # 1. BUILD BIG-5 GROUND TRUTH (both languages)
+    # 1. BUILD BIG-5 GROUND TRUTH (Twitter and/or Weibo, per --dataset)
     # ==========================================
-    all_records = []
-    for lang, gt_csv, media_csv in [
-        ("en", args.twitter_en_gt_csv, args.twitter_en_media_csv),
-        ("es", args.twitter_es_gt_csv, args.twitter_es_media_csv),
-    ]:
-        if gt_csv is None or media_csv is None:
-            continue
-        recs, n_dropped = build_big5_image_records(gt_csv, media_csv, lang)
-        all_records.extend(recs)
-        if args.verbose:
-            print(f"[INFO] {lang}: {len(recs)} image instances built "
-                  f"({n_dropped} stray materiality/biological values dropped per the nature_visual "
-                  f"correction rule).")
+    all_records = build_big5_image_records(args)
+    if args.verbose:
+        for label in sorted(set(r["language"] for r in all_records)):
+            n = sum(1 for r in all_records if r["language"] == label)
+            print(f"[INFO] {label}: {n} image instances built.")
 
     if not all_records:
-        raise ValueError("No BIG-5 records built. Pass at least one --twitter_{en,es}_gt_csv "
-                         "+ matching --twitter_{en,es}_media_csv pair.")
+        raise ValueError(f"No BIG-5 records built for --dataset {args.dataset!r}. Check the "
+                         "configured GT-csv/images_dir paths actually matched files on disk.")
 
     # Built from the FULL record set, before any --max_samples subsetting, so the
     # fixed diagnostic sample stays identical across runs regardless of --max_samples.
@@ -1102,16 +982,7 @@ def main():
             # own JSON only stored a SUMMARY (filename/GT), not the full record
             # dict `Big5ImageDataset` needs — so we look the missing ones back
             # up by filename from a fresh full build.
-            by_filename = {}
-            for lang, gt_csv, media_csv in [
-                ("en", args.twitter_en_gt_csv, args.twitter_en_media_csv),
-                ("es", args.twitter_es_gt_csv, args.twitter_es_media_csv),
-            ]:
-                if gt_csv is None or media_csv is None:
-                    continue
-                recs, _ = build_big5_image_records(gt_csv, media_csv, lang)
-                for r in recs:
-                    by_filename[r["filename"]] = r
+            by_filename = {r["filename"]: r for r in build_big5_image_records(args)}
             for d in missing_diag:
                 r = by_filename.get(d["filename"])
                 if r is not None:
@@ -1132,13 +1003,12 @@ def main():
     # ==========================================
     # 2. LOAD TAXONOMY (needed for imagenet/places/coco_q2l; unused for multitask_direct)
     # ==========================================
-    pipeline = None
+    taxonomy = None
     if args.model_family in ("imagenet", "places", "coco_q2l"):
         if args.verbose:
             print(f"[INFO] Loading Taxonomy from {args.excel_path}...")
-        pipeline = TaxonomyEvaluationPipeline()
-        df_taxonomy = pd.read_excel(args.excel_path, sheet_name="data corrected")
-        pipeline.load_custom_excel_annotations(df_taxonomy, "Biotic/abiotic", "Material/immaterial")
+        taxonomy = TaxonomyLookup()
+        taxonomy.load(args.excel_path)
 
     # ==========================================
     # 3. BUILD MODEL + PREPROCESSING (per family)
@@ -1225,7 +1095,7 @@ def main():
         q2l_col_nature, q2l_col_biotic, q2l_col_material = [], [], []
         for cid in q2l_ordered_cat_ids:
             synset_str = COCO_TO_WNSYNSET[cid]
-            node_attrs = pipeline.get_node_attributes(synset_str)
+            node_attrs = taxonomy.get_node_attributes(synset_str)
             if not node_attrs:
                 q2l_col_nature.append(None); q2l_col_biotic.append(None); q2l_col_material.append(None)
                 continue
@@ -1248,7 +1118,7 @@ def main():
     # ==========================================
     # 4. DATASET / DATALOADER
     # ==========================================
-    dataset = Big5ImageDataset(all_records, args.images_cache_dir, preprocess)
+    dataset = Big5ImageDataset(all_records, preprocess)
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False,
                             num_workers=args.num_workers, collate_fn=big5_collate_fn)
 
@@ -1256,14 +1126,14 @@ def main():
     # 5. INFERENCE LOOP
     # ==========================================
     results = []  # list of dicts: language, gt_nature, gt_biotic, gt_material, pred_nature, pred_biotic, pred_material
-    print(f"Running inference over {len(dataset)} BIG-5 images "
-          f"(downloading/caching to {args.images_cache_dir} as needed)...")
+    print(f"Running inference over {len(dataset)} BIG-5 images (local, --dataset {args.dataset!r})...")
     with torch.no_grad():
         for batch in tqdm(dataloader, disable=not args.verbose):
             if batch is None:
-                # every single image in this batch failed to download/open
+                # every single image in this batch failed to open
                 continue
-            images, gt_nature, gt_biotic, gt_material, languages, platform_ids, image_indices, filenames = batch
+            (images, gt_nature, gt_biotic, gt_material, languages, platform_ids,
+             image_indices, filenames, local_paths) = batch
             images = images.to(device)
 
             if args.model_family == "imagenet":
@@ -1272,8 +1142,8 @@ def main():
                 for i, pred_idx in enumerate(preds_idx):
                     raw_pred_name = weights.meta['categories'][pred_idx]  # torchvision's own name for this index
                     wnid = imagenet_idx_to_wnid(pred_idx)
-                    synset_str = pipeline.get_synset_str_from_wnid(wnid) if wnid else None
-                    node_attrs = pipeline.get_node_attributes(synset_str) if synset_str else None
+                    synset_str = taxonomy.get_synset_str_from_wnid(wnid) if wnid else None
+                    node_attrs = taxonomy.get_node_attributes(synset_str) if synset_str else None
                     no_match = not node_attrs
                     if not node_attrs:
                         pred_nat = pred_bio = pred_mat = None
@@ -1284,7 +1154,8 @@ def main():
                     results.append({"language": languages[i], "gt_nature": gt_nature[i], "gt_biotic": gt_biotic[i],
                                     "gt_material": gt_material[i], "pred_nature": pred_nat,
                                     "pred_biotic": pred_bio, "pred_material": pred_mat,
-                                    "filename": filenames[i], "no_taxonomy_match": no_match,
+                                    "filename": filenames[i], "local_path": local_paths[i],
+                                    "no_taxonomy_match": no_match,
                                     "raw_prediction": f"{raw_pred_name} ({wnid})"})
 
             elif args.model_family == "places":
@@ -1293,7 +1164,7 @@ def main():
                 for i, pred_id in enumerate(preds_idx):
                     raw_pred_name = places_categories[pred_id]
                     synset_str = places_id_to_synset.get(pred_id)
-                    node_attrs = pipeline.get_node_attributes(synset_str) if synset_str else None
+                    node_attrs = taxonomy.get_node_attributes(synset_str) if synset_str else None
                     no_match = not node_attrs
                     if not node_attrs:
                         pred_nat = pred_bio = pred_mat = None
@@ -1304,7 +1175,8 @@ def main():
                     results.append({"language": languages[i], "gt_nature": gt_nature[i], "gt_biotic": gt_biotic[i],
                                     "gt_material": gt_material[i], "pred_nature": pred_nat,
                                     "pred_biotic": pred_bio, "pred_material": pred_mat,
-                                    "filename": filenames[i], "no_taxonomy_match": no_match,
+                                    "filename": filenames[i], "local_path": local_paths[i],
+                                    "no_taxonomy_match": no_match,
                                     "raw_prediction": f"{raw_pred_name} (id={pred_id})"})
 
             elif args.model_family == "coco_q2l":
@@ -1334,7 +1206,8 @@ def main():
                     results.append({"language": languages[i], "gt_nature": gt_nature[i], "gt_biotic": gt_biotic[i],
                                     "gt_material": gt_material[i], "pred_nature": pred_nat,
                                     "pred_biotic": pred_bio, "pred_material": pred_mat,
-                                    "filename": filenames[i], "no_taxonomy_match": no_match,
+                                    "filename": filenames[i], "local_path": local_paths[i],
+                                    "no_taxonomy_match": no_match,
                                     "raw_prediction": raw_pred_name})
 
             else:  # multitask_direct -- always answers directly, no "unmapped" concept applies
@@ -1357,7 +1230,8 @@ def main():
                     results.append({"language": languages[i], "gt_nature": gt_nature[i], "gt_biotic": gt_biotic[i],
                                     "gt_material": gt_material[i], "pred_nature": pred_nat_batch[i],
                                     "pred_biotic": pred_bio_batch[i], "pred_material": pred_mat_batch[i],
-                                    "filename": filenames[i], "no_taxonomy_match": False,
+                                    "filename": filenames[i], "local_path": local_paths[i],
+                                    "no_taxonomy_match": False,
                                     "raw_prediction": raw_pred_name})
 
     # ==========================================
@@ -1402,7 +1276,7 @@ def main():
     if args.verbose:
         buckets = stratified_eyeball_examples(results, n_per_bucket=args.eyeball_samples_per_bucket)
         print(f"\n=== QUALITATIVE SAMPLES BY CATEGORY (up to {args.eyeball_samples_per_bucket} each) ===")
-        print_eyeball_examples(buckets, args.images_cache_dir)
+        print_eyeball_examples(buckets)
         print("-" * 60)
 
     # ==========================================
@@ -1427,10 +1301,9 @@ def main():
               f"({len(diagnostic_sample)} images, from {args.diagnostic_sample_file}) ===")
         for d in diagnostic_sample:
             r = results_by_filename.get(d["filename"])
-            local_path = os.path.join(args.images_cache_dir, d["filename"])
-            print(f"  {local_path}")
+            print(f"  {d.get('local_path', d['filename'])}")
             if r is None:
-                print(f"    [MISSING from this run -- download or image-open failed for this run]")
+                print(f"    [MISSING from this run -- image-open failed for this run]")
                 continue
             print(f"    raw model output: {r['raw_prediction']}")
             print(f"    gt:              nature={r['gt_nature']} biotic={r['gt_biotic']} material={r['gt_material']}")
@@ -1450,9 +1323,11 @@ def main():
         print(f"\n--- {title} ---")
         for task in ("nature", "biotic", "material"):
             t = m[task]
-            print(f"  {task.capitalize():10s} (Support: {t['support']:5d})  "
-                  f"Acc: {t['accuracy']:.4f}  P: {t['precision']:.4f}  "
-                  f"R: {t['recall']:.4f}  F1: {t['f1']:.4f}")
+            print(f"  {task.capitalize():10s}  Acc: {t['accuracy']:.4f}")
+            for polarity in ("positive", "negative"):
+                pt = t[polarity]
+                print(f"    [{polarity}] P: {pt['precision']:.4f}  R: {pt['recall']:.4f}  "
+                      f"F1: {pt['f1']:.4f}  (Support: {pt['support']})")
 
     print_block("COMBINED (all languages)", combined_metrics)
     for lang, m in per_language_metrics.items():
@@ -1463,11 +1338,17 @@ def main():
         import wandb
         wandb_log_dict = {}
         for task in ("nature", "biotic", "material"):
-            for k, v in combined_metrics[task].items():
-                wandb_log_dict[f"Combined/{task.capitalize()}/{k}"] = v
+            wandb_log_dict[f"Combined/{task.capitalize()}/Accuracy"] = combined_metrics[task]["accuracy"]
+            for polarity in ("positive", "negative"):
+                pt = combined_metrics[task][polarity]
+                for k, v in pt.items():
+                    wandb_log_dict[f"Combined/{task.capitalize()}/{polarity.capitalize()}/{k}"] = v
             for lang, m in per_language_metrics.items():
-                for k, v in m[task].items():
-                    wandb_log_dict[f"{lang}/{task.capitalize()}/{k}"] = v
+                wandb_log_dict[f"{lang}/{task.capitalize()}/Accuracy"] = m[task]["accuracy"]
+                for polarity in ("positive", "negative"):
+                    pt = m[task][polarity]
+                    for k, v in pt.items():
+                        wandb_log_dict[f"{lang}/{task.capitalize()}/{polarity.capitalize()}/{k}"] = v
         wandb.log(wandb_log_dict)
 
     diagnostic_sample_predictions = []
@@ -1486,7 +1367,7 @@ def main():
         "model_family": args.model_family,
         "model_id": args.model_id,
         "comparison_file": args.comparison_file,
-        "dataset": "big5_twitter",
+        "dataset": args.dataset,
         "samples_evaluated": len(results),
         "no_taxonomy_match_count": n_no_match,
         "no_taxonomy_match_rate": no_match_rate,
@@ -1503,6 +1384,26 @@ def main():
         import wandb
         wandb.save(args.output_file)
         wandb.finish()
+
+    # ==========================================
+    # 8. APPEND TO THE SHARED RESULTS CSV (Table 4 shape)
+    # ==========================================
+    # Table 4 groups rows by the DATASET the model was TRAINED on, not by
+    # --model_family's own internal name -- translate once here.
+    training_dataset = {
+        "imagenet": "ImageNet", "places": "Places365",
+        "coco_q2l": "COCO", "multitask_direct": "BIG-5",
+    }[args.model_family]
+    base_row = {
+        "run_id": args.model_id, "dataset": args.dataset, "model": args.model_id,
+        "model_type": args.model_family, "training_dataset": training_dataset,
+    }
+    rows = []
+    rows += binary_metrics_to_rows(base_row, "Nature", combined_metrics["nature"])
+    rows += binary_metrics_to_rows(base_row, "Biotic", combined_metrics["biotic"])
+    rows += binary_metrics_to_rows(base_row, "Material", combined_metrics["material"])
+    append_results_rows(args.results_csv, rows)
+    print(f"💾 Appended {len(rows)} rows to {args.results_csv}")
 
 
 if __name__ == "__main__":

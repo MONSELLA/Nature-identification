@@ -106,6 +106,58 @@ SUMMARY_CAPTION_PROMPT_PLACES = (
     "Output ONLY the summary text."
 )
 
+# -----------------------------------------------------------------------------
+# --no_caption variant (ImageNet only)
+# -----------------------------------------------------------------------------
+# With Stage 1 ablated away there is no caption to summarize, but ClipMatch
+# still needs SOME caption-derived text — so this call survives and changes
+# JOB: it stops being a re-summarization and becomes the run's one and only
+# short, direct image description. Framing it as "summarize" would be asking
+# the model to compress a description it was never given.
+#
+# WHAT CHANGES vs. SUMMARY_CAPTION_PROMPT_IMAGENET, and why:
+#   - the "{caption}" block and its "Using both the image and this
+#     description" clause are gone (nothing to reference).
+#   - a NAMING-SPECIFICITY clause is added. In the two-pass baseline the
+#     248-token caption was where fine-grained detail surfaced, and the
+#     summary only had to preserve it. Without it, no stage in the pipeline
+#     produces a specific name — and ImageNet-1k is largely fine-grained
+#     (dozens of breeds/species, each with its own candidate embedding), so
+#     "a dog on grass" is near-equidistant from thirty dog classes and the
+#     argmax between them is close to noise. This is where ImageNet top-1 is
+#     actually won.
+#   - background/setting suppression is made EXPLICIT rather than resting on
+#     "exclusively" alone. This is the opposite kind of specificity and it
+#     hurts: the candidate side is a mean over short "a photo of a {}."
+#     templates, and the measured 0.34 -> 0.41 gain came precisely from
+#     stripping the long caption's context.
+#   - the plural stays ("or subjects"), as in the incumbent prompt that
+#     measured 0.41, but is made CONDITIONAL ("if more than one is equally
+#     prominent"). An open invitation to enumerate walks back toward the
+#     concatenated-object-list ClipMatch variant this project rejected twice
+#     for semantic dilution, and every word spent on a second entity is a word
+#     not spent on "golden retriever" instead of "dog".
+# The 20-word cap and the "Output ONLY ..." guard are unchanged.
+#
+# NOT BENCHMARK-SHAPED ON PURPOSE: it never mentions ImageNet, a class list,
+# or that the text will be matched against candidates. That would likely lift
+# top-1 while measuring how well each VLM guesses the label format rather than
+# how well it sees.
+#
+# NOTE this makes the ImageNet arm a "long caption + summary" vs "short
+# caption" comparison, NOT "caption vs no caption" — two things move at once.
+# The clean caption ablation lives on BIG-5 (Twitter/Weibo), where --no_caption
+# genuinely removes the stage. Do not report the ImageNet delta as evidence
+# about captioning.
+SUMMARY_CAPTION_PROMPT_IMAGENET_NO_CAPTION = (
+    "Write a short description of this image (at most 20 words) that exclusively "
+    "captures the main subject, or subjects if more than one is equally prominent. "
+    "Name each subject as specifically as you can — the precise breed, species, or "
+    "type of object rather than a general category. "
+    "Do not describe the background, the setting, or anything else. "
+    "Output ONLY the description text."
+)
+
 # Keyed by the same dataset names as clip_metrics.CLIPMATCH_DATASETS — those
 # are the only two datasets that run ClipMatch, so they are the only two that
 # ever request a summary caption.
@@ -114,16 +166,52 @@ SUMMARY_CAPTION_PROMPTS = {
     "places365": SUMMARY_CAPTION_PROMPT_PLACES,
 }
 
+# The --no_caption counterparts. DELIBERATELY has no "places365" entry: the
+# scene-centric variant has never been written or validated, and silently
+# substituting the object-centric one (or the with-caption one, which would
+# leave a literal "{caption}" placeholder in the prompt) is exactly the kind
+# of quiet mismatch get_summary_caption_prompt exists to prevent. Places365 +
+# --no_caption therefore raises; add a validated prompt here if that run is
+# ever wanted.
+SUMMARY_CAPTION_PROMPTS_NO_CAPTION = {
+    "imagenet": SUMMARY_CAPTION_PROMPT_IMAGENET_NO_CAPTION,
+}
 
-def get_summary_caption_prompt(dataset: str) -> str:
+
+def summary_caption_prompt_name(dataset: str, no_caption: bool = False) -> str:
+    """The identifier recorded in the artifact header's
+    `summary_caption_prompt` for this (dataset, no_caption) pair. Kept beside
+    the lookup below so the recorded name can never drift from the prompt
+    actually used — comparing ClipMatch numbers across artifacts written with
+    different variants would be comparing different setups."""
+    return f"summary_caption_prompt_{dataset}" + ("_no_caption" if no_caption else "")
+
+
+def get_summary_caption_prompt(dataset: str, no_caption: bool = False) -> str:
     """The ClipMatch summary-caption prompt for `dataset` (see
     SUMMARY_CAPTION_PROMPTS). Raises on an unknown dataset rather than
     silently falling back to one of the two — a silent fallback would mean
     scoring Places images with the object-centric prompt (or vice versa) with
-    nothing in the artifact to show it happened."""
+    nothing in the artifact to show it happened.
+
+    `no_caption=True` returns the --no_caption variant
+    (SUMMARY_CAPTION_PROMPTS_NO_CAPTION), which takes NO "{caption}"
+    placeholder and must be used verbatim. Only ImageNet has one; every other
+    dataset raises here rather than being handed a prompt whose "{caption}"
+    slot nothing will ever fill."""
+    table = SUMMARY_CAPTION_PROMPTS_NO_CAPTION if no_caption else SUMMARY_CAPTION_PROMPTS
     try:
-        return SUMMARY_CAPTION_PROMPTS[dataset]
+        return table[dataset]
     except KeyError:
+        if no_caption:
+            raise ValueError(
+                f"No --no_caption summary-caption prompt for dataset {dataset!r}; "
+                f"expected one of {sorted(SUMMARY_CAPTION_PROMPTS_NO_CAPTION)}. The "
+                f"caption-free variant has only been written and validated for ImageNet "
+                f"(see SUMMARY_CAPTION_PROMPTS_NO_CAPTION). Either add a validated prompt "
+                f"there, or pass --no_summarize_clipmatch_caption — noting that ClipMatch "
+                f"then has no text at all on a --no_caption run and cannot be scored."
+            ) from None
         raise ValueError(
             f"No summary-caption prompt for dataset {dataset!r}; expected one of "
             f"{sorted(SUMMARY_CAPTION_PROMPTS)}. Only these datasets run ClipMatch "
@@ -194,6 +282,80 @@ Image: Two people taking a selfie outdoors. The man on the left is wearing a pla
   "reasoning": "Step 1: Macro elements include things (person, trees), stuff (grass) and the scene (urban walk). Step 2: For micro elements, the 'hockey helmet' logo on the shirt is not a nature representation, so it will be ignored.",
   "objects": ["person", "trees", "urban walk", "grass"]
 }}"""
+
+
+# -----------------------------------------------------------------------------
+# ABLATION (--no_caption): extraction WITHOUT the Stage-1 caption
+# -----------------------------------------------------------------------------
+# Identical to EXTRACTION_PROMPT above except that the "{caption}" preamble is
+# gone — the model looks at the image directly instead of at the image plus its
+# own free-form description of it. This is the ONLY prompt difference between
+# the baseline and the caption-ablation run, so any measured delta is
+# attributable to the caption stage itself and not to rewritten instructions.
+# NOTE: this string has no format placeholder, so it is used verbatim (never
+# .format()-ed) — the {{ }} escapes inside its JSON examples are kept for
+# consistency with EXTRACTION_PROMPT and are stripped by
+# get_extraction_prompt() below, which is the only supported way to fetch it.
+EXTRACTION_PROMPT_NO_CAPTION = """You are an expert computer vision annotator. Your task is to extract visual entities from the image, keeping the total to a maximum of 12 items to avoid noise.
+
+RULES:
+ - Macro Elements (Objective): Extract the countable Things (salient objects like dog, guitar, desk, tree), uncountable Stuff (amorphous regions like sky, grass, ocean, sand, road), and the overarching Scene (settings like forest, office, restaurant), objectively.
+ - Micro Elements (Nature-Filtered): For tiny details, non-salient items, background objects, or depicted entities (e.g., a distant cat in the background, a little dog figurine, or a flower printed on a dress), ONLY extract them if they represent nature according to your system instructions. Ignore all other minor details.
+ - Use the 'reasoning' field to explicitly state your two-step plan: list the macro elements (things, stuff, and scenes), then identify any valid nature-related micro elements.
+ - Format all extracted entities as concise, singular nouns or compound nouns.
+ - Place all chosen entities into the single 'objects' list.
+ - Do not hallucinate entities not visually present.
+ - Do not repeat the same extracted entity twice.
+
+EXAMPLE 1 (Mixed Environment):
+Image: A person sitting in an indoor office chair at a desk with a laptop. On the desk is a little dog figurine and an orange. The person is wearing a shirt with a geometric triangle pattern. In the background, there is a potted plant near a window.
+{{
+  "reasoning": "Step 1: Macro elements include things (desk, chair, person, laptop, window), and the scene (office). Step 2: For micro elements, the little dog figurine, the orange, and the potted plant represent nature, so they will be extracted. I will ignore the geometric pattern on the shirt as it is not a nature representation.",
+  "objects": ["desk", "chair", "person", "laptop", "window", "office", "dog figurine", "orange", "potted plant"]
+}}
+
+EXAMPLE 2 (Pure Nature Space):
+Image: A sunny beach with crashing ocean waves and sand. A surfer carrying a surfboard with a bird logo walks near the water. A small crab is resting on the sand.
+{{
+  "reasoning": "Step 1: Macro elements include things (surfer, surfboard), stuff (ocean, sand), and the scene (beach). Step 2: For micro elements, the small crab and the bird logo represents nature and will be extracted.",
+  "objects": ["surfer", "surfboard", "ocean", "sand", "beach", "crab", "bird logo"]
+}}
+
+EXAMPLE 3 (Pure No-nature Space):
+Image: A photograph of a brightly lit convenience store in an urban city. Shelves are stocked with snacks and soda bottles. A cashier stands behind the counter.
+{{
+  "reasoning": "Step 1: Macro elements include things (shelf, cashier, counter) and the scene (store, city). Step 2: For micro elements, there are junk food snacks and soda bottles, but since none of these represent nature, they will be ignored. I will only extract the macro items.",
+  "objects": ["shelf", "cashier", "counter", "store", "city"]
+}}
+
+EXAMPLE 4 (Social Media Text & Depiction):
+Image: A messy indoor bedroom with a desk, a chair and a bed. A person wearing a shirt with a flower print is taking a selfie in the mirror. A teddy bear is laying on the bed. Overlaid on the image is a text banner that says "Save the trees!".
+{{
+  "reasoning": "Step 1: Macro elements include things (person, mirror, desk, chair, bed) and the scene (bedroom). Step 2: For micro elements, the 'flower' print on the shirt, the 'teddy bear' (depicting an animal), and the word 'trees' from the text overlay all represent nature-related concepts and will be extracted. The rest of the messy room clutter will be ignored.",
+  "objects": ["person", "mirror", "desk", "chair", "bed", "bedroom", "flower", "teddy bear", "trees"]
+}}
+
+EXAMPLE 5 (Social Media Selfie):
+Image: Two people taking a selfie outdoors. The man on the left is wearing a plain black T-shirt. The woman on the right is wearing a red T-shirt with a hockey helmet logo. The background shows an outdoor setting with a paved walkway with a few trees and grass in the distance.
+{{
+  "reasoning": "Step 1: Macro elements include things (person, trees), stuff (grass) and the scene (urban walk). Step 2: For micro elements, the 'hockey helmet' logo on the shirt is not a nature representation, so it will be ignored.",
+  "objects": ["person", "trees", "urban walk", "grass"]
+}}"""
+
+def get_extraction_prompt(no_caption: bool = False) -> str:
+    """Return the Stage-2 extraction prompt for this run.
+
+    no_caption=False (default) -> EXTRACTION_PROMPT, a TEMPLATE that still
+    needs .format(caption=...) applied by the caller.
+    no_caption=True  -> the caption-ablation prompt, already fully rendered
+    (its JSON-example braces un-escaped), to be used verbatim.
+    """
+    if no_caption:
+        # The literal prompt carries doubled braces so it stays byte-comparable
+        # with EXTRACTION_PROMPT; undo that here since nothing will .format() it.
+        return EXTRACTION_PROMPT_NO_CAPTION.replace("{{", "{").replace("}}", "}")
+    return EXTRACTION_PROMPT
+
 
 class ObjectExtractionResponse(BaseModel):
     """Structured schema for baseline and nature-filtered entity extraction."""

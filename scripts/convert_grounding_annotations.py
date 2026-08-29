@@ -18,11 +18,14 @@ What it does, per image:
      from the outer union. pycocotools' own `frPyObjects` UNIONS every polygon
      it is given, so holes must be handled explicitly here or they'd be
      silently filled.
-  4. Merges objects that share the same (label, synset, axis labels) into ONE
+  4. Merges objects that share the same NAME SET and axis labels into ONE
      concept mask, because SAM3's `semantic_seg` is concept-level: prompting
      "flower" returns a single mask covering every flower, so an image with
      4 separately-drawn flower objects must become one GT flower mask.
-  5. Emits RLE + COCO-style abs-xywh bbox + area.
+  5. Emits RLE + COCO-style abs-xywh bbox + area, carrying EVERY name the
+     region was given (a cloud mask named both "cloud" and "sky") — see the
+     NAMES section below for why one region with two names replaced the old
+     two-identical-regions derivation.
 
 It also materializes the no-nature half of the evaluation set: images the
 majority-vote annotators marked `nature=No`, whose GT is the EMPTY mask set
@@ -156,85 +159,92 @@ def _norm_label(text):
 
 
 # =============================================================================
-# Derived sky regions
+# Names — a mask may be named several things at once
 # =============================================================================
-def derive_sky_from_cloud(record, stats):
-    """Where an image annotates `cloud` but NOT `sky`, add a `sky` region over
-    the EXACT same pixels, inheriting that image's own cloud axis labels.
+# REPLACES A REMOVED DERIVATION, and the reason matters. An earlier version had
+# `derive_sky_from_cloud`: where an image annotated `cloud` but no `sky`, it
+# ADDED a second GT region with byte-identical pixels named `sky`, on the
+# correct observation that a cloud's pixels are sky pixels too. That fix cost
+# more than it bought:
+#
+#   * RECALL WAS HARMED, which is the decisive point. Duplicating the region
+#     doubles the GT count for pixels the model can only ever produce ONE mask
+#     over (SAM3's semantic head returns one region per concept, and one-to-one
+#     assignment gives each prediction to at most one GT). A model that
+#     correctly grounded that region was therefore guaranteed one false
+#     negative it had no way to avoid.
+#   * It created an EXACT geometric tie between two GT rows, so the assignment
+#     between them was arbitrary and had to be nudged back toward the
+#     label-consistent pairing after the fact (grounding_gt_metrics.
+#     tie_break_identical_gt) — machinery that existed only to undo the
+#     duplication's own damage.
+#
+# The annotation now says the true thing directly: ONE region, TWO names. The
+# evaluation treats every name as equally correct (exact match against ANY name
+# counts; the hierarchical score takes the best-scoring name), so nothing is
+# lost and no region is invented. `--no_derive_sky` is gone with the code it
+# disabled; re-adding either is a regression, not a fix.
+def _object_names(obj):
+    """Every name carried by one annotated object, normalized.
 
-    WHY THIS IS A DERIVATION AND NOT AN ANNOTATION FIX: a cloud is always seen
-    against sky, so the pixels a cloud occupies are sky pixels too — the
-    annotator simply had no reason to draw the same outline twice when no sky
-    was visible beyond the cloud itself. But SAM3 prompted with "sky" will
-    answer for that region, and without this the correct answer is charged as a
-    false positive purely because of a drawing convention. Measured: 13 of the
-    170 annotated images are affected.
+    `names` (written by the annotation tool) is authoritative. An object saved
+    before multi-naming carries only the flat entity_label/wordnet_synset_id
+    fields, which become a single-element list — so old and new annotation
+    files convert identically and no re-annotation is forced.
 
-    SCOPE, exactly as specified: images that already annotate BOTH cloud and
-    sky (12 of them) are left completely alone — their sky region is the
-    annotator's own judgment about how far the sky extends beyond the cloud,
-    which is strictly better information than anything derivable here.
-
-    AXES ARE INHERITED FROM THAT IMAGE'S OWN CLOUD, never hardcoded. Materiality
-    especially cannot be assumed: of the 13 affected images, some clouds are
-    photographed (`material`) and some are drawn/illustrated (`immaterial`), and
-    the sky in the same pixels is necessarily the same kind of thing as the
-    cloud drawn on it. Inheriting keeps that per-image, which a fixed default
-    would get wrong roughly half the time.
-
-    The derived object is flagged `derived_from_cloud: True` so it is always
-    distinguishable from a hand-drawn region in the processed GT.
-
-    NOTE the consequence for matching: the derived sky and its source cloud have
-    IDENTICAL masks, so their pairwise IoU is 1.0 and a single predicted mask is
-    a legitimate candidate for either. That is the annotation honestly saying
-    "these pixels are both sky and cloud" — a model naming both gets two true
-    positives, a model naming one gets one TP and one FN. It does make the
-    one-to-one assignment genuinely ambiguous, which is a further reason the
-    Hungarian solver (SciPy) matters rather than the greedy fallback.
+    Mirrors labeling_app/export_coco.object_names; kept separate because
+    labeling_app deliberately shares no code with the parent repo.
     """
-    labels = {_norm_label(o.get("entity_label") or o.get("entity_label_freetext"))
-              for o in record.get("objects") or []}
-    if "sky" in labels or "cloud" not in labels:
-        return record
-
-    clouds = [o for o in record["objects"]
-              if _norm_label(o.get("entity_label")
-                             or o.get("entity_label_freetext")) == "cloud"]
-    derived = []
-    for cloud in clouds:
-        derived.append({
-            **cloud,                       # same mask polygons, holes and all
-            "id": f"{cloud.get('id', 'obj')}__derived_sky",
-            "entity_label": "sky",
-            "entity_label_freetext": "",
-            "wordnet_synset_id": "sky.n.01",
-            "in_taxonomy": True,
-            "taxonomy_node": "sky.n.01",
-            "unmapped_from_wordnet": False,
-            # nature / biotic / material carried over from `cloud` by the
-            # spread above — inherited per image, deliberately not defaulted.
-            "derived_from_cloud": True,
-            "notes": (f"Derived by convert_grounding_annotations.py: image "
-                      f"annotated 'cloud' with no 'sky'; sky added over the same "
-                      f"region, axes inherited from that cloud."),
+    raw = obj.get("names")
+    if not (isinstance(raw, list) and raw):
+        raw = [{
+            "wordnet_synset_id": obj.get("wordnet_synset_id"),
+            "entity_label": obj.get("entity_label") or "",
+            "entity_label_freetext": obj.get("entity_label_freetext") or "",
+            "in_taxonomy": obj.get("in_taxonomy"),
+            "taxonomy_node": obj.get("taxonomy_node"),
+            "unmapped_from_wordnet": obj.get("unmapped_from_wordnet"),
+        }]
+    out = []
+    for n in raw:
+        label = n.get("entity_label") or n.get("entity_label_freetext") or ""
+        if not (label or n.get("wordnet_synset_id")):
+            continue  # an empty row the annotator added and never filled in
+        out.append({
+            "entity_label": n.get("entity_label") or "",
+            "entity_label_freetext": n.get("entity_label_freetext") or "",
+            "wordnet_synset_id": n.get("wordnet_synset_id"),
+            "in_taxonomy": bool(n.get("in_taxonomy")),
+            "taxonomy_node": n.get("taxonomy_node"),
+            "unmapped_from_wordnet": bool(n.get("unmapped_from_wordnet")),
         })
-    stats["derived_sky"] += len(derived)
-    stats["derived_sky_images"].append(record.get("image_id"))
-    return {**record, "objects": list(record["objects"]) + derived}
+    return out
+
+
+def name_text(name):
+    """The surface form of one name — the free-text label when that is what the
+    annotator used, otherwise the WordNet-derived label."""
+    if name.get("unmapped_from_wordnet"):
+        return name.get("entity_label_freetext") or name.get("entity_label") or ""
+    return name.get("entity_label") or name.get("entity_label_freetext") or ""
 
 
 def merge_key(obj):
     """Objects merge into one concept mask only if they agree on EVERYTHING
-    that gets scored — label, synset, and all three taxonomy axes.
+    that gets scored — the full SET of names, and all three taxonomy axes.
 
     Deliberately conservative: two objects both labeled "tree" but annotated
     with different material values are a real distinction (a real tree and a
-    drawn one), so they stay separate rather than being averaged away.
+    drawn one), so they stay separate rather than being averaged away. The same
+    now applies to naming: a mask named {tree} and a mask named {tree, foliage}
+    are different claims about their pixels, so they are not merged — merging
+    them would silently attach a name to pixels the annotator never gave it.
+    Name ORDER does not matter (a frozenset), only membership.
     """
+    names = frozenset((_norm_label(name_text(n)), n.get("wordnet_synset_id"))
+                      for n in _object_names(obj))
     return (
-        _norm_label(obj.get("entity_label") or obj.get("entity_label_freetext")),
-        obj.get("wordnet_synset_id"),
+        names,
         bool(obj.get("nature")),
         obj.get("biotic"),
         obj.get("material"),
@@ -244,14 +254,11 @@ def merge_key(obj):
 # =============================================================================
 # Conversion
 # =============================================================================
-def convert_image(record, image_path, stats, derive_sky=True):
+def convert_image(record, image_path, stats):
     """One annotator JSON -> one processed GT record (or None if skipped)."""
     if record.get("skip_reason"):
         stats["skipped"] += 1
         return None
-
-    if derive_sky:
-        record = derive_sky_from_cloud(record, stats)
 
     with Image.open(image_path) as im:  # header read only, no pixel decode
         width, height = im.size
@@ -263,7 +270,11 @@ def convert_image(record, image_path, stats, derive_sky=True):
 
     out_objects = []
     for key, members in groups.items():
-        label, synset, nature, biotic, material = key
+        _names_key, nature, biotic, material = key
+        # The key's name set is unordered; take the ordered list off the first
+        # member so `names[0]` stays the annotator's own primary name.
+        names = _object_names(members[0])
+        label = name_text(names[0]) if names else ""
 
         mask = np.zeros((height, width), dtype=bool)
         member_areas = []
@@ -288,17 +299,24 @@ def convert_image(record, image_path, stats, derive_sky=True):
 
         out_objects.append({
             "gt_id": f"{record.get('image_id')}::{len(out_objects)}",
-            "entity_label": members[0].get("entity_label") or "",
-            "entity_label_freetext": members[0].get("entity_label_freetext") or "",
-            "wordnet_synset_id": synset,
-            "in_taxonomy": bool(members[0].get("in_taxonomy")),
-            "taxonomy_node": members[0].get("taxonomy_node"),
-            "unmapped_from_wordnet": bool(members[0].get("unmapped_from_wordnet")),
+            # EVERY name this region carries — all equally correct when a
+            # predicted phrase is scored against it (see the NAMES section
+            # above). The flat fields below repeat names[0], the PRIMARY name,
+            # for display and per-label grouping.
+            "names": names,
+            "entity_label": names[0].get("entity_label") if names else "",
+            "entity_label_freetext": (names[0].get("entity_label_freetext")
+                                      if names else ""),
+            "wordnet_synset_id": names[0].get("wordnet_synset_id") if names else None,
+            "in_taxonomy": bool(names[0].get("in_taxonomy")) if names else False,
+            "taxonomy_node": names[0].get("taxonomy_node") if names else None,
+            "unmapped_from_wordnet": (bool(names[0].get("unmapped_from_wordnet"))
+                                      if names else False),
             "ambiguous": any(m.get("ambiguous") for m in members),
             "nature": nature,
             "biotic": biotic,
             "material": material,
-            "derived_from_cloud": bool(members[0].get("derived_from_cloud")),
+            "n_names": len(names),
             "n_source_objects": len(members),   # >1 == concept-merged
             "bbox": [x0, y0, x1 - x0 + 1, y1 - y0 + 1],  # COCO abs xywh
             "area": area,
@@ -317,6 +335,8 @@ def convert_image(record, image_path, stats, derive_sky=True):
         })
         if len(members) > 1:
             stats["merged_groups"] += 1
+        if len(names) > 1:
+            stats["multi_named"] += 1
 
     stats["converted"] += 1
     stats["objects_out"] += len(out_objects)
@@ -376,8 +396,10 @@ def select_no_nature(rows, nature_platform_counts, seed):
 def build_coco(nature_records, no_nature_records):
     """COCO-format instances JSON over the nature half.
 
-    Categories are keyed by WordNet synset id — the thing the evaluation
-    actually matches on — not by the free-text label. No-nature images are
+    Categories are keyed by each region's PRIMARY WordNet synset id, since COCO
+    allows exactly one category per annotation; the full name list travels in
+    the annotation's own `names` field, which is what the evaluation actually
+    scores against. No-nature images are
     included as images with ZERO annotations, which is exactly what "absolute
     no-nature GT" means in COCO's own encoding.
     """
@@ -407,6 +429,7 @@ def build_coco(nature_records, no_nature_records):
                 "area": obj["area"],
                 "iscrowd": 0,
                 "entity_label": obj["entity_label"],
+                "names": obj["names"],
                 "nature": obj["nature"],
                 "biotic": obj["biotic"],
                 "material": obj["material"],
@@ -435,9 +458,6 @@ def main():
                          "tool moves them between the top level and _shared/")
     ap.add_argument("--seed", type=int, default=0,
                     help="seed for the no-nature sample (frozen in the manifest)")
-    ap.add_argument("--no_derive_sky", dest="derive_sky", action="store_false",
-                    help="do NOT add a sky region to images that annotate cloud "
-                         "but no sky (see derive_sky_from_cloud)")
     ap.add_argument("--no_coco", action="store_true",
                     help="skip the portable COCO-format export")
     args = ap.parse_args()
@@ -484,7 +504,6 @@ def main():
     rows = load_subset_rows(args.root)
     stats = Counter()
     stats["empty_mask_detail"] = []
-    stats["derived_sky_images"] = []
     nature_records, missing_images, skipped_ids = [], [], []
 
     for path in src_files:
@@ -501,7 +520,7 @@ def main():
             missing_images.append(image_id)
             continue
 
-        converted = convert_image(record, image_path, stats, derive_sky=args.derive_sky)
+        converted = convert_image(record, image_path, stats)
         if converted is None:
             skipped_ids.append(image_id)
             continue
@@ -513,9 +532,8 @@ def main():
     print(f"processed/nature/     {len(nature_records)} images, "
           f"{stats['objects_out']} objects "
           f"({stats['merged_groups']} concept-merged, {stats['skipped']} skipped)")
-    if args.derive_sky:
-        print(f"                      +{stats['derived_sky']} derived sky region(s) "
-              f"over {len(stats['derived_sky_images'])} cloud-without-sky image(s)")
+    print(f"                      {stats['multi_named']} region(s) carry more than "
+          f"one name (e.g. one mask named both 'cloud' and 'sky')")
 
     # --- 3. processed/no_nature/ -------------------------------------------
     platform_counts = Counter(r["platform"] for r in nature_records)
@@ -563,9 +581,7 @@ def main():
         "nature_image_ids": sorted(r["image_id"] for r in nature_records),
         "no_nature_image_ids": sorted(r["image_id"] for r in no_nature_records),
         "concept_merged_groups": stats["merged_groups"],
-        "derive_sky_from_cloud": args.derive_sky,
-        "derived_sky_objects": stats["derived_sky"],
-        "derived_sky_images": sorted(stats["derived_sky_images"]),
+        "multi_named_objects": stats["multi_named"],
         "empty_masks_dropped": stats["empty_masks"],
         "empty_mask_detail": stats["empty_mask_detail"],
         "missing_images": sorted(missing_images),

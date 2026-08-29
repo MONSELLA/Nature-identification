@@ -1,0 +1,84 @@
+#!/bin/bash
+#SBATCH -n 4                 
+#SBATCH -N 1                 
+#SBATCH --mem=24G                     
+#SBATCH -p a40               
+#SBATCH --qos=q_a40          
+#SBATCH --account=ga40       
+#SBATCH --job-name=closed_set_imagenet
+#SBATCH --output=../logs/out.log  
+#SBATCH --gres=gpu:1
+
+## For evaluate_imagenet.py
+##python evaluate_imagenet.py \
+##    --data_dir /home/pmonserrat/datasets/imagenet/extracted_data \
+##    --model_name vit_b_16 \
+##    --batch_size 128 \
+##    --wandb \
+##    --verbose
+
+##python evaluate_imagenet.py \
+##  --data_dir /home/pmonserrat/datasets/imagenet/extracted_data \
+##  --excel_path /home/pmonserrat/code/flat_wordnet_tree_fixed.xlsx \
+##  --model_type multitask_direct \
+##  --multitask_checkpoint_path /home/pmonserrat/code/weights/trained_DenseNet121_100epochs.pth \
+##  --multitask_backbone_choice DenseNet121 \
+##  --verbose --wandb
+
+## For evaluate_places.py
+##python evaluate_places.py --data_dir /home/pmonserrat/datasets/places/val_formatted \
+##  --excel_path /home/pmonserrat/code/flat_wordnet_tree_fixed.xlsx \
+##  --model_name resnet50 --places_weights /home/pmonserrat/code/weights/resnet50_places365.pth.tar \
+##  --verbose --wandb --batch_size 128 --allow-unresolved
+
+##python evaluate_places.py \
+##  --data_dir /home/pmonserrat/datasets/places/val_formatted \
+##  --excel_path /home/pmonserrat/code/flat_wordnet_tree_fixed.xlsx \
+##  --model_type multitask_direct \
+##  --multitask_checkpoint_path /home/pmonserrat/code/weights/trained_DenseNet121_100epochs.pth \
+##  --multitask_backbone_choice DenseNet121 \
+##  --verbose --wandb --allow-unresolved
+
+## For evaluate_coco.py
+##python evaluate_coco.py \
+##  --images_dir /home/pmonserrat/datasets/coco/images/val2017 \
+##  --instances_json /home/pmonserrat/datasets/coco/annotations/instances_val2017.json \
+##  --excel_path /home/pmonserrat/code/flat_wordnet_tree_fixed.xlsx \
+##  --model_type q2l \
+##  --q2l_repo_path /home/pmonserrat/query2labels \
+##  --q2l_config /home/pmonserrat/code/weights/query2labels/config_r101.json \
+##  --checkpoint_path /home/pmonserrat/code/weights/query2labels/checkpoint_r101.pkl \
+##  --verbose --wandb
+##  --multitask_checkpoint_path /home/pmonserrat/code/weights/trained_DenseNet121_100epochs.pth \
+##  --multitask_backbone_choice DenseNet121 \
+
+# For evaluate_big5.py
+##python evaluate_big5.py \
+##  --twitter_en_gt_csv /home/pmonserrat/datasets/big_5/table_for_pau_twitter-en-6.csv \
+##  --twitter_en_media_csv /home/pmonserrat/datasets/big_5/phase-1_twitter-en.csv \
+##  --twitter_es_gt_csv /home/pmonserrat/datasets/big_5/table_for_pau_twitter-es-6.csv \
+##  --twitter_es_media_csv /home/pmonserrat/datasets/big_5/phase-1_twitter-es.csv \
+##  --images_cache_dir /home/pmonserrat/datasets/big_5/images \
+##  --excel_path /home/pmonserrat/code/flat_wordnet_tree_fixed.xlsx \
+##  --model_family multitask_direct \
+##  --multitask_checkpoint_path /home/pmonserrat/code/weights/trained_DenseNet121_100epochs.pth \
+##  --multitask_backbone_choice DenseNet121 \
+##  --verbose
+
+## For qualitative_vlm_evaluation.py
+##python qualitative_vlm_evaluation.py \
+##  --diagnostic_sample_file /home/pmonserrat/code/closed_set/big5_diagnostic_sample.json \
+##  --images_cache_dir /home/pmonserrat/datasets/big_5/images \
+##  --comparison_file /home/pmonserrat/code/closed_set/big5_model_comparison.json \
+##  --verbose
+
+## For count_classes.py
+python count_classes.py \
+    --dataset all \
+    --excel_path /home/pmonserrat/code/flat_wordnet_tree_fixed.xlsx \
+    --imagenet_dir /home/pmonserrat/datasets/imagenet/extracted_data \
+    --coco_instances_json /home/pmonserrat/datasets/coco/annotations/instances_val2017.json \
+    --places_categories_txt /home/pmonserrat/datasets/places/categories_places365.txt \
+    --places_sourcekey_sheet sourcekey \
+    --places_missing_sheet "still missing MIT Places" \
+

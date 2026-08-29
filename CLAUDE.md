@@ -96,6 +96,38 @@ evaluating the models.
 - Baseline is TWO-PASS: open-ended caption (no schema) → separate structured
   extraction call. Never collapse into single-pass-with-schema without it being
   an explicit, labeled ablation.
+- CAPTION ABLATION (`--no_caption`, `scripts/job_vlm_pipeline_no_caption.sh`):
+  the ONE labeled exception to the two-pass rule. Skips Stage 1 entirely (no
+  caption VLM call) and prompts extraction from the image alone with
+  `prompts.get_extraction_prompt(no_caption=True)` — byte-identical to
+  `EXTRACTION_PROMPT` minus the `{caption}` preamble, so the only variable vs.
+  the baseline is the caption stage. Records still carry `caption: ""`; the
+  artifact header carries `caption_stage: false` +
+  `extraction_prompt_variant`, and `--stage score` reads it to report
+  CLIPScore/F-CLIPScore as N/A (means over an empty set, `caption_stage:
+  false` in `summary["reference_free"]`, `None` in W&B) instead of a
+  meaningless number from an empty-string embedding. Object-CLIPScore and every
+  taxonomy/axis metric are unaffected. Give it its own `--run_name` so
+  baseline artifacts are never overwritten.
+- ON IMAGENET `--no_caption` COMPOSES with the ClipMatch summary call instead
+  of being refused: ClipMatch needs SOME caption-derived text, so that call
+  survives and switches to `prompts.SUMMARY_CAPTION_PROMPT_IMAGENET_NO_CAPTION`
+  — no `{caption}` placeholder, used verbatim, becoming the run's ONE short
+  direct image description rather than a re-summarization. It adds a
+  NAMING-SPECIFICITY clause (ImageNet-1k is fine-grained and no stage produces
+  a specific name once the caption is gone) and explicit background
+  suppression, keeps the 20-word cap, the conditional plural and the
+  "Output ONLY" guard. Header records
+  `summary_caption_prompt: summary_caption_prompt_imagenet_no_caption`
+  (`prompts.summary_caption_prompt_name`). CONSEQUENCE FOR REPORTING: the
+  ImageNet arm compares "long caption + summary" vs "short caption", NOT
+  "caption vs no caption" — the clean caption ablation is BIG-5's. Two
+  combinations are refused up front by
+  `run_vlm_pipeline._validate_no_caption_config` (called before any slow
+  load): `--no_caption` on Places365 (no validated caption-free scene prompt
+  exists — add one to `SUMMARY_CAPTION_PROMPTS_NO_CAPTION` if that run is
+  wanted), and `--no_caption --no_summarize_clipmatch_caption` on any
+  ClipMatch dataset (leaves no text at all).
 - Caption prompt (baseline, neutral, no nature-priming), `src/models/prompts.py`'s
   `CAPTION_PROMPT`:
     "Describe this image, including any text."
@@ -762,7 +794,12 @@ rationale. Hard conventions:
   `--balance` mode (`none` / `downsample_nature` / `loss_weight`) produced a
   number; the first run uses `downsample_nature`.
 - TRAINING EXAMPLES are reconstructed EXACTLY from the artifact, importing the
-  prompt builders from `src.models.prompts` rather than copying them. Stages:
+  prompt builders from `src.models.prompts` rather than copying them. The
+  extraction example follows the SOURCE ARTIFACT's own `caption_stage` header:
+  a `--no_caption` artifact rebuilds from `get_extraction_prompt(no_caption=
+  True)`, never `EXTRACTION_PROMPT.format(caption="")` — otherwise training
+  sees a prompt shape (empty quoted description) that never occurs at
+  inference. Threaded per artifact, since one build can merge several. Stages:
   extraction + both labeling calls; the free-form CAPTION stage is deliberately
   excluded (and errors if requested, rather than being silently dropped).
 - `TaxonomyResponse`'s two reasoning fields are now stored SEPARATELY in the

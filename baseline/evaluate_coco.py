@@ -100,15 +100,13 @@ import argparse
 from types import SimpleNamespace
 
 import torch
-import torch.nn as nn
 import numpy as np
 from PIL import Image
 from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms as transforms
-from torchvision import models as tv_models
-from sklearn.metrics import accuracy_score, precision_recall_fscore_support, average_precision_score
+from sklearn.metrics import average_precision_score
 
-# Make both the repo root (for the missing `first_tests` module) and this
+# Make both the repo root (for `baseline.common` / `src...`) and this
 # script's own directory importable, the same pattern used throughout
 # baseline/ — see count_classes.py's comment on why this is needed.
 parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -118,97 +116,13 @@ this_dir = os.path.abspath(os.path.dirname(__file__))
 if this_dir not in sys.path:
     sys.path.insert(0, this_dir)
 
-from first_tests.evaluation import TaxonomyEvaluationPipeline
-
-
-# ============================================================================
-# MULTITASK DIRECT-TAXONOMY MODEL (Paula Feliu's TFG) -- same as
-# evaluate_imagenet.py / evaluate_places.py. See those scripts' comments for
-# the full rationale on inlining rather than importing an external repo, and
-# for the verified label-encoding source citation.
-# ============================================================================
-class CustomBackbone(nn.Module):
-    """Swappable CNN feature-extractor — see the identical class in
-    evaluate_imagenet.py for full comments on its structure."""
-    def __init__(self, model_choice='ResNet18'):
-        super(CustomBackbone, self).__init__()
-        self.model_choice = model_choice
-        if model_choice == 'DenseNet121':
-            model_base = tv_models.densenet121(weights=None)
-            model_base.classifier = nn.Identity()
-            self.feature_dim = 1024
-        elif model_choice == 'ResNet18':
-            model_base = tv_models.resnet18(weights=None)
-            model_base.fc = nn.Identity()
-            self.feature_dim = 512
-        elif model_choice == 'EfficientNetB0':
-            model_base = tv_models.efficientnet_b0(weights=None)
-            model_base.classifier = nn.Identity()
-            self.feature_dim = 1280
-        else:
-            model_base = tv_models.resnet50(weights=None)
-            model_base.fc = nn.Identity()
-            self.feature_dim = 2048
-        self.backbone = model_base
-
-    def forward(self, x):
-        x = self.backbone(x)
-        return x.view(x.size(0), -1)
-
-
-class MultiTaskModel(nn.Module):
-    """Wraps a CustomBackbone with four independent linear prediction heads
-    sharing the same features — see evaluate_imagenet.py for full comments."""
-    def __init__(self, backbone, feature_dim):
-        super(MultiTaskModel, self).__init__()
-        self.backbone = backbone
-        self.fc_nature = nn.Linear(feature_dim, 2)
-        self.fc_materiality = nn.Linear(feature_dim, 3)
-        self.fc_biological = nn.Linear(feature_dim, 3)
-        self.fc_landscape = nn.Linear(feature_dim, 8)
-
-    def forward(self, x):
-        features = self.backbone(x)
-        out_nature = self.fc_nature(features)
-        out_materiality = self.fc_materiality(features)
-        out_biological = self.fc_biological(features)
-        out_landscape = self.fc_landscape(features)
-        return out_nature, out_materiality, out_biological, out_landscape
-
-
-# Translate the multitask model's own 0/1 class indices into this project's
-# convention (1 = positive: nature/biotic/material) — see evaluate_imagenet.py
-# for the full citation of where these encodings come from.
-MULTITASK_MATERIALITY_TO_OURS = {0: 1, 1: 0}  # their material(0)->our 1, their immaterial(1)->our 0
-MULTITASK_BIOLOGICAL_TO_OURS = {0: 1, 1: 0}   # their biotic(0)->our 1, their abiotic(1)->our 0
-
-
-# ============================================================================
-# COCO -> WORDNET SYNSET MAPPING (identical to evaluate_coco.py)
-# ============================================================================
-# Same hand-built COCO-category-id -> WordNet-synset table used throughout
-# this project (see lib/dataset_loader.py's identical COCO_TO_WNSYNSET for the
-# general explanation of why COCO needs this manual mapping at all).
-COCO_TO_WNSYNSET = {
-    1: 'person.n.01', 2: 'bicycle.n.01', 3: 'car.n.01', 4: 'motorcycle.n.01', 5: 'airplane.n.01',
-    6: 'bus.n.01', 7: 'train.n.01', 8: 'truck.n.01', 9: 'boat.n.01', 10: 'traffic_light.n.01',
-    11: 'fireplug.n.01', 13: 'street_sign.n.01', 14: 'parking_meter.n.01', 15: 'bench.n.01',
-    16: 'bird.n.01', 17: 'cat.n.01', 18: 'dog.n.01', 19: 'horse.n.01', 20: 'sheep.n.01',
-    21: 'cow.n.01', 22: 'elephant.n.01', 23: 'bear.n.01', 24: 'zebra.n.01', 25: 'giraffe.n.01',
-    27: 'backpack.n.01', 28: 'umbrella.n.01', 31: 'bag.n.04', 32: 'necktie.n.01', 33: 'bag.n.06',
-    34: 'frisbee.n.01', 35: 'ski.n.01', 36: 'snowboard.n.01', 37: 'ball.n.01', 38: 'kite.n.03',
-    39: 'baseball_bat.n.01', 40: 'baseball_glove.n.01', 41: 'skateboard.n.01', 42: 'surfboard.n.01',
-    43: 'tennis_racket.n.01', 44: 'bottle.n.01', 46: 'wineglass.n.01', 47: 'cup.n.01', 48: 'fork.n.01',
-    49: 'knife.n.01', 50: 'spoon.n.01', 51: 'bowl.n.01', 52: 'banana.n.02', 53: 'apple.n.01',
-    54: 'sandwich.n.01', 55: 'orange.n.01', 56: 'broccoli.n.02', 57: 'carrot.n.01', 58: 'hotdog.n.02',
-    59: 'pizza.n.01', 60: 'doughnut.n.02', 61: 'cake.n.03', 62: 'chair.n.01', 63: 'sofa.n.01',
-    64: 'pot_plant.n.01', 65: 'bed.n.01', 67: 'dining_table.n.01', 70: 'toilet.n.02',
-    72: 'television_receiver.n.01',  # corrected from 'television.n.02'
-    73: 'laptop.n.01', 74: 'mouse.n.04', 75: 'remote_control.n.01', 76: 'computer_keyboard.n.01',
-    77: 'cellular_telephone.n.01', 78: 'microwave.n.02', 79: 'oven.n.01', 80: 'toaster.n.02',
-    81: 'sink.n.01', 82: 'refrigerator.n.01', 84: 'book.n.02', 85: 'clock.n.01', 86: 'vase.n.01',
-    87: 'scissors.n.01', 88: 'teddy.n.01', 89: 'hand_blower.n.01', 90: 'toothbrush.n.01',
-}
+from baseline.common import (
+    TaxonomyLookup, CustomBackbone, MultiTaskModel, safe_binary_map,
+    MULTITASK_MATERIALITY_TO_OURS, MULTITASK_BIOLOGICAL_TO_OURS,
+    COCO_TO_WNSYNSET, append_results_rows, binary_metrics_to_rows,
+    single_row, DEFAULT_RESULTS_CSV, binary_metrics_from_labels,
+    empty_binary_metrics as _empty_binary_metrics,
+)
 
 
 def load_coco_categories(instances_json_path):
@@ -469,6 +383,9 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--output_file", type=str, default="q2l_coco_baseline.json")
+    parser.add_argument("--results_csv", type=str, default=DEFAULT_RESULTS_CSV,
+                        help="Shared long-format CSV every baseline run appends its rows to "
+                             "(pivot this to build the thesis tables instead of the per-run JSON).")
     parser.add_argument("--max_samples", type=int, default=None)
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--wandb", action="store_true")
@@ -651,23 +568,13 @@ def main():
 
     if args.verbose:
         print(f"[INFO] Loading Taxonomy from {args.excel_path}...")
-    pipeline = TaxonomyEvaluationPipeline()
-    import pandas as pd
-    df_taxonomy = pd.read_excel(args.excel_path, sheet_name="data corrected")
-    pipeline.load_custom_excel_annotations(df_taxonomy, "Biotic/abiotic", "Material/immaterial")
+    taxonomy = TaxonomyLookup()
+    taxonomy.load(args.excel_path)
 
     id_to_synset, unmapped_coco_ids = build_category_id_to_synset(id_to_name)
     if unmapped_coco_ids and args.verbose:
         print(f"⚠️  {len(unmapped_coco_ids)} COCO categories have no entry in COCO_TO_WNSYNSET: "
               f"{unmapped_coco_ids}")
-
-    def safe_binary_map(val, positive_str, negative_str):
-        if not isinstance(val, str):
-            return None
-        val = val.strip().lower()
-        if val == positive_str.lower(): return 1
-        if val == negative_str.lower(): return 0
-        return None
 
     # Build one taxonomy-label COLUMN per COCO category, aligned with the
     # SAME `ordered_cat_ids` column ordering used by CocoMultiLabelDataset
@@ -677,7 +584,7 @@ def main():
     stats = {"nature": 0, "biotic": 0, "abiotic": 0, "material": 0, "immaterial": 0, "unmapped": 0}
     for cid in ordered_cat_ids:
         synset_str = id_to_synset.get(cid)
-        node_attrs = pipeline.get_node_attributes(synset_str) if synset_str else None
+        node_attrs = taxonomy.get_node_attributes(synset_str) if synset_str else None
         if not node_attrs:
             stats["unmapped"] += 1
             col_nature.append(None); col_biotic.append(None); col_material.append(None)
@@ -791,12 +698,12 @@ def main():
         # non-matching/unmapped columns (None/0) are excluded from `cols`.
         cols = [c for c, lab in enumerate(col_labels) if lab == 1]
         if not cols:
-            return {"accuracy": 0, "precision": 0, "recall": 0, "f1": 0, "support": 0}
+            return _empty_binary_metrics()
 
         targets_pool = all_targets if restrict_pool is None else all_targets[restrict_pool]
         preds_pool = all_preds if restrict_pool is None else all_preds[restrict_pool]
         if len(targets_pool) == 0:
-            return {"accuracy": 0, "precision": 0, "recall": 0, "f1": 0, "support": 0}
+            return _empty_binary_metrics()
 
         # Reduce a per-CLASS multi-hot row down to a single per-IMAGE binary
         # label: "does this image contain ANY of the relevant classes at
@@ -806,12 +713,9 @@ def main():
         if len(set(gt_any_pos.tolist())) < 2:
             # Ground truth is all-one-class after restriction -- e.g. no abiotic
             # examples exist among COCO's classes. Not a valid binary task.
-            return {"accuracy": 0, "precision": 0, "recall": 0, "f1": 0, "support": 0}
+            return _empty_binary_metrics()
 
-        acc = accuracy_score(gt_any_pos, pred_any_pos)
-        p, r, f1, _ = precision_recall_fscore_support(gt_any_pos, pred_any_pos, average='binary', zero_division=0)
-        return {"accuracy": float(acc), "precision": float(p), "recall": float(r),
-                "f1": float(f1), "support": int(len(gt_any_pos))}
+        return binary_metrics_from_labels(gt_any_pos.tolist(), pred_any_pos.tolist())
 
     def per_image_binary_metrics_direct(col_labels, direct_preds, restrict_pool=None):
         """
@@ -825,7 +729,7 @@ def main():
         """
         cols = [c for c, lab in enumerate(col_labels) if lab == 1]
         if not cols:
-            return {"accuracy": 0, "precision": 0, "recall": 0, "f1": 0, "support": 0}
+            return _empty_binary_metrics()
 
         # dtype=object because this list can contain None values mixed with
         # integers, which a plain numeric numpy array can't represent.
@@ -837,20 +741,17 @@ def main():
             targets_pool = all_targets[restrict_pool]
             preds_pool = direct_preds_arr[restrict_pool]
         if len(targets_pool) == 0:
-            return {"accuracy": 0, "precision": 0, "recall": 0, "f1": 0, "support": 0}
+            return _empty_binary_metrics()
 
         gt_any_pos = (targets_pool[:, cols].sum(axis=1) > 0).astype(int)
         if len(set(gt_any_pos.tolist())) < 2:
-            return {"accuracy": 0, "precision": 0, "recall": 0, "f1": 0, "support": 0}
+            return _empty_binary_metrics()
 
         # A None prediction (model said "not applicable") is scored as the
         # OPPOSITE of ground truth (`1 - g`), guaranteeing it counts as wrong
         # rather than being silently dropped or defaulted to a fixed class.
-        pred_direct = np.array([1 - g if p is None else p for g, p in zip(gt_any_pos, preds_pool)])
-        acc = accuracy_score(gt_any_pos, pred_direct)
-        p, r, f1, _ = precision_recall_fscore_support(gt_any_pos, pred_direct, average='binary', zero_division=0)
-        return {"accuracy": float(acc), "precision": float(p), "recall": float(r),
-                "f1": float(f1), "support": int(len(gt_any_pos))}
+        pred_direct = [1 - g if p is None else p for g, p in zip(gt_any_pos.tolist(), preds_pool)]
+        return binary_metrics_from_labels(gt_any_pos.tolist(), pred_direct)
 
     # Nature-positive image mask, used to restrict biotic/material ground truth
     # (see per_image_binary_metrics docstring for why this restriction matters).
@@ -876,15 +777,12 @@ def main():
             collapses each image down to one yes/no first)."""
             cols = [c for c, lab in enumerate(col_labels) if lab is not None]
             if not cols:
-                return {"accuracy": 0, "precision": 0, "recall": 0, "f1": 0, "support": 0}
+                return _empty_binary_metrics()
             # `.ravel()` flattens the 2D (images x classes) array into one
             # long 1D array of individual (image, class) decisions.
             y_true = all_targets[:, cols].astype(int).ravel()
             y_pred = all_preds[:, cols].astype(int).ravel()
-            acc = accuracy_score(y_true, y_pred)
-            p, r, f1, _ = precision_recall_fscore_support(y_true, y_pred, average='binary', zero_division=0)
-            return {"accuracy": float(acc), "precision": float(p), "recall": float(r),
-                    "f1": float(f1), "support": int(len(y_true))}
+            return binary_metrics_from_labels(y_true.tolist(), y_pred.tolist())
 
         nature_per_class = per_class_binary_metrics(col_nature)
         biotic_per_class = per_class_binary_metrics(col_biotic)
@@ -918,20 +816,24 @@ def main():
         print("N/A -- this model gives one holistic nature/materiality/biological call per image, "
               "not per-class scores, so neither mAP nor per-class metrics apply.")
 
-    if args.model_type == "q2l":
-        for title, m in [("Nature vs. No-Nature", nature_per_class),
-                         ("Biotic vs. Abiotic", biotic_per_class),
-                         ("Material vs. Immaterial", material_per_class)]:
-            print(f"\n--- PER-CLASS Binary: {title} (Support: {m['support']}) ---")
-            print(f"Accuracy:  {m['accuracy']:.4f}\nPrecision: {m['precision']:.4f}\n"
-                  f"Recall:    {m['recall']:.4f}\nF1 Score:  {m['f1']:.4f}")
+    def print_binary_block(title, m):
+        print(f"\n--- {title} ---")
+        print(f"Accuracy:  {m['accuracy']:.4f}")
+        for polarity in ("positive", "negative"):
+            pm = m[polarity]
+            print(f"  [{polarity}] Precision: {pm['precision']:.4f}  Recall: {pm['recall']:.4f}  "
+                  f"F1: {pm['f1']:.4f}  (Support: {pm['support']})")
 
-    for title, m in [("Nature vs. No-Nature", nature_per_image),
-                     ("Biotic vs. Abiotic", biotic_per_image),
-                     ("Material vs. Immaterial", material_per_image)]:
-        print(f"\n--- PER-IMAGE Binary: {title} (Support: {m['support']}) ---")
-        print(f"Accuracy:  {m['accuracy']:.4f}\nPrecision: {m['precision']:.4f}\n"
-              f"Recall:    {m['recall']:.4f}\nF1 Score:  {m['f1']:.4f}")
+    if args.model_type == "q2l":
+        for title, m in [("PER-CLASS Binary: Nature vs. No-Nature", nature_per_class),
+                         ("PER-CLASS Binary: Biotic vs. Abiotic", biotic_per_class),
+                         ("PER-CLASS Binary: Material vs. Immaterial", material_per_class)]:
+            print_binary_block(title, m)
+
+    for title, m in [("PER-IMAGE Binary: Nature vs. No-Nature", nature_per_image),
+                     ("PER-IMAGE Binary: Biotic vs. Abiotic", biotic_per_image),
+                     ("PER-IMAGE Binary: Material vs. Immaterial", material_per_image)]:
+        print_binary_block(title, m)
     print("=" * 60)
 
     if args.wandb:
@@ -940,13 +842,14 @@ def main():
         def flatten_metrics(prefix, m):
             if m is None:
                 return {}
-            return {
-                f"{prefix}/Accuracy": m['accuracy'],
-                f"{prefix}/Precision": m['precision'],
-                f"{prefix}/Recall": m['recall'],
-                f"{prefix}/F1": m['f1'],
-                f"{prefix}/Support": m['support'],
-            }
+            out = {f"{prefix}/Accuracy": m['accuracy']}
+            for polarity in ("positive", "negative"):
+                pm = m[polarity]
+                out[f"{prefix}/{polarity.capitalize()}/Precision"] = pm['precision']
+                out[f"{prefix}/{polarity.capitalize()}/Recall"] = pm['recall']
+                out[f"{prefix}/{polarity.capitalize()}/F1"] = pm['f1']
+                out[f"{prefix}/{polarity.capitalize()}/Support"] = pm['support']
+            return out
 
         wandb_log_dict = {"COCO/mAP": coco_mAP}
         wandb_log_dict.update(flatten_metrics("PerClass/Nature", nature_per_class))
@@ -982,6 +885,22 @@ def main():
         import wandb
         wandb.save(args.output_file)
         wandb.finish()
+
+    # ==========================================
+    # 10. APPEND TO THE SHARED RESULTS CSV (Table 3 shape)
+    # ==========================================
+    base_row = {"run_id": model_field, "dataset": "coco", "model": model_field, "model_type": args.model_type}
+    rows = [single_row(base_row, "Base (mAP)", granularity="", accuracy=coco_mAP,
+                        support=len(dataset))]
+    if args.model_type == "q2l":
+        rows += binary_metrics_to_rows({**base_row, "granularity": "class"}, "Nature", nature_per_class)
+        rows += binary_metrics_to_rows({**base_row, "granularity": "class"}, "Biotic", biotic_per_class)
+        rows += binary_metrics_to_rows({**base_row, "granularity": "class"}, "Material", material_per_class)
+    rows += binary_metrics_to_rows({**base_row, "granularity": "image"}, "Nature", nature_per_image)
+    rows += binary_metrics_to_rows({**base_row, "granularity": "image"}, "Biotic", biotic_per_image)
+    rows += binary_metrics_to_rows({**base_row, "granularity": "image"}, "Material", material_per_image)
+    append_results_rows(args.results_csv, rows)
+    print(f"💾 Appended {len(rows)} rows to {args.results_csv}")
 
 
 if __name__ == "__main__":

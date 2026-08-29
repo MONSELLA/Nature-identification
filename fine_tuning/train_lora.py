@@ -722,6 +722,24 @@ def main() -> None:
                          "is spent on this run, rather than discovering it hours in.")
     ap.add_argument("--save_steps", type=int, default=200)
     ap.add_argument("--save_total_limit", type=int, default=2)
+    ap.add_argument("--load_best_model_at_end", action="store_true", default=False,
+                    help="Load the checkpoint with the LOWEST eval_loss at the end of "
+                         "training, instead of trainer.save_model() just saving whatever "
+                         "state training happened to end on. Off by default -- the earlier "
+                         "runs in this project's history evaluated the final-step checkpoint, "
+                         "and this flag changes that behavior, so it's opt-in rather than a "
+                         "silent default change. HF REQUIRES save_steps to be a round "
+                         "multiple of eval_steps (or vice versa) whenever this is on; if the "
+                         "--save_steps/--eval_steps you passed don't satisfy that, --save_steps "
+                         "is silently forced to equal --eval_steps (printed when this happens) "
+                         "rather than crashing after training has already started. NOTE:  "
+                         "--save_total_limit still only keeps this many checkpoints on disk, "
+                         "but HF exempts the best one from that rotation once this flag is on "
+                         "-- it will not be deleted even if it falls outside the N most recent. "
+                         "That protection does NOT apply retroactively to a run that already "
+                         "started without this flag (see this project's own August 2026 "
+                         "self-distillation run: its early checkpoints were already rotated "
+                         "out under save_total_limit=2 well before this flag existed).")
 
     # --- Image / cache ---
     ap.add_argument("--max_image_side", type=int, default=1024,
@@ -767,6 +785,24 @@ def main() -> None:
     use_weights = any(r.get("weight", 1.0) != 1.0 for r in train_ds.rows)
     print(f"train: {len(train_ds)} examples | val: {len(val_ds) if val_ds else 0}")
     print(f"loss aggregation: {'per-example mean, weighted' if use_weights else 'token mean (model default)'}")
+    if len(train_ds) == 0:
+        # Fail BEFORE loading the base model (minutes, real GPU time) rather
+        # than deep inside trainer.train() or, worse, silently "succeeding"
+        # with a model.forward() over zero examples. Confirmed real cause,
+        # not hypothetical: build_rft_dataset.py's --splits join is keyed on
+        # the raw image_path string, so an artifact whose image_path
+        # convention doesn't match splits.json's (e.g. relative vs absolute
+        # paths from a different cluster) can silently accept nothing --
+        # see that script's basename-fallback comment for the concrete case
+        # this was written from.
+        raise RuntimeError(
+            f"train.jsonl at {args.dataset_dir} has 0 examples. This almost always means "
+            f"build_rft_dataset.py's join between the artifact's image_path and "
+            f"splits.json's image_split matched nothing -- check that script's own stats.json "
+            f"for images_not_in_splits vs images_accepted, and confirm the artifact's "
+            f"image_path convention (absolute vs relative, which cluster it was produced on) "
+            f"actually matches what splits.json was built from."
+        )
 
     # --- Model ---
     processor = AutoProcessor.from_pretrained(args.model)
@@ -867,6 +903,33 @@ def main() -> None:
     if args.wandb_project:
         os.environ.setdefault("WANDB_PROJECT", args.wandb_project)
 
+    # `bool(val_ds)`, NOT `val_ds is not None` -- RFTDataset defines __len__,
+    # so an EMPTY-but-non-None val_ds (0 examples -- confirmed real: a
+    # mismatched image_path convention between an artifact and splits.json
+    # can silently accept nothing, see build_rft_dataset.py) is falsy in
+    # Python's own truthiness rules. eval_strategy/eval_on_start below
+    # already gate on `if val_ds`, not `is not None` -- this must match
+    # them exactly, or eval_strategy ends up "no" while
+    # load_best_model_at_end is still True, which HF's own _validate_args
+    # rejects (confirmed real crash, not hypothetical: "requires the save
+    # and eval strategy to match ... Evaluation strategy: no, Save
+    # strategy: steps").
+    load_best_model_at_end = args.load_best_model_at_end and bool(val_ds)
+    save_steps = args.save_steps
+    if load_best_model_at_end and save_steps % args.eval_steps != 0 and args.eval_steps % save_steps != 0:
+        # HF requires save_steps to be a round multiple of eval_steps (or the
+        # reverse) whenever load_best_model_at_end is on, so it can always
+        # locate an eval-time metric at a step that was also checkpointed.
+        # Failing that requirement raises INSIDE trainer.train(), after the
+        # dataset/model/vision-cache setup above has already run -- forcing
+        # save_steps = eval_steps here catches the same mismatch before any
+        # of that (and any real GPU time) is spent, at the cost of it not
+        # necessarily being the --save_steps the user actually passed.
+        print(f"--load_best_model_at_end requires save_steps to divide (or be divided "
+              f"by) eval_steps -- got save_steps={save_steps}, eval_steps={args.eval_steps}. "
+              f"Forcing save_steps={args.eval_steps} to satisfy this.")
+        save_steps = args.eval_steps
+
     training_args = TrainingArguments(
         output_dir=args.output_dir,
         learning_rate=args.learning_rate,
@@ -905,8 +968,11 @@ def main() -> None:
         eval_steps=args.eval_steps,
         eval_on_start=args.eval_on_start if val_ds else False,
         save_strategy="steps",
-        save_steps=args.save_steps,
+        save_steps=save_steps,
         save_total_limit=args.save_total_limit,
+        load_best_model_at_end=load_best_model_at_end,
+        metric_for_best_model="eval_loss" if load_best_model_at_end else None,
+        greater_is_better=False if load_best_model_at_end else None,
         dataloader_num_workers=args.dataloader_num_workers,
         remove_unused_columns=False,   # the collator needs image_path/weight through
         seed=args.seed,
@@ -943,6 +1009,10 @@ def main() -> None:
     if resume_checkpoint:
         print(f"Found existing checkpoint, resuming from: {resume_checkpoint}")
     trainer.train(resume_from_checkpoint=resume_checkpoint)
+    # With load_best_model_at_end, trainer.train() already reloaded the
+    # BEST (lowest eval_loss) checkpoint's weights into trainer.model before
+    # returning -- this save_model call, and the adapter it writes, reflect
+    # that best checkpoint, not necessarily the last training step.
     trainer.save_model(os.path.join(args.output_dir, "adapter"))
     processor.save_pretrained(os.path.join(args.output_dir, "adapter"))
 
@@ -951,6 +1021,9 @@ def main() -> None:
                    "image_token_id": image_token_id,
                    "n_train_examples": len(train_ds),
                    "n_val_examples": len(val_ds) if val_ds else 0,
+                   "load_best_model_at_end_effective": load_best_model_at_end,
+                   "best_model_checkpoint": trainer.state.best_model_checkpoint,
+                   "best_metric": trainer.state.best_metric,
                    "vision_cache": cache.stats() if cache else None}, fh, indent=1)
     print(f"Saved adapter to {os.path.join(args.output_dir, 'adapter')}")
 

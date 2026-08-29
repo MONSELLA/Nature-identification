@@ -107,6 +107,29 @@ def main() -> None:
 
     with open(args.splits, "r", encoding="utf-8") as fh:
         image_split: Dict[str, str] = json.load(fh)["image_split"]
+    # BASENAME FALLBACK INDEX. image_split's keys are the raw image_path
+    # strings from whatever artifact(s) built splits.json (this project's own
+    # usage: the student's DCC-cluster artifact, ABSOLUTE paths like
+    # "/home/pmonserrat/datasets/big_5/twitter/<id>_<idx>.jpg"). A teacher
+    # artifact produced on a DIFFERENT cluster can store image_path
+    # differently for the exact same file -- confirmed real, not
+    # hypothetical: google/gemma-4-26B-A4B-it's artifact (run on BSC, per its
+    # header's /gpfs/projects/bsc100/... model path) stores RELATIVE paths
+    # like "../../datasets/big_5/twitter/<id>_<idx>.jpg". An exact-string
+    # dict lookup between the two silently matches NOTHING -- every record
+    # falls into images_not_in_splits and the run produces zero examples
+    # with no error, which is exactly what happened before this fallback
+    # existed. Basename is a safe join key here: filenames are
+    # "<platform_id>_<idx>.<ext>" (CLAUDE.md), and platform_id's Twitter
+    # (numeric snowflake) vs Weibo (alphanumeric) ID formats make a
+    # cross-platform basename collision practically impossible, even though
+    # rft_common.group_key defensively prefixes with platform elsewhere.
+    # Tried as a FALLBACK only, after the exact match -- never changes
+    # behavior for artifacts whose image_path already matches splits.json
+    # verbatim (this project's own DCC-produced artifacts).
+    image_split_by_basename: Dict[str, str] = {}
+    for k, v in image_split.items():
+        image_split_by_basename.setdefault(os.path.basename(k), v)
 
     rng = random.Random(args.seed)
     stats = BuildStats()
@@ -125,6 +148,10 @@ def main() -> None:
         for rec in records:
             split = image_split.get(rec["image_path"])
             if split is None:
+                split = image_split_by_basename.get(os.path.basename(rec["image_path"]))
+                if split is not None:
+                    stats.bump("images_matched_by_basename_fallback")
+            if split is None:
                 stats.bump("images_not_in_splits")
                 continue
             stats.bump(f"images_seen/{split}")
@@ -136,7 +163,13 @@ def main() -> None:
             stats.bump(f"images_accepted/{split}")
             stats.bump(f"images_accepted/{split}/gt_nature={verdict.gt_nature}")
             if split in args.build_splits:
-                accepted[split].append((rec, platform))
+                # Carry the artifact's own caption_stage alongside the record:
+                # a --no_caption artifact must have its extraction example
+                # rebuilt from the caption-free prompt, and several artifacts
+                # (one per platform) are merged here, so this cannot be read
+                # once globally. Defaults True for artifacts written before the
+                # header carried the field.
+                accepted[split].append((rec, platform, bool(header.get("caption_stage", True))))
 
     source_model = sorted(source_models)[0] if len(source_models) == 1 else "+".join(sorted(source_models))
     if len(source_models) > 1:
@@ -148,7 +181,7 @@ def main() -> None:
     weights: Dict[bool, float] = {True: 1.0, False: 1.0}
     if "train" in accepted:
         train = accepted["train"]
-        n_nat = sum(1 for rec, _ in train if (rec.get("targets") or [{}])[0].get("gt_nature") is True)
+        n_nat = sum(1 for rec, *_ in train if (rec.get("targets") or [{}])[0].get("gt_nature") is True)
         n_non = len(train) - n_nat
         if args.balance == "downsample_nature":
             if n_nat > n_non:
@@ -177,8 +210,9 @@ def main() -> None:
         recs = accepted.get(split, [])
         out_path = os.path.join(args.out, f"{split}.jsonl")
         with open(out_path, "w", encoding="utf-8") as fh:
-            for rec, platform in recs:
-                for ex in examples_for_record(rec, platform, source_model, tuple(args.stages), stats):
+            for rec, platform, rec_caption_stage in recs:
+                for ex in examples_for_record(rec, platform, source_model, tuple(args.stages),
+                                              stats, no_caption=not rec_caption_stage):
                     row = json.loads(ex.to_json())
                     if args.balance == "loss_weight" and split == "train":
                         row["weight"] = round(weights.get(bool(ex.gt_nature), 1.0), 6)

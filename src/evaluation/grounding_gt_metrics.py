@@ -16,12 +16,26 @@ WHAT IS SHARED WITH COCO (imported, never reimplemented):
 
 WHAT IS NEW HERE, and why COCO does not need it:
 
+  0. MULTI-NAMED GT REGIONS. One annotated mask may carry SEVERAL names, and
+     the evaluation treats every one of them as equally correct: exact match
+     succeeds if the predicted phrase names ANY of them, and the hierarchical
+     score (hP/hR/hF1 + Wu-Palmer) is taken from the BEST-SCORING name. This
+     replaced an earlier convention that DUPLICATED a region under a second
+     name (a cloud mask copied as `sky`), which harmed recall by inventing a
+     GT region no concept-level segmenter can produce twice — see
+     convert_grounding_annotations' NAMES section for the full argument.
+     A region is still bucketed, counted and reported under its PRIMARY
+     (first) name; only the naming credit consults all of them.
+
   1. VOID REGIONS FOR OVERLAPPING GT (`build_void_rles`, `void_iou_matrix`).
      The annotator drew `cloud` ON TOP OF `sky`, `bird` inside `sky`, `sun`
      inside `sky`. Measured on the shipped annotations: 88 of 414 GT pairs
      overlap (21.3%), pairwise GT IoU reaches 0.747, and 14 objects sit >90%
      inside a larger one. COCO's own protocol has no answer for this because
-     COCO instances of one class rarely nest that way.
+     COCO instances of one class rarely nest that way. NOTE this is a DIFFERENT
+     case from multi-naming above and both are needed: multi-naming is for one
+     region that is two things at once, voiding is for two regions of genuinely
+     different extent where one nests inside the other.
 
      The problem is a convention we cannot verify in advance: the annotator's
      `sky` INCLUDES the pixels behind the clouds (it is amodal — the sky really
@@ -195,19 +209,29 @@ def void_iou(pred_rle: Dict[str, Any], gt_rle: Dict[str, Any],
     return float(inter / union) if union > 0 else 0.0
 
 
-def tie_break_identical_gt(ious, gt_rles, gt_labels, pred_labels,
+def tie_break_identical_gt(ious, gt_rles, gt_label_sets, pred_labels,
                            epsilon=1e-9):
     """Nudge the IoU matrix so that an EXACT geometric tie between two GT
     regions is resolved in favour of the label-consistent pairing.
 
-    WHY THIS IS NEEDED. Deriving `sky` from `cloud` (see
-    convert_grounding_annotations.derive_sky_from_cloud) produces 13 images
-    where two GT regions have BYTE-IDENTICAL masks. Their rows in the IoU matrix
-    are then identical, so every assignment permuting them scores exactly the
-    same total and the solver's choice among them is arbitrary. A model that
+    WHY THIS IS NEEDED. Two GT regions with BYTE-IDENTICAL masks have identical
+    rows in the IoU matrix, so every assignment permuting them scores exactly
+    the same total and the solver's choice among them is arbitrary. A model that
     correctly said "sky" and "cloud" can be cross-paired — its cloud mask
     matched against GT sky — and scored as having named BOTH wrong, for reasons
     that have nothing to do with the model.
+
+    MOSTLY INERT NOW, and deliberately kept anyway. The 13 identical-mask pairs
+    that motivated this came from the removed `derive_sky_from_cloud`
+    duplication; a single region carrying both names produces no tie at all.
+    But nothing prevents an annotator drawing two genuinely coincident regions
+    (a `tree` and a `foliage` traced identically), and this is the correct
+    handling if they ever do — so it stays, costing one dict pass when no
+    duplicates exist.
+
+    `gt_label_sets[i]` is the collection of surface forms GT region i answers
+    to — a mask may carry several names, and agreement with ANY of them is what
+    makes a pairing label-consistent.
 
     WHY THIS IS NOT GT LEAKAGE. The tie is EXACT: the geometry carries literally
     zero information distinguishing the two options, and the nudge is
@@ -223,7 +247,7 @@ def tie_break_identical_gt(ious, gt_rles, gt_labels, pred_labels,
     (but distinct) regions are left completely alone, because there the
     geometry DOES carry information and must be allowed to decide.
     """
-    if ious.size == 0 or not gt_labels or not pred_labels:
+    if ious.size == 0 or not gt_label_sets or not pred_labels:
         return ious
     counts = {}
     for i, rle in enumerate(gt_rles):
@@ -235,7 +259,7 @@ def tie_break_identical_gt(ious, gt_rles, gt_labels, pred_labels,
     for idxs in groups:
         for gi in idxs:
             for pj, plabel in enumerate(pred_labels):
-                if _labels_agree(gt_labels[gi], plabel):
+                if any(_labels_agree(g, plabel) for g in (gt_label_sets[gi] or ())):
                     out[gi, pj] += epsilon
     return out
 
@@ -357,6 +381,38 @@ def absorb_predictions(
     return absorbed, best
 
 
+def pick_primary_contributor(gt_rle: Dict[str, Any],
+                             void_rle: Optional[Dict[str, Any]],
+                             member_rles: Sequence[Dict[str, Any]]) -> int:
+    """Which member of a many-to-one group should stand in for the group's
+    NAME? Returns the index (into `member_rles`) of the mask that accounts for
+    the most GT pixels — i.e. the member with the largest void-aware
+    intersection with the GT region.
+
+    A many-to-one group can mix a well-named member with junk ("tree" +
+    "vague blob"), and scoring the group's naming by its BEST member (as this
+    module used to) or its MEAN silently rewards or dilutes on members that
+    contributed almost nothing to the actual match. Picking by GEOMETRIC
+    CONTRIBUTION instead asks a different, more defensible question: of
+    everything the model said about this region, what did it call the part it
+    actually found? That is the one name a reader would reasonably attribute
+    to "the model's answer for this GT object".
+
+    Ties (equal contribution) resolve to the first such member, deterministically.
+    """
+    best_idx, best_area = 0, -1
+    for i, rle in enumerate(member_rles):
+        area = _area(_merge([rle, gt_rle], intersect=True))
+        if void_rle is not None:
+            # void_rle is a SUBSET of gt_rle (see build_void_rles), so
+            # (rle & void) == (rle & gt & void) — no need to re-intersect
+            # with gt_rle first, matching the identity void_iou already relies on.
+            area -= _area(_merge([rle, void_rle], intersect=True))
+        if area > best_area:
+            best_idx, best_area = i, area
+    return best_idx
+
+
 # =============================================================================
 # False-positive taxonomy
 # =============================================================================
@@ -433,6 +489,16 @@ def label_breakdown(rows, min_support=1):
     Each row is `{"gt_label", "found": bool, "iou": float|None,
     "exact_match": bool|None}`. Returns per label: support, recall, mean IoU
     over the found ones, and exact-naming rate over the found ones.
+
+    ONE ROW PER GT NAME, not per GT region: a mask named both `cloud` and `sky`
+    contributes a row to each, because it genuinely is both concepts and a
+    reader asking "is sky found?" wants that mask counted. Consequence to state
+    when quoting this table: the supports SUM TO MORE than the GT region count
+    whenever multi-named regions exist, so they are not a partition of the GT
+    the way the size buckets are. `exact_match` on such a row is that NAME's
+    own surface-form verdict, so `sky` recall 1.00 with an exact-name rate of
+    0.20 reads correctly as "the region was always found, but the model
+    usually called it something else (here: cloud)".
     """
     by_label = {}
     for r in rows:

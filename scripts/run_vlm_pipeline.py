@@ -119,7 +119,8 @@ from src import grounding_pipeline
 from src.loaders.excel_loader import TaxonomyGraph
 from src.loaders.dataset_loader import (load_dataset, get_candidate_vocab, coco_gt_boxes,
                                         BIG5_DATASETS)
-from src.models.prompts import build_system_prompts
+from src.models.prompts import (build_system_prompts, get_summary_caption_prompt,
+                               summary_caption_prompt_name)
 from src.models.vlm_models import MODEL_REGISTRY, create_vlm
 from src.vlm_pipeline import run_inference, resolve_hybrid_label, _normalize_object
 from src.evaluation import clip_metrics
@@ -924,6 +925,38 @@ def _filter_to_split(items, split_file, key, what):
     return kept
 
 
+def _validate_no_caption_config(args):
+    """Fail fast on the --no_caption flag combinations that cannot produce a
+    scoreable run. Called at the top of phase_infer (before anything slow) and
+    kept as its own function so both combinations are directly testable.
+
+    --no_caption removes Stage 1. On BIG-5/COCO that is the whole story. On a
+    ClipMatch dataset (ImageNet/Places) ClipMatch still needs SOME
+    caption-derived text, so the summary call survives and switches to its
+    caption-free variant — a short direct image description rather than a
+    re-summarization. Two ways that can fail:
+      1. the dataset has no validated caption-free summary prompt (currently
+         anything but ImageNet — see prompts.SUMMARY_CAPTION_PROMPTS_NO_CAPTION);
+      2. --no_summarize_clipmatch_caption is also passed, which removes the
+         only remaining text source and leaves ClipMatch nothing to score."""
+    if not getattr(args, "no_caption", False):
+        return
+    if args.dataset not in clip_metrics.CLIPMATCH_DATASETS:
+        return  # BIG-5 / COCO: no ClipMatch, nothing else to check.
+    if args.no_summarize_clipmatch_caption:
+        raise SystemExit(
+            f"--no_caption + --no_summarize_clipmatch_caption on '{args.dataset}' would "
+            "leave no caption-derived text at all, and ClipMatch (plus the axis and "
+            "hierarchical metrics that read its predicted class) cannot be scored without "
+            "one. Drop --no_summarize_clipmatch_caption: on a --no_caption run that call "
+            "is a short direct image description, not a summary of anything."
+        )
+    try:
+        get_summary_caption_prompt(args.dataset, no_caption=True)
+    except ValueError as e:
+        raise SystemExit(f"--no_caption on dataset '{args.dataset}': {e}") from None
+
+
 def phase_infer(args, vlm=None):
     """
     Runs the ENTIRE inference half of the pipeline: load the dataset and the
@@ -945,6 +978,11 @@ def phase_infer(args, vlm=None):
     print(f"🚀 [infer] dataset='{args.dataset}', model='{args.model_family}/{args.model_name}' "
           f"-> responses_file='{args.responses_file}'")
     phase_t0 = time.time()
+
+    # Validate the --no_caption combination BEFORE the (slow) taxonomy-graph
+    # load, dataset scan and model load, so a bad flag combination costs a
+    # second rather than several minutes of a queued GPU job.
+    _validate_no_caption_config(args)
 
     graph = TaxonomyGraph()
     # --sheet_name may be a sheet NAME (string) or a numeric INDEX (still a
@@ -1011,12 +1049,22 @@ def phase_infer(args, vlm=None):
         "candidate_vocab": candidate_vocab,
         "max_hops": args.max_hops,
         "summarize_clipmatch_caption": summarize_for_clipmatch,
+        # False only for the --no_caption ABLATION: this artifact was produced
+        # WITHOUT the Stage-1 caption, so every record's "caption" is empty by
+        # construction and the caption-based CLIP metrics are inapplicable
+        # (not zero). --stage score branches on this, so an ablation artifact
+        # is never silently compared against a baseline one.
+        "caption_stage": not args.no_caption,
+        "extraction_prompt_variant": ("no_caption" if args.no_caption else "with_caption"),
         # WHICH summary prompt this artifact was produced with (object-centric
         # for ImageNet vs scene-centric for Places — see
         # prompts.SUMMARY_CAPTION_PROMPTS). Recorded because the two are not
         # interchangeable: comparing ClipMatch numbers across artifacts written
         # with different prompt variants would be comparing different setups.
-        "summary_caption_prompt": (f"summary_caption_prompt_{args.dataset}"
+        # ALSO distinguishes the --no_caption variant of that prompt (a short
+        # direct description) from the with-caption one (a re-summarization) —
+        # same reason: the two are not interchangeable.
+        "summary_caption_prompt": (summary_caption_prompt_name(args.dataset, args.no_caption)
                                     if summarize_for_clipmatch else None),
         # Provenance for a fine-tuned run: whether this artifact was produced
         # with an RFT adapter applied (and to which base model + adapter
@@ -1214,6 +1262,7 @@ def phase_infer(args, vlm=None):
                 # prompt, see prompts.get_summary_caption_prompt.
                 dataset=args.dataset,
                 use_lora=bool(args.lora_adapter_path),
+                no_caption=args.no_caption,
             ):
                 rec["record_type"] = "image"
                 f.write(json.dumps(rec) + "\n")
@@ -1752,8 +1801,22 @@ def phase_score(args):
     image_paths = [r["image_path"] for r in records]
     captions = [r["caption"] for r in records]
     image_embs = scorer.encode_images(image_paths, verbose=args.verbose)
-    caption_embs = scorer.encode_text(captions, warn_truncation=False,
-                                      verbose=args.verbose, desc="captions")
+    # --no_caption ABLATION artifacts have no caption to encode (every
+    # "caption" is ""), so CLIPScore/F-CLIPScore are INAPPLICABLE here, not
+    # zero — encoding empty strings would manufacture a meaningless constant
+    # embedding and report it as a score. `caption_stage` defaults to True so
+    # every artifact written before this flag existed behaves exactly as
+    # before. Object-CLIPScore and every taxonomy/axis metric are unaffected.
+    has_caption_stage = bool(header.get("caption_stage", True))
+    if has_caption_stage:
+        caption_embs = scorer.encode_text(captions, warn_truncation=False,
+                                          verbose=args.verbose, desc="captions")
+    else:
+        caption_embs = None
+        if args.verbose:
+            print("[score] artifact has caption_stage=false (--no_caption ablation): "
+                  "skipping caption encoding; CLIPScore/F-CLIPScore reported as N/A.",
+                  flush=True)
 
     # Flatten object texts with per-image offsets, encode once.
     # Every image has a DIFFERENT number of extracted objects, so we can't
@@ -1790,6 +1853,21 @@ def phase_score(args):
     caption_token_mean = n_caption_truncated = None
     candidate_token_counts = candidate_token_mean = n_candidate_truncated = None
     primary_embs_cm = None
+    if run_clipmatch and not has_caption_stage and not header.get("summarize_clipmatch_caption"):
+        # ClipMatch scores a caption-derived text against the candidate vocab.
+        # A --no_caption artifact still HAS one — the short direct description
+        # written by the caption-free summary call — so only the artifact with
+        # NEITHER is unscoreable. Refuse rather than scoring empty strings and
+        # reporting the result as a ClipMatch number. (phase_infer blocks this
+        # combination up front; this covers a standalone --stage score.)
+        raise SystemExit(
+            f"This artifact was produced with --no_caption AND without the summary call "
+            f"(header caption_stage=false, summarize_clipmatch_caption=false), so it "
+            f"carries no caption-derived text at all — but dataset '{dataset}' runs "
+            f"ClipMatch, which needs one. Re-run inference without "
+            f"--no_summarize_clipmatch_caption."
+        )
+
     if run_clipmatch:
         # Which text drives ClipMatch THIS run: the VLM's own summary caption
         # when the artifact has one, else the raw caption (old artifacts /
@@ -1841,7 +1919,24 @@ def phase_score(args):
         # missing/empty (e.g. an older partial artifact) so this never
         # silently drops an image from scoring.
         if run_summary_clipmatch:
+            # The per-record fallback to the full caption covers an older or
+            # partial artifact whose summary is missing/empty, so no image is
+            # ever silently dropped from scoring. On a --no_caption artifact
+            # that fallback is itself empty (there is no caption), so an empty
+            # summary there means a genuinely failed generation — counted and
+            # reported rather than passed off as a scored image, since an empty
+            # string still yields an argmax and would look like a real
+            # (uniformly wrong) prediction.
             summary_texts = [r.get("clipmatch_summary_caption") or r["caption"] for r in records]
+            n_empty_primary = sum(1 for t in summary_texts if not t.strip())
+            if n_empty_primary:
+                print(f"⚠️ [score] {n_empty_primary}/{len(summary_texts)} images have an EMPTY "
+                      f"ClipMatch text"
+                      + ("" if has_caption_stage else " (--no_caption run: no caption to fall "
+                                                      "back on, so the summary call itself "
+                                                      "returned nothing)")
+                      + " — their ClipMatch prediction is meaningless and will score as wrong. "
+                        "Check the summary-caption stage in the infer log.")
             primary_embs_cm = cm_scorer.encode_text(
                 summary_texts, verbose=args.verbose, desc="summary captions (clipmatch)")
             summary_token_counts, summary_token_mean, n_summary_truncated = _clip_token_stats(
@@ -2096,8 +2191,13 @@ def phase_score(args):
                 image_n_vlm_nature += 1
 
         # --- reference-free CLIP metrics (all datasets) ---
-        image_clipscore = clip_metrics.clipscore(image_embs[idx], caption_embs[idx])
-        image_fclip = clip_metrics.f_clipscore(image_embs[idx], caption_embs[idx], rec_obj_embs)
+        # None on a --no_caption run: both of these score the CAPTION against
+        # the image, and there is no caption. _mean/_std drop Nones, so the
+        # summary reports them over an empty set rather than over zeros.
+        image_clipscore = (clip_metrics.clipscore(image_embs[idx], caption_embs[idx])
+                           if caption_embs is not None else None)
+        image_fclip = (clip_metrics.f_clipscore(image_embs[idx], caption_embs[idx], rec_obj_embs)
+                       if caption_embs is not None else None)
         image_objclip = clip_metrics.object_clipscore(image_embs[idx], rec_obj_embs)
         clipscore_vals.append(image_clipscore)
         fclip_vals.append(image_fclip)
@@ -2687,6 +2787,11 @@ def phase_score(args):
             # Mean AND population std (same convention as the hierarchical
             # metrics): a mean alone can't distinguish "every image scores
             # close to this" from a widely-spread or bimodal distribution.
+            # False on a --no_caption ablation run: "clipscore"/"f_clipscore"
+            # below are then means over an EMPTY set (0.0 by _mean's own
+            # convention), i.e. NOT MEASURED — do not compare them against a
+            # baseline run's. "object_clipscore" is unaffected either way.
+            "caption_stage": has_caption_stage,
             "clipscore": _mean(clipscore_vals),
             "clipscore_std": _std(clipscore_vals),
             "f_clipscore": _mean(fclip_vals),
@@ -3061,9 +3166,14 @@ def _print_summary(s, run_clipmatch):
           f"material-only {d['label_parse_failure_rate_material']:.1%} "
           f"({d['label_parse_failures_material']}/{d['label_calls_material']})")
     rf = s["reference_free"]
-    print(f"CLIPScore: {rf['clipscore']:.4f}±{rf.get('clipscore_std', 0.0):.4f} | "
-          f"F-CLIPScore: {rf['f_clipscore']:.4f}±{rf.get('f_clipscore_std', 0.0):.4f} | "
-          f"Object-CLIPScore: {rf['object_clipscore']:.4f}±{rf.get('object_clipscore_std', 0.0):.4f}")
+    if rf.get("caption_stage", True):
+        print(f"CLIPScore: {rf['clipscore']:.4f}±{rf.get('clipscore_std', 0.0):.4f} | "
+              f"F-CLIPScore: {rf['f_clipscore']:.4f}±{rf.get('f_clipscore_std', 0.0):.4f} | "
+              f"Object-CLIPScore: {rf['object_clipscore']:.4f}±{rf.get('object_clipscore_std', 0.0):.4f}")
+    else:
+        # --no_caption ablation: the two caption-based scores are undefined here.
+        print(f"CLIPScore: n/a (--no_caption) | F-CLIPScore: n/a (--no_caption) | "
+              f"Object-CLIPScore: {rf['object_clipscore']:.4f}±{rf.get('object_clipscore_std', 0.0):.4f}")
     neg_labels = {"nature": "no_nature", "biotic_matched": "abiotic", "material_matched": "immaterial"}
     axis_names = {"nature": "nature", "biotic_matched": "life category", "material_matched": "tangibility"}
     for axis in ("nature", "biotic_matched", "material_matched"):
@@ -3231,8 +3341,12 @@ def _log_wandb(args, summary, run_clipmatch):
         "WordNetMappingRate": summary["diagnostics"]["wordnet_mapping_rate"],
         "LabelParseFailureRate": summary["diagnostics"]["label_parse_failure_rate"],
         "LabelParseFailureRate/MaterialOnly": summary["diagnostics"]["label_parse_failure_rate_material"],
-        "CLIPScore": summary["reference_free"]["clipscore"],
-        "F-CLIPScore": summary["reference_free"]["f_clipscore"],
+        # None (not 0.0) on a --no_caption ablation run, so W&B shows a gap
+        # rather than a plausible-looking zero for a metric never measured.
+        "CLIPScore": (summary["reference_free"]["clipscore"]
+                      if summary["reference_free"].get("caption_stage", True) else None),
+        "F-CLIPScore": (summary["reference_free"]["f_clipscore"]
+                        if summary["reference_free"].get("caption_stage", True) else None),
         "Object-CLIPScore": summary["reference_free"]["object_clipscore"],
         "Nature/F1": summary["nature"]["f1"], "Nature/Accuracy": summary["nature"]["accuracy"],
         "Nature/F1_NoNature": summary["nature"]["f1_neg"],
@@ -3510,14 +3624,27 @@ def build_arg_parser():
                         "template enables it by default and renders a prompt already ending "
                         "in an open '<think>' block, which breaks this pipeline two ways: "
                         "structured calls run under guided decoding, so the model is forced "
-                        "into JSON from inside an unterminated think block (measured: ~10% "
-                        "extraction parse-failure on Qwen3.5-9B vs <1% on Ministral-3-8B at "
+                        "into JSON from inside an unterminated think block (measured: ~10%% "
+                        "extraction parse-failure on Qwen3.5-9B vs <1%% on Ministral-3-8B at "
                         "identical settings), and the free-form caption call has no grammar "
                         "at all, so chain-of-thought text lands in the caption itself. This "
                         "pipeline's schemas already carry their own explicit reasoning "
                         "fields, so template-level thinking is redundant here. Pass this "
                         "only to run thinking-mode as a deliberate, labeled ablation.")
     p.add_argument("--temperature", type=float, default=0.0)
+    p.add_argument("--no_caption", action="store_true",
+                   help="ABLATION: remove the Stage-1 captioning call entirely. Extraction is "
+                        "then prompted from the IMAGE ALONE using the caption-free variant of "
+                        "the extraction prompt (src.models.prompts.get_extraction_prompt"
+                        "(no_caption=True)) — same instructions/examples, minus the caption "
+                        "preamble, so the only variable between a baseline run and this one is "
+                        "the caption stage itself. Records still carry an (empty) \"caption\" "
+                        "field so every downstream consumer keeps its shape; --stage score reads "
+                        "the artifact header's caption_stage=false and reports CLIPScore/"
+                        "F-CLIPScore as N/A (they score the caption, which does not exist here) "
+                        "while Object-CLIPScore and every taxonomy/axis metric are unaffected. "
+                        "Incompatible with the ImageNet/Places summary-caption ClipMatch call — "
+                        "pass --no_summarize_clipmatch_caption alongside it there.")
     p.add_argument("--no_summarize_clipmatch_caption", action="store_true",
                    help="On ImageNet/Places, --stage infer asks the VLM for an extra short "
                         "(<=~20-word) summary of its own caption, grounded in the image, and "
