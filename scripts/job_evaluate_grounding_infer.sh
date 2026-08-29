@@ -63,10 +63,16 @@
 #
 # Run from the scripts/ directory, like every other job_*.sh here.
 
-# facebook/sam3 is a GATED HuggingFace repo, so grounding needs an authenticated
-# token. Export HF_TOKEN in your shell before `sbatch`, or put it in ~/.env —
-# never hardcode it here (this file is tracked in git).
-export HF_TOKEN="${HF_TOKEN:-}"
+# facebook/sam3 is a GATED HuggingFace repo, so grounding needs authentication.
+# Either run `hf auth login` once (the token is then cached in
+# ~/.cache/huggingface/token and picked up automatically), or export HF_TOKEN in
+# your shell before `sbatch`. Never hardcode it here — this file is tracked.
+#
+# UNSET IT IF EMPTY, deliberately: an empty HF_TOKEN is WORSE than none at all.
+# huggingface_hub would send a literal "Authorization: Bearer " header (httpx
+# then raises `Illegal header value b'Bearer '`) instead of falling back to the
+# cached login token. So only export it when it actually has a value.
+if [ -n "${HF_TOKEN:-}" ]; then export HF_TOKEN; else unset HF_TOKEN; fi
 export VLLM_USE_FLASHINFER_SAMPLER=0
 
 set -o pipefail

@@ -480,7 +480,15 @@ class SAM3Grounder:
         # pick it up from the HF_TOKEN env var / `huggingface-cli login`'s
         # cached token (huggingface_hub's own resolution order — passing
         # token=None here still lets that automatic lookup happen).
-        token = hf_token or os.environ.get("HF_TOKEN")
+        # `or None` is load-bearing: an EMPTY HF_TOKEN (e.g. a job script doing
+        # `export HF_TOKEN="${HF_TOKEN:-}"` with nothing set) would otherwise be
+        # passed through as "", and huggingface_hub sends a literal
+        # "Authorization: Bearer " header for it — httpx rejects that with
+        # `LocalProtocolError: Illegal header value b'Bearer '`. Worse, an empty
+        # string SUPPRESSES the automatic fallback below. Collapsing "" to None
+        # restores it, so an unset-or-empty token means "use the cached
+        # `hf auth login` credential", which is what a caller always intends.
+        token = hf_token or os.environ.get("HF_TOKEN") or None
         self.processor = Sam3Processor.from_pretrained(model_name, token=token)
         self.model = Sam3Model.from_pretrained(model_name, token=token, **dtype_kwargs)
         self.model.eval().to(device)

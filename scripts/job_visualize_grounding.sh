@@ -5,8 +5,8 @@
 #SBATCH --qos=normal
 #SBATCH --account=acct_gen
 #SBATCH --job-name=viz_grounding
-#SBATCH --gres=gpu:a40:1
-#SBATCH --output=/home/pmonserrat/code/logs/slurm_viz_grounding_%j.out
+#SBATCH --gres=gpu:1
+#SBATCH --output=/home/pmonserrat/code/logs/slurm_viz_grounding.out
 #
 # Render ONE image's SAM3 nature masks as a figure (scripts/visualize_grounding.py)
 # — the qualitative "final output of the pipeline" picture for the thesis.
@@ -30,10 +30,16 @@
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate tfm
 
-# facebook/sam3 is a GATED HuggingFace repo, so grounding needs an authenticated
-# token. Export HF_TOKEN in your shell before `sbatch`, or put it in ~/.env —
-# never hardcode it here (this file is tracked in git).
-export HF_TOKEN="${HF_TOKEN:-}"
+# facebook/sam3 is a GATED HuggingFace repo, so grounding needs authentication.
+# Either run `hf auth login` once (the token is then cached in
+# ~/.cache/huggingface/token and picked up automatically), or export HF_TOKEN in
+# your shell before `sbatch`. Never hardcode it here — this file is tracked.
+#
+# UNSET IT IF EMPTY, deliberately: an empty HF_TOKEN is WORSE than none at all.
+# huggingface_hub would send a literal "Authorization: Bearer " header (httpx
+# then raises `Illegal header value b'Bearer '`) instead of falling back to the
+# cached login token. So only export it when it actually has a value.
+if [ -n "${HF_TOKEN:-}" ]; then export HF_TOKEN; else unset HF_TOKEN; fi
 
 CODE_DIR=/home/pmonserrat/code
 RESULTS_DIR=$CODE_DIR/results
@@ -61,7 +67,7 @@ cd "$CODE_DIR/scripts" || exit 1
 echo "image     : $IMAGE"
 echo "artifact  : $RESPONSES"
 echo "out_dir   : $OUT_DIR"
-[ -z "$HF_TOKEN" ] && echo "WARNING: HF_TOKEN is unset — SAM3 (facebook/sam3) is gated and the load will fail."
+[ -z "${HF_TOKEN:-}" ] && echo "note: HF_TOKEN not set — relying on the cached \`hf auth login\` token in ~/.cache/huggingface/token."
 
 python visualize_grounding.py \
   --image "$IMAGE" \
