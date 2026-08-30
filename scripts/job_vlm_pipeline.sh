@@ -72,7 +72,19 @@ export VLLM_USE_FLASHINFER_SAMPLER=0
 # MoE saves FLOPs, not parameter memory: the 26B MoE's KV budget on a 96 GB
 # card is no better than an 8B dense model's on a 48 GB one.
 #
-# family|hf_name|max_model_len|batch_cap
+# HYBRID-ATTENTION MODELS NEED --max_num_seqs. Qwen3.6-35B-A3B interleaves
+# Gated-DeltaNet (Mamba-style) layers with normal attention, and vLLM allocates
+# ONE MAMBA STATE BLOCK PER CONCURRENT SEQUENCE out of the same leftover memory
+# as the KV cache. With 65.5 GiB of weights against a 76.8 GiB budget only
+# ~5.5 GiB is left, i.e. ~274 blocks — and vLLM's DEFAULT max_num_seqs is 1024,
+# so it refuses to start at all:
+#     ValueError: max_num_seqs (1024) exceeds available Mamba cache blocks (274)
+# --batch_size does NOT bound this: it only caps how many prompts this script
+# SUBMITS per call, while max_num_seqs caps what the engine schedules. A purely
+# transformer model has no such per-sequence allocation and is unaffected, which
+# is why only the hybrid entry sets the field.
+#
+# family|hf_name|max_model_len|batch_cap|max_num_seqs (empty = vLLM default)
 MODELS=(
   # Base tier — L40S 48 GB (--array 0-14)
   "mistral|mistralai/Ministral-3-8B-Instruct-2512-BF16|8192|128" #0-2
@@ -87,7 +99,7 @@ MODELS=(
   "gemma|google/gemma-4-E4B-it|8192|384" #24-26
   # MoE tier — RTX 6000 96 GB (--array 27-35)
   "gemma|google/gemma-4-26B-A4B-it|8192|128" #27-29
-  "qwen|Qwen/Qwen3.6-35B-A3B|8192|64" #30-32
+  "qwen|Qwen/Qwen3.6-35B-A3B|8192|64|128" #30-32  hybrid: see note above
   "internvl|OpenGVLab/InternVL3_5-30B-A3B|8192|128" #33-35
 )
 
@@ -108,7 +120,7 @@ if [ "$MODEL_IDX" -ge "${#MODELS[@]}" ]; then
   exit 1
 fi
 
-IFS='|' read -r MODEL_FAMILY MODEL_NAME MAX_LEN BATCH_CAP <<< "${MODELS[$MODEL_IDX]}"
+IFS='|' read -r MODEL_FAMILY MODEL_NAME MAX_LEN BATCH_CAP MODEL_SEQS <<< "${MODELS[$MODEL_IDX]}"
 DATASET="${DATASETS[$DATASET_IDX]}"
 
 mkdir -p ../logs
@@ -179,8 +191,17 @@ BATCH=$(( DS_BATCH < BATCH_CAP ? DS_BATCH : BATCH_CAP ))
 # so a difference in the numbers is never a difference in the serving config.
 GPU_UTIL=0.8
 
-# --max_num_seqs is set per dataset inside EXTRA_ARGS above (BIG-5 Weibo only).
-echo "Config: dataset=$DATASET model=$MODEL_NAME batch_size=$BATCH gpu_util=$GPU_UTIL (no-caption run)"
+# --max_num_seqs comes from two places, deliberately: per DATASET inside
+# EXTRA_ARGS (BIG-5 Weibo, to bound concurrent vision-encoding — recap v19) and
+# per MODEL via the 5th MODELS field (hybrid-attention models, which cannot
+# start without it). The model-level one is only added when the dataset did not
+# already set one, so a dataset-specific cap is never silently overridden.
+SEQS_ARG=""
+if [ -n "${MODEL_SEQS:-}" ] && [[ "$EXTRA_ARGS" != *"--max_num_seqs"* ]]; then
+  SEQS_ARG="--max_num_seqs $MODEL_SEQS"
+fi
+
+echo "Config: dataset=$DATASET model=$MODEL_NAME batch_size=$BATCH gpu_util=$GPU_UTIL ${SEQS_ARG:-(max_num_seqs: vLLM default)} (no-caption run)"
 
 # NO-CAPTION RUN (--no_caption): Stage 1 is skipped entirely, so
 # --max_new_tokens_caption below is inert and is kept only so this file stays
@@ -195,6 +216,7 @@ python run_vlm_pipeline.py \
   --model_name "$MODEL_NAME" \
   --max_model_len "$MAX_LEN" \
   --batch_size "$BATCH" \
+  $SEQS_ARG \
   --gpu_memory_utilization "$GPU_UTIL" \
   --clipscore_model longclip \
   --clipmatch_model metaclip2 \
