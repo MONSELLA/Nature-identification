@@ -96,7 +96,27 @@ CODE=/home/pmonserrat/code
 # caption_stage through to get_extraction_prompt) — training on one tree and
 # evaluating in the other configuration would teach the adapter a prompt shape
 # it never sees at inference. Override with RESULTS=... for a captioned run.
-RESULTS=${RESULTS:-$CODE/results/vlm_pipeline/ablation_no_caption}
+RESULTS=${RESULTS:-$CODE/results/vlm_pipeline/baseline_no_caption}
+# FALLBACK, because no-caption runs have landed in more than one tree
+# (baseline_no_caption/ from the current grid, ablation_no_caption/ from the
+# earlier caption ablation). If the teacher's artifacts are not under $RESULTS,
+# every other vlm_pipeline/*no_caption*/ tree is tried before giving up —
+# pinning one root is exactly what made the grounding job re-infer a model
+# whose predictions already existed one directory over. An explicit RESULTS=
+# still wins: the fallback only runs when the default finds nothing.
+if [ -z "${RESULTS_EXPLICIT:-}" ]; then
+  TEACHER_SLUG_PROBE=${TEACHER:-google/gemma-4-31B-it}; TEACHER_SLUG_PROBE=${TEACHER_SLUG_PROBE//\//_}
+  if [ ! -f "$RESULTS/big5_twitter/responses/vlm_responses_$TEACHER_SLUG_PROBE.jsonl" ]; then
+    for d in "$CODE/results/vlm_pipeline"/*no_caption*/; do
+      [ -d "$d" ] || continue
+      if [ -f "${d}big5_twitter/responses/vlm_responses_$TEACHER_SLUG_PROBE.jsonl" ]; then
+        echo "note: teacher artifacts not under $RESULTS — using ${d%/} instead"
+        RESULTS="${d%/}"
+        break
+      fi
+    done
+  fi
+fi
 # Threaded into the evaluation steps so the adapter is scored under the SAME
 # configuration it was trained on. Set NO_CAPTION=0 alongside a captioned
 # RESULTS to run the old captioned flow.
@@ -132,6 +152,7 @@ echo "DISTILLATION: student=$STUDENT  teacher=$TEACHER  (label=$TEACHER_LABEL)"
 echo "  artifacts  : $RESULTS"
 echo "  config     : ${NO_CAPTION_FLAG:-captioned}"
 echo "  balance    : $BALANCE"
+echo "  train batch: ${TRAIN_BATCH:-4} x accum $(( 16 / ${TRAIN_BATCH:-4} )) = 16 effective"
 echo "=========================================================================="
 
 # --- (no step 1) Splits must already exist — reused verbatim, never --------
@@ -198,8 +219,24 @@ elif [ "${QLORA:-0}" = "1" ]; then
   ACCUM_STEPS=$((16 / BATCH_SIZE))
 else
   AUTO_FIND_FLAG=""
-  BATCH_SIZE=1
-  ACCUM_STEPS=16
+  # SIZED FOR THE 96 GB rtx6000, not the 48 GB l40s this originally ran on.
+  # The 12B student is ~24 GB of weights in bf16; LoRA adds almost nothing
+  # (only the r=16 adapters carry grads/optimizer state) and gradient
+  # checkpointing keeps activations modest, so ~70 GB is free for the batch.
+  # 1 -> 4 is comfortable; the per-sample cost that actually varies here is the
+  # vision encoder at --max_image_side 1024 on uncapped social-media images.
+  #
+  # THE EFFECTIVE BATCH IS HELD AT 16 (batch x accumulation), deliberately:
+  # the same number of optimizer steps against the same LR schedule as the
+  # l40s run, so this is a speed change and not a different experiment. Raise
+  # TRAIN_BATCH to trade accumulation for parallelism, never to change 16.
+  BATCH_SIZE=${TRAIN_BATCH:-4}
+  ACCUM_STEPS=$(( 16 / BATCH_SIZE ))
+  if [ $(( BATCH_SIZE * ACCUM_STEPS )) -ne 16 ]; then
+    echo "ERROR: TRAIN_BATCH=$BATCH_SIZE does not divide the effective batch of 16" \
+         "(use 1, 2, 4, 8 or 16) — refusing to silently change the training recipe." >&2
+    exit 1
+  fi
 fi
 python train_lora.py \
   --model "$STUDENT" \
@@ -207,7 +244,7 @@ python train_lora.py \
   --output_dir "$RUN" \
   --lora_r "$LORA_R" \
   --eval_steps 246 \
-  --per_device_eval_batch_size 2 \
+  --per_device_eval_batch_size "${EVAL_BATCH:-8}" \
   --eval_on_start \
   --load_best_model_at_end \
   --no_vision_cache \
@@ -251,7 +288,7 @@ python run_vlm_pipeline.py \
   --lora_adapter_path "$RUN/adapter" \
   --lora_max_rank "$LORA_R" \
   --max_model_len 8192 \
-  --batch_size 62 \
+  --batch_size "${EVAL_INFER_BATCH:-96}" \
   --clipscore_model longclip \
   --clipmatch_model metaclip2 \
   --results_dir "$CODE/results/" \
