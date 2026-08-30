@@ -35,6 +35,12 @@
 # RESUMABLE, at both stages: --resume skips images already in the artifact, and
 # grounding only touches records without masks. Re-run freely.
 #
+# NO-CAPTION CONFIGURATION (--no_caption), matching the current VLM benchmark:
+# Stage 1 is skipped and entities are extracted from the image alone. BIG-5 runs
+# no ClipMatch, so nothing else changes. The run_name keeps these artifacts in
+# their own tree — the model slug in the filename is the same with or without a
+# caption stage, so only the path separates the two configurations.
+#
 # OUTPUT LAYOUT (identical to the VLM pipeline's — see README):
 #   <RESULTS_DIR>/<RUN_NAME>/
 #     grounding_gt_results.json                merged, keyed dataset->model
@@ -78,7 +84,7 @@ MODEL_SLUG="${MODEL_NAME//\//_}"
 
 CODE_DIR=/home/pmonserrat/code
 RESULTS_DIR="$CODE_DIR/results/"
-RUN_NAME="vlm_pipeline/grounding/big5/"
+RUN_NAME="vlm_pipeline/grounding_no_caption/big5/"
 OUT_ROOT="${RESULTS_DIR}${RUN_NAME}"
 
 # BIG-5 data
@@ -164,6 +170,7 @@ python run_pipeline.py \
     --run_name "$RUN_NAME" \
     --dtype bfloat16 \
     --trust_remote_code \
+    --no_caption \
     --resume \
     --verbose \
 || { echo "INFERENCE/GROUNDING FAILED — not scoring an incomplete artifact"; exit 1; }

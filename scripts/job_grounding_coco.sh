@@ -22,6 +22,13 @@
 # Each stage is its own OS SUBPROCESS (run_pipeline.py), so the VLM's VRAM is
 # fully reclaimed before SAM3 loads, and SAM3's before CLIP loads for scoring.
 #
+# NO-CAPTION CONFIGURATION (--no_caption), matching the current VLM benchmark:
+# Stage 1 is skipped and entities are extracted from the image alone. COCO is
+# not a ClipMatch dataset, so this composes with no extra flags. The artifact
+# header records caption_stage=false, and the run_name keeps these artifacts in
+# their own tree so they can never be confused with captioned ones (the model
+# slug in the filename is identical either way).
+#
 # RESUMABLE. --resume means a re-submission after a timeout/preemption picks up
 # where the artifact left off instead of re-running inference from scratch:
 # run_vlm_pipeline.py skips images already present and appends the rest. The
@@ -69,7 +76,7 @@ if [ -n "${HF_TOKEN:-}" ]; then export HF_TOKEN; else unset HF_TOKEN; fi
 # family|hf_name|max_model_len|batch_cap
 MODELS=(
   "gemma|google/gemma-4-E4B-it|8192|96"
-  "gemma|google/gemma-4-12B-it|8192|96"
+  "gemma|google/gemma-4-12B-it|8192|64"   # 24 GB of weights on a 48 GB card
   "gemma|google/gemma-4-26B-A4B-it|8192|64"
   "qwen|Qwen/Qwen3.6-27B|8192|96"
 )
@@ -86,7 +93,7 @@ MODEL_SLUG="${MODEL_NAME//\//_}"
 
 CODE_DIR=/home/pmonserrat/code
 RESULTS_DIR="$CODE_DIR/results/"
-RUN_NAME="vlm_pipeline/grounding/coco/"
+RUN_NAME="vlm_pipeline/grounding_no_caption/coco/"
 
 COCO_IMAGES_DIR=/home/pmonserrat/datasets/coco/images/val2017
 COCO_INSTANCES_JSON=/home/pmonserrat/datasets/coco/annotations/instances_val2017.json
@@ -132,6 +139,7 @@ python run_pipeline.py \
     --clipscore_model longclip \
     --dtype bfloat16 \
     --trust_remote_code \
+    --no_caption \
     --score \
     --resume \
     --verbose
