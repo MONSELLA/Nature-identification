@@ -1,11 +1,11 @@
 #!/bin/bash
 #SBATCH --cpus-per-task=6
 #SBATCH --mem=32G
-#SBATCH --partition=l40s
+#SBATCH --partition=a40
 #SBATCH --qos=normal
 #SBATCH --account=acct_gen
 #SBATCH --job-name=ground_big5
-#SBATCH --gres=gpu:l40s:1
+#SBATCH --gres=gpu:1
 #SBATCH --array=0-3
 #SBATCH --output=/dev/null
 #
@@ -18,14 +18,22 @@
 # layout. It REPLACES the big5 half of job_evaluate_grounding.sh, which assumed
 # a full-dataset artifact already existed and subset it after the fact.
 #
-# THE 340-IMAGE SUBSET IS SELECTED BEFORE INFERENCE, not after. The GT covers
-# 340 hand-drawn images (170 nature + 170 no-nature) out of ~6663 BIG-5 images,
-# so make_grounding_split_file.py writes those basenames and --split_file
-# restricts BOTH inference and grounding to them. That is ~20x less VLM and
-# SAM3 work than infer-everything-then-subset, on exactly the raw social-media
-# resolutions that make the vision encoder OOM-prone. It also means this job
-# needs no pre-existing artifact — a freshly fine-tuned adapter can be
-# evaluated from nothing.
+# IT REUSES EXISTING PREDICTIONS WHENEVER THEY EXIST. If this model already has
+# full BIG-5 artifacts (the normal VLM benchmark writes them per platform), the
+# 340 annotated images are SUBSET out of those and the VLM is never loaded — only
+# SAM3 runs. Re-inferring predictions that already exist would be pure waste, and
+# on a large model it is also what makes this job need a big GPU it otherwise
+# does not (gemma-4-26B-A4B is ~52 GB of weights: it cannot load on a 48 GB card
+# at all, while SAM3 alone fits comfortably).
+#
+# WHEN NO ARTIFACT EXISTS it falls back to running inference itself, restricted
+# to the 340 images via --split_file (make_grounding_split_file.py) so a fresh
+# model still costs ~20x less than infer-everything-then-subset. That path DOES
+# load the VLM, so it needs a GPU that fits the model.
+#
+# WHICH PATH RAN IS PRINTED. $2 overrides where existing artifacts are looked
+# for (default: the no-caption benchmark tree), e.g. to evaluate a fine-tuned
+# adapter whose own artifacts live elsewhere.
 #
 # ONE DATASET, BOTH PLATFORMS. --dataset big5 pools Twitter and Weibo
 # (dataset_loader.BIG5_DATASETS), which is required here: the annotations span
@@ -71,7 +79,6 @@ MODELS=(
   "gemma|google/gemma-4-E4B-it|8192|64"
   "gemma|google/gemma-4-12B-it|8192|64"
   "gemma|google/gemma-4-26B-A4B-it|8192|48"
-  "qwen|Qwen/Qwen3.6-27B|8192|64"
 )
 
 MODEL_IDX=$SLURM_ARRAY_TASK_ID
@@ -121,12 +128,23 @@ cd "$CODE_DIR/scripts" || exit 1
 SPLIT_FILE="${OUT_ROOT}grounding_gt_split.txt"
 ARTIFACT="${OUT_ROOT}responses/vlm_responses_${MODEL_SLUG}.jsonl"
 
+# Where to look for THIS model's existing full-dataset predictions. The VLM
+# benchmark writes one artifact per platform, so all three names are tried and
+# every match is merged (the GT spans both platforms — 84 twitter / 86 weibo).
+SOURCE_ROOT="${2:-${RESULTS_DIR}vlm_pipeline/baseline_no_caption}"
+SOURCE_ARTIFACTS=()
+for ds in big5_twitter big5_weibo big5; do
+    f="${SOURCE_ROOT}/${ds}/responses/vlm_responses_${MODEL_SLUG}.jsonl"
+    [ -e "$f" ] && SOURCE_ARTIFACTS+=("$f")
+done
+
 echo "=============================================================="
 echo "BIG-5 dense-GT grounding evaluation (infer -> ground -> score)"
 echo "  model      : $MODEL_NAME  (slug=$MODEL_SLUG)"
 echo "  GT dir     : $BIG5_GT_DIR"
 echo "  batch_size : $BATCH  max_num_seqs: $MAX_NUM_SEQS"
 echo "  output     : $OUT_ROOT"
+echo "  source     : $SOURCE_ROOT  (existing artifacts found: ${#SOURCE_ARTIFACTS[@]})"
 echo "=============================================================="
 
 if [ ! -d "$BIG5_GT_DIR/nature" ]; then
@@ -143,37 +161,94 @@ echo "--- building the split file from the GT ---"
 python make_grounding_split_file.py --gt_dir "$BIG5_GT_DIR" --out "$SPLIT_FILE" || exit 1
 echo "  $(wc -l < "$SPLIT_FILE") annotated images"
 
-# --- 2. Inference + grounding, restricted to those images ---------------------
-# --score is deliberately NOT passed: run_vlm_pipeline.py's score stage
-# computes the IMAGE-LEVEL axis metrics, which is a different question from the
-# dense mask evaluation below and would write a second results file into the
-# same tree. The dense scoring is step 3, and it is the point of this job.
-echo
-echo "--- VLM inference + SAM3 grounding (340 images) ---"
-python run_pipeline.py \
-    --dataset big5 \
-    --big_5_twitter_images_dir "$BIG5_TWITTER_IMAGES" \
-    --big_5_weibo_images_dir "$BIG5_WEIBO_IMAGES" \
-    --twitter_en_gt_csv "$ANNOT_DIR/twitter-en-6_majority.csv" \
-    --twitter_es_gt_csv "$ANNOT_DIR/twitter-es-6_majority.csv" \
-    --weibo_ch0_gt_csv "$ANNOT_DIR/weibo-ch-6-B-0_majority.csv" \
-    --weibo_ch1_gt_csv "$ANNOT_DIR/weibo-ch-6-B-1_majority.csv" \
-    --split_file "$SPLIT_FILE" \
-    --model_family "$MODEL_FAMILY" \
-    --model_name "$MODEL_NAME" \
-    --max_model_len "$MAX_LEN" \
-    --batch_size "$BATCH" \
-    --max_num_seqs "$MAX_NUM_SEQS" \
-    --grounding_batch_size "$GROUND_BATCH" \
-    --max_pairs_per_forward "$GROUND_MAX_PAIRS" \
-    --results_dir "$RESULTS_DIR" \
-    --run_name "$RUN_NAME" \
-    --dtype bfloat16 \
-    --trust_remote_code \
-    --no_caption \
-    --resume \
-    --verbose \
-|| { echo "INFERENCE/GROUNDING FAILED — not scoring an incomplete artifact"; exit 1; }
+# --- 2. Predictions for those images: REUSE, or infer ------------------------
+mkdir -p "${OUT_ROOT}responses"
+
+if [ ${#SOURCE_ARTIFACTS[@]} -gt 0 ]; then
+    # ---- REUSE PATH: no VLM is loaded at all --------------------------------
+    echo
+    echo "--- reusing existing predictions (${#SOURCE_ARTIFACTS[@]} artifact(s)) ---"
+    for f in "${SOURCE_ARTIFACTS[@]}"; do echo "    $f"; done
+
+    # An ALREADY-GROUNDED subset from a previous run is passed LAST so its
+    # records win the merge (subset_artifact_for_gt.py keeps the last occurrence
+    # of each image name). Without this, every run would rebuild a fresh
+    # ungrounded copy over the previous one and SAM3 would re-run from scratch
+    # each time — even for an invocation whose only intent was to re-score.
+    SUBSET_SOURCES=("${SOURCE_ARTIFACTS[@]}")
+    [ -e "$ARTIFACT" ] && SUBSET_SOURCES+=("$ARTIFACT")
+    # Via a temp file: subset_artifact_for_gt.py reads every input fully before
+    # opening the output, so writing over an input would technically work, but
+    # this matches the project's crash-safety convention and costs nothing.
+    SUBSET_INFO=$(python subset_artifact_for_gt.py \
+        --artifact "${SUBSET_SOURCES[@]}" \
+        --gt_dir "$BIG5_GT_DIR" \
+        --out "${ARTIFACT}.tmp") || exit 1
+    mv "${ARTIFACT}.tmp" "$ARTIFACT"
+    echo "$SUBSET_INFO"
+
+    # "<grounded>/<total>" — how many subset records already carry SAM3 masks.
+    counts=$(echo "$SUBSET_INFO" | grep -o 'SUBSET_GROUNDED=[0-9]*/[0-9]*' | cut -d= -f2)
+    n_grounded="${counts%%/*}"
+    n_total="${counts##*/}"
+
+    if [ "${n_grounded:-0}" -lt "${n_total:-0}" ]; then
+        echo
+        echo "--- grounding $(( n_total - n_grounded )) of $n_total records (SAM3 only) ---"
+        # --in_place on THIS subset, never on the production artifacts: the
+        # subset is this evaluation's own working copy. run_grounding_pipeline.py
+        # writes via a temp file and swaps on success, so a crash cannot corrupt it.
+        python run_grounding_pipeline.py \
+            --responses_file "$ARTIFACT" \
+            --in_place \
+            --batch_size "$GROUND_BATCH" \
+            --max_pairs_per_forward "$GROUND_MAX_PAIRS" \
+            --verbose \
+        || { echo "GROUNDING FAILED — not scoring an ungrounded artifact"; exit 1; }
+    else
+        echo "  all $n_total records already grounded — skipping SAM3"
+    fi
+else
+    # ---- INFER PATH: no existing predictions, so run the VLM ----------------
+    # Restricted to the 340 annotated images via --split_file. NOTE this loads
+    # the model, so the GPU in the SBATCH header must fit it.
+    echo
+    echo "--- no existing artifact under $SOURCE_ROOT — running inference ---"
+    echo "--- building the split file from the GT ---"
+    python make_grounding_split_file.py --gt_dir "$BIG5_GT_DIR" --out "$SPLIT_FILE" || exit 1
+    echo "  $(wc -l < "$SPLIT_FILE") annotated images"
+
+    echo
+    echo "--- VLM inference + SAM3 grounding (340 images) ---"
+    # --score is deliberately NOT passed: run_vlm_pipeline.py's score stage
+    # computes IMAGE-LEVEL axis metrics, a different question from the dense
+    # mask evaluation below, and would write a second results file into this
+    # same tree. The dense scoring is step 3, and it is the point of this job.
+    python run_pipeline.py \
+        --dataset big5 \
+        --big_5_twitter_images_dir "$BIG5_TWITTER_IMAGES" \
+        --big_5_weibo_images_dir "$BIG5_WEIBO_IMAGES" \
+        --twitter_en_gt_csv "$ANNOT_DIR/twitter-en-6_majority.csv" \
+        --twitter_es_gt_csv "$ANNOT_DIR/twitter-es-6_majority.csv" \
+        --weibo_ch0_gt_csv "$ANNOT_DIR/weibo-ch-6-B-0_majority.csv" \
+        --weibo_ch1_gt_csv "$ANNOT_DIR/weibo-ch-6-B-1_majority.csv" \
+        --split_file "$SPLIT_FILE" \
+        --model_family "$MODEL_FAMILY" \
+        --model_name "$MODEL_NAME" \
+        --max_model_len "$MAX_LEN" \
+        --batch_size "$BATCH" \
+        --max_num_seqs "$MAX_NUM_SEQS" \
+        --grounding_batch_size "$GROUND_BATCH" \
+        --max_pairs_per_forward "$GROUND_MAX_PAIRS" \
+        --results_dir "$RESULTS_DIR" \
+        --run_name "$RUN_NAME" \
+        --dtype bfloat16 \
+        --trust_remote_code \
+        --no_caption \
+        --resume \
+        --verbose \
+    || { echo "INFERENCE/GROUNDING FAILED — not scoring an incomplete artifact"; exit 1; }
+fi
 
 # --- 3. Score against the hand-drawn masks -----------------------------------
 # Void handling is ON by default and should stay on: the annotation draws

@@ -1,11 +1,11 @@
 #!/bin/bash
 #SBATCH --cpus-per-task=6
 #SBATCH --mem=32G
-#SBATCH --partition=l40s
+#SBATCH --partition=rtx6000
 #SBATCH --qos=normal
 #SBATCH --account=acct_gen
 #SBATCH --job-name=ground_coco
-#SBATCH --gres=gpu:l40s:1
+#SBATCH --gres=gpu:rtx6000:1
 #SBATCH --array=0-3
 #SBATCH --output=/dev/null
 #
@@ -78,7 +78,6 @@ MODELS=(
   "gemma|google/gemma-4-E4B-it|8192|96"
   "gemma|google/gemma-4-12B-it|8192|64"   # 24 GB of weights on a 48 GB card
   "gemma|google/gemma-4-26B-A4B-it|8192|64"
-  "qwen|Qwen/Qwen3.6-27B|8192|96"
 )
 
 MODEL_IDX=$SLURM_ARRAY_TASK_ID
