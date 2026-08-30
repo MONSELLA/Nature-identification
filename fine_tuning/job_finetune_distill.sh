@@ -2,11 +2,11 @@
 #SBATCH -n 4
 #SBATCH -N 1
 #SBATCH --mem=64G
-#SBATCH --partition=l40s
+#SBATCH --partition=rtx6000
 #SBATCH --qos=normal
 #SBATCH --account=acct_gen
 #SBATCH --job-name=rft_lora_distill
-#SBATCH --gres=gpu:l40s:1
+#SBATCH --gres=gpu:rtx6000:1
 #SBATCH --output=/dev/null
 # 
 # DISTILLATION variant of job_finetune.sh: LoRA fine-tune the SAME 12B
@@ -88,14 +88,32 @@ set -euo pipefail
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 CODE=/home/pmonserrat/code
-RESULTS=$CODE/results/vlm_pipeline/baseline
+# WHICH TREE THE TEACHER'S (and the student's baseline) ARTIFACTS COME FROM.
+# Defaults to the NO-CAPTION tree, because that is the configuration the
+# project now runs. This is not cosmetic: build_rft_dataset.py rebuilds each
+# training example from the SOURCE ARTIFACT'S OWN header, so a no-caption
+# artifact produces caption-free extraction prompts (rft_common threads
+# caption_stage through to get_extraction_prompt) — training on one tree and
+# evaluating in the other configuration would teach the adapter a prompt shape
+# it never sees at inference. Override with RESULTS=... for a captioned run.
+RESULTS=${RESULTS:-$CODE/results/vlm_pipeline/ablation_no_caption}
+# Threaded into the evaluation steps so the adapter is scored under the SAME
+# configuration it was trained on. Set NO_CAPTION=0 alongside a captioned
+# RESULTS to run the old captioned flow.
+if [ "${NO_CAPTION:-1}" = "1" ]; then
+  NO_CAPTION_FLAG="--no_caption"
+  CONFIG_SUFFIX="_no_caption"
+else
+  NO_CAPTION_FLAG=""
+  CONFIG_SUFFIX=""
+fi
 DATA=/home/pmonserrat/datasets/big_5/rft
 STUDENT=google/gemma-4-12B-it
 STUDENT_SLUG=${STUDENT//\//_}
 TEACHER=${TEACHER:-google/gemma-4-31B-it}
 TEACHER_SLUG=${TEACHER//\//_}
 TEACHER_LABEL=${TEACHER_LABEL:-gemma31b}
-RUN=$CODE/runs/lora_gemma12b_from_${TEACHER_LABEL}_balanced
+RUN=$CODE/runs/lora_gemma12b_from_${TEACHER_LABEL}${CONFIG_SUFFIX}_balanced
 BALANCE=${BALANCE:-downsample_nature}   # none | downsample_nature | loss_weight
 LORA_R=16
 
@@ -105,9 +123,16 @@ if [ "${QLORA:-0}" = "1" ]; then
 fi
 
 mkdir -p ../logs
-exec > "../logs/out_rft_lora_distill_${TEACHER_LABEL}.log" 2>&1
+exec > "../logs/out_rft_lora_distill_${TEACHER_LABEL}${CONFIG_SUFFIX}.log" 2>&1
 
 cd "$CODE/fine_tuning"
+
+echo "=========================================================================="
+echo "DISTILLATION: student=$STUDENT  teacher=$TEACHER  (label=$TEACHER_LABEL)"
+echo "  artifacts  : $RESULTS"
+echo "  config     : ${NO_CAPTION_FLAG:-captioned}"
+echo "  balance    : $BALANCE"
+echo "=========================================================================="
 
 # --- (no step 1) Splits must already exist — reused verbatim, never --------
 # regenerated here. See the file-header note above for why.
@@ -135,7 +160,7 @@ python build_rft_dataset.py \
   --artifact "$RESULTS/big5_weibo/responses/vlm_responses_$TEACHER_SLUG.jsonl" \
   --splits "$DATA/splits/splits.json" \
   --balance "$BALANCE" \
-  --out "$DATA/rft_gemma12b_from_${TEACHER_LABEL}_$BALANCE"
+  --out "$DATA/rft_gemma12b_from_${TEACHER_LABEL}${CONFIG_SUFFIX}_$BALANCE"
 
 # --- 3. LoRA fine-tune the STUDENT (12B) on the TEACHER's responses --------
 # Same hyperparameters/flags as job_finetune.sh's step 3 (--no_vision_cache,
@@ -178,7 +203,7 @@ else
 fi
 python train_lora.py \
   --model "$STUDENT" \
-  --dataset_dir "$DATA/rft_gemma12b_from_${TEACHER_LABEL}_$BALANCE" \
+  --dataset_dir "$DATA/rft_gemma12b_from_${TEACHER_LABEL}${CONFIG_SUFFIX}_$BALANCE" \
   --output_dir "$RUN" \
   --lora_r "$LORA_R" \
   --eval_steps 246 \
@@ -195,7 +220,7 @@ python train_lora.py \
   --material_definition_path "$CODE/data/big5_taxonomy/big5_material_definition.txt" \
   --max_image_side 1024 \
   --wandb_project TFM_VLM \
-  --run_name "rft_lora_gemma12b_from_${TEACHER_LABEL}_$BALANCE"
+  --run_name "rft_lora_gemma12b_from_${TEACHER_LABEL}${CONFIG_SUFFIX}_$BALANCE"
 
 # --- 4/5. Evaluate the DISTILLED student on the HELD-OUT TEST SPLIT --------
 # POOLED across platforms (--dataset big5), matching job_finetune.sh's own
@@ -230,8 +255,9 @@ python run_vlm_pipeline.py \
   --clipscore_model longclip \
   --clipmatch_model metaclip2 \
   --results_dir "$CODE/results/" \
-  --run_name "vlm_pipeline/rft_distill_${TEACHER_LABEL}/big5/" \
-  --output_file "vlm_pipeline_big5_rft_distill_${TEACHER_LABEL}_results.json" \
+  --run_name "vlm_pipeline/rft_distill_${TEACHER_LABEL}${CONFIG_SUFFIX}/big5/" \
+  --output_file "vlm_pipeline_big5_rft_distill_${TEACHER_LABEL}${CONFIG_SUFFIX}_results.json" \
+  $NO_CAPTION_FLAG \
   --max_new_tokens_caption 248 \
   --max_new_tokens_extraction 512 \
   --max_new_tokens_label 512 \
@@ -269,8 +295,8 @@ python run_vlm_pipeline.py \
   --split_file "$DATA/splits/test_images.txt" \
   --responses_file "$BASELINE_MERGED" \
   --results_dir "$CODE/results/" \
-  --run_name "vlm_pipeline/baseline_testsplit/big5/" \
-  --output_file "vlm_pipeline_big5_baseline_testsplit_results.json" \
+  --run_name "vlm_pipeline/baseline_testsplit${CONFIG_SUFFIX}/big5/" \
+  --output_file "vlm_pipeline_big5_baseline_testsplit${CONFIG_SUFFIX}_results.json" \
   --clipscore_model longclip \
   --clipmatch_model metaclip2
 rm -f "$BASELINE_MERGED"
