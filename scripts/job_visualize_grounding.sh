@@ -54,8 +54,8 @@ RESULTS_DIR=$CODE_DIR/results
 # no-caption run extracted "dog"/"mushroom plush"/"sofa", so the two produce
 # visibly different SAM3 prompts and therefore different figures. Point this at
 # the run the surrounding text is actually describing.
-IMAGE="${1:-/home/pmonserrat/datasets/big_5/twitter/1703862454143304161_0.jpg}"
-RESPONSES="${2:-$RESULTS_DIR/vlm_pipeline/ablation_no_caption/big5_twitter/responses/vlm_responses_google_gemma-4-26B-A4B-it.jsonl}"
+IMAGE="${1:-/home/pmonserrat/datasets/big_5/twitter/1535201101846556672_0.jpg}"
+RESPONSES="${2:-$RESULTS_DIR/vlm_pipeline/ablation_no_caption/big5_twitter/responses/vlm_responses_google_gemma-4-12B-it.jsonl}"
 
 OUT_DIR="$RESULTS_DIR/figures/grounding"
 ALPHA=0.45           # mask opacity over the photograph

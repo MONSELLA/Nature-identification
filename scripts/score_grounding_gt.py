@@ -85,6 +85,7 @@ import os
 import sys
 from collections import Counter
 from functools import lru_cache
+from pathlib import Path
 
 import numpy as np
 
@@ -1147,7 +1148,34 @@ def main():
                     help="score overlapping GT pixels normally instead of "
                          "voiding them (comparison only — see the metrics "
                          "module docstring)")
-    ap.add_argument("--out", default="grounding_gt_eval")
+    ap.add_argument("--out", default=None,
+                    help="LEGACY output prefix: writes <out>_results.json and "
+                         "<out>_per_image.csv side by side, wherever you point it. Kept "
+                         "for one-off runs; prefer --results_dir/--run_name below, which "
+                         "lay the outputs out exactly like the VLM pipeline's own.")
+    lay = ap.add_argument_group(
+        "output layout (mirrors run_vlm_pipeline.py)",
+        "Writes <results_dir>/<run_name>/<output_file> as a MERGED results store keyed "
+        "dataset -> model (update_results_store, under a lock, so several models "
+        "accumulate in one file instead of overwriting each other) and the per-image CSV "
+        "into <results_dir>/<run_name>/predictions/. Same convention as --stage score, so "
+        "a grounding evaluation and a VLM evaluation can be read the same way.")
+    lay.add_argument("--results_dir", default=None,
+                     help="Root for the layout above. Enables it when given.")
+    lay.add_argument("--run_name", default=None,
+                     help="Subfolder of --results_dir (may be multi-level, e.g. "
+                          "vlm_pipeline/grounding/big5).")
+    lay.add_argument("--output_file", default="grounding_gt_results.json",
+                     help="Name of the merged results JSON inside --results_dir/--run_name.")
+    lay.add_argument("--dataset", default="big5_grounding",
+                     help="Key this run is stored under in the results JSON. Distinct from "
+                          "the VLM pipeline's own big5/big5_twitter/... keys on purpose: "
+                          "this is the dense hand-drawn GT, a different measurement over a "
+                          "different (340-image) subset, and merging the two under one key "
+                          "would silently overwrite one with the other.")
+    lay.add_argument("--model_label", default=None,
+                     help="Model key inside the results JSON. Read from the artifact "
+                          "header's model/model_name when not given.")
     args = ap.parse_args()
 
     from src.loaders.excel_loader import TaxonomyGraph
@@ -1180,11 +1208,66 @@ def main():
         "missing_from_artifact": missing[:50],
     }
 
-    with open(f"{args.out}_results.json", "w", encoding="utf-8") as fh:
-        json.dump(results, fh, indent=2, default=str)
-    _write_csv(f"{args.out}_per_image.csv", nature_rows, no_nature_rows)
+    results_path, csv_path = _resolve_outputs(args)
+    if args.results_dir:
+        # MERGED store, exactly like run_vlm_pipeline.py's own results JSON:
+        # {dataset: {model: {...}}}, read-modify-write under a file lock, so
+        # two models scored concurrently cannot clobber each other's entry.
+        from src.utils import update_results_store
+        model_key = args.model_label or _artifact_model(args.artifact)
+        update_results_store(results_path, dataset=args.dataset,
+                             model=model_key, metrics=results)
+        print(f"\nstored under {args.dataset!r} -> {model_key!r} in {results_path}")
+    else:
+        with open(results_path, "w", encoding="utf-8") as fh:
+            json.dump(results, fh, indent=2, default=str)
+    _write_csv(csv_path, nature_rows, no_nature_rows)
     _print_summary(results, missing)
-    print(f"\nwrote {args.out}_results.json and {args.out}_per_image.csv")
+    print(f"\nwrote {results_path} and {csv_path}")
+
+
+def _artifact_model(artifact_paths):
+    """The model key for the results store, read from the FIRST artifact's own
+    header — the same `model`/`model_name` the VLM pipeline keys its results by,
+    so a grounding entry and a VLM entry for one model line up under the same
+    name. Falls back to the artifact filename when a header is absent (an older
+    or hand-built artifact)."""
+    for path in artifact_paths:
+        try:
+            with open(path, encoding="utf-8") as fh:
+                header = json.loads(fh.readline())
+        except (OSError, ValueError):
+            continue
+        if header.get("record_type") == "header":
+            model = header.get("model") or header.get("model_name")
+            if model:
+                return model
+    return os.path.basename(artifact_paths[0]).replace("vlm_responses_", "").replace(".jsonl", "")
+
+
+def _resolve_outputs(args):
+    """(results_json_path, per_image_csv_path) for whichever layout was asked for.
+
+    --results_dir selects the VLM-pipeline layout (results JSON at the run_name
+    root, per-image CSV under predictions/, filename carrying dataset+model so
+    two models never overwrite each other). Otherwise the legacy --out prefix
+    puts both files side by side. Exactly one of the two is in play, and
+    passing neither is an error rather than a silent write into the CWD."""
+    if args.results_dir:
+        out_dir = Path(args.results_dir)
+        if args.run_name:
+            out_dir = out_dir / args.run_name
+        (out_dir / "predictions").mkdir(parents=True, exist_ok=True)
+        results_path = out_dir / Path(args.output_file).name
+        model_slug = (args.model_label or _artifact_model(args.artifact)).replace("/", "_")
+        csv_path = (out_dir / "predictions"
+                    / f"{results_path.stem}_{args.dataset}_{model_slug}_per_image.csv")
+        return str(results_path), str(csv_path)
+    if not args.out:
+        raise SystemExit(
+            "Nothing to write to: pass --results_dir (+ --run_name) for the VLM-pipeline "
+            "layout, or --out <prefix> for the legacy side-by-side files.")
+    return f"{args.out}_results.json", f"{args.out}_per_image.csv"
 
 
 def _write_csv(path, nature_rows, no_nature_rows):

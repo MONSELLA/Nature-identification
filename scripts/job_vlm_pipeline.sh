@@ -1,12 +1,12 @@
 #!/bin/bash
 #SBATCH --cpus-per-task=6
 #SBATCH --mem=32G
-#SBATCH --partition=rtx6000
+#SBATCH --partition=l40s
 #SBATCH --qos=normal
 #SBATCH --account=acct_gen
 #SBATCH --job-name=vlm_pipeline
-#SBATCH --gres=gpu:rtx6000:1
-#SBATCH --array=30-35
+#SBATCH --gres=gpu:l40s:1
+#SBATCH --array=6-6
 #SBATCH --output=/dev/null
 
 source ~/miniconda3/etc/profile.d/conda.sh
