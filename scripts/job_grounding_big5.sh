@@ -128,14 +128,44 @@ cd "$CODE_DIR/scripts" || exit 1
 SPLIT_FILE="${OUT_ROOT}grounding_gt_split.txt"
 ARTIFACT="${OUT_ROOT}responses/vlm_responses_${MODEL_SLUG}.jsonl"
 
-# Where to look for THIS model's existing full-dataset predictions. The VLM
-# benchmark writes one artifact per platform, so all three names are tried and
-# every match is merged (the GT spans both platforms — 84 twitter / 86 weibo).
-SOURCE_ROOT="${2:-${RESULTS_DIR}vlm_pipeline/baseline_no_caption}"
+# Where to look for THIS model's existing full-dataset predictions.
+#
+# SEARCHED, not hardcoded to one tree. Runs land under whatever --run_name they
+# were given (baseline_no_caption/, ablation_no_caption/, ...), and pinning a
+# single default meant a model whose artifacts sat one directory over was
+# silently re-inferred from scratch. Every vlm_pipeline/*no_caption*/ tree is
+# scanned instead. $2 overrides with an explicit root when needed.
+#
+# ONLY NO-CAPTION ARTIFACTS QUALIFY. This job runs --no_caption, and the header
+# is the only thing that distinguishes the two configurations (the filename is
+# the same either way), so each candidate's caption_stage is checked and a
+# captioned artifact is skipped with a printed reason rather than quietly mixing
+# configurations into one evaluation.
+if [ -n "${2:-}" ]; then
+    SOURCE_ROOTS=("$2")
+else
+    SOURCE_ROOTS=()
+    for d in "${RESULTS_DIR}vlm_pipeline"/*no_caption*/; do
+        [ -d "$d" ] && SOURCE_ROOTS+=("${d%/}")
+    done
+fi
+
 SOURCE_ARTIFACTS=()
-for ds in big5_twitter big5_weibo big5; do
-    f="${SOURCE_ROOT}/${ds}/responses/vlm_responses_${MODEL_SLUG}.jsonl"
-    [ -e "$f" ] && SOURCE_ARTIFACTS+=("$f")
+SKIPPED_CAPTIONED=()
+for root in "${SOURCE_ROOTS[@]}"; do
+    # The VLM benchmark writes one artifact per platform, so all three dataset
+    # names are tried and every match is merged — the GT spans both platforms
+    # (84 twitter / 86 weibo) and taking one alone would halve recall.
+    for ds in big5_twitter big5_weibo big5; do
+        f="${root}/${ds}/responses/vlm_responses_${MODEL_SLUG}.jsonl"
+        [ -e "$f" ] || continue
+        # The header is line 1 of the JSON-Lines artifact.
+        if head -1 "$f" | grep -q '"caption_stage": *false'; then
+            SOURCE_ARTIFACTS+=("$f")
+        else
+            SKIPPED_CAPTIONED+=("$f")
+        fi
+    done
 done
 
 echo "=============================================================="
@@ -144,7 +174,12 @@ echo "  model      : $MODEL_NAME  (slug=$MODEL_SLUG)"
 echo "  GT dir     : $BIG5_GT_DIR"
 echo "  batch_size : $BATCH  max_num_seqs: $MAX_NUM_SEQS"
 echo "  output     : $OUT_ROOT"
-echo "  source     : $SOURCE_ROOT  (existing artifacts found: ${#SOURCE_ARTIFACTS[@]})"
+echo "  searched   : ${SOURCE_ROOTS[*]:-(none)}"
+echo "  reusable   : ${#SOURCE_ARTIFACTS[@]} no-caption artifact(s) for this model"
+if [ ${#SKIPPED_CAPTIONED[@]} -gt 0 ]; then
+    echo "  SKIPPED ${#SKIPPED_CAPTIONED[@]} artifact(s) whose header is not caption_stage=false:"
+    for f in "${SKIPPED_CAPTIONED[@]}"; do echo "      $f"; done
+fi
 echo "=============================================================="
 
 if [ ! -d "$BIG5_GT_DIR/nature" ]; then
@@ -152,14 +187,6 @@ if [ ! -d "$BIG5_GT_DIR/nature" ]; then
     echo "       Copy convert_grounding_annotations.py's processed/ output to the cluster first."
     exit 1
 fi
-
-# --- 1. Which images the GT covers -------------------------------------------
-# Regenerated every run: it is derived purely from the GT directory, costs
-# milliseconds, and a stale split file would silently evaluate the wrong subset.
-echo
-echo "--- building the split file from the GT ---"
-python make_grounding_split_file.py --gt_dir "$BIG5_GT_DIR" --out "$SPLIT_FILE" || exit 1
-echo "  $(wc -l < "$SPLIT_FILE") annotated images"
 
 # --- 2. Predictions for those images: REUSE, or infer ------------------------
 mkdir -p "${OUT_ROOT}responses"
@@ -213,7 +240,9 @@ else
     # Restricted to the 340 annotated images via --split_file. NOTE this loads
     # the model, so the GPU in the SBATCH header must fit it.
     echo
-    echo "--- no existing artifact under $SOURCE_ROOT — running inference ---"
+    echo "--- no reusable no-caption artifact found for $MODEL_SLUG — running inference ---"
+    echo "    (searched: ${SOURCE_ROOTS[*]:-none})"
+    echo "    NOTE this loads the VLM: the GPU in the SBATCH header must fit it."
     echo "--- building the split file from the GT ---"
     python make_grounding_split_file.py --gt_dir "$BIG5_GT_DIR" --out "$SPLIT_FILE" || exit 1
     echo "  $(wc -l < "$SPLIT_FILE") annotated images"
