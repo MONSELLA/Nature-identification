@@ -125,6 +125,33 @@ fi
 DATA=/home/pmonserrat/datasets/big_5/rft
 MODEL=google/gemma-4-12B-it
 SLUG=google_gemma-4-12B-it
+
+# FALLBACK ACROSS THE NO-CAPTION TREES. No-caption runs have landed in more
+# than one root (baseline_no_caption/ from the current grid,
+# ablation_no_caption/ from the earlier caption ablation), and pinning a single
+# default just reports the artifact missing when it exists one directory over.
+# An explicit RESULTS= is respected as-is; this only fires on the default.
+if [ -z "${RESULTS_EXPLICIT:-}" ] \
+   && [ ! -f "$RESULTS/big5_twitter/responses/vlm_responses_$SLUG.jsonl" ]; then
+  for d in "$CODE/results/vlm_pipeline"/*no_caption*/; do
+    [ -d "$d" ] || continue
+    if [ -f "${d}big5_twitter/responses/vlm_responses_$SLUG.jsonl" ]; then
+      echo "note: $SLUG artifacts not under $RESULTS — using ${d%/} instead"
+      RESULTS="${d%/}"
+      break
+    fi
+  done
+fi
+for DS in big5_twitter big5_weibo; do
+  if [ ! -f "$RESULTS/$DS/responses/vlm_responses_$SLUG.jsonl" ]; then
+    echo "ERROR: $RESULTS/$DS/responses/vlm_responses_$SLUG.jsonl not found." \
+         "This self-distillation trains on $MODEL's OWN no-caption predictions," \
+         "so both platforms' artifacts must exist. Run the VLM benchmark for" \
+         "$MODEL on $DS first, or pass RESULTS=<tree> explicitly." >&2
+    exit 1
+  fi
+done
+echo "artifacts  : $RESULTS"
 RUN=$CODE/runs/lora_gemma12b${CONFIG_SUFFIX}_balanced
 BALANCE=${BALANCE:-downsample_nature}   # none | downsample_nature | loss_weight
 # QLORA=1 sbatch job_finetune.sh opts into 4-bit (bitsandbytes NF4) base
