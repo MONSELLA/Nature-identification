@@ -2,11 +2,11 @@
 #SBATCH -n 4
 #SBATCH -N 1
 #SBATCH --mem=64G
-#SBATCH --partition=rtx6000
+#SBATCH --partition=l40s
 #SBATCH --qos=normal
 #SBATCH --account=acct_gen
 #SBATCH --job-name=rft_lora
-#SBATCH --gres=gpu:rtx6000:1
+#SBATCH --gres=gpu:l40s:1
 #SBATCH --output=/dev/null
 #
 # BACK TO 1 GPU — a 2-card allocation (the naive-model-parallelism approach
@@ -246,6 +246,28 @@ python build_rft_dataset.py \
 # #SBATCH lines above) -- confirm the real --qos/--account names for that
 # partition on this cluster before running, e.g.:
 #   AUTO_FIND=1 sbatch --partition=rtx6000 --qos=<confirm> --account=<confirm> job_finetune.sh
+# --- Batch sizing, PICKED FROM THE ACTUAL CARD -------------------------------
+# This job has run on both a 48 GB l40s and a 96 GB rtx6000, and the safe batch
+# differs by 4x between them, so it is detected at runtime rather than being a
+# constant somebody has to remember to change with the #SBATCH line.
+#
+# WHAT SETS THE LIMIT is not the weights but the logits tensor: Gemma's vocab is
+# 262,144, and one ~3650-token sample costs bf16 logits + accelerate's fp32 copy
+# + cross_entropy's workspace = ~8.9 GiB at eval, ~12.5 GiB at train (the extra
+# being the gradient). Against ~26 GiB of weights/optimizer that gives:
+#     48 GB card -> train 1, eval 2   (the values the l40s run proved)
+#     96 GB card -> train 4, eval 4   (measured: eval 8 OOM'd by ~10 MB)
+# Effective batch is held at 16 either way, so the optimizer-step count and LR
+# schedule — and therefore --eval_steps — are identical on both cards.
+GPU_MIB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1)
+if [ "${GPU_MIB:-0}" -ge 80000 ] 2>/dev/null; then
+  DEFAULT_TRAIN_BATCH=4; DEFAULT_EVAL_BATCH=4; DEFAULT_INFER_BATCH=96
+else
+  DEFAULT_TRAIN_BATCH=1; DEFAULT_EVAL_BATCH=2; DEFAULT_INFER_BATCH=62
+fi
+echo "GPU reports ${GPU_MIB:-unknown} MiB -> train batch ${TRAIN_BATCH:-$DEFAULT_TRAIN_BATCH}," \
+     "eval batch ${EVAL_BATCH:-$DEFAULT_EVAL_BATCH} (override with TRAIN_BATCH=/EVAL_BATCH=)"
+
 if [ "${AUTO_FIND:-0}" = "1" ]; then
   AUTO_FIND_FLAG="--auto_find_batch_size"
   BATCH_SIZE=${START_BATCH:-8}
@@ -260,7 +282,7 @@ else
   # [batch x seq x 262144-vocab] logits tensor, ~8.9 GiB/sample at eval and
   # ~12.5 at train, so a 96 GB card supports ~4 where a 48 GB one supported 1-2.
   # Effective batch stays 16 so the step count and LR schedule are unchanged.
-  BATCH_SIZE=${TRAIN_BATCH:-4}
+  BATCH_SIZE=${TRAIN_BATCH:-$DEFAULT_TRAIN_BATCH}
   ACCUM_STEPS=$(( 16 / BATCH_SIZE ))
   if [ $(( BATCH_SIZE * ACCUM_STEPS )) -ne 16 ]; then
     echo "ERROR: TRAIN_BATCH=$BATCH_SIZE does not divide the effective batch of 16" >&2
@@ -273,7 +295,7 @@ python train_lora.py \
   --output_dir "$RUN" \
   --lora_r "$LORA_R" \
   --eval_steps 246 \
-  --per_device_eval_batch_size "${EVAL_BATCH:-4}" \
+  --per_device_eval_batch_size "${EVAL_BATCH:-$DEFAULT_EVAL_BATCH}" \
   --eval_on_start \
   --load_best_model_at_end \
   --no_vision_cache \
@@ -318,7 +340,7 @@ python run_vlm_pipeline.py \
   --lora_adapter_path "$RUN/adapter" \
   --lora_max_rank "$LORA_R" \
   --max_model_len 8192 \
-  --batch_size "${EVAL_INFER_BATCH:-96}" \
+  --batch_size "${EVAL_INFER_BATCH:-$DEFAULT_INFER_BATCH}" \
   --clipscore_model longclip \
   --clipmatch_model metaclip2 \
   --results_dir "$CODE/results/" \

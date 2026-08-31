@@ -152,8 +152,7 @@ echo "DISTILLATION: student=$STUDENT  teacher=$TEACHER  (label=$TEACHER_LABEL)"
 echo "  artifacts  : $RESULTS"
 echo "  config     : ${NO_CAPTION_FLAG:-captioned}"
 echo "  balance    : $BALANCE"
-echo "  train batch: ${TRAIN_BATCH:-4} x accum $(( 16 / ${TRAIN_BATCH:-4} )) = 16 effective" \
-     "| eval batch ${EVAL_BATCH:-4}"
+echo "  batch      : sized from the detected GPU (see below)"
 echo "=========================================================================="
 
 # --- (no step 1) Splits must already exist — reused verbatim, never --------
@@ -210,6 +209,28 @@ python build_rft_dataset.py \
 # headroom evidence behind it (see the earlier a40 OOM-message math), and
 # --eval_on_start means a bad --eval_steps choice costs at most one
 # ill-timed extra eval pass, not a crash risk.
+# --- Batch sizing, PICKED FROM THE ACTUAL CARD -------------------------------
+# This job has run on both a 48 GB l40s and a 96 GB rtx6000, and the safe batch
+# differs by 4x between them, so it is detected at runtime rather than being a
+# constant somebody has to remember to change with the #SBATCH line.
+#
+# WHAT SETS THE LIMIT is not the weights but the logits tensor: Gemma's vocab is
+# 262,144, and one ~3650-token sample costs bf16 logits + accelerate's fp32 copy
+# + cross_entropy's workspace = ~8.9 GiB at eval, ~12.5 GiB at train (the extra
+# being the gradient). Against ~26 GiB of weights/optimizer that gives:
+#     48 GB card -> train 1, eval 2   (the values the l40s run proved)
+#     96 GB card -> train 4, eval 4   (measured: eval 8 OOM'd by ~10 MB)
+# Effective batch is held at 16 either way, so the optimizer-step count and LR
+# schedule — and therefore --eval_steps — are identical on both cards.
+GPU_MIB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1)
+if [ "${GPU_MIB:-0}" -ge 80000 ] 2>/dev/null; then
+  DEFAULT_TRAIN_BATCH=4; DEFAULT_EVAL_BATCH=4; DEFAULT_INFER_BATCH=96
+else
+  DEFAULT_TRAIN_BATCH=1; DEFAULT_EVAL_BATCH=2; DEFAULT_INFER_BATCH=62
+fi
+echo "GPU reports ${GPU_MIB:-unknown} MiB -> train batch ${TRAIN_BATCH:-$DEFAULT_TRAIN_BATCH}," \
+     "eval batch ${EVAL_BATCH:-$DEFAULT_EVAL_BATCH} (override with TRAIN_BATCH=/EVAL_BATCH=)"
+
 if [ "${AUTO_FIND:-0}" = "1" ]; then
   AUTO_FIND_FLAG="--auto_find_batch_size"
   BATCH_SIZE=${START_BATCH:-8}
@@ -248,7 +269,7 @@ else
   # the same number of optimizer steps against the same LR schedule as the
   # l40s run, so this is a speed change and not a different experiment. Raise
   # TRAIN_BATCH to trade accumulation for parallelism, never to change 16.
-  BATCH_SIZE=${TRAIN_BATCH:-4}
+  BATCH_SIZE=${TRAIN_BATCH:-$DEFAULT_TRAIN_BATCH}
   ACCUM_STEPS=$(( 16 / BATCH_SIZE ))
   if [ $(( BATCH_SIZE * ACCUM_STEPS )) -ne 16 ]; then
     echo "ERROR: TRAIN_BATCH=$BATCH_SIZE does not divide the effective batch of 16" \
@@ -262,7 +283,7 @@ python train_lora.py \
   --output_dir "$RUN" \
   --lora_r "$LORA_R" \
   --eval_steps 246 \
-  --per_device_eval_batch_size "${EVAL_BATCH:-4}" \
+  --per_device_eval_batch_size "${EVAL_BATCH:-$DEFAULT_EVAL_BATCH}" \
   --eval_on_start \
   --load_best_model_at_end \
   --no_vision_cache \
@@ -306,7 +327,7 @@ python run_vlm_pipeline.py \
   --lora_adapter_path "$RUN/adapter" \
   --lora_max_rank "$LORA_R" \
   --max_model_len 8192 \
-  --batch_size "${EVAL_INFER_BATCH:-96}" \
+  --batch_size "${EVAL_INFER_BATCH:-$DEFAULT_INFER_BATCH}" \
   --clipscore_model longclip \
   --clipmatch_model metaclip2 \
   --results_dir "$CODE/results/" \
