@@ -152,7 +152,8 @@ echo "DISTILLATION: student=$STUDENT  teacher=$TEACHER  (label=$TEACHER_LABEL)"
 echo "  artifacts  : $RESULTS"
 echo "  config     : ${NO_CAPTION_FLAG:-captioned}"
 echo "  balance    : $BALANCE"
-echo "  train batch: ${TRAIN_BATCH:-4} x accum $(( 16 / ${TRAIN_BATCH:-4} )) = 16 effective"
+echo "  train batch: ${TRAIN_BATCH:-2} x accum $(( 16 / ${TRAIN_BATCH:-2} )) = 16 effective" \
+     "| eval batch ${EVAL_BATCH:-2}"
 echo "=========================================================================="
 
 # --- (no step 1) Splits must already exist — reused verbatim, never --------
@@ -219,18 +220,28 @@ elif [ "${QLORA:-0}" = "1" ]; then
   ACCUM_STEPS=$((16 / BATCH_SIZE))
 else
   AUTO_FIND_FLAG=""
-  # SIZED FOR THE 96 GB rtx6000, not the 48 GB l40s this originally ran on.
-  # The 12B student is ~24 GB of weights in bf16; LoRA adds almost nothing
-  # (only the r=16 adapters carry grads/optimizer state) and gradient
-  # checkpointing keeps activations modest, so ~70 GB is free for the batch.
-  # 1 -> 4 is comfortable; the per-sample cost that actually varies here is the
-  # vision encoder at --max_image_side 1024 on uncapped social-media images.
+  # SIZED FOR THE 96 GB rtx6000, but MUCH more conservatively than the weight
+  # footprint suggests, because the binding constraint is NOT the weights.
+  #
+  # THE LOGITS TENSOR IS WHAT LIMITS THE BATCH HERE. Gemma's vocabulary is
+  # 262,144 tokens, and the loss materializes [batch x seq_len x vocab] in fp32
+  # (accelerate upcasts the forward output, then cross_entropy works on it):
+  #     batch 1 x ~3400 tok x 262144 x 4B =  3.3 GiB
+  #     batch 2                           =  6.6 GiB
+  #     batch 4                           = 13.3 GiB   (x2 again for its grad)
+  #     batch 8                           = 26.6 GiB
+  # MEASURED: batch 8 at eval tried to allocate 28.49 GiB on a 96 GB card with
+  # 66 GB already in use, and OOM'd at eval_on_start. This cost scales with the
+  # VOCABULARY, not the model or the card, which is why doubling VRAM does not
+  # buy a proportionally bigger batch. Training additionally needs the gradient
+  # of that same tensor, so 2 (6.6 GiB + 6.6 GiB) is the conservative step up
+  # from the l40s run's 1, not 4.
   #
   # THE EFFECTIVE BATCH IS HELD AT 16 (batch x accumulation), deliberately:
   # the same number of optimizer steps against the same LR schedule as the
   # l40s run, so this is a speed change and not a different experiment. Raise
   # TRAIN_BATCH to trade accumulation for parallelism, never to change 16.
-  BATCH_SIZE=${TRAIN_BATCH:-4}
+  BATCH_SIZE=${TRAIN_BATCH:-2}
   ACCUM_STEPS=$(( 16 / BATCH_SIZE ))
   if [ $(( BATCH_SIZE * ACCUM_STEPS )) -ne 16 ]; then
     echo "ERROR: TRAIN_BATCH=$BATCH_SIZE does not divide the effective batch of 16" \
@@ -244,7 +255,7 @@ python train_lora.py \
   --output_dir "$RUN" \
   --lora_r "$LORA_R" \
   --eval_steps 246 \
-  --per_device_eval_batch_size "${EVAL_BATCH:-8}" \
+  --per_device_eval_batch_size "${EVAL_BATCH:-2}" \
   --eval_on_start \
   --load_best_model_at_end \
   --no_vision_cache \
