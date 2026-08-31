@@ -2,11 +2,11 @@
 #SBATCH -n 4
 #SBATCH -N 1
 #SBATCH --mem=64G
-#SBATCH --partition=l40s
+#SBATCH --partition=rtx6000
 #SBATCH --qos=normal
 #SBATCH --account=acct_gen
 #SBATCH --job-name=rft_lora
-#SBATCH --gres=gpu:l40s:1
+#SBATCH --gres=gpu:rtx6000:1
 #SBATCH --output=/dev/null
 #
 # BACK TO 1 GPU — a 2-card allocation (the naive-model-parallelism approach
@@ -106,14 +106,26 @@ set -euo pipefail
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 CODE=/home/pmonserrat/code
-RESULTS=$CODE/results/vlm_pipeline/baseline
+# NO-CAPTION TREE by default — the configuration the project now runs.
+# build_rft_dataset.py rebuilds each training example from the SOURCE
+# ARTIFACT'S OWN header, so a no-caption artifact yields caption-free
+# extraction prompts; training on one configuration and serving in the other
+# would teach a prompt shape that never occurs at inference.
+RESULTS=${RESULTS:-$CODE/results/vlm_pipeline/baseline_no_caption}
+if [ "${NO_CAPTION:-1}" = "1" ]; then
+  NO_CAPTION_FLAG="--no_caption"
+  CONFIG_SUFFIX="_no_caption"
+else
+  NO_CAPTION_FLAG=""
+  CONFIG_SUFFIX=""
+fi
 # Splits + the reconstructed RFT training sets are DATA, not code — they live
 # alongside the raw BIG-5 images/annotations, not under $CODE/data. Only the
 # trained adapter (a model artifact, $RUN below) stays under $CODE.
 DATA=/home/pmonserrat/datasets/big_5/rft
 MODEL=google/gemma-4-12B-it
 SLUG=google_gemma-4-12B-it
-RUN=$CODE/runs/lora_gemma12b_balanced
+RUN=$CODE/runs/lora_gemma12b${CONFIG_SUFFIX}_balanced
 BALANCE=${BALANCE:-downsample_nature}   # none | downsample_nature | loss_weight
 # QLORA=1 sbatch job_finetune.sh opts into 4-bit (bitsandbytes NF4) base
 # weights instead of full bf16 -- shrinks the ~24GB frozen decoder to ~6GB,
@@ -139,15 +151,26 @@ fi
 LORA_R=16
 
 mkdir -p ../logs
-exec > "../logs/out_rft_lora.log" 2>&1
+exec > "../logs/out_rft_lora${CONFIG_SUFFIX}.log" 2>&1
 
 cd "$CODE/fine_tuning"
 
 # --- 1. Splits (70/10/20, grouped by post, Twitter+Weibo pooled) ------------
-python make_splits.py \
-  --artifact "$RESULTS/big5_twitter/responses/vlm_responses_$SLUG.jsonl" \
-  --artifact "$RESULTS/big5_weibo/responses/vlm_responses_$SLUG.jsonl" \
-  --out "$DATA/splits"
+# WRITE-ONCE. Regenerating splits.json invalidates every number already
+# reported against it — the distillation runs share this exact test set, and a
+# rebuild from a different artifact set (e.g. the no-caption tree instead of
+# the captioned one) can move images between splits even at the same seed. So
+# it is only built when genuinely absent; an existing file is reused verbatim.
+# Force a rebuild with REBUILD_SPLITS=1 only if you intend to invalidate every
+# comparison that used the old file.
+if [ -f "$DATA/splits/splits.json" ] && [ "${REBUILD_SPLITS:-0}" != "1" ]; then
+  echo "splits.json exists — reusing it verbatim (write-once; REBUILD_SPLITS=1 to override)."
+else
+  python make_splits.py \
+    --artifact "$RESULTS/big5_twitter/responses/vlm_responses_$SLUG.jsonl" \
+    --artifact "$RESULTS/big5_weibo/responses/vlm_responses_$SLUG.jsonl" \
+    --out "$DATA/splits"
+fi
 
 # --- 2. Rejection-sampled training set -------------------------------------
 # For DISTILLATION later, point --artifact at a heavier model's responses
@@ -158,7 +181,7 @@ python build_rft_dataset.py \
   --artifact "$RESULTS/big5_weibo/responses/vlm_responses_$SLUG.jsonl" \
   --splits "$DATA/splits/splits.json" \
   --balance "$BALANCE" \
-  --out "$DATA/rft_gemma12b_$BALANCE"
+  --out "$DATA/rft_gemma12b${CONFIG_SUFFIX}_$BALANCE"
 
 # --- 3. LoRA fine-tune (base hyperparameters; --use_dora NOT passed, so ----
 #        the adapter stays servable directly by vLLM in step 5 — see
@@ -233,16 +256,24 @@ elif [ "${QLORA:-0}" = "1" ]; then
   ACCUM_STEPS=$((16 / BATCH_SIZE))
 else
   AUTO_FIND_FLAG=""
-  BATCH_SIZE=1
-  ACCUM_STEPS=16
+  # See job_finetune_distill.sh for the arithmetic: the limit is the
+  # [batch x seq x 262144-vocab] logits tensor, ~8.9 GiB/sample at eval and
+  # ~12.5 at train, so a 96 GB card supports ~4 where a 48 GB one supported 1-2.
+  # Effective batch stays 16 so the step count and LR schedule are unchanged.
+  BATCH_SIZE=${TRAIN_BATCH:-4}
+  ACCUM_STEPS=$(( 16 / BATCH_SIZE ))
+  if [ $(( BATCH_SIZE * ACCUM_STEPS )) -ne 16 ]; then
+    echo "ERROR: TRAIN_BATCH=$BATCH_SIZE does not divide the effective batch of 16" >&2
+    exit 1
+  fi
 fi
 python train_lora.py \
   --model "$MODEL" \
-  --dataset_dir "$DATA/rft_gemma12b_$BALANCE" \
+  --dataset_dir "$DATA/rft_gemma12b${CONFIG_SUFFIX}_$BALANCE" \
   --output_dir "$RUN" \
   --lora_r "$LORA_R" \
   --eval_steps 246 \
-  --per_device_eval_batch_size 2 \
+  --per_device_eval_batch_size "${EVAL_BATCH:-4}" \
   --eval_on_start \
   --load_best_model_at_end \
   --no_vision_cache \
@@ -255,7 +286,7 @@ python train_lora.py \
   --material_definition_path "$CODE/data/big5_taxonomy/big5_material_definition.txt" \
   --max_image_side 1024 \
   --wandb_project TFM_VLM \
-  --run_name "rft_lora_gemma12b_$BALANCE" \
+  --run_name "rft_lora_gemma12b${CONFIG_SUFFIX}_$BALANCE" \
   
 # --- 4/5. Evaluate on the HELD-OUT TEST SPLIT, POOLED across both platforms
 # (--dataset big5, not big5_twitter/big5_weibo run separately) so there is
@@ -287,12 +318,13 @@ python run_vlm_pipeline.py \
   --lora_adapter_path "$RUN/adapter" \
   --lora_max_rank "$LORA_R" \
   --max_model_len 8192 \
-  --batch_size 62 \
+  --batch_size "${EVAL_INFER_BATCH:-96}" \
   --clipscore_model longclip \
   --clipmatch_model metaclip2 \
   --results_dir "$CODE/results/" \
-  --run_name "vlm_pipeline/rft/big5/" \
-  --output_file "vlm_pipeline_big5_rft_results.json" \
+  $NO_CAPTION_FLAG \
+  --run_name "vlm_pipeline/rft${CONFIG_SUFFIX}/big5/" \
+  --output_file "vlm_pipeline_big5_rft${CONFIG_SUFFIX}_results.json" \
   --max_new_tokens_caption 248 \
   --max_new_tokens_extraction 512 \
   --max_new_tokens_label 512 \
@@ -340,8 +372,8 @@ python run_vlm_pipeline.py \
   --split_file "$DATA/splits/test_images.txt" \
   --responses_file "$BASELINE_MERGED" \
   --results_dir "$CODE/results/" \
-  --run_name "vlm_pipeline/baseline_testsplit/big5/" \
-  --output_file "vlm_pipeline_big5_baseline_testsplit_results.json" \
+  --run_name "vlm_pipeline/baseline_testsplit${CONFIG_SUFFIX}/big5/" \
+  --output_file "vlm_pipeline_big5_baseline_testsplit${CONFIG_SUFFIX}_results.json" \
   --clipscore_model longclip \
   --clipmatch_model metaclip2
 rm -f "$BASELINE_MERGED"
