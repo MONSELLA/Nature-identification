@@ -90,15 +90,44 @@ IFS='|' read -r MODEL_FAMILY MODEL_NAME MAX_LEN BATCH_CAP <<< "${MODELS[$MODEL_I
 # (model_name.replace("/", "_")), so the path echoed at the end is the real one.
 MODEL_SLUG="${MODEL_NAME//\//_}"
 
+# --- LoRA adapter (optional) --------------------------------------------------
+# LORA_ADAPTER=<run dir or its adapter/ subdir> evaluates a fine_tuning/
+# train_lora.py adapter served on top of the base model, no merge needed.
+#
+# THE OUTPUTS MUST BE SEPARATED BY HAND. An adapter does not change
+# --model_name, so run_vlm_pipeline.py names its artifact
+# vlm_responses_<base slug>.jsonl either way — the path is the ONLY thing that
+# keeps an adapter's predictions from being written over (or resumed onto) the
+# base model's. Hence the label folded into RUN_NAME below.
+LORA_ADAPTER="${LORA_ADAPTER:-}"
+LORA_ARGS=""
+LORA_SUFFIX=""
+if [ -n "$LORA_ADAPTER" ]; then
+    # Accept either the run directory or its adapter/ subdirectory: train_lora.py
+    # writes the peft output to <output_dir>/adapter, and both spellings get
+    # typed in practice.
+    [ -d "$LORA_ADAPTER/adapter" ] && LORA_ADAPTER="$LORA_ADAPTER/adapter"
+    if [ ! -f "$LORA_ADAPTER/adapter_config.json" ]; then
+        echo "ABORT: $LORA_ADAPTER is not a peft adapter directory (no adapter_config.json)."
+        exit 1
+    fi
+    # Default label = the run directory's own name, which already encodes
+    # teacher/configuration (e.g. lora_gemma12b_from_gemma26b_a4b_no_caption_balanced).
+    LORA_LABEL="${LORA_LABEL:-$(basename "$(dirname "$LORA_ADAPTER")")}"
+    LORA_ARGS="--lora_adapter_path $LORA_ADAPTER --lora_max_rank ${LORA_RANK:-16}"
+    LORA_SUFFIX="_${LORA_LABEL}"
+    echo "LoRA adapter : $LORA_ADAPTER  (outputs labelled ${LORA_LABEL})"
+fi
+
 CODE_DIR=/home/pmonserrat/code
 RESULTS_DIR="$CODE_DIR/results/"
-RUN_NAME="vlm_pipeline/grounding_no_caption/coco/"
+RUN_NAME="vlm_pipeline/grounding_no_caption${LORA_SUFFIX}/coco/"
 
 COCO_IMAGES_DIR=/home/pmonserrat/datasets/coco/images/val2017
 COCO_INSTANCES_JSON=/home/pmonserrat/datasets/coco/annotations/instances_val2017.json
 
 mkdir -p "$CODE_DIR/logs"
-exec > "$CODE_DIR/logs/out_ground_coco_${MODEL_SLUG}.log" 2>&1
+exec > "$CODE_DIR/logs/out_ground_coco_${MODEL_SLUG}${LORA_SUFFIX}.log" 2>&1
 cd "$CODE_DIR/scripts" || exit 1
 
 # COCO images are pre-resized benchmark images, not raw social-media
@@ -138,6 +167,7 @@ python run_pipeline.py \
     --clipscore_model longclip \
     --dtype bfloat16 \
     --trust_remote_code \
+    $LORA_ARGS \
     --no_caption \
     --score \
     --resume \
