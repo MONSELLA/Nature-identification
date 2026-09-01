@@ -6,7 +6,7 @@
 #SBATCH --account=acct_gen
 #SBATCH --job-name=ground_coco
 #SBATCH --gres=gpu:rtx6000:1
-#SBATCH --array=0-3
+#SBATCH --array=0-2
 #SBATCH --output=/dev/null
 #
 # COCO GROUNDING EVALUATION, END TO END IN ONE JOB:
@@ -99,7 +99,15 @@ MODEL_SLUG="${MODEL_NAME//\//_}"
 # vlm_responses_<base slug>.jsonl either way — the path is the ONLY thing that
 # keeps an adapter's predictions from being written over (or resumed onto) the
 # base model's. Hence the label folded into RUN_NAME below.
-LORA_ADAPTER="${LORA_ADAPTER:-}"
+# POSITIONAL FIRST, env second. This cluster has been confirmed to drop
+# variables passed via `VAR=... sbatch` / `--export=ALL,VAR=...` — the job then
+# either silently falls back to the default or, as seen here, Slurm fails to
+# retrieve the environment at all and holds the job:
+#     (user env retrieval failed requeued held)
+# A positional argument always arrives, unaffected by any export policy. The
+# env var is kept as a fallback so existing invocations still work.
+#   sbatch --array=1 scripts/job_grounding_coco.sh /path/to/lora_run
+LORA_ADAPTER="${1:-${LORA_ADAPTER:-}}"
 LORA_ARGS=""
 LORA_SUFFIX=""
 if [ -n "$LORA_ADAPTER" ]; then
