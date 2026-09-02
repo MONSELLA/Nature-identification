@@ -1,11 +1,11 @@
 #!/bin/bash
 #SBATCH --cpus-per-task=6
 #SBATCH --mem=32G
-#SBATCH --partition=rtx6000
+#SBATCH --partition=l40s
 #SBATCH --qos=normal
 #SBATCH --account=acct_gen
 #SBATCH --job-name=ground_coco
-#SBATCH --gres=gpu:rtx6000:1
+#SBATCH --gres=gpu:l40s:1
 #SBATCH --array=0-2
 #SBATCH --output=/dev/null
 #

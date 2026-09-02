@@ -1,12 +1,12 @@
 #!/bin/bash
 #SBATCH --cpus-per-task=6
 #SBATCH --mem=32G
-#SBATCH --partition=a40
+#SBATCH --partition=l40s
 #SBATCH --qos=normal
 #SBATCH --account=acct_gen
 #SBATCH --job-name=ground_big5
-#SBATCH --gres=gpu:1
-#SBATCH --array=0-3
+#SBATCH --gres=gpu:l40s:1
+#SBATCH --array=1-1
 #SBATCH --output=/dev/null
 #
 # BIG-5 DENSE-GT GROUNDING EVALUATION, END TO END IN ONE JOB:
@@ -310,6 +310,7 @@ else
         --split_file "$SPLIT_FILE" \
         --model_family "$MODEL_FAMILY" \
         --model_name "$MODEL_NAME" \
+        $LORA_ARGS \
         --max_model_len "$MAX_LEN" \
         --batch_size "$BATCH" \
         --max_num_seqs "$MAX_NUM_SEQS" \
@@ -320,7 +321,6 @@ else
         --dtype bfloat16 \
         --trust_remote_code \
         --no_caption \
-        --resume \
         --verbose \
     || { echo "INFERENCE/GROUNDING FAILED — not scoring an incomplete artifact"; exit 1; }
 fi

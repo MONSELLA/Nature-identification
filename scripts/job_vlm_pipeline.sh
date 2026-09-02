@@ -1,12 +1,12 @@
 #!/bin/bash
 #SBATCH --cpus-per-task=6
 #SBATCH --mem=32G
-#SBATCH --partition=l40s
+#SBATCH --partition=rtx6000
 #SBATCH --qos=normal
 #SBATCH --account=acct_gen
 #SBATCH --job-name=vlm_pipeline
-#SBATCH --gres=gpu:l40s:1
-#SBATCH --array=6-6
+#SBATCH --gres=gpu:rtx6000:1
+#SBATCH --array=33-33
 #SBATCH --output=/dev/null
 
 source ~/miniconda3/etc/profile.d/conda.sh
@@ -189,7 +189,7 @@ BATCH=$(( DS_BATCH < BATCH_CAP ? DS_BATCH : BATCH_CAP ))
 # pre-resized images could in principle afford a higher figure, but one value
 # across the grid keeps every model/dataset pair on identical engine settings,
 # so a difference in the numbers is never a difference in the serving config.
-GPU_UTIL=0.8
+GPU_UTIL=0.9
 
 # --max_num_seqs comes from two places, deliberately: per DATASET inside
 # EXTRA_ARGS (BIG-5 Weibo, to bound concurrent vision-encoding — recap v19) and
