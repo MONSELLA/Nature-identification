@@ -6,7 +6,7 @@
 #SBATCH --account=acct_gen
 #SBATCH --job-name=rescore_imagenet
 #SBATCH --gres=gpu:l40s:1
-#SBATCH --array=0-10%1
+#SBATCH --array=11-11
 #SBATCH --output=/dev/null
 
 source ~/miniconda3/etc/profile.d/conda.sh
@@ -78,7 +78,7 @@ MODELS=(
   "google/gemma-4-E4B-it"                         #8
   "google/gemma-4-26B-A4B-it"                     #9
   "Qwen/Qwen3.6-35B-A3B"                          #10
-  #"OpenGVLab/InternVL3_5-30B-A3B"                 #11
+  "OpenGVLab/InternVL3_5-30B-A3B"                 #11
 )
 
 if [ "$SLURM_ARRAY_TASK_ID" -ge "${#MODELS[@]}" ]; then

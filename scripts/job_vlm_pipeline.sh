@@ -6,7 +6,7 @@
 #SBATCH --account=acct_gen
 #SBATCH --job-name=vlm_pipeline
 #SBATCH --gres=gpu:rtx6000:1
-#SBATCH --array=33-33
+#SBATCH --array=36
 #SBATCH --output=/dev/null
 
 source ~/miniconda3/etc/profile.d/conda.sh
@@ -25,6 +25,18 @@ export VLLM_USE_FLASHINFER_SAMPLER=0
 #   base    idx 0-4    0-14       L40S     48 GB    --partition=l40s --gres=gpu:l40s:1
 #   light   idx 5-8    15-26      A40      48 GB    --partition=a40  --gres=gpu:a40:1
 #   moe     idx 9-11   27-35      RTX6000  96 GB    (whatever the queue calls it)
+#   heavy   idx 12-14  36-44      RTX6000  96 GB    --partition=rtx6000 --gres=gpu:rtx6000:1
+#
+# heavy is the ONLY tier that currently shares a GPU with another tier (moe) —
+# nothing stops both being queued back to back on the same partition, they just
+# aren't meant to run concurrently against the same card's memory budget.
+# Current #SBATCH --array above is scoped to imagenet ONLY within the heavy
+# tier (task ids 36, 39, 42 — model_index*3 + 0, since imagenet is
+# DATASETS[0]), not the full 36-44 range: the three heavyweight models are the
+# first real test of the 96GB card near its weight ceiling (see the table
+# below — InternVL3_5-38B leaves single-digit GB of KV budget), and ImageNet's
+# pre-resized images are the lowest-risk dataset to validate that on before
+# trusting big5's raw-resolution images to the same three models.
 #
 # Nothing in the script reads the tier — it only needs the right --array range
 # on the right GPU. A range submitted to the wrong card still runs; it just
@@ -59,6 +71,9 @@ export VLLM_USE_FLASHINFER_SAMPLER=0
 #   gemma-4-26B-A4B      96GB     52 GB     21.8 GB     292         75      128
 #   InternVL3_5-30B-A3B  96GB     60 GB     13.8 GB     192         72      128
 #   Qwen3.6-35B-A3B      96GB     70 GB      3.8 GB     196         19       64
+#   Qwen3.6-27B          96GB     54 GB     32.4 GB    ~460        ~70       64  hybrid, see note below
+#   gemma-4-31B-it       96GB     62 GB     24.4 GB    ~640        ~38       48
+#   InternVL3_5-38B      96GB     76 GB    ~10.4 GB    ~466        ~22       32
 #
 # Two models are genuinely tight and their caps reflect it, not timidity:
 #   - gemma-4-12B on a 48 GB card: 24 GB of weights plus a 256-wide head_dim
@@ -72,17 +87,52 @@ export VLLM_USE_FLASHINFER_SAMPLER=0
 # MoE saves FLOPs, not parameter memory: the 26B MoE's KV budget on a 96 GB
 # card is no better than an 8B dense model's on a 48 GB one.
 #
-# HYBRID-ATTENTION MODELS NEED --max_num_seqs. Qwen3.6-35B-A3B interleaves
-# Gated-DeltaNet (Mamba-style) layers with normal attention, and vLLM allocates
-# ONE MAMBA STATE BLOCK PER CONCURRENT SEQUENCE out of the same leftover memory
-# as the KV cache. With 65.5 GiB of weights against a 76.8 GiB budget only
-# ~5.5 GiB is left, i.e. ~274 blocks — and vLLM's DEFAULT max_num_seqs is 1024,
-# so it refuses to start at all:
+# HEAVYWEIGHT TIER (added for the rtx6000 imagenet run) — MB/req and
+# concurrency are ROUGH estimates (config.json layer/head counts pulled from
+# each model's HF repo, weights = params * 2 bytes bf16, KV budget = 96GB *
+# GPU_UTIL - weights; the MB/req figure additionally assumes each model's own
+# realized attention geometry — Qwen3.6-27B and gemma-4-31B-it both mix
+# windowed and full-attention layers at different head-dim/kv-head counts per
+# layer type, unlike the dense uniform-attention models the base/light tiers'
+# numbers were calibrated against, so treat these as order-of-magnitude, not
+# exact):
+#   - InternVL3_5-38B is the tightest job THIS SCRIPT HAS EVER RUN: 76 GB of
+#     weights (a plain Qwen3-32B decoder + a 6B InternViT tower, both bf16)
+#     against an 86.4 GB budget at GPU_UTIL=0.9 leaves ~10 GB total for KV
+#     cache — less absolute headroom than gemma-4-12B's already-flagged tight
+#     case, on a model 3x its size. It is NOT hybrid (uniform full attention,
+#     no sliding window, no Mamba state), so there's no hard startup gate the
+#     way Qwen3.6-27B has — vLLM's own memory profiler will simply cap
+#     concurrency to whatever fits (~22 sequences at this budget) rather than
+#     refuse to start. batch_cap is set to 32 (not the usual ~2x concurrency)
+#     specifically to keep this job's failure mode "runs slow" rather than
+#     "host-side prep balloons while the engine is already memory-starved".
+#     If this OOMs on the first real run, the lever is
+#     --gpu_memory_utilization for this entry alone (there's currently no
+#     per-model override — see the uniform-GPU_UTIL rationale above), not a
+#     bigger/smaller batch_cap.
+#   - gemma-4-31B-it: 62 GB weights leaves ~24 GB, proportionally about as
+#     tight as gemma-4-12B's already-tight 48GB case (both leave roughly 30%
+#     of budget for KV) — treated with the same caution, batch_cap 48.
+#   - Qwen3.6-27B is a SECOND hybrid model (see HYBRID-ATTENTION note below) —
+#     unlike Qwen3.6-35B-A3B's near-zero headroom, its 32.4 GB leftover after
+#     weights is ~6x the 35B-A3B case, so max_num_seqs 64 here has real margin
+#     rather than being calibrated right at the edge.
+#
+# HYBRID-ATTENTION MODELS NEED --max_num_seqs. Qwen3.6-35B-A3B and Qwen3.6-27B
+# both interleave Gated-DeltaNet (Mamba-style) linear-attention layers with
+# normal full-attention layers (Qwen3.6-27B: 1 full-attention layer per 4,
+# confirmed in its config.json's layer_types), and vLLM allocates ONE MAMBA
+# STATE BLOCK PER CONCURRENT SEQUENCE out of the same leftover memory as the
+# KV cache. For Qwen3.6-35B-A3B, 65.5 GiB of weights against a 76.8 GiB budget
+# leaves only ~5.5 GiB, i.e. ~274 blocks — and vLLM's DEFAULT max_num_seqs is
+# 1024, so it refuses to start at all:
 #     ValueError: max_num_seqs (1024) exceeds available Mamba cache blocks (274)
 # --batch_size does NOT bound this: it only caps how many prompts this script
 # SUBMITS per call, while max_num_seqs caps what the engine schedules. A purely
-# transformer model has no such per-sequence allocation and is unaffected, which
-# is why only the hybrid entry sets the field.
+# transformer model (every entry above except the two Qwen hybrids) has no
+# such per-sequence allocation and is unaffected, which is why only the hybrid
+# entries set the field.
 #
 # family|hf_name|max_model_len|batch_cap|max_num_seqs (empty = vLLM default)
 MODELS=(
@@ -101,6 +151,11 @@ MODELS=(
   "gemma|google/gemma-4-26B-A4B-it|8192|128" #27-29
   "qwen|Qwen/Qwen3.6-35B-A3B|8192|64|128" #30-32  hybrid: see note above
   "internvl|OpenGVLab/InternVL3_5-30B-A3B|8192|128" #33-35
+  # Heavyweight tier — RTX 6000 96 GB (--array 36-44; current #SBATCH above is
+  # scoped to imagenet only within this tier — 36,39,42)
+  "qwen|Qwen/Qwen3.6-27B|8192|64|64" #36-38  hybrid: see note above
+  "gemma|google/gemma-4-31B-it|8192|48" #39-41
+  "internvl|OpenGVLab/InternVL3_5-38B|8192|32" #42-44
 )
 
 DATASETS=("imagenet" "big5_twitter" "big5_weibo")

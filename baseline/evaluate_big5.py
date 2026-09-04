@@ -797,6 +797,12 @@ def parse_args():
     parser.add_argument("--results_csv", type=str, default=DEFAULT_RESULTS_CSV,
                         help="Shared long-format CSV every baseline run appends its rows to "
                              "(pivot this to build the thesis tables instead of the per-run JSON).")
+    parser.add_argument("--per_image_csv", type=str, default=None,
+                        help="If given, write ONE ROW PER EVALUATED IMAGE (filename, local_path, "
+                             "language, gt_nature/biotic/material, pred_nature/biotic/material, "
+                             "raw_prediction, no_taxonomy_match) to this CSV -- the full result set, "
+                             "unlike --comparison_file/--diagnostic_sample_file, which only track a "
+                             "small fixed cross-model sample.")
     parser.add_argument("--eyeball_samples_per_bucket", type=int, default=3,
                         help="How many example images to print per qualitative category "
                              "(nature TP/FP/TN/FN, no-taxonomy-match, biotic/material errors) "
@@ -1233,6 +1239,17 @@ def main():
                                     "filename": filenames[i], "local_path": local_paths[i],
                                     "no_taxonomy_match": False,
                                     "raw_prediction": raw_pred_name})
+
+    # ==========================================
+    # 5b. PER-IMAGE GT/PREDICTION CSV (optional, full result set)
+    # ==========================================
+    if args.per_image_csv:
+        out_dir = os.path.dirname(os.path.abspath(args.per_image_csv))
+        os.makedirs(out_dir, exist_ok=True)
+        columns = ["filename", "local_path", "language", "gt_nature", "gt_biotic", "gt_material",
+                   "pred_nature", "pred_biotic", "pred_material", "no_taxonomy_match", "raw_prediction"]
+        pd.DataFrame(results, columns=columns).to_csv(args.per_image_csv, index=False)
+        print(f"💾 Per-image GT/prediction results ({len(results)} images) saved to {args.per_image_csv}")
 
     # ==========================================
     # 6. METRICS -- combined + per-language

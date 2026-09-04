@@ -495,6 +495,28 @@ def load_coco(images_dir, instances_json, taxonomy_graph):
 # Places365 helpers (module-level so both load_places365 and get_candidate_vocab
 # resolve scene names to synsets identically).
 # ---------------------------------------------------------------------------
+# Places scene names whose correct sense is NOT the one the search below would
+# pick. Every Places category denotes a PLACE, but WordNet orders senses by
+# corpus frequency, so a name whose commonest sense is an object/substance
+# resolves to that instead — and the MIT-set restriction cannot catch it when
+# the wrong sense happens to BE in that set.
+#
+# `delicatessen` is the found case: sense .n.01 is "ready-to-eat food products"
+# (under food.n.02, annotated nature/biotic) and .n.02 is "a shop selling
+# ready-to-eat food products" (under shop.n.01). The Places class is the SHOP,
+# so the unpatched resolver made a delicatessen interior count as nature — and
+# it was the sole class behind the `food` wedge in the Places-365 figure.
+# .n.02 resolves through the graph as non-nature, which is why the fix removes
+# the class from the nature subset entirely (51 -> 50) rather than relabelling it.
+#
+# The override is consulted BEFORE the MIT-set filter and is deliberately not
+# restricted by it: the whole point is that the right sense is missing from that
+# set, which is what let the wrong one win.
+_PLACES_SENSE_OVERRIDES = {
+    "delicatessen": "delicatessen.n.02",
+}
+
+
 def _resolve_places_name_to_synset(cls, taxonomy_synsets):
     """Resolve a Places scene name (e.g. "forest/broadleaf") to a MIT-tagged
     taxonomy synset string, or None if it doesn't resolve. Heuristic — see the
@@ -519,6 +541,12 @@ def _resolve_places_name_to_synset(cls, taxonomy_synsets):
     candidates = [base, head]
     if '/' in cls:
         candidates.append(cls.split('/')[-1])
+    # Hand-pinned sense first (see _PLACES_SENSE_OVERRIDES): frequency ordering
+    # picks the wrong one for these, and the MIT-set filter cannot rescue it.
+    for c in candidates:
+        pinned = _PLACES_SENSE_OVERRIDES.get(c.replace(' ', '_').lower())
+        if pinned:
+            return pinned
     seen = set()
     for c in candidates:
         key = c.replace(' ', '_')
