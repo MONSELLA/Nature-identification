@@ -40,6 +40,11 @@ on the instance (a wooden table with visible grain is nature; a painted one is
 not, and the class node cannot tell you which this image shows). Tangibility is
 **always** the VLM's call, never the mapping's, for the same reason.
 
+The caption step is optional. With `--no_caption`, entities are extracted
+straight from the image; this is the configuration used for the reported
+benchmark runs. The captioned two-pass variant was kept for the caption
+ablation (`scripts/significance_test_caption_ablation.py`).
+
 **2. Grounding pipeline** — *pixel-based.* Where in the image is it, and how
 much of the frame does it occupy?
 
@@ -56,6 +61,30 @@ parallel file, so one record always holds everything predicted for one image.
 |---|---|
 | `vlm_responses_<model>.jsonl` | the **raw prediction record** — caption, entities, per-entity labels and reasoning, hybrid finals, masks, relevance scores. Complete and unflattened, so it can feed metrics not yet invented. Contains no computed metric. |
 | `<run>_<dataset>_<model>_predictions.csv` | the **qualitative-review file** — one row per image, everything from the `.jsonl` *plus* every per-image metric computed at scoring time. This file alone should be enough to spot-check a run. |
+
+## Models evaluated
+
+Fifteen open VLMs from five families, all served through vLLM
+(`scripts/job_vlm_pipeline.sh`):
+
+| tier | models |
+|---|---|
+| lightweight | Qwen3.5-0.8B · InternVL3.5-2B · Ministral-3-3B · Gemma-4-E4B |
+| base | Ministral-3-8B · Qwen3.5-9B · Gemma-4-12B · LLaVA-OneVision-2-8B · InternVL3.5-8B |
+| mixture-of-experts | Gemma-4-26B-A4B · Qwen3.6-35B-A3B · InternVL3.5-30B-A3B |
+| heavyweight | Qwen3.6-27B · Gemma-4-31B · InternVL3.5-38B |
+
+**Closed-set baselines** (`baseline/`): ImageNet classifiers (ConvNeXt-B,
+ViT-B/16, Swin-V2-B), a Places365 ResNet-50, a COCO Query2Label multi-label
+model, and a DenseNet-121 trained directly on the three taxonomy axes. Their
+class predictions go through the same taxonomy mapping, so they can be compared
+with the VLMs.
+
+**Fine-tuning** (`fine_tuning/`): LoRA on Gemma-4-12B's language decoder, using
+rejection sampling on a 70/10/20 BIG-5 split grouped by post. There are two
+variants: self-distillation, and distillation from Gemma-4-26B-A4B. The
+fine-tuned model is evaluated through the same pipeline via
+`--lora_adapter_path`. See [`fine_tuning/README.md`](fine_tuning/README.md).
 
 ---
 
@@ -102,7 +131,22 @@ python scripts/run_vlm_pipeline.py \
   --model_family gemma --model_name google/gemma-4-12B-it \
   --big_5_twitter_images_dir  /path/to/big_5/twitter \
   --twitter_en_gt_csv /path/to/twitter-en-6_majority.csv \
-  --run_name my_run/big5_twitter/ --output_file results.json
+  --no_caption \
+  --results_dir results --run_name my_run/big5_twitter/
+```
+
+Everything lands under `results/my_run/big5_twitter/`: the shared metrics JSON
+(`--output_file`, one entry per dataset and model), `responses/` holding the
+`.jsonl` artifacts, and `predictions/` holding the per-image CSVs. Use
+`--stage infer` or `--stage score` to run one half on its own; scoring never
+reruns the VLM.
+
+To add SAM3 grounding to an existing artifact:
+
+```bash
+python scripts/run_grounding_pipeline.py \
+  --responses_file results/my_run/big5_twitter/responses/vlm_responses_<model>.jsonl \
+  --in_place
 ```
 
 On the cluster, the `scripts/job_*.sh` launchers wrap this:
@@ -133,7 +177,8 @@ Reported per dataset, never merged into a single headline number:
 - **Per-axis accuracy / precision / recall / F1** on all three axes.
 - **CLIPScore**, **F-CLIPScore** (Oh & Hwang, cited exactly) and
   **Object-CLIPScore** (our F-CLIPScore-inspired variant — deliberately *not*
-  called F-CLIPScore).
+  called F-CLIPScore). The first two need a caption, so they read n/a under
+  `--no_caption`.
 - **ClipMatch** + **hierarchical precision/recall** (hP/hR/hF1, Wu-Palmer) on
   ImageNet and Places365, which have a closed candidate vocabulary. Hierarchical
   scoring gives partial credit for the right branch of the tree, so predicting
@@ -147,6 +192,20 @@ Reported per dataset, never merged into a single headline number:
 Three conventions worth knowing when reading any result: ground-truth-unmapped
 instances are *excluded*, prediction-unmapped instances are *penalised as
 wrong*, and mapped/unmapped subsets are always reported separately.
+
+## Data
+
+No datasets are included. BIG-5 images and annotations belong to the BIG-5
+project and are not public. ImageNet, COCO (val2017) and Places365 have to be
+downloaded separately, and their paths are passed as CLI flags. The launchers
+use the thesis cluster's paths, so edit them for your own setup. The
+hand-drawn BIG-5 grounding masks used by `score_grounding_gt.py` are not
+included either.
+
+The one data file that is included is the annotated taxonomy,
+`data/big5_taxonomy/flat_wordnet_tree_fixed.xlsx`. It maps WordNet synsets onto
+the three axes and is what makes the ImageNet, COCO and Places365 labels usable
+as ground truth.
 
 ## Setup
 
