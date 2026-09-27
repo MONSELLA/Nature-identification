@@ -29,7 +29,7 @@ Reading the .jsonl artifact directly preserves full fidelity for these
 
 PER-IMAGE GRANULARITY: nature is always exactly one verdict per image. A
 disagreement image contributes UP TO TWO ground-truth instances for
-biotic/material (per CLAUDE.md's own convention for BIG-5 scoring) -- this
+biotic/material (the pipeline's own convention for BIG-5 scoring) -- this
 script keeps ONE row per image for the bootstrap (matching the requested
 design) by averaging the per-instance correctness within an image, so a
 disagreement image scores 0.0/0.5/1.0 on that axis instead of contributing

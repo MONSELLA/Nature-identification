@@ -713,7 +713,7 @@ def load_big5(sources):
     `nep_biological_visual_<idx>` per image slot — differing ONLY in how many
     slots they have (see _big5_slot_count). `nep_immaterial_specific_visual_<idx>`
     (the format subcategory: illustration/infographic/videogame/plain_text/
-    other) is deliberately IGNORED — per recap §2b those subcategories are not
+    other) is deliberately IGNORED — those subcategories are not
     a classification target for this pipeline.
 
     IMAGES ARE LOCAL, NOT DOWNLOADED: each images_dir is one flat folder that

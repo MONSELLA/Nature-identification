@@ -76,7 +76,7 @@
 #
 # WANDB: --wandb_project below assumes this cluster account is ALREADY
 # authenticated (no job script in this repo sets WANDB_API_KEY/WANDB_MODE
-# explicitly, and W&B logging already works elsewhere per CLAUDE.md's
+# explicitly, and W&B logging already works elsewhere per the project's
 # Environment section) — if this hangs instead of failing, that assumption
 # was wrong; run `wandb login` once outside a batch job.
 #

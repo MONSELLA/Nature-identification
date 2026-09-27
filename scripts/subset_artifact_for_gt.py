@@ -11,12 +11,11 @@ WHY THIS EXISTS. The BIG-5 artifacts hold every image of their platform
 grounding GT covers 340 of them. Running SAM3 over all 6663 to evaluate 340
 would spend roughly 20x the GPU time for no extra measurement — and BIG-5
 images are precisely the raw social-media resolutions that make the vision
-encoder OOM-prone (recap v18/v19), so the wasted work is also the riskiest
+encoder OOM-prone, so the wasted work is also the riskiest
 work.
 
 WHY A SEPARATE FILE RATHER THAN `--in_place` ON THE ORIGINAL. The project
-convention is ONE artifact per run, enriched in place by grounding
-(CLAUDE.md). Grounding only 340 of 6663 records IN PLACE would leave the
+convention is ONE artifact per run, enriched in place by grounding. Grounding only 340 of 6663 records IN PLACE would leave the
 production artifact partially grounded — every ungrounded record
 indistinguishable from "SAM3 found nothing" for any later analysis, and the
 dataset-wide nature relevance scores silently computed over a 5% subset. So

@@ -225,7 +225,7 @@ MULTITASK_BIOLOGICAL_TO_OURS = {0: 1, 1: 0}   # their biotic(0)->our 1, their ab
 # BINARY METRICS (accuracy + per-polarity precision/recall/F1/support)
 # ============================================================================
 # Positive classes throughout this project: nature=1, biotic=1, material=1
-# (see CLAUDE.md "Inherited conventions"). Every metrics dict below has the
+# (the project's inherited conventions). Every metrics dict below has the
 # shape {"accuracy": float, "positive": {precision,recall,f1,support}, "negative": {...}}.
 def empty_binary_metrics():
     """Placeholder for a binary task that couldn't be computed at all (e.g.
@@ -262,7 +262,7 @@ def calculate_binary_metrics(gt_indices, pred_indices, label_map):
 
     Ground-truth-unmapped instances are EXCLUDED (no usable ground truth to
     score against at all). Prediction-unmapped instances are PENALIZED AS
-    WRONG (the opposite of ground truth) -- per CLAUDE.md's "Inherited
+    WRONG (the opposite of ground truth) -- per the project's "Inherited
     conventions": "Prediction-unmapped instances: penalized as wrong (never
     defaulted to 'no nature')."
     """

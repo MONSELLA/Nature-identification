@@ -50,7 +50,7 @@
 #   sbatch --qos=<real> --account=<real> fine_tuning/job_finetune_distill.sh
 #
 # WHAT'S DIFFERENT FROM job_finetune.sh:
-#   1. SPLITS ARE REUSED, NOT REGENERATED. Per CLAUDE.md's fine_tuning section:
+#   1. SPLITS ARE REUSED, NOT REGENERATED. Per fine_tuning/README.md:
 #      "For DISTILLATION later, point --artifact at a heavier model's
 #      responses ... Nothing else changes: the splits stay the same file, so
 #      the test set is untouched." Re-deriving splits.json here (even

@@ -31,7 +31,7 @@ taxonomy dimensions directly).
 
 ------------------------------------------------------------------------------
 DATA SOURCES -- via src.loaders.dataset_loader.load_big5 (shared with the VLM
-pipeline; see that module and CLAUDE.md's BIG-5 GT notes for the full format)
+pipeline; see that module for the full format)
 ------------------------------------------------------------------------------
 Ground truth comes from the SAME majority-vote CSVs and loader the VLM
 pipeline uses (`src.loaders.dataset_loader.load_big5`/`big5_sources`), so this
@@ -42,7 +42,7 @@ script never re-implements CSV parsing:
     (nature_visual_0..8, slot count auto-detected), images read locally from
     --weibo_images_dir.
 --dataset selects which platform(s) to evaluate: "big5_twitter" (Twitter
-only), "big5_weibo" (Weibo only), or "big5" (both pooled -- per CLAUDE.md,
+only), "big5_weibo" (Weibo only), or "big5" (both pooled --
 prefer the per-platform runs for reporting, since pooling silently averages
 the two platforms together in the results CSV). Images are LOCAL, not
 downloaded -- each platform's images_dir is a flat folder already containing
@@ -123,7 +123,7 @@ from baseline.common import (
 # Same GT loader the VLM pipeline uses (src/loaders/dataset_loader.py) --
 # handles both BIG-5 platforms (Twitter/Weibo), local (non-downloaded)
 # images, and the platform_id apostrophe-stripping / slot-count-detection
-# fixes documented in CLAUDE.md. NOT a `baseline/`-owned module (imported,
+# fixes documented there. NOT a `baseline/`-owned module (imported,
 # not modified) -- see the module docstring's "DATA SOURCES" section.
 from src.loaders.dataset_loader import load_big5, big5_sources
 
@@ -487,7 +487,7 @@ def build_big5_image_records(args):
     which scores every element of a coder-disagreement cell as its own GT
     instance -- see load_big5's own docstring). A disagreement cell (BOTH
     True and False present, e.g. "material; immaterial") keeps only its
-    FIRST value here; per CLAUDE.md this is a small fraction of the data.
+    FIRST value here; this is a small fraction of the data.
     """
     sources = _big5_sources_for_args(args)
     if not sources:
@@ -718,7 +718,7 @@ def parse_args():
     parser.add_argument("--dataset", type=str, default="big5_twitter",
                         choices=["big5_twitter", "big5_weibo", "big5"],
                         help="Which BIG-5 platform(s) to evaluate. 'big5_twitter'/'big5_weibo' restrict to one "
-                             "platform (recommended for reporting -- see CLAUDE.md); 'big5' pools both. Matches "
+                             "platform (recommended for reporting); 'big5' pools both. Matches "
                              "the results CSV's 'dataset' column so Twitter and Weibo runs are never silently "
                              "averaged together.")
     parser.add_argument("--twitter_en_gt_csv", type=str, default=None,

@@ -8,7 +8,7 @@ never drift from the one another script believes it sends.
 
 Contents:
   - CAPTION_PROMPT               : baseline open-ended caption (neutral, no
-                                   nature-priming) — verbatim from CLAUDE.md.
+                                   nature-priming).
   - EXTRACTION_PROMPT            : structured object-extraction instruction.
   - ObjectExtractionResponse     : pydantic schema for the extraction call.
   - TaxonomyResponse             : pydantic schema for per-object labeling.
@@ -42,7 +42,7 @@ from pydantic import BaseModel, Field
 # =============================================================================
 # Stage 1 — Captioning (baseline, two-pass; neutral, NO nature-priming)
 # =============================================================================
-# Verbatim from CLAUDE.md's "hard conventions". Do NOT add "pay attention to
+# Do NOT add "pay attention to
 # nature" here unless running the nature-priming ablation explicitly.
 #
 # This is the very FIRST thing we ask the VLM about an image: a plain, open-
@@ -220,7 +220,7 @@ def get_summary_caption_prompt(dataset: str, no_caption: bool = False) -> str:
 # =============================================================================
 # Stage 2 — Object extraction (structured)
 # =============================================================================
-# The image is re-sent on this call (recap §5a "second look"): the model gets
+# The image is re-sent on this call (the "second look"): the model gets
 # another chance to surface objects omitted from the free-form caption. The
 # instruction explicitly asks for part-objects / sub-elements (e.g. a flower
 # printed on a dress), because a nature representation may be only a PART of a
@@ -660,8 +660,8 @@ def build_system_prompts(nature_path: str, biotic_path: str, material_path: str)
     """Build the three system prompts the pipeline needs, reading each
     definition file once:
 
-      - caption_system         : NATURE definition only (no axis-priming, per
-                                 the recap) — used for EXTRACTION only. The
+      - caption_system         : NATURE definition only (no axis-priming)
+                                 — used for EXTRACTION only. The
                                  caption call itself (src/vlm_pipeline.py's
                                  caption_batch, via run_inference) deliberately
                                  does NOT receive this prompt, so the very

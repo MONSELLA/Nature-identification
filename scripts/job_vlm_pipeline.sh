@@ -190,7 +190,7 @@ echo "Task $SLURM_ARRAY_TASK_ID: Running $MODEL_NAME on $DATASET"
 # --- Per-dataset GPU budget -------------------------------------------------
 # --gpu_memory_utilization reserves WEIGHTS + KV CACHE; the vision encoder's
 # activations come out of what is LEFT OVER. That leftover is where the BIG-5
-# OOM lived (recap v18/v19), so the two dataset families want opposite tuning:
+# OOM lived, so the two dataset families want opposite tuning:
 #
 #   imagenet/places : pre-resized benchmark images, vision encoder barely
 #                     stresses the leftover.
@@ -240,14 +240,14 @@ BATCH=$(( DS_BATCH < BATCH_CAP ? DS_BATCH : BATCH_CAP ))
 
 # --gpu_memory_utilization: 0.8 for EVERY dataset, deliberately. It reserves
 # WEIGHTS + KV CACHE, and the vision encoder's activations come out of what is
-# LEFT OVER — which is where the BIG-5 OOM lived (recap v18/v19). ImageNet's
+# LEFT OVER — which is where the BIG-5 OOM lived. ImageNet's
 # pre-resized images could in principle afford a higher figure, but one value
 # across the grid keeps every model/dataset pair on identical engine settings,
 # so a difference in the numbers is never a difference in the serving config.
 GPU_UTIL=0.9
 
 # --max_num_seqs comes from two places, deliberately: per DATASET inside
-# EXTRA_ARGS (BIG-5 Weibo, to bound concurrent vision-encoding — recap v19) and
+# EXTRA_ARGS (BIG-5 Weibo, to bound concurrent vision-encoding) and
 # per MODEL via the 5th MODELS field (hybrid-attention models, which cannot
 # start without it). The model-level one is only added when the dataset did not
 # already set one, so a dataset-specific cap is never silently overridden.

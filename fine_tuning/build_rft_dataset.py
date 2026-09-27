@@ -50,7 +50,7 @@ available but off by default: the acceptance test says nothing about caption
 quality (a correct image-level verdict can follow from a mediocre caption), it
 is by far the longest generation in the chain, and training on it risks
 dragging the neutral descriptive caption toward taxonomy vocabulary — which the
-project deliberately keeps out of that call (CLAUDE.md's caption conventions).
+project deliberately keeps out of that call.
 Adding "caption" to --stages is a one-word change if you want the full
 on-policy chain.
 """
@@ -120,7 +120,7 @@ def main() -> None:
     # falls into images_not_in_splits and the run produces zero examples
     # with no error, which is exactly what happened before this fallback
     # existed. Basename is a safe join key here: filenames are
-    # "<platform_id>_<idx>.<ext>" (CLAUDE.md), and platform_id's Twitter
+    # "<platform_id>_<idx>.<ext>", and platform_id's Twitter
     # (numeric snowflake) vs Weibo (alphanumeric) ID formats make a
     # cross-platform basename collision practically impossible, even though
     # rft_common.group_key defensively prefixes with platform elsewhere.

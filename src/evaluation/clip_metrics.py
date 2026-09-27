@@ -125,7 +125,7 @@ CLIP_PRESETS = {
     # fine-tune of it. Native transformers `MetaClip2Model`/`MetaClip2Processor`
     # (auto-dispatched via AutoModel/AutoProcessor), NO trust_remote_code —
     # same hassle-free category as SigLIP2/the LAION checkpoints below, not
-    # FG-CLIP2's custom-init risk (see that preset's comment / recap §11).
+    # FG-CLIP2's custom-init risk (see that preset's comment).
     # Needs transformers>=4.56.0 (when MetaClip2 was merged upstream); already
     # covered by this project's transformers>=5.14.1 floor (requirements.txt),
     # so no extra dependency bump. MetaClip2Model mirrors CLIPModel's own
@@ -137,8 +137,7 @@ CLIP_PRESETS = {
     # SigLIP2: native transformers AutoModel/AutoProcessor, NO trust_remote_code
     # — unlike FG-CLIP2 (tried and abandoned as a CLIP backend: its
     # trust_remote_code __init__ crashed with a meta-tensor error under this
-    # project's transformers version; see data/llm_reference/vlm_pipeline_recap.txt
-    # §11 for the full history), SigLIP2's whole forward path is plain library
+    # project's transformers version), SigLIP2's whole forward path is plain library
     # code, so there's no custom-model-class __init__ to crash. SiglipModel has
     # no separate text_projection/visual_projection submodule (the pooled
     # output from text_model/vision_model IS already the projected embedding),
@@ -513,7 +512,7 @@ def fill_template(template: str, name: str, use_inflect: bool = False) -> str:
     template's own hardcoded article, whatever it is, goes in as written
     ("a photo of a apple", "a photo of a cars"). This is deliberately NOT
     grammar-corrected by default: --use_inflect_for_clipmatch is what opts
-    into that (see below), and the project's own history (recap v10) is that
+    into that (see below), and the project's own history is that
     an inflect-driven determiner was tried project-wide once before, reverted
     on suspicion of hurting ClipMatch, and that suspicion was never actually
     isolated from a concurrent CLIP-backend swap — so it stays an explicit,

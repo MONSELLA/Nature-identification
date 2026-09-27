@@ -13,17 +13,13 @@
 # the cluster before running. Paths below fall into two groups:
 #   VERIFIED   -- confirmed against another file that actually RUNS
 #                 successfully against these exact paths on the cluster
-#                 (scripts/job_vlm_pipeline.sh, scripts/job_vlm_pipeline_heavy.sh,
-#                 scripts/job_coco_infer_ground.sh, src/loaders/excel_loader.py's
-#                 own default, scripts/evaluate_taxonomy_labeling.py's argparse
-#                 defaults): EXCEL_PATH, IMAGENET_DIR, PLACES_DIR,
+#                 (scripts/job_vlm_pipeline.sh, scripts/job_grounding_coco.sh,
+#                 src/loaders/excel_loader.py's own default): EXCEL_PATH, IMAGENET_DIR, PLACES_DIR,
 #                 places_categories_txt (count_classes call), COCO_IMAGES_DIR,
 #                 COCO_INSTANCES_JSON, BIG5_*_IMAGES_DIR, and all four BIG-5
 #                 *_GT_CSV paths.
 #   UNVERIFIED -- no other file in this repo references these; they're
-#                 carried over from baseline/closed_set_job_test.sh's
-#                 commented-out example invocations (which may themselves be
-#                 stale) or are plain guesses at a plausible layout: every
+#                 plain guesses at a plausible layout: every
 #                 *_WEIGHTS/*_CHECKPOINT/*_CONFIG path and Q2L_REPO_PATH.
 #                 CONFIRM these against the actual cluster filesystem
 #                 (e.g. `ls ~/code/weights/`) before trusting a run.
@@ -83,7 +79,7 @@ BIG5_TWITTER_IMAGES_DIR="${DATA_ROOT}/big_5/twitter"
 BIG5_WEIBO_IMAGES_DIR="${DATA_ROOT}/big_5/weibo"
 
 # BIG-5 majority-vote ground-truth CSVs -- VERIFIED against
-# scripts/job_vlm_pipeline.sh / scripts/job_vlm_pipeline_heavy.sh, which
+# scripts/job_vlm_pipeline.sh, which
 # already run successfully against these exact paths on the cluster.
 TWITTER_EN_GT_CSV="${DATA_ROOT}/big_5/annotations/twitter-en-6_majority.csv"
 TWITTER_ES_GT_CSV="${DATA_ROOT}/big_5/annotations/twitter-es-6_majority.csv"
@@ -219,8 +215,8 @@ python evaluate_coco.py \
     ${WANDB_FLAG} --verbose
 
 # ============================================================================
-# 4. TABLE 4: BIG-5 (Twitter and Weibo, kept as SEPARATE runs/rows -- see
-#    CLAUDE.md: pooling the two platforms silently averages them together)
+# 4. TABLE 4: BIG-5 (Twitter and Weibo, kept as SEPARATE runs/rows --
+#    pooling the two platforms silently averages them together)
 # ============================================================================
 run_big5_family () {
     local BIG5_DATASET="$1"   # big5_twitter | big5_weibo

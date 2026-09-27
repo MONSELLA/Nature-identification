@@ -1,20 +1,14 @@
-# Not useful files/folders
+# Local tools and scratch work (not part of the thesis code)
+labeling_app/
+visualization_app/
 first_ideas/
 notebooks/
 temporal.ipynb
-labeling_app/
-.claude
-visualization_app/
-
-#IDE
+scripts/analysis/
+.claude/
 .vscode/
 
-# NOTE: Slurm launchers (*.sh) ARE tracked deliberately — they are the only
-# record of how each experiment was actually run, and an untracked launcher is
-# unrecoverable if the working tree is lost. Never hardcode a token in one;
-# read it from the environment (export HF_TOKEN=... before sbatch).
-
-# Python cache / build artifacts
+# Python
 __pycache__/
 *.egg-info/
 .ipynb_checkpoints/
@@ -22,9 +16,7 @@ __pycache__/
 # Secrets (e.g. HF_TOKEN)
 .env
 
-results/**
-
-logs/**
-results/**
-runs/**
-scripts/analysis/**
+# Outputs
+results/
+logs/
+runs/
