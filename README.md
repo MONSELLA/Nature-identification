@@ -2,7 +2,7 @@
 
 Master's thesis (TFM) for the **BIG-5** project: benchmarking Vision-Language
 Models on their ability to detect representations of *nature* in social-media
-imagery, and to place what they find on a three-axis taxonomy.
+imagery, and categorize each of them according to three specific axes.
 
 Every image (and every entity within it) is classified on three binary axes:
 
