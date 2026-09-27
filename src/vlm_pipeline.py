@@ -378,7 +378,7 @@ def label_objects_batch(
 ) -> List[List[Dict[str, Any]]]:
     """
     Per-object taxonomy labeling, routed by the object's WordNet mapping so the
-    VLM is only asked what mapping could not already answer (recap §6; saves
+    VLM is only asked what mapping could not already answer (saves
     compute vs. always asking all three axes):
 
       - HUMAN term (see HUMAN_TERMS)      -> NO VLM call: nature=False outright,
@@ -539,7 +539,7 @@ def run_inference(
     Run caption -> extraction -> (mapping + labeling) over every image and yield
     one record per image. Mapping now happens HERE (Phase 1), not in Phase-2
     scoring, so the VLM is only queried for what WordNet could not resolve
-    (recap §6) — mapped non-nature objects skip the VLM entirely and
+    — mapped non-nature objects skip the VLM entirely and
     mapped-nature objects are asked material only. Each record:
 
         {

@@ -359,7 +359,7 @@ def center_weighted_score(mask: np.ndarray, sigma: float = DEFAULT_CENTER_SIGMA)
     which keeps it bounded in [0, 1] and makes it directly comparable to
     coverage_ratio_score (an all-nature image scores 1.0 under both).
 
-    Motivation (recap §1.B.4): centrally-placed content is more likely to be the
+    Motivation: centrally-placed content is more likely to be the
     compositional focus of the image, so nature filling the middle of the frame
     should count for more than nature in a corner.
     """
@@ -639,7 +639,7 @@ class SAM3Grounder:
 # =============================================================================
 def _nature_object_indices(rec: Dict[str, Any]) -> List[int]:
     """Indices of the entities we actually ground: only those whose HYBRID
-    resolved label says nature (recap §6 — `final_nature`, i.e. WordNet where
+    resolved label says nature (`final_nature`, i.e. WordNet where
     the object mapped and the VLM's own judgment where it didn't).
 
     Falls back to the raw VLM label for artifacts old enough to predate
@@ -866,7 +866,7 @@ def grounding_diagnostics(counts: Dict[str, int], n_images: int) -> Dict[str, An
     The confirmation RATE is the number that matters for auditing: a low rate
     means the VLM is claiming nature entities the segmenter cannot find, which
     is precisely the hallucination failure mode the Grounding pipeline exists to
-    check (recap §9 — agreement with an independent model, NOT ground truth).
+    check (agreement with an independent model, NOT ground truth).
     """
     n_nature = counts.get("nature_entities", 0)
     n_grounded = counts.get("grounded_entities", 0)

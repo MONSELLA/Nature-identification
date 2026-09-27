@@ -13,7 +13,7 @@ but rewritten as free functions that operate on the maintained
 `add_synset_and_ancestors`), so there is a single graph in the project rather
 than a second copy.
 
-Scope (per CLAUDE.md): these metrics run for ImageNet + Places ONLY (single-
+Scope: these metrics run for ImageNet + Places ONLY (single-
 label, closed candidate vocab). No spaCy noun-chunking is needed here — the
 VLM pipeline already produces an explicit object list, so `resolve_to_wordnet`
 consumes that list directly.
@@ -187,7 +187,7 @@ def compute_hierarchical_metrics(
     if y_pred_synset is None:
         # No prediction at all (e.g. the model extracted zero objects, or
         # nothing mapped to any candidate class) — this is scored as a total
-        # miss, not skipped/excluded (see CLAUDE.md's "prediction-unmapped
+        # miss, not skipped/excluded (the "prediction-unmapped
         # penalized as wrong" convention).
         return {"hp": 0.0, "hr": 0.0, "hf1": 0.0}
 

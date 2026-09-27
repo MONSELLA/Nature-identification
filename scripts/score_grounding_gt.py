@@ -1271,7 +1271,7 @@ def _resolve_outputs(args):
 
 
 def _write_csv(path, nature_rows, no_nature_rows):
-    """One row per image — the qualitative-review file, per CLAUDE.md's
+    """One row per image — the qualitative-review file, per the project's
     convention that a spot-check must never require opening the .jsonl."""
     with open(path, "w", newline="", encoding="utf-8") as fh:
         w = csv.writer(fh)

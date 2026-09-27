@@ -14,10 +14,7 @@
 #     VLM inference  ->  SAM3 grounding  ->  scoring
 #
 # ...the same shape as the VLM-pipeline job (job_vlm_pipeline.sh): one command,
-# resumable, writing into the standard <results_dir>/<run_name>/ layout. It
-# REPLACES the old two-step job_coco_infer_ground.sh + job_evaluate_grounding.sh
-# coco pass, where the artifact had to be produced by one job and scored by a
-# second, and a half-finished run could not be continued.
+# resumable, writing into the standard <results_dir>/<run_name>/ layout.
 #
 # Each stage is its own OS SUBPROCESS (run_pipeline.py), so the VLM's VRAM is
 # fully reclaimed before SAM3 loads, and SAM3's before CLIP loads for scoring.
@@ -140,7 +137,7 @@ cd "$CODE_DIR/scripts" || exit 1
 
 # COCO images are pre-resized benchmark images, not raw social-media
 # resolutions, so this needs neither a lowered --batch_size nor --max_num_seqs
-# to avoid the BIG-5 vision-encoder OOM (recap v18/v19), and the grounding
+# to avoid the BIG-5 vision-encoder OOM, and the grounding
 # stage's own defaults (--batch_size 8, --max_pairs_per_forward 16) are left
 # alone — they exist for exactly this already-modest-image case.
 DS_BATCH=96

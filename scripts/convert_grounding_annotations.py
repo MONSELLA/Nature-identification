@@ -192,8 +192,7 @@ def _object_names(obj):
     fields, which become a single-element list — so old and new annotation
     files convert identically and no re-annotation is forced.
 
-    Mirrors labeling_app/export_coco.object_names; kept separate because
-    labeling_app deliberately shares no code with the parent repo.
+    Mirrors the annotation tool's own export logic.
     """
     raw = obj.get("names")
     if not (isinstance(raw, list) and raw):

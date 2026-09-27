@@ -1,158 +1,36 @@
-# requirements.txt
-#
-# Dependencies for the BIG-5 nature-identification codebase, derived from an
-# import scan of every file under src/, scripts/, and baseline/. Grouped by
-# which part of the pipeline actually needs each package, so it's clear what
-# you can skip if you're only running a subset of the scripts.
-
-# --- Core scientific / data stack (used everywhere) ---
+# Core
 numpy>=1.24
 pandas>=2.0
-openpyxl>=3.1          # engine pandas needs to read the .xlsx taxonomy workbook (pd.read_excel)
-scikit-learn>=1.3      # accuracy/precision/recall/F1, average_precision_score
-scipy>=1.10            # linear_sum_assignment — the Hungarian one-to-one box
-                       # assignment behind COCO's detection evaluation
-                       # (src/evaluation/detection_metrics.py). Already pulled in
-                       # transitively by scikit-learn, but listed explicitly
-                       # because this codebase now imports it directly. That
-                       # module degrades to a greedy matcher if it is missing
-                       # rather than crashing, so an absent scipy would show up
-                       # as slightly worse recall on crowded images, not an
-                       # error — which is exactly why it is pinned here.
-networkx>=3.0          # the WordNet taxonomy DAG (src/loaders/excel_loader.py)
-nltk>=3.8               # WordNet corpus access (synsets, hypernyms, wup_similarity)
-tqdm>=4.65              # progress bars in baseline/*.py specifically (the active VLM/Grounding
-                        # pipeline uses its own src.utils.BatchProgress instead, no tqdm import there)
+openpyxl>=3.1          # reads the taxonomy workbook
+scikit-learn>=1.3
+scipy>=1.10            # Hungarian matching in the COCO detection evaluation
+networkx>=3.0
+nltk>=3.8              # WordNet
+pydantic>=2.0          # structured VLM output schemas
+Pillow>=10.0
+tqdm>=4.65
+wandb>=0.16
 
-# --- Structured VLM output (src/models/prompts.py, src/models/vlm_models.py) ---
-pydantic>=2.0          # v2 API required (model_json_schema / model_fields)
-
-# --- VLM inference backends (src/models/vlm_models.py) ---
-# Every registered model family (qwen/mistral/llava/internvl/gemma) is served
-# through vLLM — needs SamplingParams, StructuredOutputsParams
-# (vllm.sampling_params — this is the CURRENT vLLM API name; older vLLM
-# releases called this GuidedDecodingParams, but that name is gone from the
-# code now, so don't go looking for it), and vllm.distributed.parallel_state's
-# destroy_model_parallel/destroy_distributed_environment.
-# (The HuggingFace-served BLIP/BLIP-2/InstructBLIP/BLIP-3 family and its
-# `outlines`-based structured-decoding path were REMOVED — this project only
-# evaluates vLLM-served models. Don't re-add `outlines` here unless that
-# backend comes back; nothing else in this codebase imports it.)
-#
-# IMPORTANT — DO NOT re-add an `outlines<1.0.0` upper pin here, and DO NOT
-# pin transformers/torch/xformers/outlines to specific versions of your own.
-# Doing so caps vLLM at a stale release: `outlines<1.0.0` (previously here)
-# forced pip to backtrack to vllm 0.9.2, which (a) crashed on newer
-# transformers via the aimv2 config collision and (b) was too old to load
-# recent models (Gemma's rope_scaling config -> "rope_scaling should have a
-# 'rope_type' key"). vLLM pins its OWN coherent torch/xformers/transformers/
-# outlines set — let it win. Give it only a recent FLOOR and stay out of the way.
+# Models. Let vLLM pin its own torch/transformers set; transformers>=5.14.1
+# is required for SAM3 (transformers.models.sam3).
 vllm>=0.10.0
-# 5.14.1 floor (higher than vLLM's OWN floor) because the Grounding pipeline's
-# SAM3 support (transformers.models.sam3) only exists from 5.14.1 on —
-# confirmed present there. If Sam3Model.from_pretrained("facebook/sam3")
-# raises an unknown-model-type error, this floor is why: upgrade transformers,
-# don't chase it as a config problem. (Loaded via the EXPLICIT Sam3Model/
-# Sam3Processor classes, never AutoModel/AutoProcessor — AutoModel resolves to
-# Sam3VideoModel, not this image model, on at least one newer transformers
-# release; see src/grounding_pipeline.py's SAM3Grounder.__init__.)
-# CHECKED FOR CONFLICT WITH vLLM (this is exactly the kind of pairing that
-# broke things before — see the outlines<1.0.0 story above): vLLM's own
-# latest PyPI release (0.26.0, checked 2026-07) declares `transformers>=5.5.3`
-# with NO upper bound, so pip can freely pick any transformers >=5.14.1 to
-# satisfy both constraints at once — no conflict today. This has NOT always
-# been true of every vLLM release (older ones have pinned transformers<5 at
-# times), so if a future vLLM release reintroduces an upper cap below 5.14.1,
-# `pip install -r requirements.txt` will fail loudly (not silently downgrade)
-# rather than installing something broken — if that happens, the fix is to
-# bump `vllm>=` to a release whose own transformers ceiling clears 5.14.1,
-# not to lower this floor (that just reintroduces the SAM3 breakage).
 transformers>=5.14.1
 torch>=2.1
 torchvision>=0.16
-Pillow>=10.0
 
-# --- CLIP-based metrics (src/evaluation/clip_metrics.py) ---
-# F-CLIPScore, Object-CLIPScore, ClipMatch all run through a CLIPScorer.
-# clip_metrics.CLIP_PRESETS currently offers SEVEN checkpoints — keep this
-# list in sync with that dict if it changes, this has drifted before:
-#   "original" (openai/clip-vit-large-patch14), "metaclip"
-#   (facebook/metaclip-h14-fullcc2.5b), "altclip" (BAAI/AltCLIP), "siglip2"
-#   (google/siglip2-base-patch16-224), "laion_h14"
-#   (laion/CLIP-ViT-H-14-laion2B-s32B-b79K), "laion_bigg"
-#   (laion/CLIP-ViT-bigG-14-laion2B-39B-b160k) — all six native transformers
-#   AutoModel/AutoProcessor, NO trust_remote_code, covered by transformers
-#   above, no extra packages — PLUS "longclip", which is different enough to
-#   need its own dependencies below.
-sentencepiece>=0.1.99  # AltCLIP's text tower is XLM-RoBERTa-based; its
-                       # tokenizer needs sentencepiece, which transformers
-                       # does NOT pull in as a hard dependency on its own.
-# inflect: ONLY needed for two opt-in ClipMatch flags —
-# --use_wordnet_definitions_clipmatch (picks the correct "a"/"an" for each
-# WordNet lemma's primary name) and --use_inflect_for_clipmatch
-# (clip_metrics.fill_template, grammar-corrects the determiner in front of
-# every class name/entity across OBJECT_TEMPLATE + the 80/15 candidate
-# templates — "a photo of an apple", "a photo of cars"). NOT used by the
-# default template-filling path (plain template.format(), whatever article
-# the template itself hardcodes). NOTE: v8 added an inflect determiner
-# project-wide, v10 REVERTED it (suspected, never isolated, of contributing to
-# a ClipMatch drop that was confounded with a concurrent MetaCLIP switch),
-# v15 reinstated it as the default, v16 makes it opt-in again via
-# --use_inflect_for_clipmatch instead of reopening that same ambiguity — see
-# the recap.
-inflect>=7.0
-# longclip (CLIP_PRESETS["longclip"]) is NOT a transformers checkpoint at
-# all — clip_metrics.py routes it to a LOCAL CLONE of the Long-CLIP GitHub
-# repo (LONG_CLIP_REPO_PATH, currently "/home/pmonserrat/Long-CLIP") plus its
-# own checkpoint file (checkpoints/longclip-L.pt), neither of which pip can
-# install — same category as the "NOT on PyPI" baseline/ deps at the bottom
-# of this file. Only these two extra PACKAGES are needed once that repo is
-# cloned and the checkpoint downloaded:
-ftfy>=6.1
-regex>=2023.0
-# (FG-CLIP2 was tried and abandoned — meta-tensor crash in its
-# trust_remote_code __init__ under this project's transformers version; see
-# clip_metrics.CLIP_PRESETS's comment.)
-# NOTE: LLM2CLIP is intentionally NOT supported — its text tower requires the
-# `llm2vec` package, which hard-pins transformers<=4.44.2. That's incompatible
-# with vLLM's transformers>=5.5.3 requirement in this project's single
-# environment (confirmed: installing llm2vec force-downgrades transformers
-# and breaks vLLM). Would need a second, separate environment to use — not
-# worth the operational overhead here.
+# CLIP metrics
+sentencepiece>=0.1.99  # AltCLIP tokenizer
+inflect>=7.0           # only for --use_inflect_for_clipmatch / --use_wordnet_definitions_clipmatch
+ftfy>=6.1              # Long-CLIP (needs a local clone of the Long-CLIP repo + checkpoint,
+regex>=2023.0          # see LONG_CLIP_REPO_PATH in src/evaluation/clip_metrics.py)
 
-# --- Grounding pipeline (src/grounding_pipeline.py) ---
-# SAM3 (facebook/sam3) is loaded through plain transformers, via the EXPLICIT
-# Sam3Model/Sam3Processor classes (never AutoModel/AutoProcessor — see the
-# floor comment above) — no trust_remote_code, no separate detector, no
-# separate segmentation model. Needs `transformers.models.sam3`, which is why the
-# transformers floor above is 5.14.1, not some older version — see that
-# entry's comment.
-# pycocotools (listed below for the closed-set baselines) is ALSO required here
-# for RLE mask encoding/decoding and RLE union merging.
+# Grounding masks (RLE) and COCO ground truth
+pycocotools>=2.0.7
 
-# --- Experiment tracking ---
-wandb>=0.16
+# Fine-tuning (fine_tuning/ only)
+peft
 
-# --- Closed-set baseline scripts only (baseline/evaluate_coco.py, evaluate_big5.py) ---
-pycocotools>=2.0.7     # COCO ground-truth loading
-timm>=0.9              # canonical ImageNet index->WNID mapping (baseline/evaluate_big5.py)
-# inplace_abn is imported by the Q2L TResNet backbone (baseline/evaluate_coco.py,
-# evaluate_big5.py) but is OPTIONAL: both scripts install a numerically-identical
-# eval-only shim automatically if it isn't installed (see
-# install_inplace_abn_shim_if_missing). Uncomment if you have a working CUDA
-# dev toolchain and want the real fused kernel instead of the shim:
-# inplace-abn
-
-# TO FINISH, run pip install -e .
-
-# --- NOT on PyPI, not included here ---
-# baseline/count_classes.py, evaluate_imagenet.py, evaluate_coco.py,
-# evaluate_places.py, and evaluate_big5.py all import
-# `first_tests.evaluation.TaxonomyEvaluationPipeline`, which is not present in
-# this repository (see each script's module docstring) and cannot be pip-
-# installed. The maintained taxonomy resolver used by the rest of the codebase
-# is src/loaders/excel_loader.py's TaxonomyGraph instead.
-#
-# baseline/evaluate_coco.py and evaluate_big5.py's --model_family coco_q2l
-# also import `models.query2label` and `utils.misc` from a local clone of
-# https://github.com/SlongLiu/query2labels (via --q2l_repo_path), not from PyPI.
+# Closed-set baselines (baseline/ only)
+timm>=0.9
+# The Query2Label COCO baseline also needs a local clone of
+# https://github.com/SlongLiu/query2labels (passed via --q2l_repo_path).

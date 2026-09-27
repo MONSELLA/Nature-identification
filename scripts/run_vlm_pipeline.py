@@ -43,15 +43,15 @@ End-to-end driver for the baseline BIG-5 VLM pipeline, in three stages:
                   re-score an existing artifact (e.g. after a metrics-code
                   change) without re-running inference.
 
-Metrics (per CLAUDE.md scoping):
+Metrics:
   - accuracy / precision / recall / F1   : ALL datasets, but scored differently
-    by dataset type (recap §6):
+    by dataset type:
       * ImageNet/Places (single-label): nature/biotic come from the ClipMatch
         TOP-1 PREDICTED CLASS's own taxonomy position — the global argmax over
         candidate_vocab (see src/loaders/dataset_loader.get_candidate_vocab),
         which is restricted to classes MAPPED INTO THE GRAPH only, so the
         prediction can never land on an unannotated class. material is ALWAYS
-        the VLM's own label (CLAUDE.md — never mapped), taken from the
+        the VLM's own label (never mapped), taken from the
         extracted object most representative of that predicted class.
       * COCO/BIG-5: image-level nature (nature=1 if ANY extracted object is
         nature) + matched-object biotic/material (COCO box-IoU matching is
@@ -173,7 +173,7 @@ def _synset_lemma_terms(synset_id):
 
 def gt_match_terms(target):
     """Normalized surface forms that count as 'the GT object was extracted':
-    the class name plus every WordNet lemma of the GT synset (recap §8d — GT
+    the class name plus every WordNet lemma of the GT synset (GT
     class OR any WordNet-synset synonym)."""
     terms = set()
     cn = target.get("class_name")
@@ -228,7 +228,7 @@ def find_matching_object(objects, target):
 
 
 # =============================================================================
-# COCO box-IoU detection evaluation (Grounding pipeline; recap §8/§9)
+# COCO box-IoU detection evaluation (Grounding pipeline)
 # =============================================================================
 def build_coco_eval_vocab(gt_boxes_by_image):
     """Surface-form lookup for the COCO classes this run actually evaluates:
@@ -348,7 +348,7 @@ def score_label_agreement(phrase, gt_box, graph):
 
 def score_axis_agreement(pred_final, gt_box):
     """Compare a matched pair's biotic/material axes: the PREDICTED entity's
-    own hybrid-resolved label (`object_finals`, recap §6) against the GT
+    own hybrid-resolved label (`object_finals`) against the GT
     box's own taxonomy position (`dataset_loader.get_gt_from_graph`) — read
     straight off the box correspondence the detection matching already
     produced, rather than the lexical `find_matching_object` the plain COCO
@@ -368,7 +368,7 @@ def score_axis_agreement(pred_final, gt_box):
     that problem: GT biotic/material come from the graph mapping (can be
     True, False, or None), and predicted biotic/material come from the
     entity's OWN independently-derived label — material in particular is
-    ALWAYS the VLM's own judgment, never mapped (recap §6), so even a
+    ALWAYS the VLM's own judgment, never mapped, so even a
     WordNet-mapped-nature entity's material comparison tests a genuinely
     separate source, not the same lookup on both sides.
 
@@ -395,7 +395,7 @@ def score_image_entities(rec, gt_boxes_by_file, eval_vocab_terms, graph, iou_thr
 
     This is THE detection evaluation for this pipeline — there is no
     instance-level counterpart any more (removed deliberately; see the module
-    notes and the recap's RESOLVED IN v24). An instance-level view asks "did
+    notes). An instance-level view asks "did
     each individual predicted object land on an individual annotated object",
     which is not the question this pipeline is built around: the VLM extracts a
     CONCEPT ("orange slice"), SAM3 grounds that concept, and COCO annotates
@@ -793,7 +793,7 @@ def image_pred_nature(object_final_labels):
 def _binary_metrics(y_true, y_pred):
     """Standard accuracy/precision/recall/F1 for one taxonomy axis, given
     matching lists of true and predicted booleans — computed for BOTH the
-    positive class (nature/biotic/material, per CLAUDE.md's convention) and the
+    positive class (nature/biotic/material, per the project's convention) and the
     negative class (no-nature/abiotic/immaterial, suffixed `_neg`), since
     accuracy/positive-class numbers alone can hide a weak negative-class score
     (e.g. a model that over-predicts "nature" can show high nature recall while
@@ -1732,7 +1732,7 @@ def phase_score(args):
     # class list (ImageNet/Places) — see clip_metrics.CLIPMATCH_DATASETS.
     run_clipmatch = dataset in clip_metrics.CLIPMATCH_DATASETS and candidate_vocab
     # Single-label datasets drive their nature/biotic/material metrics off the
-    # forced top-1 ClipMatch class (recap §6.1/§6.2); that requires the fixed
+    # forced top-1 ClipMatch class; that requires the fixed
     # candidate vocab, so it coincides exactly with run_clipmatch. COCO/BIG-5
     # keep the image-level-OR + matched-object path instead.
     single_label = bool(run_clipmatch)
@@ -1998,7 +1998,7 @@ def phase_score(args):
     # Labeling-stage parse failures, scoped to the objects the VLM was ACTUALLY
     # asked to label (`vlm_called`). This is NOT the same denominator as
     # n_object_records: label_objects_batch routes mapped NON-nature objects to
-    # NO VLM call at all (recap §6), so dividing failures by every extracted
+    # NO VLM call at all, so dividing failures by every extracted
     # object silently dilutes the rate by however many objects the mapping
     # already settled. Split by the two call types, which use different schemas
     # and different system prompts and so can fail at different rates:
@@ -2015,7 +2015,7 @@ def phase_score(args):
     # run_grounding_pipeline.py's phase_ground). "attempted" = nature entities
     # SAM3 was asked about (grounded is True or False, never None); "confirmed"
     # = SAM3 found nature pixels for it; the rest were attempted but SAM3's
-    # confidence never crossed --mask_threshold (recap §9's "agreement with an
+    # confidence never crossed --mask_threshold ("agreement with an
     # independent model", never a ground-truth signal).
     run_grounding = bool(header.get("grounding"))
     n_grounding_attempted = n_grounding_confirmed = 0
@@ -2029,9 +2029,8 @@ def phase_score(args):
     # score_image_entities on why the semantic head replaced that).
     #
     # ENTITY (concept) granularity ONLY — the instance-level block that used to
-    # run alongside this is gone; see score_image_entities and the recap's
-    # RESOLVED IN v24/v25 for why concepts, not raw SAM3 instances, are the
-    # right unit for this pipeline.
+    # run alongside this is gone; see score_image_entities for why concepts,
+    # not raw SAM3 instances, are the right unit for this pipeline.
     run_detection = dataset == "coco" and run_grounding
     ent_counts = {"tp": 0, "fp": 0, "fn": 0, "excluded_pred": 0, "crowd_suppressed": 0,
                   "n_gt_instances": 0, "n_pred_instances": 0,
@@ -2204,7 +2203,7 @@ def phase_score(args):
         objclip_vals.append(image_objclip)
 
         # --- extraction-hit diagnostic (ALL datasets; reporting-only) ---
-        # recap §6.3: keep the exact-match extraction rate as a descriptive
+        # Keep the exact-match extraction rate as a descriptive
         # diagnostic, but it NO LONGER gates or feeds the nature/biotic/material
         # scores (those come from the forced top-1 ClipMatch class on single-
         # label datasets, and from matched-object finals on COCO/BIG-5).
@@ -2546,7 +2545,7 @@ def phase_score(args):
         # this from `grounded is None` (never attempted at all, not nature).
         # Surfaced per image for qualitative review (which specific objects the
         # VLM claimed but SAM3 couldn't confirm in pixels) and accumulated below
-        # into a run-level rate (recap §9: agreement with an independent model,
+        # into a run-level rate (agreement with an independent model,
         # never ground truth — a low confirmation rate flags VLM hallucination
         # OR an under-sensitive --mask_threshold, not "ground truth says wrong").
         ungrounded_objects = ([g["object"] for g in object_groundings
@@ -2840,7 +2839,7 @@ def phase_score(args):
                             "heuristic GT default — BIG-5 is the only genuine material benchmark."),
     }
     if run_grounding:
-        # recap §9: this is agreement with an INDEPENDENT model (SAM3), never
+        # This is agreement with an INDEPENDENT model (SAM3), never
         # ground truth — a low confirmation_rate flags either VLM hallucination
         # (claimed an entity SAM3 can't find in pixels) or an under-sensitive
         # --mask_threshold, not "the model was wrong" in a GT sense.
@@ -3110,7 +3109,7 @@ def phase_score(args):
     # predictions CSV needs its path up front) — reused here, not recomputed.
     update_results_store(out_path, dataset=dataset, model=header.get("model"), metrics=summary)
     # Per-IMAGE nature/biotic/material GT composition of THIS run's sampled
-    # dataset (recap: sampling is deterministic — a fixed --max_samples always
+    # dataset (sampling is deterministic — a fixed --max_samples always
     # yields the same subset — so this is stable across reruns of the same
     # config). Keyed by --max_samples so different configurations (e.g. 1000 vs
     # the full dataset) accumulate side by side instead of overwriting.
@@ -3678,7 +3677,7 @@ def build_arg_parser():
                         "default — an inflect-driven determiner was tried project-wide once "
                         "before, reverted on suspicion of a ClipMatch drop, and that suspicion "
                         "was never actually isolated from a concurrent CLIP-backend swap at the "
-                        "time (see the recap), so it's an explicit opt-in rather than the default "
+                        "time, so it's an explicit opt-in rather than the default "
                         "this time, to keep any future comparison unambiguous. Needs the "
                         "`inflect` package. Has no effect together with "
                         "--use_wordnet_definitions_clipmatch (that path always inflects its own "

@@ -369,7 +369,7 @@ class VLLMBackedVLM(BaseVLM):
                  **kwargs: Any) -> None:
         super().__init__(model_name, **kwargs)
         # LoRA/DoRA fine-tune served DIRECTLY by vLLM, no merge needed — see
-        # fine_tuning/train_lora.py and CLAUDE.md's fine-tuning section. This
+        # fine_tuning/train_lora.py and fine_tuning/README.md. This
         # is what lets the RFT adapter be applied SELECTIVELY per call: the
         # base engine and the LoRA-adjusted engine are the SAME resident vLLM
         # engine, and every generate/generate_batch call chooses which one it

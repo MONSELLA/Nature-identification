@@ -26,8 +26,8 @@ to know which source file fed which key.
 MODEL NAME: recovered from the filename (`big5_grounding_<name>_results.json`
 -> `<name>`), then passed through `MODEL_DISPLAY_NAMES` for a table-ready
 label — e.g. the RFT adapter names `rft_selfdistill`/
-`rft_distill_gemma26b_a4b` become `self-distill`/`teacher-distill` (per
-CLAUDE.md's fine-tuning section: the LoRA adapter's own training data source
+`rft_distill_gemma26b_a4b` become `self-distill`/`teacher-distill` (see
+fine_tuning/README.md: the LoRA adapter's own training data source
 is what distinguishes them, not the base model, which is `google/gemma-4-12B-it`
 for both). A `<name>` with no entry in the table is kept AS WRITTEN and
 flagged in the console output, so an unrecognized model is never silently

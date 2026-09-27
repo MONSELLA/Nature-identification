@@ -248,7 +248,7 @@ def _print_summary(args, header, d, elapsed, out_path):
     print(f"Entities: {d['objects_total']} total | {d['nature_entities']} nature "
           f"({d['nature_entities_per_image']:.2f}/image)")
     # The headline diagnostic: how often an independent segmenter could actually
-    # find, in pixels, the nature the VLM claimed was there (recap §9 — this is
+    # find, in pixels, the nature the VLM claimed was there (this is
     # AGREEMENT WITH AN INDEPENDENT MODEL, not ground truth).
     print(f"Grounding-confirmation rate: {d['grounding_confirmation_rate']:.1%} "
           f"({d['grounded_entities']}/{d['nature_entities']} nature entities confirmed)")

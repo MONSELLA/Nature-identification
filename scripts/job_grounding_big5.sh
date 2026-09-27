@@ -15,8 +15,7 @@
 #
 # ...the same shape as job_grounding_coco.sh and the VLM-pipeline job: one
 # command, resumable, writing into the standard <results_dir>/<run_name>/
-# layout. It REPLACES the big5 half of job_evaluate_grounding.sh, which assumed
-# a full-dataset artifact already existed and subset it after the fact.
+# layout.
 #
 # IT REUSES EXISTING PREDICTIONS WHENEVER THEY EXIST. If this model already has
 # full BIG-5 artifacts (the normal VLM benchmark writes them per platform), the
@@ -105,7 +104,7 @@ MODEL_SLUG="${MODEL_NAME//\//_}"
 #     (user env retrieval failed requeued held)
 # A positional argument always arrives, unaffected by any export policy. The
 # env var is kept as a fallback so existing invocations still work.
-#   sbatch --array=1 scripts/job_grounding_coco.sh /path/to/lora_run
+#   sbatch --array=1 scripts/job_grounding_big5.sh /path/to/lora_run
 LORA_ADAPTER="${1:-${LORA_ADAPTER:-}}"
 LORA_ARGS=""
 LORA_SUFFIX=""
@@ -151,7 +150,7 @@ fi
 
 # BIG-5 images are uncapped phone-camera/screenshot resolutions, so both the
 # VLM's and SAM3's concurrency stay modest here — what is comfortable on
-# pre-resized COCO images is not (recap v18/v19).
+# pre-resized COCO images is not.
 DS_BATCH=64
 BATCH=$(( DS_BATCH < BATCH_CAP ? DS_BATCH : BATCH_CAP ))
 MAX_NUM_SEQS=32

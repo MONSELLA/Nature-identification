@@ -29,8 +29,8 @@
 # load_dataset — each record carries its own `targets` — so no image dirs and
 # no GT CSVs are passed below. NOTE the consequence: this scores the
 # annotations AS THEY WERE AT INFERENCE TIME. If the BIG-5 CSVs have been
-# revised since, patch the artifact first with scripts/refresh_big5_gt.py,
-# otherwise the numbers silently reflect stale labels.
+# revised since, re-run inference, otherwise the numbers silently reflect
+# stale labels.
 #
 #   sbatch scripts/job_score_testsplit.sh                          # gemma-4-12B
 #   sbatch scripts/job_score_testsplit.sh google/gemma-4-26B-A4B-it

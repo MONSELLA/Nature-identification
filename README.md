@@ -62,28 +62,32 @@ parallel file, so one record always holds everything predicted for one image.
 ## Layout
 
 ```
-src/                        importable library — no CLI, no side effects
-  vlm_pipeline.py             caption → extract → map → label (+ hybrid resolution)
-  grounding_pipeline.py       SAM3 segmentation + nature relevance score
-  models/prompts.py           every prompt and response schema, in one place
-  models/vlm_models.py        vLLM-backed VLM backends
-  loaders/dataset_loader.py   the four datasets + their taxonomy mappings
-  loaders/excel_loader.py     the annotated taxonomy graph (WordNet + Excel)
-  evaluation/                 clip_metrics · taxonomy_metrics · detection_metrics
-                              · grounding_gt_metrics
+src/                          importable library — no CLI, no side effects
+  vlm_pipeline.py               caption → extract → map → label (+ hybrid resolution)
+  grounding_pipeline.py         SAM3 segmentation + nature relevance score
+  models/prompts.py             every prompt and response schema, in one place
+  models/vlm_models.py          vLLM-backed VLM backends
+  loaders/dataset_loader.py     the four datasets + their taxonomy mappings
+  loaders/excel_loader.py       the annotated taxonomy graph (WordNet + Excel)
+  evaluation/                   clip_metrics · taxonomy_metrics · detection_metrics
+                                · grounding_gt_metrics
 
-scripts/                    entry points (run these)
-  run_vlm_pipeline.py         THE main entry point — --stage all|infer|score
-  run_grounding_pipeline.py   grounding over an existing artifact
-  run_pipeline.py             VLM inference → grounding, end to end
-  score_grounding_gt.py       score masks against hand-drawn BIG-5 annotations
-  job_*.sh                    Slurm launchers — see "Running" below
+scripts/                      entry points
+  run_vlm_pipeline.py           THE main entry point — --stage all|infer|score
+  run_grounding_pipeline.py     SAM3 grounding over an existing artifact
+  run_pipeline.py               VLM inference → grounding, end to end
+  convert_grounding_annotations.py  hand-drawn BIG-5 polygons → RLE ground truth
+  subset_artifact_for_gt.py     cut an artifact down to the annotated images
+  make_grounding_split_file.py  list the annotated images as a --split_file
+  score_grounding_gt.py         score masks against the hand-drawn BIG-5 GT
+  combine_grounding_metrics.py  merge per-model grounding results into one JSON
+  significance_test_caption_ablation.py  paired bootstrap for the caption ablation
+  visualize_grounding.py        render one image's nature masks (thesis figures)
+  job_*.sh                      Slurm launchers — see "Running" below
 
-fine_tuning/                LoRA fine-tuning by rejection sampling (own README)
-baseline/                   closed-set CV baselines (the pre-VLM comparison)
-labeling_app/               local web app that produced the hand-drawn GT
-visualization_app/          local web app for browsing prediction CSVs
-data/big5_taxonomy/         taxonomy definitions + the annotated WordNet tree
+fine_tuning/                  LoRA fine-tuning by rejection sampling (own README)
+baseline/                     closed-set CV baselines (the pre-VLM comparison)
+data/big5_taxonomy/           taxonomy definitions + the annotated WordNet tree
 ```
 
 ## Running
@@ -105,11 +109,15 @@ On the cluster, the `scripts/job_*.sh` launchers wrap this:
 
 | launcher | what it runs |
 |---|---|
-| `job_vlm_pipeline.sh` | the main VLM benchmark — model × dataset Slurm array |
-| `job_coco_infer_ground.sh` | COCO: VLM inference → SAM3 grounding |
-| `job_evaluate_grounding.sh` | grounding scored against COCO **and** BIG-5 GT |
-| `job_evaluate_grounding_infer.sh` / `_lora.sh` | the same for a fine-tuned adapter |
+| `scripts/job_vlm_pipeline.sh` | the main VLM benchmark — model × dataset Slurm array |
+| `scripts/job_grounding_coco.sh` | COCO: VLM inference → SAM3 grounding → mask-IoU scoring |
+| `scripts/job_grounding_big5.sh` | BIG-5: grounding scored against the hand-drawn masks |
+| `scripts/job_score_testsplit.sh` | re-score a base model on the fine-tuning test split |
 | `fine_tuning/job_finetune*.sh`, `job_evaluate.sh` | LoRA training and evaluation |
+| `baseline/run_all_experiments.sh` | every closed-set baseline |
+
+Both grounding launchers also take a LoRA adapter directory as their first
+argument, to evaluate a fine-tuned model.
 
 SAM3 (`facebook/sam3`) is a **gated** HuggingFace repo. Export a token that has
 accepted its licence before submitting — never hardcode one in a job script:
@@ -136,7 +144,7 @@ Reported per dataset, never merged into a single headline number:
 - **Nature relevance score** — how much of the frame nature occupies, both as a
   plain coverage ratio and centre-weighted.
 
-Two conventions worth knowing when reading any result: ground-truth-unmapped
+Three conventions worth knowing when reading any result: ground-truth-unmapped
 instances are *excluded*, prediction-unmapped instances are *penalised as
 wrong*, and mapped/unmapped subsets are always reported separately.
 
@@ -148,11 +156,3 @@ pip install -e .
 ```
 
 Needs a CUDA GPU for the VLM (served via vLLM) and for SAM3.
-
----
-
-`CLAUDE.md` carries the detailed engineering conventions — exact metric
-definitions, routing rules, and the reasoning behind decisions that look
-arbitrary from the outside. `data/llm_reference/vlm_pipeline_recap.txt` is the
-running design history: what was tried, what was measured, and what was
-rejected.

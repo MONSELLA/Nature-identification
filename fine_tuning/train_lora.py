@@ -522,8 +522,7 @@ def language_model_of(model):
     DEPTH that varies by architecture — a single-vision-tower VLM
     (Qwen-VL/LLaVA-style) puts it at `model.language_model` (depth 1); an
     OMNI-modal wrapper juggling several encoders nests it one level deeper.
-    Confirmed directly on google/gemma-4-12B-it via
-    fine_tuning/inspect_model_layers.ipynb: `model.model` is
+    Confirmed directly on google/gemma-4-12B-it: `model.model` is
     `Gemma4UnifiedModel`, whose own children are `language_model`
     (`Gemma4UnifiedTextModel`, the actual decoder), `embed_vision`, AND
     `embed_audio` — three siblings, not one. An earlier version of this
